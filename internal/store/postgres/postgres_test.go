@@ -12,13 +12,19 @@ import (
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
-// openTestDB connects to TEST_DATABASE_URL and resets the tables. It skips when
-// the variable is unset, so `go test ./...` works with no database running --
-// the authoritative run is CI on Linux with a Postgres service.
+// openTestDB connects to TEST_DATABASE_URL and resets the tables.
+//
+// Locally, an unset variable skips the tests -- that is the point, so
+// `go test ./...` works with no database running. In CI it is a hard failure:
+// a green build there must mean the SQL was executed, not that it was skipped.
+// (`go test` prints "ok" either way, so silence is not evidence.)
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("TEST_DATABASE_URL is required in CI: the Postgres integration tests must not silently skip")
+		}
 		t.Skip("TEST_DATABASE_URL is not set; skipping Postgres integration tests")
 	}
 	db, err := Open(context.Background(), dsn)
