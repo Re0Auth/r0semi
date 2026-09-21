@@ -1,0 +1,49 @@
+r0semi / Re0Auth
+Copyright (c) the r0semi contributors
+Licensed under the Mozilla Public License 2.0 (see LICENSE).
+
+This product includes third-party software. The list below covers every module
+in the build graph of the released binaries and libraries. All of them are
+distributed under permissive licenses; none is copyleft in a way that affects
+this project's licensing.
+
+Apache License 2.0
+------------------
+
+The following are licensed under the Apache License, Version 2.0. A copy of the
+license is available at <https://www.apache.org/licenses/LICENSE-2.0>.
+
+  - github.com/coreos/go-oidc/v3
+    Copyright 2014 CoreOS, Inc.
+    This product includes software developed at CoreOS, Inc.
+    (http://www.coreos.com/).
+    (Reproduced from that module's NOTICE, as Apache-2.0 §4(d) requires.)
+
+  - github.com/go-jose/go-jose/v4
+    (Ships no NOTICE file; attribution only.)
+
+MIT License
+-----------
+
+  - github.com/alexedwards/scs/v2
+  - github.com/cenkalti/backoff/v4
+  - github.com/jackc/pgx/v5
+  - github.com/jackc/puddle/v2
+  - github.com/jackc/pgpassfile
+  - github.com/jackc/pgservicefile
+
+BSD 3-Clause License
+--------------------
+
+  - golang.org/x/oauth2
+  - golang.org/x/sync
+  - golang.org/x/text
+  - golang.org/x/time
+
+  Copyright 2009 The Go Authors. All rights reserved.
+
+---
+
+Full license texts are distributed with each module in the Go module cache and
+are retrievable with `go mod download` followed by inspecting the module source.
+Nothing in this NOTICE modifies the terms of any of those licenses.

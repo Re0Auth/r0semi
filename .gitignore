@@ -27,6 +27,16 @@ go.work.sum
 # env file
 .env
 
+# local configuration and secrets
+config/*.local.*
+config/*.secret.*
+*.local.toml
+
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Never commit third-party documents (papers, PDFs): redistribution rights are
+# usually not ours, and they bloat the repository. Link instead.
+docs/*.pdf
+*.pdf
