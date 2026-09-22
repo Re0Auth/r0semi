@@ -79,3 +79,13 @@ func (s *Sessions) SweepExpired(ctx context.Context) (int64, error) {
 	}
 	return tag.RowsAffected(), nil
 }
+
+// RevokeAllSessions deletes every session, signing everyone out. It is the session
+// half of the Kill Switch. Returns how many were removed.
+func (s *Sessions) RevokeAllSessions(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

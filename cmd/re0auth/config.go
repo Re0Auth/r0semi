@@ -32,8 +32,16 @@ type file struct {
 	Storage storageSection        `toml:"storage"`
 	Vault   vaultSection          `toml:"vault"`
 	Client  clientSection         `toml:"client"`
+	Admin   adminSection          `toml:"admin"`
 	IdP     map[string]idpSection `toml:"idp"`
 	Sources []sourceSection       `toml:"sources"`
+}
+
+// adminSection is the operator allowlist. There is no role table: an account is
+// an operator because a deployment names it here, never because it signed up.
+type adminSection struct {
+	// Subjects are account ids (`usr_…`) allowed to use /v1/admin.
+	Subjects []string `toml:"subjects"`
 }
 
 type serverSection struct {
@@ -145,6 +153,9 @@ type settings struct {
 
 	idpCredentials []idp.Credentials
 	sources        []federation.Source
+	// adminSubjects is the operator allowlist. Empty means the operator plane is
+	// not mounted at all.
+	adminSubjects []string
 }
 
 // retiredKEK is a key that can only unwrap, kept for as long as records written
@@ -319,6 +330,23 @@ func loadConfig(path string) (settings, error) {
 			return settings{}, err
 		}
 		cfg.clientSecret = value
+	}
+
+	// Operator plane. Off unless a deployment names at least one account: an admin
+	// API is not something to expose by accident, and an empty allowlist that
+	// still mounted the routes would be a door with no lock.
+	if v := strings.TrimSpace(os.Getenv("RE0AUTH_ADMIN_SUBJECTS")); v != "" {
+		for _, part := range strings.Split(v, ",") {
+			if s := strings.TrimSpace(part); s != "" {
+				cfg.adminSubjects = append(cfg.adminSubjects, s)
+			}
+		}
+	} else {
+		for _, s := range f.Admin.Subjects {
+			if s = strings.TrimSpace(s); s != "" {
+				cfg.adminSubjects = append(cfg.adminSubjects, s)
+			}
+		}
 	}
 
 	if err := loadIdP(&cfg, f.IdP); err != nil {

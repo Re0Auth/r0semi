@@ -78,7 +78,7 @@ Fiber（组件实例）
 | `clients` | 下游应用注册表 | `oauth.clients` | `store.sql` |
 | `oauth` | 授权服务器：authorize/token/refresh/revoke/introspect | `oauth.as` | `oauth.clients`, `oauth.tokens`, `audit.log` |
 | `consent` | 授权同意页 | — | `oauth.clients`, `oauth.as` |
-| `admin` | 应用注册 / 审核 / 吊销 / Kill Switch | — | `store.sql`, `oauth.clients`, `oauth.as`, `audit.log` |
+| `admin` | 应用注册 / 审核 / 吊销 / Kill Switch（**已实现**，见 §4.12） | `admin` | `oauth.clients`, `oauth.tokens`, `audit.log` |
 
 依赖图（边 `a ──> b` 表示 a 向 b 提供能力；单向、无环）：
 
@@ -477,6 +477,21 @@ storage: every port is persistent (accounts, tokens, device authorizations, clie
 
 > 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
 > `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
+
+### 4.12 管理面（v1 已实现：`internal/admin` + `httpapi`）
+
+应用注册 / 审核 / 吊销 / Kill Switch。完整契约见 [admin.md](./admin.md)。要点：
+
+- **管理员 = 配置允许列表里的 `usr_…`**（`[admin].subjects` 或 `RE0AUTH_ADMIN_SUBJECTS`），
+  不是角色表，也不可自我提权。列表为空时整个 `/v1/admin/*` **不挂载**；已登录但不在列表里的账号
+  访问它得到 `404`，与一个不存在的路径无区别。
+- 逻辑在 `internal/admin`，只依赖两个窄端口：`Clients`（`oauth.ClientAdmin` + `ClientRegistry`）
+  与 `Tokens`（`oauth.TokenAdmin` 批量删除），外加可选的 `SessionRevoker`。因此同一套逻辑既跑 Postgres
+  也跑内存，HTTP 层与存储无关。
+- **暂停 = 从协议入口消失**：注册表 `Get` 对 `suspended` 返回 `ErrClientNotFound`，与未注册无差别；
+  只有 `GET /v1/admin/clients` 还看得见它。停用先于删令牌，失败方向安全。
+- 每个动作写审计，`Detail["actor"]` 是发起管理员。审计失败**不回滚**已发生的安全动作，只告警。
+- Kill Switch 覆盖令牌与会话（`all` / `client` / `subject`）；**绑定/上游那一半未实现**，见 admin.md §4.2。
 
 ## 5. 安全不变量（必须由测试守护）
 

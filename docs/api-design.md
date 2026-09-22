@@ -193,6 +193,21 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 
 > enrollment / 扫码托管已迁出 Re0Auth，成为**参考数据源**的一部分（见 architecture.md §4.10）。
 
+### 管理面（`/v1/admin`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/v1/admin/clients` | 全部客户端（含 `suspended`）；审核 inventory |
+| `POST` | `/v1/admin/clients` | 注册客户端；secret 仅返回一次 |
+| `POST` | `/v1/admin/clients/{client_id}/suspend` | 暂停并吐销其令牌 |
+| `POST` | `/v1/admin/clients/{client_id}/activate` | 恢复（**不**恢复令牌） |
+| `DELETE` | `/v1/admin/clients/{client_id}` | 删除注册并吐销令牌；幂等 |
+| `POST` | `/v1/admin/kill_switch` | 按 `all`/`client`/`subject` 批量吐销（`all` 另清会话） |
+
+会话 + CSRF。管理员是**配置允许列表里的 `usr_…`**（`[admin].subjects` / `RE0AUTH_ADMIN_SUBJECTS`），
+不是角色；列表为空则整个平面不挂载。非管理员（含已登录的）访问得到 `404`。
+完整契约与边界（尤其 Kill Switch **不**覆盖绑定/上游）见 [admin.md](./admin.md)。
+
 ---
 
 ## 5. 为什么没有“导出上游凭据”端点

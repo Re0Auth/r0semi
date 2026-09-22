@@ -1151,3 +1151,55 @@ func TestClientAdminLifecycleAndSuspension(t *testing.T) {
 		t.Fatalf("SetStatus after delete = %v, want ErrClientNotFound", err)
 	}
 }
+
+// revokeMatching is the one query behind every bulk revocation; its filters must
+// select a client, a subject, or everything.
+func TestRevokeMatchingFilters(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	mustExec := func(query string) {
+		t.Helper()
+		if _, err := db.pool.Exec(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tables := []string{"oidc_access_tokens", "oidc_refresh_tokens"}
+
+	mustExec(`INSERT INTO oidc_access_tokens (id_hash, client_id, subject, expires_at) VALUES ('a1','cli_a','usr_1', now()+interval '1 hour')`)
+	mustExec(`INSERT INTO oidc_access_tokens (id_hash, client_id, subject, expires_at) VALUES ('b1','cli_b','usr_1', now()+interval '1 hour')`)
+	mustExec(`INSERT INTO oidc_access_tokens (id_hash, client_id, subject, expires_at) VALUES ('c1','cli_a','usr_2', now()+interval '1 hour')`)
+	mustExec(`INSERT INTO oidc_refresh_tokens (token_hash, id_hash, client_id, subject, expires_at) VALUES ('r1','a1','cli_a','usr_1', now()+interval '1 hour')`)
+
+	n, err := revokeMatching(ctx, db.pool, tables, oauth.TokenFilter{ClientID: "cli_a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("client filter removed %d, want 3", n)
+	}
+	n, err = revokeMatching(ctx, db.pool, tables, oauth.TokenFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("empty filter removed %d, want 1", n)
+	}
+}
+
+func TestRevokeAllSessionsDeletesEveryRow(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	store := db.Sessions()
+	for _, token := range []string{"t1", "t2"} {
+		if err := store.Commit(token, []byte("data"), time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := store.RevokeAllSessions(ctx)
+	if err != nil || n != 2 {
+		t.Fatalf("removed %d (%v), want 2", n, err)
+	}
+	if _, found, _ := store.Find("t1"); found {
+		t.Fatal("a session survived the kill switch")
+	}
+}

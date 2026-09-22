@@ -849,6 +849,12 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 	return nil
 }
 
+// RevokeTokens implements oauth.TokenAdmin for the OP-managed token tables. It
+// is what a suspended client, a compromised subject, or the Kill Switch call.
+func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
+	return revokeMatching(ctx, s.pool, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
+}
+
 // DescribeDeviceAuthorization is the device verification page's view of a
 // pending device grant (OP-backed counterpart of the same oauth.Service method).
 func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error) {

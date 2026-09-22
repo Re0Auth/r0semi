@@ -79,6 +79,14 @@ name = "First-party client"
 redirect_uris = ["https://app.example/callback"]
 scopes        = ["account.id", "phigros.profile.read"]
 
+[admin]
+# The operator allowlist: account ids (usr_…) allowed to use /v1/admin. Empty, or
+# the section absent, means the operator plane is not mounted at all. There are no
+# roles, and no account can add itself: an operator is one because this list says
+# so. Find your id from GET /v1/me, or from the usr_… in the session view.
+# Environment override: RE0AUTH_ADMIN_SUBJECTS="usr_…,usr_…"
+subjects = []
+
 # Identity providers. Only the ones listed here are offered, so a deployment
 # exposes exactly what it configured. Known names: github, google, discord,
 # microsoft, qq.

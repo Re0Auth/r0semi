@@ -27,6 +27,7 @@ import (
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/config"
@@ -52,14 +53,17 @@ type storage struct {
 	accounts account.Store
 	tokens   oauth.Store
 	devices  oauth.DeviceStore
-	clients  oauth.ClientRegistry
+	clients  admin.Clients
 	// credentials is the vault's repository: the one place a decrypted secret
 	// never reaches.
 	credentials vault.Repo
 	bindings    federation.BindingStore
 	bindFlows   federation.BindFlowStore
 	sessions    scs.Store
-	authzStore  authz.Store
+	// sessionRevoker drops every browser session for the Kill Switch. Nil in
+	// memory mode, where sessions cannot be enumerated.
+	sessionRevoker admin.SessionRevoker
+	authzStore     authz.Store
 	// audit is the durable audit-log sink; nil would mean "nobody is auditing",
 	// which must never be a silent state.
 	audit audit.Logger
@@ -227,6 +231,7 @@ func main() {
 		// One switch for "this issuer is https": Secure cookies and HSTS.
 		Secure: cfg.CookieSecure,
 	}
+	var tokenRevoker oauth.TokenAdmin
 	if store.db != nil {
 		// Durable storage means the OpenID Provider can run (ADR-0001).
 		oidcHandler, oidcStore, err := openOIDC(cfg, store, sessions, logger)
@@ -238,13 +243,42 @@ func main() {
 		apiConfig.GrantStore = oidcStore
 		apiConfig.DeviceStore = oidcStore
 		apiConfig.Authorization = oidcHandler
+		// The OP owns the tokens in this mode, so it is also what revokes them.
+		tokenRevoker = oidcStore
 		slog.Info("authorization engine", "engine", "openid-provider")
 	} else {
 		// Without a database the OP store has nowhere to live, so the in-memory
 		// hand-rolled engine remains. This is the only mode where it does.
 		apiConfig.AS = as
 		apiConfig.Authz = authzService
+		memTokens, ok := store.tokens.(oauth.TokenAdmin)
+		if !ok {
+			die("admin", errors.New("the in-memory token store cannot revoke tokens in bulk"))
+		}
+		tokenRevoker = memTokens
 		slog.Warn("authorization engine", "engine", "built-in (in-memory)", "reason", "no database")
+	}
+
+	// The operator plane. It is mounted only when a deployment names at least one
+	// admin account; `httpapi.New` rejects a service with an empty allowlist, and
+	// this skips it entirely rather than mounting a door with no lock.
+	if len(cfg.adminSubjects) > 0 {
+		adminSvc, err := admin.New(admin.Config{
+			Clients:  store.clients,
+			Tokens:   tokenRevoker,
+			Sessions: store.sessionRevoker,
+			Audit:    logger,
+		})
+		if err != nil {
+			die("admin", err)
+		}
+		admins := make([]account.UserID, 0, len(cfg.adminSubjects))
+		for _, s := range cfg.adminSubjects {
+			admins = append(admins, account.UserID(s))
+		}
+		apiConfig.Admin = adminSvc
+		apiConfig.Admins = admins
+		slog.Info("operator plane enabled", "admins", len(admins))
 	}
 	api, err := httpapi.New(apiConfig)
 	if err != nil {
@@ -307,8 +341,11 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 		bindings:    db.Bindings(),
 		bindFlows:   db.BindFlows(),
 		sessions:    sessions,
-		authzStore:  authzRequests,
-		audit:       db.Audit(),
+		// The concrete store, not the scs.Store interface: only it can drop
+		// every session at once, which is the Kill Switch's session half.
+		sessionRevoker: sessions,
+		authzStore:     authzRequests,
+		audit:          db.Audit(),
 		// Both are swept, and the first error is surfaced: one failing must not
 		// hide the other.
 		sweep: func(ctx context.Context) (int64, error) {

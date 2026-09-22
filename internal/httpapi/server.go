@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/internal/authz"
@@ -89,6 +90,13 @@ type Config struct {
 	// store so the views reflect the tokens the OP actually issued.
 	GrantStore  GrantStore
 	DeviceStore DeviceStore
+
+	// Admin, when set together with a non-empty Admins allowlist, mounts the
+	// operator plane under /v1/admin. Both are required: an admin service with
+	// nobody allowed to call it would be a door with no handle, and an allowlist
+	// with no service would be a promise that does nothing.
+	Admin  admin.Service
+	Admins []account.UserID
 }
 
 // TokenIntrospector resolves a bearer token to its grant. It is the business
@@ -133,6 +141,10 @@ type Server struct {
 	introspector TokenIntrospector
 	grants       GrantStore
 	devices      DeviceStore
+	// adminSvc is the operator plane; nil when it is not configured.
+	adminSvc admin.Service
+	// adminAllowed is the allowlist of account subjects that may call it.
+	adminAllowed map[account.UserID]bool
 }
 
 // New validates cfg and returns a Server.
@@ -192,6 +204,16 @@ func New(cfg Config) (*Server, error) {
 	if devices == nil {
 		devices = cfg.AS
 	}
+	if cfg.Admin != nil && len(cfg.Admins) == 0 {
+		return nil, errors.New("httpapi: Config.Admin requires a non-empty Config.Admins")
+	}
+	if cfg.Admin != nil && cfg.Sessions == nil {
+		return nil, errors.New("httpapi: Config.Admin requires Config.Sessions")
+	}
+	adminAllowed := make(map[account.UserID]bool, len(cfg.Admins))
+	for _, a := range cfg.Admins {
+		adminAllowed[a] = true
+	}
 	return &Server{
 		issuer:       strings.TrimRight(cfg.Issuer, "/"),
 		resource:     strings.TrimRight(cfg.Resource, "/"),
@@ -212,6 +234,8 @@ func New(cfg Config) (*Server, error) {
 		introspector: introspector,
 		grants:       grants,
 		devices:      devices,
+		adminSvc:     cfg.Admin,
+		adminAllowed: adminAllowed,
 	}, nil
 }
 
@@ -293,6 +317,20 @@ func (s *Server) specRoutes() []route {
 			route{http.MethodGet, "/v1/games/{game}/sources", s.handleGameSources},
 			route{http.MethodGet, "/v1/games/{game}/sources/{source}/raw/{path...}", s.withBearer(s.handleGameRaw)},
 			route{http.MethodGet, "/v1/games/{game}/{resource}", s.withBearer(s.handleGameResource)},
+		)
+	}
+	if s.adminSvc != nil {
+		// The operator plane. Its routes live under /v1 so they share the JSON
+		// and problem+json conventions, and they are documented like every other
+		// endpoint: an operator API that is not in the spec is a client waiting to
+		// be surprised just the same.
+		routes = append(routes,
+			route{http.MethodGet, "/v1/admin/clients", s.handleAdminListClients},
+			route{http.MethodPost, "/v1/admin/clients", s.handleAdminRegisterClient},
+			route{http.MethodPost, "/v1/admin/clients/{client_id}/suspend", s.handleAdminSuspendClient},
+			route{http.MethodPost, "/v1/admin/clients/{client_id}/activate", s.handleAdminActivateClient},
+			route{http.MethodDelete, "/v1/admin/clients/{client_id}", s.handleAdminDeleteClient},
+			route{http.MethodPost, "/v1/admin/kill_switch", s.handleAdminKillSwitch},
 		)
 	}
 	return routes

@@ -12,6 +12,7 @@ import (
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/federation"
@@ -110,10 +111,20 @@ func newFullConfig(t *testing.T) Config {
 		t.Fatal(err)
 	}
 
+	adminSvc, err := admin.New(admin.Config{
+		Clients: clients,
+		Tokens:  oauth.NewMemoryStore(),
+		Audit:   audit.NewMemoryLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	return Config{
 		Issuer: "https://re0auth.test", AS: as,
 		Sessions: manager, Accounts: accounts, Auth: authHandler,
 		Authz: azSvc, Federation: fed,
+		Admin: adminSvc, Admins: []account.UserID{"usr_admin"},
 	}
 }
 

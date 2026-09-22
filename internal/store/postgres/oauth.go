@@ -180,6 +180,33 @@ func (s *Tokens) DeleteBySubjectClient(ctx context.Context, subject, clientID st
 	return err
 }
 
+// RevokeTokens implements oauth.TokenAdmin on the hand-rolled engine's tables.
+// In durable deployments the OpenID Provider owns the tokens; this covers the
+// in-memory engine's Postgres store, which shares the same seam.
+func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
+	return revokeMatching(ctx, s.pool, []string{"oauth_access_tokens", "oauth_refresh_tokens"}, f)
+}
+
+// revokeMatching deletes rows selected by the filter from two token tables and
+// returns the total. Empty filter fields match everything, so the same statement
+// serves "all", "this client" and "this subject".
+//
+// Table names are compile-time constants, never request input, so building the
+// statement with Sprintf does not put anything user-controlled into the SQL.
+func revokeMatching(ctx context.Context, pool *pgxpool.Pool, tables []string, f oauth.TokenFilter) (int, error) {
+	total := 0
+	for _, table := range tables {
+		tag, err := pool.Exec(ctx, fmt.Sprintf(
+			`DELETE FROM %s WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
+			table), f.ClientID, f.Subject)
+		if err != nil {
+			return total, err
+		}
+		total += int(tag.RowsAffected())
+	}
+	return total, nil
+}
+
 // Devices implements oauth.DeviceStore on Postgres. The device code is hashed;
 // the user code is stored canonically and looked up case- and
 // separator-insensitively through an expression index.

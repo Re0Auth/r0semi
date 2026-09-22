@@ -86,6 +86,9 @@ A2/A3 可撤销、可审计、可细分，**暴露半径小于 stoken**。
 - **D5 Kill Switch（范围已修正）**：re0auth 能做的是一键作废全部**绑定**（丢弃绑定令牌 + 调各源的
   revocation endpoint），以及**对每个支持级联撤销的源发起登出请求**；它**不能**自己作废上游登录——
   那需要上游的凭据，而它没有。要连上游一起清，必须各数据源配合暴露该能力。
+  **实现状态（v1）**：`POST /v1/admin/kill_switch` 已实现**令牌与会话**那一半（`all`/`client`/`subject`）；
+  **绑定/上游那一半尚未实现**（需要先能全局枚举绑定并逐源调用）。因此当前 Kill Switch 能切断重新签发令牌，
+  但不会断开已绑定的数据源。见 [admin.md](./admin.md) §4.2。
 - **D6 采纳 OIDC**：Re0Auth 升格为 OpenID Provider（身份联邦 + 数据授权），玩家仍由外部 IdP 登录。
   新增 `id_token` / `userinfo` / JWKS / OIDC discovery 与两把新密钥（A8/A9）。决策与契约见
   [oidc-decision.md](./oidc-decision.md)（ADR-0001）。

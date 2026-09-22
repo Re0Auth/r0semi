@@ -80,6 +80,29 @@ type Store interface {
 	DeleteBySubjectClient(ctx context.Context, subject, clientID string) error
 }
 
+// TokenFilter selects tokens for bulk revocation. An empty filter matches every
+// token; when both fields are set they combine with AND.
+type TokenFilter struct {
+	ClientID string
+	Subject  string
+}
+
+// Matches reports whether a token's owner is selected by the filter.
+func (f TokenFilter) Matches(clientID, subject string) bool {
+	return (f.ClientID == "" || f.ClientID == clientID) &&
+		(f.Subject == "" || f.Subject == subject)
+}
+
+// TokenAdmin is the management side of a token store: bulk revocation, for an
+// operator disabling a client, containing a compromised account, or throwing the
+// Kill Switch. It is separate from Store so the request path depends only on the
+// operations it actually performs.
+type TokenAdmin interface {
+	// RevokeTokens deletes every matching token and reports how many rows went
+	// away. Removing zero is success: revocation is idempotent.
+	RevokeTokens(ctx context.Context, f TokenFilter) (int, error)
+}
+
 // MemoryStore is a non-durable Store for development and tests.
 type MemoryStore struct {
 	mu      sync.Mutex

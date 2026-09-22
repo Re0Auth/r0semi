@@ -190,3 +190,26 @@ func (s *MemoryStore) DeleteBySubjectClient(_ context.Context, subject, clientID
 	}
 	return nil
 }
+
+// RevokeTokens implements TokenAdmin. It returns how many records it removed,
+// because a Kill Switch report with no number is not something an operator can
+// act on.
+func (s *MemoryStore) RevokeTokens(_ context.Context, f TokenFilter) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for key, t := range s.access {
+		if f.Matches(t.ClientID, t.Subject) {
+			delete(s.access, key)
+			removed++
+		}
+	}
+	for key, t := range s.refresh {
+		if f.Matches(t.ClientID, t.Subject) {
+			delete(s.refresh, key)
+			removed++
+		}
+	}
+	return removed, nil
+}

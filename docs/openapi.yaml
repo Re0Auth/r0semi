@@ -82,6 +82,12 @@ tags:
     description: RFC 8628 user-code verification. Called by the frontend.
   - name: federation
     description: Reading a game's data through whichever source is active.
+  - name: admin
+    description: |
+      The operator plane: registering, reviewing and revoking downstream clients,
+      and the Kill Switch. Session-scoped and limited to the accounts in the
+      deployment's admin allowlist; a signed-in non-admin sees `404`, because the
+      plane is not advertised to accounts that cannot use it.
 
 # No global security: GET /v1/games/{game}/sources is public, so each operation
 # states its own requirement.
@@ -934,6 +940,270 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  /v1/admin/clients:
+    get:
+      operationId: adminListClients
+      tags: [admin]
+      summary: Every registered downstream client, suspended ones included.
+      description: |
+        The operator's inventory. Unlike `GET /v1/grants`, this is not scoped to
+        the caller: it is a deployment-wide view for reviewing what applications
+        exist and what they may request.
+
+        Requires an account whose `usr_…` id is on the deployment's admin
+        allowlist. A signed-in non-admin is answered `404`, not `403`: the
+        operator plane is not advertised to accounts that cannot use it.
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: All clients, ordered by client id.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, csrf_token]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminClient' }
+                  csrf_token: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: The caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminRegisterClient
+      tags: [admin]
+      summary: Register a downstream client.
+      description: |
+        Creates a client in the `active` state. A confidential client's secret is
+        generated and returned **once**, in `client_secret`; only its hash is
+        stored, so it cannot be read again. A public client has no secret, and the
+        field is absent from the response.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/CSRFToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, redirect_uris, scopes]
+              properties:
+                name: { type: string }
+                type: { type: string, enum: [public, confidential], default: public }
+                redirect_uris:
+                  type: array
+                  items: { type: string, format: uri }
+                scopes:
+                  type: array
+                  items: { type: string }
+      responses:
+        '201':
+          description: The registered client, and its secret when there is one.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [client]
+                properties:
+                  client: { $ref: '#/components/schemas/AdminClient' }
+                  client_secret:
+                    type: string
+                    description: Present only for a confidential client, and only here.
+        '400':
+          description: The registration was rejected (bad type, redirect URI or scope).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: The caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/admin/clients/{client_id}/suspend:
+    post:
+      operationId: adminSuspendClient
+      tags: [admin]
+      summary: Suspend a client and revoke the tokens it holds.
+      description: |
+        A suspended client is reported as **unknown** by every protocol entrance,
+        not as forbidden, so its next authorize or token request fails exactly as
+        if the id had never been registered.
+
+        Suspension happens before the token purge, so a failure while revoking
+        cannot leave the client able to mint more tokens. Idempotent.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: client_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '204':
+          description: The client is suspended. No body.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown client, or the caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/admin/clients/{client_id}/activate:
+    post:
+      operationId: adminActivateClient
+      tags: [admin]
+      summary: Re-enable a suspended client.
+      description: |
+        The inverse of suspension. It does **not** restore revoked tokens; the
+        client merely becomes usable again and must ask for consent anew.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: client_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '204':
+          description: The client is active. No body.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown client, or the caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/admin/clients/{client_id}:
+    delete:
+      operationId: adminDeleteClient
+      tags: [admin]
+      summary: Delete a client registration and revoke its tokens.
+      description: |
+        Removes the registration and deletes every token the client holds. The
+        token purge runs whether or not the registration existed, so a retry after
+        a dropped response still cuts live access. Idempotent.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: client_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '204':
+          description: The client is gone and holds no tokens. No body.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: The caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/admin/kill_switch:
+    post:
+      operationId: adminKillSwitch
+      tags: [admin]
+      summary: Revoke issued tokens in bulk. The incident-response lever.
+      description: |
+        Exactly one target, selected by `target`:
+
+        * `all` — every issued access and refresh token, and (where the deployment
+          has durable sessions) every browser session.
+        * `client` — every token the named client holds, and the client is
+          suspended so it cannot immediately mint more.
+        * `subject` — every token the named account holds. Its browser sessions are
+          **not** dropped: sessions are opaque cookies with no subject index. The
+          account can still sign in again.
+
+        **What it cannot do:** it does not touch any upstream credential, because
+        Re0Auth does not hold one; and it does not revoke data-source bindings,
+        which are a separate plane. That half of the design (threat-model D5) is
+        not implemented yet.
+
+        The response reports what was actually removed, because the number is what
+        an incident responder acts on.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/CSRFToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target: { type: string, enum: [all, client, subject] }
+                client_id: { type: string, description: Required when `target` is `client`. }
+                subject: { type: string, description: Required when `target` is `subject`. }
+      responses:
+        '200':
+          description: What the kill switch removed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KillSwitchReport' }
+        '400':
+          description: The target was missing, incomplete or ambiguous.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: The caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1021,6 +1291,34 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
+    AdminClient:
+      type: object
+      title: AdminClient
+      description: |
+        A registered client as an operator sees it. It carries no secret — only a
+        hash is stored — so there is nothing here to leak.
+      required: [client_id, name, type, status, redirect_uris, allowed_scopes, created_at]
+      properties:
+        client_id: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [public, confidential] }
+        status: { type: string, enum: [active, suspended] }
+        redirect_uris:
+          type: array
+          items: { type: string }
+        allowed_scopes:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+    KillSwitchReport:
+      type: object
+      title: KillSwitchReport
+      description: What the Kill Switch actually removed.
+      required: [tokens_revoked, sessions_revoked, clients_suspended]
+      properties:
+        tokens_revoked: { type: integer }
+        sessions_revoked: { type: integer }
+        clients_suspended: { type: integer }
     Problem:
       type: object
       title: Problem
