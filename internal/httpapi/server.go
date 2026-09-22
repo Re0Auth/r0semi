@@ -373,8 +373,16 @@ func (s *Server) Handler() http.Handler {
 		// without it a user who signs in successfully is delivered to a 404 — the
 		// one page guaranteed to make them think the login failed. A deployment
 		// with no frontend keeps the 404, which is correct: there is no page there.
+		//
+		// The query is carried through, because it is where a failed login's reason
+		// lives (`/?error=access_denied`). Dropping it would return the user to the
+		// anonymous page with no explanation for a login they just watched fail.
 		root.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, webui.BasePath+"/", http.StatusFound)
+			target := webui.BasePath + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusFound)
 		})
 	}
 	root.HandleFunc("/", s.handleNotFound)

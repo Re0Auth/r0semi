@@ -293,19 +293,20 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	state := randomToken(24)
 	verifier := client.NewVerifier()
 	nonce := client.NewNonce()
+	returnTo := safeurl.RelativePath(r.URL.Query().Get("return_to"))
 	h.manager.sessions.Put(ctx, keyFlowState, state)
 	h.manager.sessions.Put(ctx, keyFlowProvider, string(provider))
 	h.manager.sessions.Put(ctx, keyFlowMode, mode)
-	h.manager.sessions.Put(ctx, keyFlowReturnTo, safeurl.RelativePath(r.URL.Query().Get("return_to")))
+	h.manager.sessions.Put(ctx, keyFlowReturnTo, returnTo)
 	h.manager.sessions.Put(ctx, keyFlowVerifier, verifier)
 	h.manager.sessions.Put(ctx, keyFlowNonce, nonce)
 
 	authURL, err := client.AuthCodeURL(ctx, state, verifier, nonce)
 	if err != nil {
-		// A custom OIDC provider whose discovery is unreachable is a deployment
-		// problem, and the user cannot log in until it is fixed. Say so rather
-		// than redirecting them to a dead address.
-		http.Error(w, "could not start the authorization", http.StatusBadGateway)
+		// A provider whose discovery is unreachable, or that is misconfigured, is a
+		// deployment problem the person cannot see. Send them back with a reason
+		// rather than a dead-end 502 page they can do nothing with.
+		redirectError(w, r, returnTo, "provider_unavailable")
 		return
 	}
 	http.Redirect(w, r, authURL, http.StatusFound)

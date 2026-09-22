@@ -110,6 +110,9 @@ Passkey 的 OP 即可；Re0Auth 仍不持有也不验证任何密码/密钥。pr
 由 `state` 关联；回调时校验，不接受客户端回传的 `mode`/`return_to`。
 
 - `return_to` 只允许**同源相对路径**，防开放重定向。
+- 登录**无法发起**（如自定义 OIDC provider 的 discovery 不可达）时，**不返回裸 502**，而是 303 回
+  `return_to?error=provider_unavailable`，由前端给出可读提示。provider 拒绝（`error=access_denied`）
+  同样回 `return_to?error=…`；因此 `return_to` 为空时需要 `/` → `/app/` 的跳转**带上 query**，否则原因会丢。
 - IdP 采用 Authorization Code + PKCE；`state` 单次使用、短时效。
 - provider 具体细节（scope、QQ unionid、微软 tenant）属实现，不改变本节契约。
 

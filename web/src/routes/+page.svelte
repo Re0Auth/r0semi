@@ -14,23 +14,28 @@
 	let providers = $state<IDPProvider[]>([]);
 	let detail = $state('');
 	let signingOut = $state(false);
-	// Identity operations report here rather than through `phase`: a failed unlink
-	// must not throw the whole account page away.
-	let identityError = $state('');
+	// A login or identity operation that failed reports here rather than through
+	// `phase`: it must not throw the whole page away, and it has to be visible to a
+	// visitor who is still anonymous, which is exactly the state a denied login
+	// leaves them in.
+	let authError = $state('');
 	let confirmingUnlink = $state<string | null>(null);
 	let unlinking = $state<string | null>(null);
 	let linking = $state<string | null>(null);
 
 	onMount(async () => {
+		// A failed login or link comes back as ?error=... on the return URL. Read it
+		// before probing the session: a denied *login* leaves the visitor anonymous,
+		// and the reason must still be shown to them.
+		const error = new URLSearchParams(window.location.search).get('error');
+		if (error) authError = authErrorMessage(error);
+
 		try {
 			session = await api.currentSession();
 			phase = 'signed_in';
 			// The provider list is for the "link another identity" buttons. A failure
 			// to load it must not make the account page unusable.
 			providers = (await api.listIDPProviders().catch(() => ({ data: [] }))).data;
-			// A link flow that failed comes back as ?error=... on the return URL.
-			const error = new URLSearchParams(window.location.search).get('error');
-			if (error) identityError = linkErrorMessage(error);
 		} catch (err) {
 			// 401 is not a failure here: it is the ordinary state of a visitor.
 			if (err instanceof ApiError && err.needsSignIn) {
@@ -42,18 +47,26 @@
 		}
 	});
 
-	function linkErrorMessage(code: string): string {
+	// authErrorMessage turns the code the login plane redirected back with into
+	// something a person can act on. Login and linking share it because they share
+	// the return URL.
+	function authErrorMessage(code: string): string {
 		switch (code) {
+			case 'access_denied':
+				return '登录已取消，或未获得授权。';
+			case 'provider_unavailable':
+				return '该登录方式暂时不可用，请稍后再试。';
 			case 'identity_taken':
 				return '这个身份已经绑定到另一个 Re0Auth 账号了。请先登录那个账号解绑，再回来绑定。';
 			case 'not_signed_in':
 				return '登录状态已过期，请重新登录。';
+			case 'signup_failed':
 			case 'link_failed':
 			case 'identity_failed':
 			case 'exchange_failed':
-				return '绑定没有完成，请重试。';
+				return '登录没有完成，请重试。';
 			default:
-				return `绑定没有完成（${code}）。`;
+				return `登录没有完成（${code}）。`;
 		}
 	}
 
@@ -77,7 +90,7 @@
 	async function unlink(id: string) {
 		if (!session) return;
 		unlinking = id;
-		identityError = '';
+		authError = '';
 		try {
 			await api.unlinkIdentity(id, session.csrf_token);
 			// Re-read rather than splice: the server may have re-nominated the
@@ -85,7 +98,7 @@
 			session = await api.currentSession();
 			confirmingUnlink = null;
 		} catch (err) {
-			identityError = err instanceof Error ? err.message : String(err);
+			authError = err instanceof Error ? err.message : String(err);
 		} finally {
 			unlinking = null;
 		}
@@ -108,6 +121,11 @@
 {:else if phase === 'failed'}
 	<p class="mt-4 text-sm text-danger">{detail}</p>
 {:else if phase === 'anonymous'}
+	{#if authError}
+		<div class="mt-4">
+			<Alert tone="danger" title="登录没有完成">{authError}</Alert>
+		</div>
+	{/if}
 	<p class="mt-4 text-sm text-ink-muted">
 		Re0Auth 不设密码。选择一个身份提供方登录，账号会由它建立——首次登录即注册。
 	</p>
@@ -116,8 +134,8 @@
 	</div>
 {:else if session}
 	<div class="mt-4 flex flex-col gap-4">
-		{#if identityError}
-			<Alert tone="danger" title="身份操作没有完成">{identityError}</Alert>
+		{#if authError}
+			<Alert tone="danger" title="身份操作没有完成">{authError}</Alert>
 		{/if}
 		<Card>
 			<div class="border-b border-line px-4 py-3">

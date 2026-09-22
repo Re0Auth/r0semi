@@ -163,6 +163,11 @@ const idp = createServer(async (req, res) => {
 
 		// A generic OIDC provider, so the custom [idp.<name>] path is exercised end
 		// to end: discovery, JWKS, a signed id_token and a nonce.
+		// A second OIDC issuer whose discovery is down, so "a login that cannot even
+		// start" is exercised end to end: a normal provider that is unreachable.
+		case '/oidc-down/.well-known/openid-configuration':
+			res.writeHead(503, { 'content-type': 'application/json' }).end('{"error":"temporarily_unavailable"}');
+			return;
 		case '/oidc/.well-known/openid-configuration':
 			json(res, 200, {
 				issuer: `${idpBase}/oidc`,
@@ -340,6 +345,14 @@ client_id = "e2e-oidc-client"
 client_secret_env = "E2E_IDP_SECRET"
 issuer = "${idpBase}/oidc"
 display_name = "Authentik"
+
+# A provider whose discovery endpoint is down. The point is that a login which
+# cannot even start returns the user to the app with a reason, not a dead-end 502.
+[idp.legacy]
+client_id = "e2e-legacy-client"
+client_secret_env = "E2E_IDP_SECRET"
+issuer = "${idpBase}/oidc-down"
+display_name = "Legacy SSO"
 
 # A registered source, so that a scope can be shown to be enforced by the server
 # rather than by a checkbox. Nothing here is ever contacted: the tests never bind,
