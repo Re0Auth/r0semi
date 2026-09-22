@@ -870,6 +870,9 @@ func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, sub
 			}
 		}
 	}
+	// ADR-0001 O-6 (revised): a device authorization always yields a refresh
+	// token, so offline_access is granted implicitly.
+	granted = appendOfflineAccess(granted)
 	return s.ApproveDevice(ctx, userCode, subject, granted)
 }
 
@@ -905,4 +908,13 @@ func appendScopeUnique(dst []oauth.Scope, s oauth.Scope) []oauth.Scope {
 		}
 	}
 	return append(dst, s)
+}
+
+// appendOfflineAccess appends the OIDC offline_access scope if absent, so the
+// OP issues a refresh token (ADR-0001 O-6, revised).
+func appendOfflineAccess(scopes []string) []string {
+	if containsStr(scopes, oidc.ScopeOfflineAccess) {
+		return scopes
+	}
+	return append(scopes, oidc.ScopeOfflineAccess)
 }

@@ -36,7 +36,7 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 | O-3 | **`userinfo`**（`GET /oauth/userinfo`，Bearer）：默认只返回 `sub`。**email 永不返回**（[account-model.md](./account-model.md) I-3 的延伸）。展示型 claims（`name` / `picture`）留待将来独立的 `profile` scope，单独决策。 |
 | O-4 | **`sub` = Re0Auth 的 `usr_...`**：随机、稳定、伪匿名。 |
 | O-5 | **access token 仍是不透明引用令牌 + introspect**（[api-design.md](./api-design.md) D-2 不变）；`id_token` 是唯一的 JWT。 |
-| O-6 | **refresh token 采用 `offline_access` 语义**：只有请求并同意 `offline_access` 才发 refresh token（这是行为变更，见 §5）。 |
+| O-6 | **refresh token 总是签发**：Re0Auth 隐式授予 `offline_access`（它是令牌生命周期标记，不是数据权限），保持“授权码 / 设备码流总是可续期”的既有契约。 |
 | O-7 | **scope 语义不变**：未知 / 未授权的 scope → `invalid_scope`，**不是静默丢弃**（库默认会静默丢弃，迁移必须补校验）。 |
 | O-8 | **设备码流（RFC 8628）保持**，由 OP 原生提供。 |
 | O-9 | **明确不做**：`end_session`（RP-Initiated Logout）、`id_token_hint`、PAR（RFC 9126）、动态客户端注册（RFC 7591）、OIDC Session Management。不广告、不实现。 |
@@ -54,7 +54,7 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
    email 永不返回。
 2. **两把新密钥**：OP 签名私钥（RS256）与不透明令牌加密密钥（32 字节 AES-GCM）。
    纳入密钥管理与轮换（对照 [threat-model.md](./threat-model.md) §6.0 的诚实边界）。
-3. **refresh token 行为变更**：从"总是发"改为"`offline_access` 才发"。下游 SDK、前端同意页与文档需同步。
+3. **refresh token 保持总是签发**：O-6 修订后，授权码 / 设备码流总是发 refresh token；`offline_access` 隐式授予，不在同意页逐项展示（它不是数据权限）。
 4. **新端点面**：`userinfo` / `keys`(JWKS) / OIDC discovery。`end_session` 不实现。
 5. **库的现实**：稳定 API 是 legacy `Storage`；新的 `Server` API 到 v4 前标注 experimental。我们押 legacy，
    并在架构文档中记录这一依赖风险。

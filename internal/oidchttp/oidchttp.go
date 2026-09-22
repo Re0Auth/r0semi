@@ -320,6 +320,10 @@ func (h *Handler) ApproveAuthorization(ctx context.Context, id, subject string, 
 			}
 		}
 	}
+	// ADR-0001 O-6 (revised): Re0Auth always issues a refresh token. It grants
+	// offline_access implicitly rather than itemising it, because it is a
+	// token-lifetime flag, not a data permission.
+	granted = withOfflineAccess(granted)
 	if err := h.consent.CompleteLogin(ctx, id, subject, granted); err != nil {
 		return "", err
 	}
@@ -358,6 +362,16 @@ func containsString(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// withOfflineAccess appends the OIDC offline_access scope if absent. It is how
+// Re0Auth keeps its "a code flow always yields a refresh token" contract while
+// still speaking OIDC (ADR-0001 O-6, revised).
+func withOfflineAccess(scopes []string) []string {
+	if containsString(scopes, oidc.ScopeOfflineAccess) {
+		return scopes
+	}
+	return append(scopes, oidc.ScopeOfflineAccess)
 }
 
 type configError string

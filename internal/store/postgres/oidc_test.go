@@ -325,7 +325,9 @@ func TestOIDCDeviceDescribeAndDecide(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.Done || st.Subject != "usr_1" || len(st.Scopes) != 1 {
+	if !st.Done || st.Subject != "usr_1" ||
+		!containsStr(st.Scopes, "account.id") ||
+		!containsStr(st.Scopes, oidc.ScopeOfflineAccess) {
 		t.Fatalf("state = %+v", st)
 	}
 

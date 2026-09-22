@@ -352,7 +352,9 @@ func TestConsentInteraction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !done.Done() || done.GetSubject() != "usr_1" || len(done.GetScopes()) != 1 {
+	if !done.Done() || done.GetSubject() != "usr_1" ||
+		!containsString(done.GetScopes(), "account.id") ||
+		!containsString(done.GetScopes(), oidc.ScopeOfflineAccess) {
 		t.Fatalf("completed request = done=%v subject=%q scopes=%v", done.Done(), done.GetSubject(), done.GetScopes())
 	}
 
