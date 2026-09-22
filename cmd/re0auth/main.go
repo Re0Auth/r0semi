@@ -267,6 +267,7 @@ func main() {
 			Clients:  store.clients,
 			Tokens:   tokenRevoker,
 			Sessions: store.sessionRevoker,
+			Bindings: bindingRevoker{fed: federationService},
 			Audit:    logger,
 		})
 		if err != nil {
@@ -603,6 +604,33 @@ func oidcRetiredSigningKeys() ([]postgres.RetiredSigningKey, error) {
 		out = append(out, postgres.RetiredSigningKey{ID: id, Public: rsaPub})
 	}
 	return out, nil
+}
+
+// bindingRevoker adapts the federation service to the operator plane's binding
+// port. The mapping is trivial; it exists so neither package has to import the
+// other's types.
+type bindingRevoker struct{ fed federation.Service }
+
+func (b bindingRevoker) RevokeAllBindings(ctx context.Context) (admin.BindingOutcome, error) {
+	summary, err := b.fed.RevokeAllBindings(ctx)
+	return bindingOutcome(summary), err
+}
+
+func (b bindingRevoker) RevokeSubjectBindings(ctx context.Context, subject string) (admin.BindingOutcome, error) {
+	summary, err := b.fed.RevokeUserBindings(ctx, account.UserID(subject))
+	return bindingOutcome(summary), err
+}
+
+func bindingOutcome(s federation.BindingRevocationSummary) admin.BindingOutcome {
+	return admin.BindingOutcome{
+		Total:       s.Total,
+		Revoked:     s.Revoked,
+		Cascade:     s.Cascade,
+		Unsupported: s.Unsupported,
+		Unavailable: s.Unavailable,
+		Orphaned:    s.Orphaned,
+		Failed:      s.Failed,
+	}
 }
 
 // seedClient registers the first-party downstream client if it is not already

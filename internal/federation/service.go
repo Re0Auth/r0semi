@@ -90,6 +90,12 @@ type Service interface {
 	// then removes the binding. It fails closed: nothing is removed unless the
 	// source confirmed, because the credential is the only means of retrying.
 	CascadeRevoke(ctx context.Context, user account.UserID, game, source string) (RevocationResult, error)
+	// RevokeAllBindings disconnects every binding in the deployment. It is the
+	// data-source half of the Kill Switch, and it is what lets an operator reach a
+	// binding nobody told them about.
+	RevokeAllBindings(ctx context.Context) (BindingRevocationSummary, error)
+	// RevokeUserBindings disconnects every binding one account holds.
+	RevokeUserBindings(ctx context.Context, user account.UserID) (BindingRevocationSummary, error)
 }
 
 // Config wires the federation service.

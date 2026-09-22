@@ -68,19 +68,26 @@ subjects = ["usr_01J...", "usr_01K..."]
 
 恰好一个 target：
 
-| target | 令牌 | 会话 | 客户端 |
-|---|---|---|---|
-| `all` | 全部 access + refresh | **全部浏览器会话**（有持久会话时） | 不动 |
-| `client` | 该客户端全部 | 不动 | **暂停**（防止立刻重新签发） |
-| `subject` | 该账号全部 | **不动**（见下） | 不动 |
+| target | 令牌 | 会话 | 客户端 | 数据源绑定 |
+|---|---|---|---|---|
+| `all` | 全部 access + refresh | **全部浏览器会话**（有持久会话时） | 不动 | **全部** |
+| `client` | 该客户端全部 | 不动 | **暂停** | 不动（绑定属于人，不属于客户端） |
+| `subject` | 该账号全部 | **不动**（见下） | 不动 | **该账号的全部** |
+| `bindings` | 不动 | 不动 | 不动 | **全部**（窄形态：只断数据、不掉登录） |
 
-**它做不到什么，必须说清楚：**
+**绑定半边（D5 的另一半，已实现）**：对每条绑定 **本地一定切断**（先撕碎 vault 密文、再删绑定行），并尽源所能通知上游：
 
-- **不碰任何上游凭据**——Re0Auth 不持有上游凭据（[api-design.md](./api-design.md) §5）。
-- **不吊销数据源绑定**。设计（[threat-model.md](./threat-model.md) D5）里 Kill Switch 的另一半是"作废全部绑定 + 调各源撤销"，那是**另一个平面**，需要遍历全部绑定并逐源调用，**尚未实现**。当前实现只覆盖令牌与会话。
+- 若源声明了级联撤销（`cascade_revocation`），先尝试它——那会结束整个上游会话（所有设备登出）；级联 fail-closed，失败则回落到普通解绑。
+- 否则普通解绑：调源的 revocation endpoint（`token_class: long_lived` 的源报告为 `unsupported`，不假装成功）。
+- 源已不在配置里的**孤儿绑定**：没有源可通知，但仍会被本地清除，计为 `orphaned`。
+- 一个源失败**不会**中止其它绑定；每条绑定的结局计入 `bindings` 对象（`total`/`revoked`/`cascade`/`unsupported`/`unavailable`/`orphaned`/`failed`）。
+
+**它仍做不到什么，必须说清楚：**
+
+- **不直接操作任何上游凭据**——Re0Auth 不持有上游凭据（[api-design.md](./api-design.md) §5）。它只能**请求源**去动源自己持有的凭据；源不能撤销、或不可达，会如实出现在 `bindings.unsupported` / `bindings.unavailable`，而不是被折叠成成功。
 - **`subject` 不清会话**：会话是不透明的 Cookie，没有按 subject 建索引，`scs` 也无从枚举。该账号仍可重新登录。要连会话一起清，只有 `all`。
 
-响应返回**真实数字**（`tokens_revoked` / `sessions_revoked` / `clients_suspended`），因为事故响应者要的是数字，不是一句"已处理"。
+响应返回**真实数字**（`tokens_revoked` / `sessions_revoked` / `clients_suspended` / `bindings`），因为事故响应者要的是数字，不是一句“已处理”。
 
 ## 5. 审计
 
@@ -91,7 +98,6 @@ subjects = ["usr_01J...", "usr_01K..."]
 ## 6. v1 明确不做 / 后续
 
 - **自助注册 + 待审核队列**：见 §3，延后。
-- **Kill Switch 的绑定/上游半边**（D5）：未实现，需要先让绑定存储能全局枚举并逐源调用。
 - **按 subject 清会话**：需要给会话建 subject 索引，或换一种会话模型。
 - **管理前端**：当前只有 API；`/v1/admin/*` 已对齐 problem+json，前端可后接。
 - **角色/权限细分**：见 §0，等有真实需求再加，且不得引入可提权的表。

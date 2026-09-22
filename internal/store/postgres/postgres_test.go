@@ -1203,3 +1203,41 @@ func TestRevokeAllSessionsDeletesEveryRow(t *testing.T) {
 		t.Fatal("a session survived the kill switch")
 	}
 }
+
+// ListAll is the Kill Switch's view: every binding, every user, ordered so two
+// sweeps act in the same order.
+func TestBindingsListAllReturnsEveryUserInOrder(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	store := db.Bindings()
+
+	for _, b := range []federation.Binding{
+		{User: "usr_2", Game: "phigros", Source: "b"},
+		{User: "usr_1", Game: "phigros", Source: "a"},
+		{User: "usr_1", Game: "arcaea", Source: "c"},
+	} {
+		if err := store.Put(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, err := store.ListAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"usr_1|arcaea|c", "usr_1|phigros|a", "usr_2|phigros|b"}
+	if len(all) != len(want) {
+		t.Fatalf("ListAll = %d bindings, want %d", len(all), len(want))
+	}
+	for i, b := range all {
+		got := string(b.User) + "|" + b.Game + "|" + b.Source
+		if got != want[i] {
+			t.Fatalf("all[%d] = %s, want %s", i, got, want[i])
+		}
+	}
+
+	// The per-user list is unchanged: it still filters.
+	if mine, err := store.List(ctx, "usr_1"); err != nil || len(mine) != 2 {
+		t.Fatalf("List(usr_1) = %v (%v), want 2", mine, err)
+	}
+}

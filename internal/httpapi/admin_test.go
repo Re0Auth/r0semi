@@ -24,6 +24,17 @@ type adminEnv struct {
 	tokens  *oauth.MemoryStore
 }
 
+// revokingBindings stands in for the federation service in the operator tests.
+type revokingBindings struct{ total int }
+
+func (r *revokingBindings) RevokeAllBindings(context.Context) (admin.BindingOutcome, error) {
+	return admin.BindingOutcome{Total: r.total, Revoked: r.total}, nil
+}
+
+func (r *revokingBindings) RevokeSubjectBindings(context.Context, string) (admin.BindingOutcome, error) {
+	return admin.BindingOutcome{Total: 1, Revoked: 1}, nil
+}
+
 // newAdminEnv builds the stack with an operator plane. When allow is true the
 // pre-created account (GitHub subject "42", the identity the fake IdP returns) is
 // on the allowlist; otherwise nobody is.
@@ -87,7 +98,9 @@ func newAdminEnv(t *testing.T, allow bool) adminEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adminSvc, err := admin.New(admin.Config{Clients: clients, Tokens: tokens, Audit: audit.NewMemoryLogger()})
+	adminSvc, err := admin.New(admin.Config{
+		Clients: clients, Tokens: tokens, Bindings: &revokingBindings{total: 2}, Audit: audit.NewMemoryLogger(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,6 +282,33 @@ func TestAdminKillSwitchRejectsMissingTarget(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("kill switch without target = %d, want 400", resp.StatusCode)
+	}
+}
+
+// The bindings target revokes bindings only: the report carries the binding
+// outcome and no token was touched.
+func TestAdminKillSwitchBindingsTarget(t *testing.T) {
+	env := newAdminEnv(t, true)
+	browser := newBrowser(t)
+	signIn(t, browser, env.base)
+	csrf := sessionCSRF(t, env.base, browser)
+
+	ctx := context.Background()
+	if err := env.tokens.SaveAccess(ctx, "at-1", oauth.AccessToken{ClientID: "cli", Subject: "usr_1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := adminJSON(t, browser, http.MethodPost, env.base+"/v1/admin/kill_switch", csrf, map[string]any{"target": "bindings"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bindings kill switch = %d, want 200: %v", resp.StatusCode, decodeResp(t, resp))
+	}
+	rep := decodeResp(t, resp)
+	if rep["tokens_revoked"].(float64) != 0 {
+		t.Fatalf("a bindings-only switch revoked %v tokens", rep["tokens_revoked"])
+	}
+	bindings, ok := rep["bindings"].(map[string]any)
+	if !ok || bindings["total"].(float64) != 2 || bindings["revoked"].(float64) != 2 {
+		t.Fatalf("bindings report = %v", rep["bindings"])
 	}
 }
 

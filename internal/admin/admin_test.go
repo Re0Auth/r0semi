@@ -201,3 +201,95 @@ func TestActionsAreAudited(t *testing.T) {
 		t.Fatalf("actor = %q, want the caller", e.Detail["actor"])
 	}
 }
+
+type fakeBindings struct {
+	all          BindingOutcome
+	subject      BindingOutcome
+	allCalls     int
+	subjectCalls []string
+}
+
+func (f *fakeBindings) RevokeAllBindings(context.Context) (BindingOutcome, error) {
+	f.allCalls++
+	return f.all, nil
+}
+
+func (f *fakeBindings) RevokeSubjectBindings(_ context.Context, subject string) (BindingOutcome, error) {
+	f.subjectCalls = append(f.subjectCalls, subject)
+	return f.subject, nil
+}
+
+func withBindingsService(t *testing.T, bindings Bindings) (Service, *oauth.MemoryStore) {
+	t.Helper()
+	tokens := oauth.NewMemoryStore()
+	svc, err := New(Config{
+		Clients: oauth.NewMemoryClientRegistry(), Tokens: tokens,
+		Bindings: bindings, Audit: audit.NewMemoryLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return svc, tokens
+}
+
+// The bindings-only target must cut bindings and nothing else: no token is
+// revoked, nobody is signed out.
+func TestKillSwitchBindingsTargetTouchesOnlyBindings(t *testing.T) {
+	ctx := context.Background()
+	bindings := &fakeBindings{all: BindingOutcome{Total: 2, Revoked: 2}}
+	svc, tokens := withBindingsService(t, bindings)
+	saveTokens(t, tokens, "cli_a", "usr_1")
+
+	rep, err := svc.KillSwitch(ctx, "usr_admin", Target{Bindings: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bindings.allCalls != 1 || len(bindings.subjectCalls) != 0 {
+		t.Fatalf("sweep calls = all:%d subject:%v", bindings.allCalls, bindings.subjectCalls)
+	}
+	if rep.Bindings == nil || rep.Bindings.Total != 2 {
+		t.Fatalf("bindings = %+v, want the sweep outcome", rep.Bindings)
+	}
+	if rep.TokensRevoked != 0 {
+		t.Fatalf("a bindings-only switch revoked %d tokens", rep.TokensRevoked)
+	}
+	if n := countTokens(t, tokens, "usr_1"); n != 2 {
+		t.Fatalf("tokens were touched: %d remain", n)
+	}
+}
+
+// `all` grows a binding sweep; `subject` sweeps that account's bindings.
+func TestKillSwitchAllAndSubjectSweepBindings(t *testing.T) {
+	ctx := context.Background()
+	bindings := &fakeBindings{all: BindingOutcome{Total: 3, Revoked: 3}, subject: BindingOutcome{Total: 1, Revoked: 1}}
+	svc, tokens := withBindingsService(t, bindings)
+	saveTokens(t, tokens, "cli_a", "usr_1")
+
+	rep, err := svc.KillSwitch(ctx, "usr_admin", Target{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bindings.allCalls != 1 || rep.Bindings == nil || rep.Bindings.Total != 3 {
+		t.Fatalf("all: calls=%d report=%+v", bindings.allCalls, rep.Bindings)
+	}
+
+	rep, err = svc.KillSwitch(ctx, "usr_admin", Target{Subject: "usr_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings.subjectCalls) != 1 || bindings.subjectCalls[0] != "usr_1" {
+		t.Fatalf("subject sweep calls = %v", bindings.subjectCalls)
+	}
+	if rep.Bindings == nil || rep.Bindings.Total != 1 {
+		t.Fatalf("subject report = %+v", rep.Bindings)
+	}
+}
+
+// A deployment with no bindings wired refuses the bindings-only target rather
+// than reporting a hollow success.
+func TestKillSwitchBindingsTargetNeedsThePort(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	if _, err := svc.KillSwitch(context.Background(), "usr_admin", Target{Bindings: true}); !errors.Is(err, ErrBindingsUnavailable) {
+		t.Fatalf("= %v, want ErrBindingsUnavailable", err)
+	}
+}

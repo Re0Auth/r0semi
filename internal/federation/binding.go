@@ -82,6 +82,8 @@ type BindingStore interface {
 	// List returns every binding a user holds, so the account page can show what
 	// is connected and offer to disconnect it.
 	List(ctx context.Context, user account.UserID) ([]Binding, error)
+	// ListAll returns every binding in the deployment, for the Kill Switch.
+	ListAll(ctx context.Context) ([]Binding, error)
 }
 
 // MemoryBindingStore is a non-durable BindingStore for development and tests.
@@ -147,4 +149,27 @@ func (s *MemoryBindingStore) List(_ context.Context, user account.UserID) ([]Bin
 
 func bindingKey(user account.UserID, game, source string) string {
 	return string(user) + "|" + game + "|" + source
+}
+
+// ListAll implements BindingStore. It exists for the Kill Switch, which has to
+// reach a binding it was never told about; the account page never needs it.
+func (s *MemoryBindingStore) ListAll(_ context.Context) ([]Binding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]Binding, 0, len(s.m))
+	for _, b := range s.m {
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		switch {
+		case out[i].User != out[j].User:
+			return out[i].User < out[j].User
+		case out[i].Game != out[j].Game:
+			return out[i].Game < out[j].Game
+		default:
+			return out[i].Source < out[j].Source
+		}
+	})
+	return out, nil
 }

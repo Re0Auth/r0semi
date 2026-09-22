@@ -211,8 +211,10 @@ func (s *Server) handleAdminKillSwitch(w http.ResponseWriter, r *http.Request) {
 		target.ClientID = body.ClientID
 	case "subject":
 		target.Subject = body.Subject
+	case "bindings":
+		target.Bindings = true
 	default:
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", `target must be "all", "client" or "subject"`)
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", `target must be "all", "client", "subject" or "bindings"`)
 		return
 	}
 
@@ -221,6 +223,8 @@ func (s *Server) handleAdminKillSwitch(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, admin.ErrInvalidTarget):
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "the target is incomplete")
+	case errors.Is(err, admin.ErrBindingsUnavailable):
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "this deployment has no data sources to revoke")
 	case err != nil:
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "the kill switch could not complete")
 	default:

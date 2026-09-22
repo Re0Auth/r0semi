@@ -18,27 +18,16 @@ type Bindings struct{ pool *pgxpool.Pool }
 
 // Get implements federation.BindingStore.
 func (s *Bindings) Get(ctx context.Context, user account.UserID, game, source string) (federation.Binding, error) {
-	var (
-		binding federation.Binding
-		userID  string
-		expiry  *time.Time
-	)
-	err := s.pool.QueryRow(ctx, `
+	binding, err := scanBinding(s.pool.QueryRow(ctx, `
 		SELECT user_id, game, source, token_type, expiry, has_refresh, version
 		  FROM federation_bindings
 		 WHERE user_id = $1 AND game = $2 AND source = $3`,
-		string(user), game, source).
-		Scan(&userID, &binding.Game, &binding.Source, &binding.TokenType,
-			&expiry, &binding.HasRefresh, &binding.Version)
+		string(user), game, source))
 	if noRows(err) {
 		return federation.Binding{}, federation.ErrNotBound
 	}
 	if err != nil {
 		return federation.Binding{}, err
-	}
-	binding.User = account.UserID(userID)
-	if expiry != nil {
-		binding.Expiry = *expiry
 	}
 	return binding, nil
 }
@@ -71,11 +60,25 @@ func (s *Bindings) Delete(ctx context.Context, user account.UserID, game, source
 // Ordered in SQL rather than in Go, so the account page does not reorder itself
 // between two loads depending on which rows the planner happened to return first.
 func (s *Bindings) List(ctx context.Context, user account.UserID) ([]federation.Binding, error) {
-	rows, err := s.pool.Query(ctx, `
+	return s.queryBindings(ctx, `
 		SELECT user_id, game, source, token_type, expiry, has_refresh, version
 		  FROM federation_bindings
 		 WHERE user_id = $1
 		 ORDER BY game, source`, string(user))
+}
+
+// ListAll implements federation.BindingStore. It backs the Kill Switch's
+// deployment-wide sweep, which is the only caller that needs bindings it was
+// never handed by a user.
+func (s *Bindings) ListAll(ctx context.Context) ([]federation.Binding, error) {
+	return s.queryBindings(ctx, `
+		SELECT user_id, game, source, token_type, expiry, has_refresh, version
+		  FROM federation_bindings
+		 ORDER BY user_id, game, source`)
+}
+
+func (s *Bindings) queryBindings(ctx context.Context, query string, args ...any) ([]federation.Binding, error) {
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -83,22 +86,33 @@ func (s *Bindings) List(ctx context.Context, user account.UserID) ([]federation.
 
 	out := make([]federation.Binding, 0, 4)
 	for rows.Next() {
-		var (
-			binding federation.Binding
-			userID  string
-			expiry  *time.Time
-		)
-		if err := rows.Scan(&userID, &binding.Game, &binding.Source, &binding.TokenType,
-			&expiry, &binding.HasRefresh, &binding.Version); err != nil {
+		binding, err := scanBinding(rows)
+		if err != nil {
 			return nil, err
-		}
-		binding.User = account.UserID(userID)
-		if expiry != nil {
-			binding.Expiry = *expiry
 		}
 		out = append(out, binding)
 	}
 	return out, rows.Err()
+}
+
+// rowScanner is the slice of pgx shared by a Row and the current row of Rows.
+type rowScanner interface{ Scan(dest ...any) error }
+
+func scanBinding(row rowScanner) (federation.Binding, error) {
+	var (
+		binding federation.Binding
+		userID  string
+		expiry  *time.Time
+	)
+	if err := row.Scan(&userID, &binding.Game, &binding.Source, &binding.TokenType,
+		&expiry, &binding.HasRefresh, &binding.Version); err != nil {
+		return federation.Binding{}, err
+	}
+	binding.User = account.UserID(userID)
+	if expiry != nil {
+		binding.Expiry = *expiry
+	}
+	return binding, nil
 }
 
 // BindFlows implements federation.BindFlowStore on Postgres. Consume is a single

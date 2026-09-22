@@ -1149,18 +1149,28 @@ paths:
       description: |
         Exactly one target, selected by `target`:
 
-        * `all` — every issued access and refresh token, and (where the deployment
-          has durable sessions) every browser session.
+        * `all` — every issued access and refresh token; every browser session
+          (where the deployment has durable sessions); and **every data-source
+          binding**.
         * `client` — every token the named client holds, and the client is
-          suspended so it cannot immediately mint more.
-        * `subject` — every token the named account holds. Its browser sessions are
-          **not** dropped: sessions are opaque cookies with no subject index. The
-          account can still sign in again.
+          suspended so it cannot immediately mint more. A binding belongs to a
+          person, not to a client, so this target does not touch bindings.
+        * `subject` — every token and every data-source binding the named account
+          holds. Its browser sessions are **not** dropped: sessions are opaque
+          cookies with no subject index, so the account can still sign in again.
+        * `bindings` — every data-source binding, and nothing else. This is the
+          narrow form: cut data access while everyone stays signed in.
 
-        **What it cannot do:** it does not touch any upstream credential, because
-        Re0Auth does not hold one; and it does not revoke data-source bindings,
-        which are a separate plane. That half of the design (threat-model D5) is
-        not implemented yet.
+        Disconnecting a binding cuts it locally **always**, and asks the source to
+        end what it can: the upstream token is revoked where the source supports
+        it, and a source that advertises cascade revocation is asked to end the
+        whole session. Cascade is only attempted, never required: a source that is
+        down must not be able to keep a binding alive.
+
+        **What it still cannot do:** it does not act on an upstream credential
+        itself. Re0Auth holds none; it asks the source to act on the one the source
+        holds. A source that cannot revoke, or is unreachable, is reported in
+        `bindings.unsupported` / `bindings.unavailable` rather than hidden.
 
         The response reports what was actually removed, because the number is what
         an incident responder acts on.
@@ -1176,7 +1186,7 @@ paths:
               type: object
               required: [target]
               properties:
-                target: { type: string, enum: [all, client, subject] }
+                target: { type: string, enum: [all, client, subject, bindings] }
                 client_id: { type: string, description: Required when `target` is `client`. }
                 subject: { type: string, description: Required when `target` is `subject`. }
       responses:
@@ -1319,6 +1329,25 @@ components:
         tokens_revoked: { type: integer }
         sessions_revoked: { type: integer }
         clients_suspended: { type: integer }
+        bindings:
+          description: |
+            Present when a binding sweep ran. Its counts are the point: a source
+            that could not revoke is visible here instead of being folded into a
+            success.
+          $ref: '#/components/schemas/BindingOutcome'
+    BindingOutcome:
+      type: object
+      title: BindingOutcome
+      description: How much of the data-source binding set a sweep cut.
+      required: [total, revoked, cascade, unsupported, unavailable, orphaned, failed]
+      properties:
+        total: { type: integer, description: Bindings the sweep examined. }
+        revoked: { type: integer, description: Bindings removed locally. The local cut always happens. }
+        cascade: { type: integer, description: Bindings whose whole upstream session was ended. }
+        unsupported: { type: integer, description: Sources that declared they cannot revoke per client. }
+        unavailable: { type: integer, description: Sources that could not be reached. }
+        orphaned: { type: integer, description: Bindings whose source is no longer configured; cut locally, with no source left to tell. }
+        failed: { type: integer, description: Bindings whose local removal did not complete. }
     Problem:
       type: object
       title: Problem
