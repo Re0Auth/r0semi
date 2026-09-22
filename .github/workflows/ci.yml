@@ -82,8 +82,12 @@ jobs:
       # set at the job level. Without it they skip (that is how local
       # development works), and the CI guard in openTestDB turns that into a
       # failure rather than a silent pass.
+      #
+      # -p 1 serializes packages because three of them (store/postgres, oidchttp,
+      # httpapi) share one database; run in parallel, one package's TRUNCATE can
+      # wipe rows another is using mid-test.
       - name: go test
-        run: go test -race -timeout 300s ./...
+        run: go test -race -p 1 -timeout 300s ./...
 
       # Verbose, so the log proves each integration test executed rather than
       # skipped: the package summary reads "ok" in both cases.

@@ -32,7 +32,7 @@ type OIDCStore struct {
 	pool     *pgxpool.Pool
 	clients  oauth.ClientRegistry
 	registry *oauth.Registry
-	login    func(authRequestID string) string
+	login    func(ctx context.Context, authRequestID string) string
 	signer   *OIDCSigner
 	audit    audit.Logger
 
@@ -45,8 +45,10 @@ type OIDCStore struct {
 type OIDCOptions struct {
 	// Registry resolves scopes; it is what makes IsScopeAllowed real.
 	Registry *oauth.Registry
-	// Login builds the consent URL the authorize endpoint redirects to.
-	Login func(authRequestID string) string
+	// Login builds the consent URL the authorize endpoint redirects to. It
+	// receives the request context, which is how the composition root binds the
+	// auth request to the browser session before the consent screen loads it.
+	Login func(ctx context.Context, authRequestID string) string
 	// Signer signs id_tokens. Required.
 	Signer *OIDCSigner
 	// Audit records token issuance and revocation. Optional.
@@ -534,13 +536,20 @@ func (s *OIDCStore) KeySet(context.Context) ([]op.Key, error) {
 
 // --- op.OPStorage ---
 
-// GetClientByClientID implements op.Storage.
+// GetClientByClientID implements op.Storage. The login hook is bound to this
+// request's context so it can touch the browser session while building the
+// consent URL.
 func (s *OIDCStore) GetClientByClientID(ctx context.Context, clientID string) (op.Client, error) {
 	c, err := s.clients.Get(ctx, clientID)
 	if err != nil {
 		return nil, err
 	}
-	return opClient{c: c, registry: s.registry, login: s.login}, nil
+	return opClient{c: c, registry: s.registry, login: func(id string) string {
+		if s.login == nil {
+			return "/login?authRequestID=" + id
+		}
+		return s.login(ctx, id)
+	}}, nil
 }
 
 // AuthorizeClientIDSecret implements op.Storage.

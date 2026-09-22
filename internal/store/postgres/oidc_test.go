@@ -334,3 +334,44 @@ func TestOIDCDeviceDescribeAndDecide(t *testing.T) {
 		t.Fatalf("describe after decision = %v, want ErrDeviceNotFound", err)
 	}
 }
+
+// The login hook is what binds an OP auth request to the browser session before
+// the consent screen loads it; it must receive the request context.
+func TestOIDCLoginHookReceivesRequestContext(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	client, err := oauth.NewClient("hook-cli", "Hook", oauth.ClientConfidential, "s",
+		[]string{"https://c.example/cb"}, []oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Clients().Create(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	store, err := db.OIDC(db.Clients(), OIDCOptions{
+		Registry: oauth.DefaultRegistry(),
+		Signer:   NewOIDCSigner("hook", key),
+		Login: func(_ context.Context, id string) string {
+			got = append(got, id)
+			return "/consent?id=" + id
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := store.GetClientByClientID(ctx, "hook-cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := c.LoginURL("req-1"); u != "/consent?id=req-1" {
+		t.Fatalf("login url = %q", u)
+	}
+	if len(got) != 1 || got[0] != "req-1" {
+		t.Fatalf("login hook got %v", got)
+	}
+}

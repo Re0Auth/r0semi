@@ -61,7 +61,7 @@ func TestOIDCWiringEndToEnd(t *testing.T) {
 	store, err := db.OIDC(db.Clients(), postgres.OIDCOptions{
 		Registry: oauth.DefaultRegistry(),
 		Signer:   postgres.NewOIDCSigner("wiring", key),
-		Login: func(id string) string {
+		Login: func(_ context.Context, id string) string {
 			return "/login?authRequestID=" + url.QueryEscape(id)
 		},
 	})
