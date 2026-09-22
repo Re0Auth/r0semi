@@ -13,6 +13,10 @@
    - TapTap `sessionToken` 是该账号名下的一项**凭据资产**，可增、删、改、查、轮换、核弹。
 3. **登录 ≠ 托管**。没有托管任何凭据的账号也是完全合法的账号。
 
+**Re0Auth 现在是 OpenID Provider**：`usr_...` 就是 OIDC 的 `sub`（随机、稳定、伪匿名）。
+向下的 `id_token` / `userinfo` **默认只携带 `sub`**；email **永不**作为 claim 返回（I-3 的延伸）。
+详见 [oidc-decision.md](./oidc-decision.md) O-3 / O-4。
+
 ## 1. 数据模型
 
 ```
@@ -80,6 +84,9 @@ v1 的处理：
   需要双方强控制证明，v1 一律延后（见 §9）。
 
 ## 5. `/auth` 平面：r0semi 作为 IdP 的 OAuth 客户端
+
+> `/oauth/*` 现在是一个完整的 OpenID Provider（见 [oidc-decision.md](./oidc-decision.md)）；
+> 本节是**反方向**：r0semi 作为**外部 IdP 的客户端**。两者是不同的代码上下文。
 
 这与 `/oauth/*`（r0semi 作为授权服务器）是**两回事**，必须分属不同代码上下文。
 

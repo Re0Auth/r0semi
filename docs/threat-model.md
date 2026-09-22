@@ -1,15 +1,19 @@
-# r0semi 威胁模型与信任边界（v0.2）
+# r0semi 威胁模型与信任边界（v0.3）
 
 > 状态：草案。本文档优先于代码，任何架构/协议决策都必须能在此文档中找到依据。
 >
-> **v0.2 的关键修订**：r0semi 从"凭据经纪（自己托管上游凭据）"改为**授权与互通层**。
+> **v0.3 的关键修订**：Re0Auth 采纳 OIDC，升格为 OpenID Provider（身份联邦 + 数据授权）。
+> 新增对下游的 `id_token` / `userinfo` / JWKS / OIDC discovery，以及两把新密钥（签名私钥、令牌加密密钥）。
+> 决策与契约见 [oidc-decision.md](./oidc-decision.md)（ADR-0001）。
+>
+> **v0.2 的关键修订**：r0semi 从“凭据经纪（自己托管上游凭据）”改为**授权与互通层**。
 > 上游平台凭据的托管方是**数据源**，r0semi 从不接触它。v0.1 把 r0semi 写成 stoken 的托管者，
 > **那条信任边界已不存在**；本文档的资产、边界、密钥层级与撤销模型据此重写。
 
 ## 1. 定位：两个独立持有者
 
-r0semi 是**授权与互通层**：对下游是 OAuth 2.0 授权服务器，对数据源是 OAuth 2.0 客户端。
-它**不是凭据金库**。
+r0semi 是**身份与授权层**：对下游是 OpenID Provider（OIDC）兼 OAuth 2.0 授权服务器，对数据源是 OAuth 2.0 客户端。
+它**不是凭据金库，也不是身份来源**（身份仍来自外部 IdP）。
 
 系统里有**两个各自独立的凭据持有者**，各有一份自己的 vault：
 
@@ -38,6 +42,8 @@ r0semi 是**授权与互通层**：对下游是 OAuth 2.0 授权服务器，对�
 | A5 | 用户身份 / 成绩数据 | 两边 | 高 | 个人数据，受合规约束 |
 | A6 | re0auth 的 AT / RT / client_secret | re0auth | 中高 | 短寿命、可撤销 |
 | A7 | 审计日志 | 两边 | 高 | 完整性要求（防篡改） |
+| A8 | OIDC 身份声明（`id_token` / `userinfo` 的 `sub`） | re0auth | 中高 | 对下游暴露账号身份；`sub` 是伪匿名的 `usr_`（oidc-decision.md O-4） |
+| A9 | OP 签名私钥（RS256）与令牌加密密钥（32B AES-GCM） | re0auth | 最高 | 新增密钥面：泄露可伪造 `id_token` / 解出不透明令牌。与 A4 同等对待（§6.0） |
 
 ## 3. 信任边界
 
@@ -48,7 +54,8 @@ r0semi 是**授权与互通层**：对下游是 OAuth 2.0 授权服务器，对�
 | B3 re0auth ↔ 数据源 | 双向 OAuth 2.0：对下是 AS；对上用授权码 + PKCE 绑定 | 数据源可信，但仍受上游协议约束（发现、scope、`token_class`） |
 | B4 数据源 ↔ 上游平台（TapTap） | 上游凭据明文的**唯一**接触路径。**re0auth 不是当事方，无法审计** | 由数据源自行承担 |
 | B5 应用 ↔ Vault（及其 KEK） | 密钥边界（两边各一份，互不可见） | 解封需鉴权 + 审计；KEK 可轮换。**默认 KEK 在进程内，KMS 适配器尚未实现**（§6.0） |
-| B6 运营者 / 内部人员 | 公共实例的最高权限 | **不受信任**，最小权限 + 全程审计 |
+| B6 | 运营者 / 内部人员 | 公共实例的最高权限 | **不受信任**，最小权限 + 全程审计 |
+| B7 | 下游 RP ↔ OP 的 OIDC 端点 | authorize / token / userinfo / keys / discovery。`userinfo` 与 `id_token` 会把 A8 交给下游；端点本身沿用 B2 的 PKCE + 精确 redirect 约束 | 客户端不可信 |
 
 ## 4. 风险形态
 
@@ -79,6 +86,9 @@ A2/A3 可撤销、可审计、可细分，**暴露半径小于 stoken**。
 - **D5 Kill Switch（范围已修正）**：re0auth 能做的是一键作废全部**绑定**（丢弃绑定令牌 + 调各源的
   revocation endpoint），以及**对每个支持级联撤销的源发起登出请求**；它**不能**自己作废上游登录——
   那需要上游的凭据，而它没有。要连上游一起清，必须各数据源配合暴露该能力。
+- **D6 采纳 OIDC**：Re0Auth 升格为 OpenID Provider（身份联邦 + 数据授权），玩家仍由外部 IdP 登录。
+  新增 `id_token` / `userinfo` / JWKS / OIDC discovery 与两把新密钥（A8/A9）。决策与契约见
+  [oidc-decision.md](./oidc-decision.md)（ADR-0001）。
 
 ## 6. 密钥层级
 
@@ -206,3 +216,9 @@ re0auth 不参与其中（它没有 stoken）。查证结果：
   TapTap / Phigros ToS 对凭据共享的约束。
 - **事故响应预案**：检测到泄露 → 触发 re0auth 侧 Kill Switch（作废全部绑定）→ 通告各数据源 →
   复盘。
+- **身份声明的相关性风险**：`id_token` / `userinfo` 让下游能把同一 `sub` 关联到同一账号（它本就是同一账号）。
+  缓解：`sub` 伪匿名、默认零附加 claim、email 永不返回（oidc-decision.md O-3 / O-4）。
+- **OP 密钥**：签名私钥泄露 ⇒ 可伪造 `id_token`；令牌加密密钥泄露 ⇒ 可解出不透明令牌。
+  两者纳入 §6.0 的密钥管理与轮换；当前同样只有进程内实现，必须如实告知部署者。
+- **未实现的 OIDC 面**：`end_session`、`id_token_hint`、PAR、动态客户端注册、Session Management 明确不做
+  （O-9），避免广告一个提供不了的能力。

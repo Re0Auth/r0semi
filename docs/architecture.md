@@ -191,10 +191,15 @@ type Credential struct {          // 一个 provider 的私有凭据形态，vau
 > 注意身份差异：Re0Auth 旧的 `internal/enrollment` 以**已登录的 `usr_`** 为主键（TapTap 账号只作元数据）；
 > 源侧反过来——**TapTap 账号就是源账号**，subject 是登录的产物。这是把枚举迁到源侧必须做的改写。
 
-### 4.4 OAuth 2.0 授权服务器（v1 已实现：`oauth`）
+### 4.4 授权服务器（OpenID Provider）（v1 已实现：`oauth`；引擎迁移中）
 
-对下的核心契约。MVP 采用**不透明令牌 + introspect**（而非 JWT）：即时可撤销，无需 JWT
-密钥轮换，且资源服务器与 AS 是同一服务。
+> **ADR-0001：Re0Auth 升格为 OpenID Provider。** 本节描述的手写 `oauth` 引擎将被
+> `github.com/zitadel/oidc/v3/pkg/op` 替换（Phase 1–4，见 [oidc-decision.md](./oidc-decision.md)）。
+> 契约已更新：`id_token`（**仅请求 `openid` 时**）、`userinfo`、JWKS、OIDC discovery、
+> `offline_access` 语义，并新增两把密钥（签名私钥、令牌加密密钥）。
+
+对下的核心契约。MVP 采用**不透明 access token + introspect**（而非 JWT）：即时可撤销，无需 JWT
+密钥轮换，且资源服务器与 AS 是同一服务。**唯一的 JWT 是 `id_token`。**
 
 - **Scope 分级**：`<provider>.<resource>.<action>`，每个 scope 带 `Risk` 与 `ExplicitConsent`。
   `Registry.Resolve` 在签发前校验 scope 已知且对该客户端合法。

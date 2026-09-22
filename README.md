@@ -1,11 +1,17 @@
 # r0semi / Re0Auth
 
-音游数据的**授权与互通层**：一套协议 + 一个参考实现。
+音游数据的**身份与授权层**：一套 OIDC/OAuth 协议 + 一个参考实现。
 
-玩家一次授权、下游一次接入，即可跨游戏、跨数据源读取数据；游戏后端通过实现 [上游协议](docs/upstream-protocol.md) 接入生态。
+玩家用外部 IdP 登录一次；下游一次 OIDC 接入，同时拿到“这是谁”（`id_token` / `userinfo`）与“能读什么”
+（带 scope 的 access token），即可跨游戏、跨数据源读取数据；游戏后端通过实现
+[上游协议](docs/upstream-protocol.md) 接入生态。
+
+Re0Auth 是音游数据域的 **OpenID Provider（身份联邦）+ 数据授权层**：身份仍来自外部 IdP，
+不自建密码 / 邮箱 / Passkey。定位变更见 [docs/oidc-decision.md](docs/oidc-decision.md)（ADR-0001）。
 
 > [!WARNING]
 > **本项目位于迭代期，未达到生产可用，请勿用真实凭据部署。**
+> **OIDC 迁移进行中**：Phase 0（定位/契约）已定，`/oauth` 目前仍是手写引擎，尚未切到 OIDC 引擎。
 > 后端持久化已收尾：**9 个存储端口全部可落 Postgres，审计日志也落 Postgres**（不设 `DATABASE_URL` 则退回内存，启动时会逐条警告）。
 > 前端已可用：**同意页**、**设备流验证页**、**授权管理页**与**数据源连接页**（连接 / 断开 / 请求登出全部设备）。
 > 三条用户旅程都有界面，威胁模型里的三层撤销都有实现。
