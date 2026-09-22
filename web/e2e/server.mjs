@@ -49,6 +49,11 @@ function subjectFor(identity) {
 	return identities.get(identity);
 }
 
+// The OAuth error the next /github/authorize should redirect with, if any. It is
+// how a login-denied callback is simulated without inventing a test-only path
+// inside re0auth: the provider itself refuses, exactly as a real one would.
+let nextError = '';
+
 // A generated RS256 key for the OpenID Provider run. re0auth now requires it
 // (fail-closed), so the harness cannot lean on an ephemeral key any more.
 let cachedSigningKey = '';
@@ -121,6 +126,15 @@ const idp = createServer(async (req, res) => {
 
 	switch (url.pathname) {
 		case '/github/authorize': {
+			if (nextError) {
+				const code = nextError;
+				nextError = '';
+				const target = new URL(url.searchParams.get('redirect_uri'));
+				target.searchParams.set('error', code);
+				target.searchParams.set('state', url.searchParams.get('state') ?? '');
+				res.writeHead(302, { location: target.toString() }).end();
+				return;
+			}
 			// Consent at the provider is assumed; the interesting consent is ours.
 			const target = new URL(url.searchParams.get('redirect_uri'));
 			target.searchParams.set('code', 'e2e-idp-code');
@@ -264,6 +278,12 @@ const idp = createServer(async (req, res) => {
 			// adding a bypass inside re0auth keeps the login path honest.
 			if (url.pathname.startsWith('/__identity/')) {
 				nextIdentity = decodeURIComponent(url.pathname.slice('/__identity/'.length));
+				res.writeHead(204).end();
+				return;
+			}
+			// Make the next provider authorization fail with the named OAuth error.
+			if (url.pathname.startsWith('/__error/')) {
+				nextError = decodeURIComponent(url.pathname.slice('/__error/'.length));
 				res.writeHead(204).end();
 				return;
 			}
