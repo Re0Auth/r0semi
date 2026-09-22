@@ -71,7 +71,8 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 | P2b | 接入 `internal/httpapi`：`Config.OIDC` 替换协议面 + 业务面 introspection 桥（OP 令牌经 `/v1/me` 验证）+ 端到端测试 | ✅ 已完成 |
 | P3a | `/v1/device/*` 与 `/v1/grants` 改走 OP 存储（`GrantStore` / `DeviceStore` 接缝）+ 测试 | ✅ 已完成 |
 | P3b | 同意交互接缝（`internal/authorization`）；OP 同意适配；`cmd/re0auth` 在有数据库时翻转默认引擎为 OP（login hook 负责把请求绑到会话） | ✅ 已完成 |
-| P4 | 下线手写 `oauth/` 引擎（仅保留内存模式）；更新 README / NOTICE | 待办 |
+| P4a | CI 在 OpenID Provider 引擎上跑浏览器 e2e；README / architecture 同步引擎说明 | ✅ 已完成 |
+| P4b | 给 OP store 一个内存实现，使 re0auth 在生产与内存模式都走 OP；随后删掉 `httpapi` 旧协议面与旧引擎接线（`oauth` 包仍作为 Upstream Kit 的引擎保留） | 待办 |
 
 ## 7. 受影响文档
 

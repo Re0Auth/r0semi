@@ -11,7 +11,7 @@ Re0Auth 是音游数据域的 **OpenID Provider（身份联邦）+ 数据授权�
 
 > [!WARNING]
 > **本项目位于迭代期，未达到生产可用，请勿用真实凭据部署。**
-> **OIDC 迁移进行中**：Phase 0（定位/契约）已定，`/oauth` 目前仍是手写引擎，尚未切到 OIDC 引擎。
+> **授权引擎**：有数据库时 `/oauth` 由 `zitadel/oidc` 提供（OpenID Provider）；无数据库的内存模式退回内建引擎，仅用于开发与 e2e（启动时会说明用的是哪一个）。
 > 后端持久化已收尾：**9 个存储端口全部可落 Postgres，审计日志也落 Postgres**（不设 `DATABASE_URL` 则退回内存，启动时会逐条警告）。
 > 前端已可用：**同意页**、**设备流验证页**、**授权管理页**与**数据源连接页**（连接 / 断开 / 请求登出全部设备）。
 > 三条用户旅程都有界面，威胁模型里的三层撤销都有实现。
@@ -26,6 +26,8 @@ cp config/re0auth.example.toml config/re0auth.toml   # 按需修改
 # 密钥不写进配置文件：文件里只写变量名（*_env）
 export RE0AUTH_KEK=$(head -c 32 /dev/urandom | base64)
 export DATABASE_URL='postgres://user:pass@localhost:5432/re0auth?sslmode=disable'
+# 不透明 access token 的加密密钥（32 字节）。不设则每次启动生成临时密钥并警告。
+export RE0AUTH_OIDC_TOKEN_KEY=$(head -c 32 /dev/urandom | base64)
 
 go build ./cmd/re0auth
 ./re0auth -config config/re0auth.toml
