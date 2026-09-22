@@ -305,6 +305,34 @@ func TestUserinfoReturnsOnlySub(t *testing.T) {
 	}
 }
 
+// sanitizeTokenResponse is pure; it runs without a database and locks the two
+// contract points the library would otherwise violate.
+func TestSanitizeTokenResponse(t *testing.T) {
+	var got map[string]any
+
+	out := sanitizeTokenResponse([]byte(`{"access_token":"at","scope":"account.id offline_access","id_token":"jwt"}`))
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["id_token"]; ok {
+		t.Fatal("id_token kept without openid scope")
+	}
+	if got["scope"] != "account.id" {
+		t.Fatalf("scope = %v, want account.id (offline_access hidden)", got["scope"])
+	}
+
+	out = sanitizeTokenResponse([]byte(`{"access_token":"at","scope":"openid account.id offline_access","id_token":"jwt"}`))
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["id_token"] != "jwt" {
+		t.Fatal("id_token dropped despite openid scope")
+	}
+	if got["scope"] != "openid account.id" {
+		t.Fatalf("scope = %v, want openid account.id", got["scope"])
+	}
+}
+
 // The consent interaction: describe, narrow on approve, and deny with a proper
 // error redirect.
 func TestConsentInteraction(t *testing.T) {

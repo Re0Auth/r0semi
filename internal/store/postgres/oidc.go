@@ -393,7 +393,7 @@ func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenReque
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)
 		VALUES ($1,$2,$3,$4,$5)`,
-		hashValue(id), clientIDOf(request), request.GetSubject(), nonNil(request.GetScopes()), expires); err != nil {
+		hashValue(id), clientIDOf(request), request.GetSubject(), nonNil(withoutOfflineAccess(request.GetScopes())), expires); err != nil {
 		return "", time.Time{}, fmt.Errorf("postgres: create access token: %w", err)
 	}
 	s.record(ctx, "oidc.token", request.GetSubject(), clientIDOf(request), audit.OutcomeOK)
@@ -421,7 +421,7 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	if r, ok := request.(interface{ GetAudience() []string }); ok {
 		audience = r.GetAudience()
 	}
-	scopes := nonNil(request.GetScopes())
+	scopes := nonNil(withoutOfflineAccess(request.GetScopes()))
 	amr = nonNil(amr)
 	audience = nonNil(audience)
 
@@ -761,6 +761,9 @@ func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, 
 			byClient[clientID] = g
 		}
 		for _, sc := range scopes {
+			if sc == oidc.ScopeOfflineAccess {
+				continue
+			}
 			g.Scopes = appendScopeUnique(g.Scopes, oauth.Scope(sc))
 		}
 		if issued.Before(g.IssuedAt) {
@@ -917,4 +920,17 @@ func appendOfflineAccess(scopes []string) []string {
 		return scopes
 	}
 	return append(scopes, oidc.ScopeOfflineAccess)
+}
+
+// withoutOfflineAccess removes offline_access before a scope list is stored or
+// shown. Re0Auth always issues a refresh token, so offline_access is an internal
+// trigger, not a scope the client should see (ADR-0001 O-6, revised).
+func withoutOfflineAccess(scopes []string) []string {
+	out := make([]string, 0, len(scopes))
+	for _, s := range scopes {
+		if s != oidc.ScopeOfflineAccess {
+			out = append(out, s)
+		}
+	}
+	return out
 }

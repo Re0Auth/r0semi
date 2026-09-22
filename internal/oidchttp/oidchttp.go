@@ -172,37 +172,68 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	h.provider.ServeHTTP(bw, r)
 	body := bw.body.Bytes()
 	if bw.status == http.StatusOK {
-		body = gateIDToken(body)
+		body = sanitizeTokenResponse(body)
 	}
 	bw.flush(w, body)
 }
 
-// gateIDToken drops id_token from a token response unless the granted scope
-// includes openid. The library adds it unconditionally (see
-// docs/zitadel-oidc-spike.md §2); O-2 forbids that.
-func gateIDToken(body []byte) []byte {
+// sanitizeTokenResponse enforces two contract points the library does not:
+//
+//   - O-2: id_token is only returned when the granted scope includes openid;
+//   - O-6 (revised): offline_access is accepted but never surfaced. Re0Auth
+//     always issues a refresh token, and treats offline_access as a
+//     compatibility no-op rather than a scope the client can see.
+func sanitizeTokenResponse(body []byte) []byte {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return body
-	}
-	if _, ok := payload["id_token"]; !ok {
 		return body
 	}
 	var scope string
 	if raw, ok := payload["scope"]; ok {
 		_ = json.Unmarshal(raw, &scope)
 	}
-	for _, s := range strings.Fields(scope) {
-		if s == "openid" {
-			return body
+	changed := false
+	if _, ok := payload["id_token"]; ok && !hasField(scope, "openid") {
+		delete(payload, "id_token")
+		changed = true
+	}
+	if clean, stripped := withoutField(scope, "offline_access"); stripped {
+		if encoded, err := json.Marshal(clean); err == nil {
+			payload["scope"] = encoded
+			changed = true
 		}
 	}
-	delete(payload, "id_token")
+	if !changed {
+		return body
+	}
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return body
 	}
 	return out
+}
+
+func hasField(scope, name string) bool {
+	for _, s := range strings.Fields(scope) {
+		if s == name {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutField(scope, name string) (string, bool) {
+	fields := strings.Fields(scope)
+	out := make([]string, 0, len(fields))
+	for _, s := range fields {
+		if s != name {
+			out = append(out, s)
+		}
+	}
+	if len(out) == len(fields) {
+		return scope, false
+	}
+	return strings.Join(out, " "), true
 }
 
 // bufferedWriter captures a response so it can be rewritten.
