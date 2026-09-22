@@ -40,10 +40,20 @@ check:
 	go test ./internal/archtest/
 	cd web && npm run check
 
-# Frontend dev server on :5173, proxying nothing: it talks to a re0auth already
-# running on :8080. Both must agree on the issuer, and the session cookie has to
-# be shared, so start re0auth with RE0AUTH_ISSUER=http://localhost:5173/app and
-# visit the app through Vite rather than through Go.
+# Frontend dev server with hot reload (Vite on :5173).
+#
+# It proxies /v1, /oauth, /.well-known, /auth and /bind to a re0auth already
+# running on :8080, so start that first — with the issuer set to the Vite origin,
+# because the session cookie is written for whatever host the browser sees:
+#
+#   RE0AUTH_ISSUER=http://localhost:5173 go run ./cmd/re0auth &
+#   make play
+#   # then open http://localhost:5173/app/
+#
+# The OAuth app's redirect URI must match: http://localhost:5173/auth/<provider>/callback.
+# (To keep the :8080 callback instead, leave the issuer alone and open the dev
+# server at http://127.0.0.1:5173/app/ after signing in; cookies are per host, not
+# per port, so :8080 and :5173 share them.)
 play:
 	cd web && npm run dev
 

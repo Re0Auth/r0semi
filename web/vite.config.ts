@@ -1,10 +1,47 @@
 import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 import tailwindcss from '@tailwindcss/vite';
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
+
+// In development the browser is on the Vite origin (:5173) while the API is the
+// Go binary on :8080, so the Go plane's paths are proxied. Everything the app
+// fetches is a relative path like `/v1/...`, which means without this it would
+// all hit Vite and 404.
+//
+// The issuer must then be the Vite origin (`RE0AUTH_ISSUER=http://localhost:5173`),
+// so that the session cookie is written for the host the app is read from. A
+// mismatch logs the user straight back out. See web/README.md.
+const apiTarget = 'http://127.0.0.1:8080';
+const apiPaths = ['/v1', '/oauth', '/.well-known', '/auth', '/bind'];
+
+// The Go binary answers `/` with a 302 to `/app/`. In development `/` is served
+// by Vite, so a login that returns to `return_to=/` (the default) would land on a
+// 404. Mirroring the redirect keeps the dev flow identical to production.
+function devRootRedirect(): Plugin {
+	return {
+		name: 're0auth-dev-root-redirect',
+		configureServer(server) {
+			server.middlewares.use((req, res, next) => {
+				// The minimal IncomingMessage this project resolves without
+				// @types/node has no `url`; it is present at runtime.
+				const path = (req as { url?: string }).url;
+				if (path === '/' || path === '') {
+					res.writeHead(302, { Location: '/app/' });
+					res.end();
+				} else {
+					next();
+				}
+			});
+		}
+	};
+}
 
 export default defineConfig({
+	server: {
+		proxy: Object.fromEntries(apiPaths.map((path) => [path, apiTarget]))
+	},
 	plugins: [
+		devRootRedirect(),
 		tailwindcss(),
 		sveltekit({
 			compilerOptions: {

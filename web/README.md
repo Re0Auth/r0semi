@@ -1,42 +1,79 @@
-# sv
+# Re0Auth frontend (`web/`)
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+A **pure client-side SPA** (SvelteKit + `adapter-static`). It is built straight
+into `internal/webui/dist` and embedded into the Go binary, so a deployment stays
+"copy one file" and there is no separate frontend server in production.
 
-## Creating a project
+Two facts shape everything here:
 
-If you're seeing this, you've probably already done this step. Congrats!
+- `paths.base` is **`/app`** and must equal `internal/webui.BasePath`. The app
+  lives under `/app/*` on the same origin as the API; the protocol plane
+  (`/oauth`, `/.well-known`) stays in Go and is never shadowed.
+- Every request the app makes is a **relative path** (`/v1/...`, `/oauth/...`).
+  In production that is the same origin, so no CORS and no proxy; in development
+  Vite proxies those paths to the Go binary.
 
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-npx sv@0.17.1 create --template minimal --types ts --install npm web
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+## Run it, embedded (what ships)
 
 ```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
+cd web && npm ci && npm run build     # writes ../internal/webui/dist
+cd .. && go run ./cmd/re0auth          # http://127.0.0.1:8080/app/
 ```
 
-## Building
+Nothing else to start. The binary embeds whatever is in `internal/webui/dist` **at
+build time**, so rebuild after frontend changes — or use the dev server below.
 
-To create a production version of your app:
+## Run it, dev server with hot reload
+
+Vite on `:5173`, proxying the Go plane to a re0auth already running on `:8080`.
 
 ```sh
-npm run build
+# 1. the backend, with the issuer set to the Vite origin
+RE0AUTH_ISSUER=http://localhost:5173 go run ./cmd/re0auth
+
+# 2. the frontend, in another terminal
+cd web && npm run dev        # or, from the repo root: make play
+# open http://localhost:5173/app/
 ```
 
-You can preview the production build with `npm run preview`.
+**The issuer must be the Vite origin.** The session cookie is written for the
+host the *browser* sees; login redirects go through `{issuer}/auth/...`. If the
+issuer were `:8080` while the app is read from `:5173`, the cookie would be set on
+`:8080` and never sent with the app's requests — the login would appear to work and
+then silently drop you back out.
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+Register the OAuth app's redirect URI to match:
+
+```
+http://localhost:5173/auth/<provider>/callback
+```
+
+`vite.config.ts` proxies `/v1`, `/oauth`, `/.well-known`, `/auth` and `/bind` to
+`http://127.0.0.1:8080`, and mirrors Go's `/` → `/app/` redirect so a login that
+returns to `return_to=/` lands on the app rather than a 404.
+
+> Alternative that needs no OAuth-app change: leave the issuer at its configured
+> value (`:8080`), sign in there, then open `http://127.0.0.1:5173/app/`. Cookies
+> are scoped per **host**, not per port, so `127.0.0.1:8080` and
+> `127.0.0.1:5173` share the same session.
+
+## Checks and tests
+
+```sh
+npm run check        # svelte-check (types)
+npm run test:e2e     # Playwright; builds and starts its own re0auth + fake IdP
+```
+
+The e2e suite (`web/e2e/`) is where the login, consent, device and binding flows
+are covered end to end, through the real shipping code, with a fake IdP at the
+network edge rather than a test-only bypass inside re0auth.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/routes/+page.svelte` | Account page: sign in, linked identities, sign out |
+| `src/routes/consent`, `device`, `grants`, `sources` | The rest of the app |
+| `src/lib/api.ts` | The only place that talks to `/v1` |
+| `src/lib/components/` | UI (including `SignIn.svelte`) |
+| `e2e/` | Playwright specs and the fake IdP/server harness |
