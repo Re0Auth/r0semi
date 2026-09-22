@@ -44,7 +44,9 @@ func openTestDB(t *testing.T) *DB {
 		         oauth_access_tokens, oauth_refresh_tokens,
 		         oauth_device_authorizations, oauth_clients,
 		         vault_credentials, federation_bindings, federation_bind_flows,
-		         sessions, authz_requests, audit_events
+		         sessions, authz_requests, audit_events,
+		         oidc_auth_requests, oidc_codes, oidc_access_tokens,
+		         oidc_refresh_tokens, oidc_devices
 		CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}

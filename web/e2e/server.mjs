@@ -25,6 +25,9 @@ const appPort = Number(process.env.E2E_PORT ?? 18099);
 const idpPort = Number(process.env.E2E_IDP_PORT ?? 18098);
 const appBase = `http://127.0.0.1:${appPort}`;
 const idpBase = `http://127.0.0.1:${idpPort}`;
+// When set, re0auth runs on Postgres and therefore uses the OpenID Provider
+// engine (ADR-0001); unset keeps the in-memory built-in engine.
+const dbUrl = process.env.E2E_DATABASE_URL ?? '';
 
 const CLIENT_ID = 'cli';
 const CALLBACK_URL = `${idpBase}/callback`;
@@ -191,9 +194,10 @@ cookie_secure = false
 rate_limit = 0
 
 [storage]
-# In-memory: each run starts from nothing, which is what makes the tests
-# independent of each other and of whatever ran before.
-driver = "memory"
+# Memory by default: each run starts from nothing, which is what makes the tests
+# independent of each other and of whatever ran before. A DSN switches to
+# Postgres, and with it the OpenID Provider engine.
+driver = "${dbUrl ? 'postgres' : 'memory'}"
 
 [vault]
 kek_env = "RE0AUTH_KEK"
@@ -265,7 +269,11 @@ const app = spawn(bin, ['-config', configFile()], {
 		// Any 32 bytes. base64 so the server's key parser accepts it directly.
 		RE0AUTH_KEK: Buffer.alloc(32, 7).toString('base64'),
 		E2E_IDP_SECRET: 'e2e-secret',
-		E2E_SOURCE_SECRET: 'e2e-source-secret'
+		E2E_SOURCE_SECRET: 'e2e-source-secret',
+		// A fixed token key keeps the run deterministic; the signing key stays
+		// ephemeral, which is fine for one run.
+		RE0AUTH_OIDC_TOKEN_KEY: Buffer.alloc(32, 9).toString('base64'),
+		...(dbUrl ? { DATABASE_URL: dbUrl } : {})
 	},
 	stdio: 'inherit'
 });

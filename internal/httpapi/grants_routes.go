@@ -31,7 +31,7 @@ func (s *Server) handleListGrants(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "no active session")
 		return
 	}
-	grants, err := s.as.Grants(r.Context(), string(user))
+	grants, err := s.grants.Grants(r.Context(), string(user))
 	if err != nil {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read grants")
 		return
@@ -76,7 +76,7 @@ func (s *Server) handleRevokeGrant(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "a client id is required")
 		return
 	}
-	if err := s.as.RevokeGrant(r.Context(), string(user), clientID); err != nil {
+	if err := s.grants.RevokeGrant(r.Context(), string(user), clientID); err != nil {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not revoke the grant")
 		return
 	}

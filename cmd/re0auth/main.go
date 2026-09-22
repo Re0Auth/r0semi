@@ -9,11 +9,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -27,6 +32,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/config"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/httpapi"
+	"github.com/Re0Auth/r0semi/internal/oidchttp"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/internal/store/postgres"
 	"github.com/Re0Auth/r0semi/internal/webui"
@@ -57,6 +63,9 @@ type storage struct {
 	// audit is the durable audit-log sink; nil would mean "nobody is auditing",
 	// which must never be a silent state.
 	audit audit.Logger
+	// db is the Postgres handle when durable; nil in memory mode. The OpenID
+	// Provider store is built on it in the composition root.
+	db *postgres.DB
 	// sweep removes expired auxiliary rows and reports how many. Nil when there
 	// is nothing to sweep.
 	sweep   func(context.Context) (int64, error)
@@ -207,19 +216,37 @@ func main() {
 		die("federation", err)
 	}
 
-	api, err := httpapi.New(httpapi.Config{
+	apiConfig := httpapi.Config{
 		Issuer:     cfg.Issuer,
-		AS:         as,
 		Sessions:   sessions,
 		Accounts:   store.accounts,
 		Auth:       authHandler,
-		Authz:      authzService,
 		Federation: federationService,
 		Frontend:   webui.FS(),
 		Limiter:    buildLimiter(cfg),
 		// One switch for "this issuer is https": Secure cookies and HSTS.
 		Secure: cfg.CookieSecure,
-	})
+	}
+	if store.db != nil {
+		// Durable storage means the OpenID Provider can run (ADR-0001).
+		oidcHandler, oidcStore, err := openOIDC(cfg, store, sessions, logger)
+		if err != nil {
+			die("oidc", err)
+		}
+		apiConfig.OIDC = oidcHandler
+		apiConfig.TokenIntrospector = oidcHandler
+		apiConfig.GrantStore = oidcStore
+		apiConfig.DeviceStore = oidcStore
+		apiConfig.Authorization = oidcHandler
+		slog.Info("authorization engine", "engine", "openid-provider")
+	} else {
+		// Without a database the OP store has nowhere to live, so the in-memory
+		// hand-rolled engine remains. This is the only mode where it does.
+		apiConfig.AS = as
+		apiConfig.Authz = authzService
+		slog.Warn("authorization engine", "engine", "built-in (in-memory)", "reason", "no database")
+	}
+	api, err := httpapi.New(apiConfig)
 	if err != nil {
 		die("http", err)
 	}
@@ -271,6 +298,7 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 	sessions := db.Sessions()
 	authzRequests := db.Authz()
 	return storage{
+		db:          db,
 		accounts:    db.Accounts(),
 		tokens:      db.Tokens(),
 		devices:     db.Devices(),
@@ -384,6 +412,97 @@ func rotateAndReport(ctx context.Context, v vault.Service) {
 	if rotation.Scanned == 0 {
 		slog.Warn("there was nothing to rotate; is the configured storage the one holding credentials?")
 	}
+}
+
+// openOIDC builds the OpenID Provider store and HTTP handler on the durable
+// database.
+func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.Logger) (*oidchttp.Handler, *postgres.OIDCStore, error) {
+	tokenKey, err := oidcTokenKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	signer, err := oidcSigningKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	registry := oauth.DefaultRegistry()
+	scopes := make([]string, 0, len(registry.Descriptors()))
+	for _, d := range registry.Descriptors() {
+		scopes = append(scopes, d.Scope.String())
+	}
+	oidcStore, err := store.db.OIDC(store.clients, postgres.OIDCOptions{
+		Registry: registry,
+		Signer:   postgres.NewOIDCSigner("re0auth", signer),
+		Audit:    logger,
+		Login: func(ctx context.Context, id string) string {
+			// Bind the request to the browser that started it, so a relayed id
+			// cannot be approved elsewhere. GetClientByClientID hands us the
+			// request context, which is where the session lives.
+			sessions.Bind(ctx, "authz", id)
+			return webui.BasePath + "/consent?id=" + url.QueryEscape(id)
+		},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	handler, err := oidchttp.New(oidchttp.Config{
+		Issuer:        cfg.Issuer,
+		Storage:       oidcStore,
+		CryptoKey:     tokenKey,
+		CryptoKeyID:   "re0auth",
+		Scopes:        scopes,
+		AllowInsecure: !cfg.CookieSecure,
+		Clients:       store.clients,
+		Registry:      registry,
+		Consent:       oidcStore,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return handler, oidcStore, nil
+}
+
+// oidcTokenKey reads the 32-byte bearer-token encryption key. An ephemeral key
+// is a real trade-off: existing access tokens become unreadable on restart.
+func oidcTokenKey() ([32]byte, error) {
+	var key [32]byte
+	if v := os.Getenv("RE0AUTH_OIDC_TOKEN_KEY"); v != "" {
+		b, err := base64.StdEncoding.DecodeString(v)
+		if err != nil || len(b) != 32 {
+			return key, errors.New("RE0AUTH_OIDC_TOKEN_KEY must be base64 of exactly 32 bytes")
+		}
+		copy(key[:], b)
+		return key, nil
+	}
+	if _, err := rand.Read(key[:]); err != nil {
+		return key, err
+	}
+	slog.Warn("RE0AUTH_OIDC_TOKEN_KEY is not set; using an ephemeral token key",
+		"consequence", "access tokens become unreadable across restarts")
+	return key, nil
+}
+
+// oidcSigningKey reads the RS256 key (base64 PKCS#8 DER), or generates an
+// ephemeral one. An ephemeral key invalidates id_tokens across restarts.
+func oidcSigningKey() (*rsa.PrivateKey, error) {
+	if v := os.Getenv("RE0AUTH_OIDC_SIGNING_KEY"); v != "" {
+		der, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_SIGNING_KEY: %w", err)
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(der)
+		if err != nil {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_SIGNING_KEY: %w", err)
+		}
+		key, ok := parsed.(*rsa.PrivateKey)
+		if !ok {
+			return nil, errors.New("RE0AUTH_OIDC_SIGNING_KEY must be an RSA private key")
+		}
+		return key, nil
+	}
+	slog.Warn("RE0AUTH_OIDC_SIGNING_KEY is not set; generating an ephemeral RS256 key",
+		"consequence", "id_tokens become invalid across restarts")
+	return rsa.GenerateKey(rand.Reader, 2048)
 }
 
 // seedClient registers the first-party downstream client if it is not already

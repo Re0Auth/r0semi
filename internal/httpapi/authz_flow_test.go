@@ -75,8 +75,10 @@ func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts
 		Issuer: "https://re0auth.test",
 		Scopes: oauth.DefaultRegistry(),
 		// Effectively no poll throttle, so a test can poll twice without
-		// sleeping. The slow_down path is covered in the oauth package.
-		DevicePollInterval: time.Millisecond,
+		// sleeping. One millisecond was not enough: two in-process HTTP round
+		// trips can complete inside it, which made this test flaky. The slow_down
+		// path is covered in the oauth package.
+		DevicePollInterval: time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatal(err)

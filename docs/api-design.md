@@ -9,10 +9,11 @@
 | # | 决策 |
 |---|---|
 | D-1 | **全站统一 `snake_case`**（字段名、参数、JSON key） |
-| D-2 | **不透明令牌 + Introspect**（RFC 7662）；不做 JWT AT，换取即时撤销 |
+| D-2 | **不透明 access token + Introspect**（RFC 7662）；不做 JWT AT，换取即时撤销。**唯一的 JWT 是 `id_token`**（见 D-6） |
 | D-3 | **v1 不做 DPoP**（RFC 9449）：只签发普通 Bearer。曾一度在 AS 元数据里广告 DPoP，已移除——广告了却只发普通 Bearer 是**静默降级**（见 §2.10） |
 | D-4 | **单域名**（如 `re0auth.r0semi.net`），但代码路由树内部**严格划清 `/oauth/` 与 `/v1/` 上下文边界** |
 | D-5 | **不提供上游凭据导出端点**：re0auth 不持有上游凭据，无物可导。需要上游原生 API 时走 `raw` 透传，而不是交出令牌（见 §5） |
+| D-6 | **采纳 OIDC**：Re0Auth 是 OpenID Provider。`id_token` 仅在请求含 `openid` 时签发，`sub` = `usr_`；`userinfo` 默认只回 `sub`，email 永不返回；服务 OIDC discovery（保留 RFC 8414 别名）。ADR 见 [oidc-decision.md](./oidc-decision.md) |
 
 ---
 
@@ -136,12 +137,16 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | `GET` | `/v1/device/verification` | RFC 8628 §3.3 | 设备流验证页：需登录，且把 user code 绑到当前浏览器会话 |
 | `GET` | `/oauth/consent` | — | 同意页（浏览器） |
 | `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 | 授权服务器元数据 |
+| `GET` | `/.well-known/openid-configuration` | OIDC Discovery 1.0 | OIDC 元数据；与 RFC 8414 文档内容一致（O-1） |
 | `GET` | `/.well-known/oauth-protected-resource` | RFC 9728 | 资源元数据 |
-| `GET` | `/.well-known/jwks.json` | — | 若未来引入 JWT（当前不签发） |
+| `GET` | `/oauth/userinfo` | OIDC Core §5.3 | Bearer；默认只返回 `sub`，email 永不返回（O-3） |
+| `GET` | `/oauth/keys` | OIDC Discovery §3 | JWKS（`id_token` 的 RS256 公钥） |
 
 硬约束：
 - PKCE S256 强制；禁 implicit、禁 ROPC；重定向 URI 精确匹配。
 - `authorize` 响应带 `iss`（RFC 9207）防混淆。
+- `id_token` **仅在请求含 `openid` scope 时**返回；否则响应中不得出现 `id_token`（O-2）。
+- `end_session` / `id_token_hint` / PAR / 动态客户端注册 / Session Management **不实现、不广告**（O-9）。
 - `token` 响应头：`Cache-Control: no-store`、`Pragma: no-cache`。
 - 标记 `explicit_consent` 的 scope 必须在同意页单独列出并要求逐项勾选（内置目录当前没有这样的 scope，机制保留）。
 

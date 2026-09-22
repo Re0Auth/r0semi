@@ -56,7 +56,7 @@ func (s *Server) handleDeviceVerification(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	auth, err := s.as.DescribeDeviceAuthorization(r.Context(), userCode)
+	auth, err := s.devices.DescribeDeviceAuthorization(r.Context(), userCode)
 	switch {
 	case errors.Is(err, oauth.ErrDeviceNotFound):
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown or expired user code")
@@ -106,7 +106,7 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.as.DecideDeviceAuthorization(r.Context(), body.UserCode, string(user),
+	err := s.devices.DecideDeviceAuthorization(r.Context(), body.UserCode, string(user),
 		body.Decision == "approve", toScopes(body.Scopes), toScopes(body.Explicit))
 	switch {
 	case errors.Is(err, oauth.ErrDeviceNotFound):

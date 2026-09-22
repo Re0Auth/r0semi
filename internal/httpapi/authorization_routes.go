@@ -61,26 +61,26 @@ func (s *Server) handleGetAuthorizationRequest(w http.ResponseWriter, r *http.Re
 		return
 	}
 	id := r.PathValue("id")
-	if authz.InvalidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
+	if !s.authInteract.ValidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown authorization request")
 		return
 	}
-	req, err := s.authz.Get(r.Context(), id)
+	view, err := s.authInteract.DescribeAuthorization(r.Context(), id)
 	if err != nil {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "authorization request expired")
 		return
 	}
 
-	missing, err := s.missingBindingViews(r.Context(), user, req.Scopes, req.ID)
+	missing, err := s.missingBindingViews(r.Context(), user, view.Scopes, view.ID)
 	if err != nil {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read data source bindings")
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":               req.ID,
-		"client":           map[string]string{"id": req.ClientID, "name": req.ClientName},
-		"scopes":           s.scopeViews(req.Scopes),
+		"id":               view.ID,
+		"client":           map[string]string{"id": view.ClientID, "name": view.ClientName},
+		"scopes":           s.scopeViews(view.Scopes),
 		"missing_bindings": missing,
 		"csrf_token":       s.sessions.CSRFToken(r.Context()),
 	})
@@ -106,7 +106,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	id := r.PathValue("id")
-	if authz.InvalidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
+	if !s.authInteract.ValidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown authorization request")
 		return
 	}
@@ -119,30 +119,22 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 
 	switch body.Decision {
 	case "deny":
-		req, err := s.authz.Deny(r.Context(), id)
+		redirect, err := s.authInteract.DenyAuthorization(r.Context(), id)
 		if err != nil {
 			s.writeProblem(w, r, http.StatusNotFound, "not_found", "authorization request expired")
 			return
 		}
 		s.sessions.Unbind(r.Context(), "authz", id)
-		writeJSON(w, http.StatusOK, map[string]string{
-			"redirect_to": oauth.BuildRedirect(req.RedirectURI, map[string]string{
-				"error": "access_denied", "state": req.State,
-			}),
-		})
+		writeJSON(w, http.StatusOK, map[string]string{"redirect_to": redirect})
 
 	case "approve":
-		resp, err := s.authz.Approve(r.Context(), id, string(user), toScopes(body.Scopes), toScopes(body.Explicit))
+		redirect, err := s.authInteract.ApproveAuthorization(r.Context(), id, string(user), toScopes(body.Scopes), toScopes(body.Explicit))
 		if err != nil {
 			s.writeDecisionError(w, r, err)
 			return
 		}
 		s.sessions.Unbind(r.Context(), "authz", id)
-		writeJSON(w, http.StatusOK, map[string]string{
-			"redirect_to": oauth.BuildRedirect(resp.RedirectURI, map[string]string{
-				"code": resp.Code, "state": resp.State,
-			}),
-		})
+		writeJSON(w, http.StatusOK, map[string]string{"redirect_to": redirect})
 
 	default:
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", `decision must be "approve" or "deny"`)

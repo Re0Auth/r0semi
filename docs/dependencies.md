@@ -15,6 +15,7 @@
 | `github.com/cenkalti/backoff/v4` | `httpclient.Retry`（上游重试装饰器） | 成熟的指数退避 + 抖动策略；**只重试幂等方法**，POST 默认不重放 |
 | `github.com/jackc/pgx/v5` (+`pgxpool`) | `internal/store/postgres` | Postgres 驱动。选它而不是 `database/sql` 是因为 v5 的泛型行扫描（`CollectRows`/`RowToStructByName`）能直接消除大量手写 `Scan` 错误 |
 | `github.com/pressly/goose/v3` | `internal/store/postgres` 的迁移执行 | 成熟的 SQL 迁移库：标准 `-- +goose Up/Down` 注解、按版本排序与乱序检测、advisory-lock session locker，并自带 `goose_db_version` 版本表。**不校验已应用迁移文件的内容**（goose 无 checksum），所以它换掉的是手写 runner，不是"内容完整性"保证 |
+| `github.com/zitadel/oidc/v3` | `internal/store/postgres` 的 `op.Storage`（ADR-0001：OpenID Provider） | OIDC 原生：设备码流（RFC 8628）内置、不透明引用令牌模型、`AuthRequest` 由实现者拥有（scope 收窄/同意可挂载）。**稳定 API 是 legacy `Storage`，新版 `Server` API 到 v4 前 experimental**。仍只用 `go-jose/v4`，不引第二套 JOSE（对照 fosite 见 [oidc-decision.md](./oidc-decision.md)） |
 | `github.com/BurntSushi/toml` | `internal/config` 与 `cmd/*` 加载 `config/*.toml` | TOML 的事实标准。配置来源只有文件和环境变量两类，不需要 koanf 那样的多来源合并层 |
 | `gopkg.in/yaml.v3` | **仅测试**：`internal/httpapi` 解析 `docs/openapi.yaml`，断言 spec 与实际路由双向一致 | YAML 的事实标准。**只在 `_test.go` 里被引用，不进任何二进制** |
 
@@ -46,7 +47,7 @@
 
 | 候选 | 结论 |
 |---|---|
-| `ory/fosite`（OAuth 2.0 AS 引擎） | **方向赞成，时机未到**。它会接管协议引擎（含 PAR、mTLS、设备流、DPoP 支持），我们保留 scope 风险分级 / 显式同意 / 审计 withholding / 两平面纪律。但它要求实现约 10 个 storage 接口——套在内存存储上是白写，**应与真实持久化存储一起做**。因 `oauth.Service` 已是唯一接缝，替换不外溢 |
+| `ory/fosite`（OAuth 2.0 AS 引擎） | **评估后未采用。** spike（`spike/fosite`）证实两点致命代价：（a）**不实现 RFC 8628 设备码流**；（b）把 75 个 indirect 依赖、第二套 JOSE（go-jose/v3）与 logrus/grpc/OTel 拉进构建图。最终选择 OIDC 原生的 `zitadel/oidc/v3`（§1），依据见 [oidc-decision.md](./oidc-decision.md) |
 | `hashicorp/go-retryablehttp` | HTTP 重试的**专用**方案（认 `Retry-After`、幂等方法、包 `*http.Client`），比通用退避更贴场景。本项目选了 `backoff` 是因为它更贴合 `httpclient.Doer` 这个装饰器接缝；若将来重试逻辑变复杂，可换成它 |
 | 云 KMS 适配器（阿里云 KMS / AWS KMS / GCP KMS） | **暂不引入**。`KeyWrapper` 接缝已就位，每个适配器都是一小段代码。**代价是持续的**：云依赖、按次计费、厂商锁定、本地开发与自托管都变复杂。买到的是**可恢复性与可归因**（KEK 不在进程里、解封可审计、密钥可停用），**不是防止解密**——被攻破的进程可以用自己的身份去调 KMS（threat-model §6.0）。自托管不需要；官方公共实例需要 |
 | `github.com/awnumar/memguard` | 解决"Go 无法保证清零"。目前 `zeroize` + `runtime.KeepAlive` 是尽力而为，**这一限制应在 threat-model 中如实承认** |

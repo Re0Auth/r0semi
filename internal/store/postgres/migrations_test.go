@@ -165,14 +165,24 @@ func TestAdoptLegacyMigrations(t *testing.T) {
 		t.Fatalf("adopted %d legacy versions, want 3", adopted)
 	}
 
-	// Goose should now apply exactly the four migrations the legacy table did
-	// not cover, leaving the schema complete.
+	// Goose should now apply exactly the migrations the legacy table did not
+	// cover (everything after version 3).
+	entries, err := fs.ReadDir(dir, ".")
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	var total int
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			total++
+		}
+	}
 	results, err := provider.Up(ctx)
 	if err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	if len(results) != 4 {
-		t.Fatalf("goose applied %d migrations, want 4", len(results))
+	if len(results) != total-3 {
+		t.Fatalf("goose applied %d migrations, want %d", len(results), total-3)
 	}
 
 	var tables int

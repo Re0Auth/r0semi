@@ -205,7 +205,7 @@ func (s *Server) withBearer(next tokenHandler) http.HandlerFunc {
 			s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "an access token is required")
 			return
 		}
-		info, err := s.as.Introspect(r.Context(), tok)
+		info, err := s.introspector.Introspect(r.Context(), tok)
 		if err != nil {
 			s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "token introspection failed")
 			return

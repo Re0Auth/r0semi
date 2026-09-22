@@ -82,8 +82,12 @@ jobs:
       # set at the job level. Without it they skip (that is how local
       # development works), and the CI guard in openTestDB turns that into a
       # failure rather than a silent pass.
+      #
+      # -p 1 serializes packages because three of them (store/postgres, oidchttp,
+      # httpapi) share one database; run in parallel, one package's TRUNCATE can
+      # wipe rows another is using mid-test.
       - name: go test
-        run: go test -race -timeout 300s ./...
+        run: go test -race -p 1 -timeout 300s ./...
 
       # Verbose, so the log proves each integration test executed rather than
       # skipped: the package summary reads "ok" in both cases.
@@ -99,8 +103,16 @@ jobs:
       # can is the class of bug where every layer is individually correct and the
       # assembled page still does not work — a CSP that blocks the app's own
       # bootstrap, for instance, which is invisible to a header assertion.
-      - name: browser tests
+      #
+      # Twice: once on the in-memory built-in engine, once on the OpenID Provider
+      # (E2E_DATABASE_URL points re0auth at the job's Postgres). The second is the
+      # shipping engine, so it must not be the one that is never exercised.
+      - name: browser tests (built-in engine)
         working-directory: web
         run: |
           npx playwright install --with-deps chromium
           npx playwright test
+
+      - name: browser tests (OpenID Provider engine)
+        working-directory: web
+        run: E2E_DATABASE_URL="$TEST_DATABASE_URL" npx playwright test

@@ -14,6 +14,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
+	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
@@ -53,6 +55,9 @@ type Config struct {
 	// Authz, when set with Sessions, enables the authorization-interaction API
 	// and turns /oauth/authorize into a real browser flow.
 	Authz authz.Service
+	// Authorization, when set, is the consent interaction (OP mode). When unset
+	// it is built from Authz, so the old engine keeps working unchanged.
+	Authorization authorization.Interaction
 	// ConsentPath is the frontend route /oauth/authorize redirects to. It must be a
 	// route the mounted frontend actually serves. Defaults to
 	// webui.BasePath + "/consent".
@@ -69,30 +74,71 @@ type Config struct {
 	// Frontend, when set, is the built single-page app mounted under
 	// webui.BasePath. Pass webui.FS() for an embedded build.
 	Frontend fs.FS
+
+	// OIDC, when set, replaces the hand-rolled protocol plane with the OpenID
+	// Provider handler (internal/oidchttp): /oauth/* and both discovery
+	// documents are served by it. When set, TokenIntrospector is required so the
+	// business plane can validate the OP's tokens; a nil introspector would leave
+	// /v1 unable to accept them, which is why New rejects the combination.
+	OIDC http.Handler
+	// TokenIntrospector validates bearer tokens for the business plane. Defaults
+	// to AS.Introspect; an OP deployment passes the OP-backed introspector.
+	TokenIntrospector TokenIntrospector
+	// GrantStore and DeviceStore route the business-plane grants and device views
+	// to the engine. They default to AS; an OP deployment passes the OP-backed
+	// store so the views reflect the tokens the OP actually issued.
+	GrantStore  GrantStore
+	DeviceStore DeviceStore
+}
+
+// TokenIntrospector resolves a bearer token to its grant. It is the business
+// plane's only dependency on the authorization engine, so the engine can be
+// swapped without the /v1 layer importing it.
+type TokenIntrospector interface {
+	Introspect(ctx context.Context, token string) (oauth.TokenInfo, error)
+}
+
+// GrantStore is the grants view's engine seam (a subset of oauth.Service).
+type GrantStore interface {
+	Grants(ctx context.Context, subject string) ([]oauth.Grant, error)
+	RevokeGrant(ctx context.Context, subject, clientID string) error
+}
+
+// DeviceStore is the device verification page's engine seam.
+type DeviceStore interface {
+	DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error)
+	DecideDeviceAuthorization(ctx context.Context, userCode, subject string, approve bool, scopes, explicit []oauth.Scope) error
 }
 
 // Server is the two-plane HTTP surface.
 type Server struct {
-	issuer    string
-	resource  string
-	errorBase string
-	scopes    *oauth.Registry
-	as        oauth.Service
-	sessions  *auth.Manager
-	accounts  account.Store
-	auth      *auth.Handler
-	authz     authz.Service
-	consent   string
-	federate  federation.Service
-	limiter   *ratelimit.Limiter
-	secure    bool
-	frontend  fs.FS
+	issuer       string
+	resource     string
+	errorBase    string
+	scopes       *oauth.Registry
+	as           oauth.Service
+	sessions     *auth.Manager
+	accounts     account.Store
+	auth         *auth.Handler
+	authz        authz.Service
+	authInteract authorization.Interaction
+	consent      string
+	federate     federation.Service
+	limiter      *ratelimit.Limiter
+	secure       bool
+	frontend     fs.FS
+	// oidc, when non-nil, is the protocol plane; introspector is always set
+	// (AS when oidc is nil, the OP bridge when it is not).
+	oidc         http.Handler
+	introspector TokenIntrospector
+	grants       GrantStore
+	devices      DeviceStore
 }
 
 // New validates cfg and returns a Server.
 func New(cfg Config) (*Server, error) {
-	if cfg.AS == nil {
-		return nil, errors.New("httpapi: Config.AS is required")
+	if cfg.AS == nil && cfg.OIDC == nil {
+		return nil, errors.New("httpapi: Config.AS or Config.OIDC is required")
 	}
 	if strings.TrimSpace(cfg.Issuer) == "" {
 		return nil, errors.New("httpapi: Config.Issuer is required")
@@ -115,27 +161,57 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Authz != nil && cfg.Sessions == nil {
 		return nil, errors.New("httpapi: Config.Authz requires Config.Sessions")
 	}
+	if cfg.Authorization != nil && cfg.Sessions == nil {
+		return nil, errors.New("httpapi: Config.Authorization requires Config.Sessions")
+	}
+	var authInteract authorization.Interaction
+	switch {
+	case cfg.Authorization != nil:
+		authInteract = cfg.Authorization
+	case cfg.Authz != nil:
+		authInteract = authzInteraction{svc: cfg.Authz}
+	}
 	if cfg.ConsentPath == "" {
 		// The consent screen is a frontend route, so its default is derived from
 		// where the frontend is mounted rather than invented separately. A
 		// deployment that moves the app must move this with it.
 		cfg.ConsentPath = webui.BasePath + "/consent"
 	}
+	if cfg.OIDC != nil && (cfg.TokenIntrospector == nil || cfg.GrantStore == nil || cfg.DeviceStore == nil) {
+		return nil, errors.New("httpapi: Config.OIDC requires Config.TokenIntrospector, Config.GrantStore and Config.DeviceStore")
+	}
+	introspector := cfg.TokenIntrospector
+	if introspector == nil {
+		introspector = cfg.AS
+	}
+	grants := cfg.GrantStore
+	if grants == nil {
+		grants = cfg.AS
+	}
+	devices := cfg.DeviceStore
+	if devices == nil {
+		devices = cfg.AS
+	}
 	return &Server{
-		issuer:    strings.TrimRight(cfg.Issuer, "/"),
-		resource:  strings.TrimRight(cfg.Resource, "/"),
-		errorBase: strings.TrimRight(cfg.ErrorBase, "/"),
-		scopes:    cfg.Scopes,
-		as:        cfg.AS,
-		sessions:  cfg.Sessions,
-		accounts:  cfg.Accounts,
-		auth:      cfg.Auth,
-		authz:     cfg.Authz,
-		consent:   cfg.ConsentPath,
-		federate:  cfg.Federation,
-		limiter:   cfg.Limiter,
-		secure:    cfg.Secure,
-		frontend:  cfg.Frontend,
+		issuer:       strings.TrimRight(cfg.Issuer, "/"),
+		resource:     strings.TrimRight(cfg.Resource, "/"),
+		errorBase:    strings.TrimRight(cfg.ErrorBase, "/"),
+		scopes:       cfg.Scopes,
+		as:           cfg.AS,
+		sessions:     cfg.Sessions,
+		accounts:     cfg.Accounts,
+		auth:         cfg.Auth,
+		authz:        cfg.Authz,
+		authInteract: authInteract,
+		consent:      cfg.ConsentPath,
+		federate:     cfg.Federation,
+		limiter:      cfg.Limiter,
+		secure:       cfg.Secure,
+		frontend:     cfg.Frontend,
+		oidc:         cfg.OIDC,
+		introspector: introspector,
+		grants:       grants,
+		devices:      devices,
 	}, nil
 }
 
@@ -176,7 +252,7 @@ func (s *Server) specRoutes() []route {
 			route{http.MethodGet, "/v1/device/verification", s.handleDeviceVerification},
 		)
 	}
-	if s.sessions != nil && s.authz != nil {
+	if s.sessions != nil && s.authInteract != nil {
 		routes = append(routes,
 			route{http.MethodGet, "/v1/authorization_requests/{id}", s.handleGetAuthorizationRequest},
 			route{http.MethodPost, "/v1/authorization_requests/{id}/decision", s.handleAuthorizationDecision},
@@ -223,9 +299,16 @@ func (s *Server) specRoutes() []route {
 }
 func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
-	root.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleASMetadata)
+	if s.oidc != nil {
+		// The OP owns the protocol plane and both discovery documents.
+		root.Handle("GET /.well-known/oauth-authorization-server", s.oidc)
+		root.Handle("GET /.well-known/openid-configuration", s.oidc)
+		root.Handle("/oauth/", s.oidc)
+	} else {
+		root.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleASMetadata)
+		root.Handle("/oauth/", s.protocolPlane())
+	}
 	root.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleResourceMetadata)
-	root.Handle("/oauth/", s.protocolPlane())
 	root.Handle("/v1/", s.businessPlane())
 	if s.auth != nil || s.bindEnabled() {
 		authMux := http.NewServeMux()
