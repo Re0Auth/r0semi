@@ -14,12 +14,19 @@
 | `golang.org/x/time/rate` | `internal/ratelimit`（按 key 令牌桶），`httpapi` 限流中间件 | 标准令牌桶。**注意它内部用真实时钟，不要和注入的假时钟混用**（会静默算错补充速率） |
 | `github.com/cenkalti/backoff/v4` | `httpclient.Retry`（上游重试装饰器） | 成熟的指数退避 + 抖动策略；**只重试幂等方法**，POST 默认不重放 |
 | `github.com/jackc/pgx/v5` (+`pgxpool`) | `internal/store/postgres` | Postgres 驱动。选它而不是 `database/sql` 是因为 v5 的泛型行扫描（`CollectRows`/`RowToStructByName`）能直接消除大量手写 `Scan` 错误 |
+| `github.com/pressly/goose/v3` | `internal/store/postgres` 的迁移执行 | 成熟的 SQL 迁移库：标准 `-- +goose Up/Down` 注解、按版本排序与乱序检测、advisory-lock session locker，并自带 `goose_db_version` 版本表。**不校验已应用迁移文件的内容**（goose 无 checksum），所以它换掉的是手写 runner，不是"内容完整性"保证 |
+| `github.com/BurntSushi/toml` | `internal/config` 与 `cmd/*` 加载 `config/*.toml` | TOML 的事实标准。配置来源只有文件和环境变量两类，不需要 koanf 那样的多来源合并层 |
 | `gopkg.in/yaml.v3` | **仅测试**：`internal/httpapi` 解析 `docs/openapi.yaml`，断言 spec 与实际路由双向一致 | YAML 的事实标准。**只在 `_test.go` 里被引用，不进任何二进制** |
 
 关于 `yaml.v3` 的两点交代：
 
 - **为什么不是 JSON。** 把 spec 写成 JSON 可以用 `encoding/json` 解析，**零新依赖**。放弃是因为 JSON 没有注释，而这份 spec 里“为什么这个 op 是这样”“为什么这里不广告 DPoP”这类注释和代码一样重要。一个不能解释自己的 spec 很快会变得与代码不符。
 - **代价是诚实的。** `yaml.v3` 的 `go.mod` 声明 `go 1.11`，属于**未裁剪**模块，`go mod tidy` 因此会把它的测试依赖（`github.com/kr/text`、`github.com/rogpeppe/go-internal`）作为 `// indirect` 拖进模块图。它们**不被编译进任何产物**（`go build ./cmd/...` 的二进制不含 `yaml`），代价仅在 `go.mod` 里多两行。
+
+关于 `goose` 的一点交代：
+
+- **它的测试依赖会进 `go.sum`。** `goose` 的测试用到 `modernc.org/sqlite` 等，`go mod tidy` 会在 `go.sum` 留下若干行；它们不在任何产物的构建图里（`go build ./cmd/...` 不含），代价与 `yaml.v3` 同类。
+- **它不做 checksum。** goose 只记录“哪个版本应用过”，不记录“应用时文件长什么样”。检测已应用迁移被篡改需要 Atlas 或自加校验列；当前接受这一边界，因为它本来就不是完整性机制。
 
 ## 2. 刻意手写（用标准库就是"成熟库"）
 
@@ -44,7 +51,7 @@
 | 云 KMS 适配器（阿里云 KMS / AWS KMS / GCP KMS） | **暂不引入**。`KeyWrapper` 接缝已就位，每个适配器都是一小段代码。**代价是持续的**：云依赖、按次计费、厂商锁定、本地开发与自托管都变复杂。买到的是**可恢复性与可归因**（KEK 不在进程里、解封可审计、密钥可停用），**不是防止解密**——被攻破的进程可以用自己的身份去调 KMS（threat-model §6.0）。自托管不需要；官方公共实例需要 |
 | `github.com/awnumar/memguard` | 解决"Go 无法保证清零"。目前 `zeroize` + `runtime.KeepAlive` 是尽力而为，**这一限制应在 threat-model 中如实承认** |
 | `jackc/pgx/v5` + `sqlc` | **已引入 `pgx`**（`internal/store/postgres`）。尚未引入 `sqlc`：目前查询不多，手写 pgx 更直接；查询量上来后再上代码生成 |
-| `BurntSushi/toml` / `knadh/koanf` | 加载 `config/*.toml` 时引入；目前配置走环境变量 |
+| `knadh/koanf` | 评估过的配置库。最终选了 `BurntSushi/toml`（见 §1）：配置来源只有文件和环境变量，koanf 的多来源合并是这一层不需要的 |
 
 ## 4. 反面教训（写下来避免重犯）
 

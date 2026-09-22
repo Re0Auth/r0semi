@@ -1,3 +1,5 @@
+-- +goose Up
+--
 -- HTTP sessions (alexedwards/scs).
 --
 -- Keyed by sha256(cookie value), not the cookie value itself: a dumped table
@@ -12,3 +14,6 @@ CREATE TABLE sessions (
 );
 
 CREATE INDEX sessions_expiry_idx ON sessions (expiry);
+
+-- +goose Down
+DROP TABLE IF EXISTS sessions;

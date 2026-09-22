@@ -1,3 +1,5 @@
+-- +goose Up
+--
 -- Append-only audit events. Nothing updates or deletes these rows: the audit
 -- log is an integrity record, not a working table.
 --
@@ -20,3 +22,6 @@ CREATE INDEX audit_events_subject_time_idx
     ON audit_events (subject, occurred_at DESC);
 CREATE INDEX audit_events_action_time_idx
     ON audit_events (action, occurred_at DESC);
+
+-- +goose Down
+DROP TABLE IF EXISTS audit_events;

@@ -1,3 +1,5 @@
+-- +goose Up
+--
 -- Pending authorization requests: the server-side handle between
 -- /oauth/authorize and the consent screen.
 --
@@ -24,3 +26,6 @@ CREATE TABLE authz_requests (
 );
 
 CREATE INDEX authz_requests_expires_idx ON authz_requests (expires_at);
+
+-- +goose Down
+DROP TABLE IF EXISTS authz_requests;

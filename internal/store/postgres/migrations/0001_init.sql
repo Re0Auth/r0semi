@@ -1,3 +1,5 @@
+-- +goose Up
+--
 -- Initial schema for the persistent stores.
 --
 -- Two conventions run through these tables:
@@ -103,3 +105,12 @@ CREATE TABLE oauth_clients (
     allowed_scopes text[]      NOT NULL DEFAULT '{}',
     created_at     timestamptz NOT NULL
 );
+
+-- +goose Down
+DROP TABLE IF EXISTS oauth_clients;
+DROP TABLE IF EXISTS oauth_device_authorizations;
+DROP TABLE IF EXISTS oauth_refresh_tokens;
+DROP TABLE IF EXISTS oauth_access_tokens;
+DROP TABLE IF EXISTS oauth_codes;
+DROP TABLE IF EXISTS accounts_identities;
+DROP TABLE IF EXISTS accounts_users;

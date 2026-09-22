@@ -1,3 +1,5 @@
+-- +goose Up
+--
 -- Federation: source bindings and pending bind flows.
 --
 -- Bindings hold METADATA ONLY. The upstream token lives in the vault, encrypted
@@ -39,3 +41,7 @@ CREATE TABLE federation_bind_flows (
 );
 
 CREATE INDEX federation_bind_flows_expires_idx ON federation_bind_flows (expires_at);
+
+-- +goose Down
+DROP TABLE IF EXISTS federation_bind_flows;
+DROP TABLE IF EXISTS federation_bindings;

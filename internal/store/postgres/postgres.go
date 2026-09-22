@@ -7,16 +7,18 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
-	"sort"
-	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver goose runs on
+	"github.com/pressly/goose/v3"
 )
 
 //go:embed migrations/*.sql
@@ -29,6 +31,8 @@ const migrationLockKey int64 = 0x7230636d6967
 // DB owns the connection pool and hands out the port implementations.
 type DB struct {
 	pool *pgxpool.Pool
+	// dsn is kept so goose can open its own database/sql handle for migrations.
+	dsn string
 }
 
 // Open connects, verifies the connection, and applies pending migrations. It is
@@ -43,7 +47,7 @@ func Open(ctx context.Context, dsn string) (*DB, error) {
 		pool.Close()
 		return nil, fmt.Errorf("postgres: ping: %w", err)
 	}
-	db := &DB{pool: pool}
+	db := &DB{pool: pool, dsn: dsn}
 	if err := db.Migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -85,9 +89,15 @@ func (db *DB) Clients() *Clients { return &Clients{pool: db.pool} }
 // Audit returns the durable audit-log sink.
 func (db *DB) Audit() *AuditLogger { return &AuditLogger{pool: db.pool} }
 
-// Migrate applies every unapplied migration in filename order, each in its own
-// transaction, under an advisory lock so two instances starting at once cannot
-// race.
+// Migrate applies every pending goose migration under an advisory lock, so two
+// instances starting at once cannot race. The lock is held on a dedicated pool
+// connection for the whole run; goose itself runs on a database/sql handle
+// (the pgx stdlib driver), because that is the seam it exposes.
+//
+// It also adopts a pre-goose `schema_migrations` table when it finds one: its
+// rows are copied into goose's version table (preserving the applied_at
+// timestamps), then it is dropped. A database that has never run a migration
+// simply gets a fresh goose_db_version.
 func (db *DB) Migrate(ctx context.Context) error {
 	conn, err := db.pool.Acquire(ctx)
 	if err != nil {
@@ -103,86 +113,86 @@ func (db *DB) Migrate(ctx context.Context) error {
 		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
 	}()
 
-	if _, err := conn.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version    text PRIMARY KEY,
-			applied_at timestamptz NOT NULL DEFAULT now()
-		)`); err != nil {
-		return fmt.Errorf("postgres: migrate: bookkeeping table: %w", err)
-	}
-
-	applied, err := appliedMigrations(ctx, conn)
+	sqlDB, err := sql.Open("pgx", db.dsn)
 	if err != nil {
+		return fmt.Errorf("postgres: migrate: open database/sql handle: %w", err)
+	}
+	defer sqlDB.Close()
+
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		return fmt.Errorf("postgres: migrate: migrations dir: %w", err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, dir)
+	if err != nil {
+		return fmt.Errorf("postgres: migrate: provider: %w", err)
+	}
+	if err := adoptLegacyMigrations(ctx, sqlDB, provider); err != nil {
 		return err
 	}
-	versions, err := migrationVersions()
-	if err != nil {
-		return err
-	}
-
-	for _, version := range versions {
-		if applied[version] {
-			continue
-		}
-		body, err := migrationsFS.ReadFile("migrations/" + version)
-		if err != nil {
-			return fmt.Errorf("postgres: migrate: read %s: %w", version, err)
-		}
-		if err := applyMigration(ctx, conn, version, string(body)); err != nil {
-			return err
-		}
+	if _, err := provider.Up(ctx); err != nil {
+		return fmt.Errorf("postgres: migrate: up: %w", err)
 	}
 	return nil
 }
 
-func appliedMigrations(ctx context.Context, conn *pgxpool.Conn) (map[string]bool, error) {
-	rows, err := conn.Query(ctx, `SELECT version FROM schema_migrations`)
+// adoptLegacyMigrations copies a pre-goose `schema_migrations` table into
+// goose's version table, then removes it. It is idempotent: re-running it after
+// a partial adoption inserts nothing that is already present and still drops
+// the legacy table.
+func adoptLegacyMigrations(ctx context.Context, sqlDB *sql.DB, provider *goose.Provider) error {
+	var legacy bool
+	if err := sqlDB.QueryRowContext(ctx,
+		`SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&legacy); err != nil {
+		return fmt.Errorf("postgres: migrate: detect legacy table: %w", err)
+	}
+	if !legacy {
+		return nil
+	}
+
+	// Let goose create its version table (and its zero row) before inserting.
+	if _, err := provider.GetDBVersion(ctx); err != nil {
+		return fmt.Errorf("postgres: migrate: init version table: %w", err)
+	}
+
+	rows, err := sqlDB.QueryContext(ctx, `SELECT version, applied_at FROM schema_migrations`)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: migrate: read applied: %w", err)
+		return fmt.Errorf("postgres: migrate: read legacy rows: %w", err)
 	}
 	defer rows.Close()
 
-	applied := make(map[string]bool)
+	type legacyRow struct {
+		filename  string
+		appliedAt time.Time
+	}
+	var legacyRows []legacyRow
 	for rows.Next() {
-		var version string
-		if err := rows.Scan(&version); err != nil {
-			return nil, err
+		var r legacyRow
+		if err := rows.Scan(&r.filename, &r.appliedAt); err != nil {
+			return fmt.Errorf("postgres: migrate: scan legacy row: %w", err)
 		}
-		applied[version] = true
+		legacyRows = append(legacyRows, r)
 	}
-	return applied, rows.Err()
-}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: migrate: iterate legacy rows: %w", err)
+	}
 
-func migrationVersions() ([]string, error) {
-	entries, err := fs.ReadDir(migrationsFS, "migrations")
-	if err != nil {
-		return nil, fmt.Errorf("postgres: migrate: list: %w", err)
-	}
-	versions := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			versions = append(versions, e.Name())
+	for _, r := range legacyRows {
+		version, err := goose.NumericComponent(r.filename)
+		if err != nil {
+			return fmt.Errorf("postgres: migrate: legacy version %q: %w", r.filename, err)
+		}
+		if _, err := sqlDB.ExecContext(ctx, `
+			INSERT INTO goose_db_version (version_id, is_applied, tstamp)
+			SELECT $1, true, $2
+			WHERE NOT EXISTS (SELECT 1 FROM goose_db_version WHERE version_id = $1)`,
+			version, r.appliedAt); err != nil {
+			return fmt.Errorf("postgres: migrate: adopt %q: %w", r.filename, err)
 		}
 	}
-	sort.Strings(versions)
-	return versions, nil
-}
 
-func applyMigration(ctx context.Context, conn *pgxpool.Conn, version, body string) error {
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("postgres: migrate: begin %s: %w", version, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, body); err != nil {
-		return fmt.Errorf("postgres: migrate: apply %s: %w", version, err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, version); err != nil {
-		return fmt.Errorf("postgres: migrate: record %s: %w", version, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("postgres: migrate: commit %s: %w", version, err)
+	if _, err := sqlDB.ExecContext(ctx, `DROP TABLE schema_migrations`); err != nil {
+		return fmt.Errorf("postgres: migrate: drop legacy table: %w", err)
 	}
 	return nil
 }

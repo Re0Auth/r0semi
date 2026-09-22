@@ -22,15 +22,22 @@ license is available at <https://www.apache.org/licenses/LICENSE-2.0>.
   - github.com/go-jose/go-jose/v4
     (Ships no NOTICE file; attribution only.)
 
+  - github.com/sethvargo/go-retry
+    (Ships no NOTICE file; attribution only.)
+
 MIT License
 -----------
 
+  - github.com/BurntSushi/toml
   - github.com/alexedwards/scs/v2
   - github.com/cenkalti/backoff/v4
   - github.com/jackc/pgx/v5
   - github.com/jackc/puddle/v2
   - github.com/jackc/pgpassfile
   - github.com/jackc/pgservicefile
+  - github.com/mfridman/interpolate
+  - github.com/pressly/goose/v3
+  - go.uber.org/multierr
 
 BSD 3-Clause License
 --------------------

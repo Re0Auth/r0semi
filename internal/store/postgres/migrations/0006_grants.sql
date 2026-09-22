@@ -1,3 +1,5 @@
+-- +goose Up
+--
 -- Indexes for the grants view.
 --
 -- A grant is not a stored entity: it is derived from the tokens a subject still
@@ -17,3 +19,7 @@
 
 CREATE INDEX oauth_access_tokens_subject_idx ON oauth_access_tokens (subject, client_id);
 CREATE INDEX oauth_refresh_tokens_subject_idx ON oauth_refresh_tokens (subject, client_id);
+
+-- +goose Down
+DROP INDEX IF EXISTS oauth_refresh_tokens_subject_idx;
+DROP INDEX IF EXISTS oauth_access_tokens_subject_idx;

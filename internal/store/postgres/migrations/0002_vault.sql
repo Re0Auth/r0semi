@@ -1,3 +1,5 @@
+-- +goose Up
+--
 -- Vault credential records.
 --
 -- This table holds only opaque crypto material: the wrapped DEK, the nonce and
@@ -23,3 +25,6 @@ CREATE TABLE vault_credentials (
     updated_at  timestamptz NOT NULL,
     PRIMARY KEY (subject, provider)
 );
+
+-- +goose Down
+DROP TABLE IF EXISTS vault_credentials;
