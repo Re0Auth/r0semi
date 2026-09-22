@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -263,35 +264,92 @@ type Clients struct{ pool *pgxpool.Pool }
 
 // Create implements oauth.ClientRegistry.
 func (s *Clients) Create(ctx context.Context, c oauth.Client) error {
+	status := c.Status
+	if status == "" {
+		status = oauth.ClientActive
+	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO oauth_clients (id, name, type, secret_hash, redirect_uris, allowed_scopes, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		c.ID, c.Name, string(c.Type), nullableBytes(c.SecretHash()),
+		INSERT INTO oauth_clients (id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		c.ID, c.Name, string(c.Type), string(status), nullableBytes(c.SecretHash()),
 		c.RedirectURIs, scopeArray(c.AllowedScopes), c.CreatedAt)
 	return err
 }
 
-// Get implements oauth.ClientRegistry.
+// Get implements oauth.ClientRegistry. A suspended client is reported as not
+// found: the protocol plane must treat it as a client id that never existed,
+// not as one that is merely forbidden.
 func (s *Clients) Get(ctx context.Context, id string) (oauth.Client, error) {
+	return scanClient(s.pool.QueryRow(ctx, `
+		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at
+		  FROM oauth_clients WHERE id = $1 AND status <> 'suspended'`, id))
+}
+
+// List implements oauth.ClientAdmin. Suspended clients are included, because the
+// admin view is exactly the place they must remain visible.
+func (s *Clients) List(ctx context.Context) ([]oauth.Client, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at
+		  FROM oauth_clients ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []oauth.Client
+	for rows.Next() {
+		c, err := scanClient(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SetStatus implements oauth.ClientAdmin.
+func (s *Clients) SetStatus(ctx context.Context, id string, status oauth.ClientStatus) error {
+	if status != oauth.ClientActive && status != oauth.ClientSuspended {
+		return fmt.Errorf("postgres: invalid client status %q", status)
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE oauth_clients SET status = $2 WHERE id = $1`, id, string(status))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return oauth.ErrClientNotFound
+	}
+	return nil
+}
+
+// Delete implements oauth.ClientAdmin. An absent row is success, so an operator
+// retrying a revocation is not told it failed at the last step.
+func (s *Clients) Delete(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM oauth_clients WHERE id = $1`, id)
+	return err
+}
+
+// scanClient reads one client row in the column order used above.
+func scanClient(row pgx.Row) (oauth.Client, error) {
 	var (
+		id         string
 		name       string
 		typ        string
+		status     string
 		secretHash []byte
 		redirects  []string
 		allowed    []string
 		createdAt  time.Time
 	)
-	err := s.pool.QueryRow(ctx, `
-		SELECT name, type, secret_hash, redirect_uris, allowed_scopes, created_at
-		  FROM oauth_clients WHERE id = $1`, id).
-		Scan(&name, &typ, &secretHash, &redirects, &allowed, &createdAt)
+	err := row.Scan(&id, &name, &typ, &status, &secretHash, &redirects, &allowed, &createdAt)
 	if noRows(err) {
 		return oauth.Client{}, oauth.ErrClientNotFound
 	}
 	if err != nil {
 		return oauth.Client{}, err
 	}
-	return oauth.RestoreClient(id, name, oauth.ClientType(typ), secretHash, redirects, scopesFrom(allowed), createdAt)
+	return oauth.RestoreClientWithStatus(id, name, oauth.ClientType(typ), oauth.ClientStatus(status),
+		secretHash, redirects, scopesFrom(allowed), createdAt)
 }
 
 func scopeArray(scopes []oauth.Scope) []string {

@@ -1091,3 +1091,63 @@ func TestAuditLoggerPersistsRecord(t *testing.T) {
 		t.Fatalf("nil detail stored as %q, want {}", raw)
 	}
 }
+
+func TestClientAdminLifecycleAndSuspension(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	reg := db.Clients()
+
+	c, err := oauth.NewClient("cli_admin", "Admin Test", oauth.ClientPublic, "",
+		[]string{"https://app.example/cb"}, []oauth.Scope{"openid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Create(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Get(ctx, "cli_admin"); err != nil {
+		t.Fatalf("active get: %v", err)
+	}
+	if err := reg.SetStatus(ctx, "cli_admin", oauth.ClientSuspended); err != nil {
+		t.Fatal(err)
+	}
+	// Suspended is reported as unknown, not as a distinct error.
+	if _, err := reg.Get(ctx, "cli_admin"); !errors.Is(err, oauth.ErrClientNotFound) {
+		t.Fatalf("suspended get = %v, want ErrClientNotFound", err)
+	}
+	// ... but the admin view still shows it.
+	all, err := reg.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range all {
+		if row.ID == "cli_admin" {
+			found = true
+			if row.Status != oauth.ClientSuspended {
+				t.Fatalf("listed status = %s, want suspended", row.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("suspended client missing from List")
+	}
+
+	if err := reg.SetStatus(ctx, "cli_admin", oauth.ClientActive); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Get(ctx, "cli_admin"); err != nil {
+		t.Fatalf("reactivated get: %v", err)
+	}
+
+	if err := reg.Delete(ctx, "cli_admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Delete(ctx, "cli_admin"); err != nil {
+		t.Fatalf("delete must be idempotent: %v", err)
+	}
+	if err := reg.SetStatus(ctx, "cli_admin", oauth.ClientActive); !errors.Is(err, oauth.ErrClientNotFound) {
+		t.Fatalf("SetStatus after delete = %v, want ErrClientNotFound", err)
+	}
+}

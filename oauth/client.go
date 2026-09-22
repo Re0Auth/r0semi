@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"sync"
 	"time"
 )
@@ -23,12 +24,26 @@ const (
 // ErrClientNotFound reports an unknown client id.
 var ErrClientNotFound = errors.New("oauth: client not found")
 
+// ClientStatus is the administrative lifecycle of a registered client.
+//
+// A suspended client is not "denied": it is reported as unknown by every
+// protocol entrance, because a ClientRegistry.Get returns ErrClientNotFound for
+// it. An operator's decision should not be distinguishable from a client id that
+// never existed.
+type ClientStatus string
+
+const (
+	ClientActive    ClientStatus = "active"
+	ClientSuspended ClientStatus = "suspended"
+)
+
 // A Client is a registered downstream application. The secret is stored only as
 // a SHA-256 hash.
 type Client struct {
 	ID            string
 	Name          string
 	Type          ClientType
+	Status        ClientStatus
 	CreatedAt     time.Time
 	RedirectURIs  []string
 	AllowedScopes []Scope
@@ -65,6 +80,7 @@ func NewClient(id, name string, typ ClientType, secret string, redirects []strin
 		ID:            id,
 		Name:          name,
 		Type:          typ,
+		Status:        ClientActive,
 		CreatedAt:     time.Now().UTC(),
 		RedirectURIs:  append([]string(nil), redirects...),
 		AllowedScopes: append([]Scope(nil), allowed...),
@@ -94,6 +110,15 @@ func (c Client) SecretHash() []byte { return append([]byte(nil), c.secretHash...
 // NewClient plus SecretHash, and is what a persistent ClientRegistry uses;
 // NewClient is for registration, where the plaintext secret is still known.
 func RestoreClient(id, name string, typ ClientType, secretHash []byte, redirects []string, allowed []Scope, createdAt time.Time) (Client, error) {
+	return RestoreClientWithStatus(id, name, typ, ClientActive, secretHash, redirects, allowed, createdAt)
+}
+
+// RestoreClientWithStatus is RestoreClient plus the persisted lifecycle status,
+// for a registry that stores it.
+func RestoreClientWithStatus(id, name string, typ ClientType, status ClientStatus, secretHash []byte, redirects []string, allowed []Scope, createdAt time.Time) (Client, error) {
+	if status != ClientActive && status != ClientSuspended {
+		return Client{}, fmt.Errorf("oauth: invalid client status %q", status)
+	}
 	switch {
 	case id == "":
 		return Client{}, errors.New("oauth: client id is required")
@@ -110,6 +135,7 @@ func RestoreClient(id, name string, typ ClientType, secretHash []byte, redirects
 		ID:            id,
 		Name:          name,
 		Type:          typ,
+		Status:        status,
 		CreatedAt:     createdAt,
 		RedirectURIs:  append([]string(nil), redirects...),
 		AllowedScopes: append([]Scope(nil), allowed...),
@@ -143,6 +169,20 @@ type ClientRegistry interface {
 	Get(ctx context.Context, id string) (Client, error)
 }
 
+// ClientAdmin is the management side of a registry: the operations an operator
+// uses to review and revoke clients. It is separate from ClientRegistry so the
+// protocol plane depends only on what it needs to serve requests, and so a
+// read-only or third-party registry remains a valid ClientRegistry.
+type ClientAdmin interface {
+	// List returns every client, suspended ones included, ordered by id.
+	List(ctx context.Context) ([]Client, error)
+	// SetStatus changes the lifecycle. An unknown id is ErrClientNotFound.
+	SetStatus(ctx context.Context, id string, status ClientStatus) error
+	// Delete removes the registration. Deleting an absent client is not an
+	// error, which keeps an operator's retry idempotent.
+	Delete(ctx context.Context, id string) error
+}
+
 // MemoryClientRegistry is a non-durable ClientRegistry for development and tests.
 type MemoryClientRegistry struct {
 	mu   sync.RWMutex
@@ -165,13 +205,50 @@ func (r *MemoryClientRegistry) Create(_ context.Context, c Client) error {
 	return nil
 }
 
-// Get implements ClientRegistry.
+// Get implements ClientRegistry. A suspended client is reported as not found,
+// so the protocol plane treats it exactly like an id that was never registered.
 func (r *MemoryClientRegistry) Get(_ context.Context, id string) (Client, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	c, ok := r.byID[id]
-	if !ok {
+	if !ok || c.Status == ClientSuspended {
 		return Client{}, ErrClientNotFound
 	}
 	return c, nil
+}
+
+// List implements ClientAdmin.
+func (r *MemoryClientRegistry) List(_ context.Context) ([]Client, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]Client, 0, len(r.byID))
+	for _, c := range r.byID {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// SetStatus implements ClientAdmin.
+func (r *MemoryClientRegistry) SetStatus(_ context.Context, id string, status ClientStatus) error {
+	if status != ClientActive && status != ClientSuspended {
+		return fmt.Errorf("oauth: invalid client status %q", status)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.byID[id]
+	if !ok {
+		return ErrClientNotFound
+	}
+	c.Status = status
+	r.byID[id] = c
+	return nil
+}
+
+// Delete implements ClientAdmin.
+func (r *MemoryClientRegistry) Delete(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.byID, id)
+	return nil
 }
