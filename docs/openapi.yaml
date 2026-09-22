@@ -1571,8 +1571,10 @@ components:
         id: { type: string }
         provider:
           type: string
-          description: Which identity provider this is.
-          enum: [github, google, discord, microsoft, qq]
+          description: |
+            Which identity provider this is: a built-in name, or the key of a
+            custom `[idp.<name>]` section.
+          examples: [github, authentik]
         display_name: { type: string }
         email: { type: string }
         avatar_url: { type: string, format: uri }

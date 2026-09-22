@@ -22,7 +22,7 @@
 ```
 User (usr_...)
 ├── identities[]                      外部 IdP 身份
-│     provider       "github" | "google" | "discord" | "qq" | "microsoft"
+│     provider       "github" | "google" | "discord" | "qq" | "microsoft" | <自定义 OIDC 名>
 │     subject        IdP 的稳定 sub / openid      ← 身份键
 │     display_name
 │     email?         仅作展示，不参与任何判定
