@@ -533,10 +533,16 @@ func TestVaultPutReplacesAndDeleteIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	id := vault.Identity{Subject: "usr_1", Provider: "phigros.taptap"}
 
-	if err := repo.Put(ctx, vault.Record{Identity: id, Version: 1, KEKID: "a", Ciphertext: []byte{1}}); err != nil {
+	// WrappedDEK and Nonce are NOT NULL in the table; a real record always has
+	// them. They are irrelevant here, where the subject is replace/delete.
+	if err := repo.Put(ctx, vault.Record{
+		Identity: id, Version: 1, WrappedDEK: []byte{1}, KEKID: "a", Nonce: []byte{1}, Ciphertext: []byte{1},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.Put(ctx, vault.Record{Identity: id, Version: 2, KEKID: "b", Ciphertext: []byte{2}}); err != nil {
+	if err := repo.Put(ctx, vault.Record{
+		Identity: id, Version: 2, WrappedDEK: []byte{2}, KEKID: "b", Nonce: []byte{2}, Ciphertext: []byte{2},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := repo.Get(ctx, id)
@@ -780,6 +786,13 @@ func TestBindingTableCannotHoldACredential(t *testing.T) {
 
 	for _, name := range columns {
 		lower := strings.ToLower(name)
+		// The table is allowed exactly one token-ish column: token_type, which
+		// holds the upstream token's *class* (revocable / long_lived), not the
+		// token. Matching the bare substring "token" would reject it while
+		// proving nothing; every other token-ish name is still forbidden.
+		if lower == "token_type" {
+			continue
+		}
 		for _, forbidden := range []string{"token", "secret", "credential", "password", "verifier"} {
 			if strings.Contains(lower, forbidden) {
 				t.Errorf("federation_bindings.%s could hold a credential", name)
