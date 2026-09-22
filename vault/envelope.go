@@ -156,11 +156,6 @@ func openSecret(dek, nonce, ct, aad []byte) ([]byte, error) {
 	return pt, nil
 }
 
-// zeroize overwrites b and keeps it alive until the write is observed, so the
-// compiler cannot elide the clearing of a dead buffer.
-//
-//go:noinline
-
 func readRandom(n int) ([]byte, error) {
 	b := make([]byte, n)
 	if _, err := io.ReadFull(rand.Reader, b); err != nil {
