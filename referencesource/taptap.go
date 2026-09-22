@@ -14,6 +14,7 @@ import (
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/tapsign"
 	"github.com/Re0Auth/r0semi/taptapoauth"
+	"github.com/Re0Auth/r0semi/vault"
 )
 
 // TapTapConfig tunes the source's TapTap login.
@@ -179,7 +180,7 @@ func (l *TapTapLogin) poll(ctx context.Context, id string, establish Establish) 
 		l.finish(id)
 		return LoginProgress{State: "failed", Message: "encode credential"}, nil
 	}
-	defer zeroize(payload)
+	defer vault.Scrub(payload)
 
 	subject := token.OpenID
 	if subject == "" {
@@ -224,6 +225,30 @@ func (l *TapTapLogin) handlePoll(w http.ResponseWriter, r *http.Request, establi
 	writeJSON(w, http.StatusOK, progress)
 }
 
+// RevokeUpstream implements UpstreamRevoker.
+//
+// Rotating the session token *is* the revocation: from the moment this succeeds,
+// the old token is dead everywhere and every device holding it is signed out.
+//
+// The replacement is discarded on purpose. Keeping it would leave this source
+// holding a live session while the person's own devices were signed out, which is
+// the exact opposite of what they asked for — a silent hijack dressed up as a
+// logout. tapsign.Revoke already does the rotate-and-discard; what only the login
+// knows is the credential's format.
+func (l *TapTapLogin) RevokeUpstream(ctx context.Context, subject string, credential []byte) error {
+	cred, err := tapsign.DecodeCredential(credential)
+	if err != nil {
+		l.record(ctx, subject, audit.OutcomeError)
+		return fmt.Errorf("referencesource: cascade revocation: %w", err)
+	}
+	if err := l.redeem.Revoke(ctx, cred); err != nil {
+		l.record(ctx, subject, audit.OutcomeError)
+		return err
+	}
+	l.record(ctx, subject, audit.OutcomeOK)
+	return nil
+}
+
 func (l *TapTapLogin) finish(id string) {
 	l.mu.Lock()
 	delete(l.attempts, id)
@@ -260,13 +285,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
-}
-
-// zeroize overwrites a buffer that held credential material.
-//
-//go:noinline
-func zeroize(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
 }

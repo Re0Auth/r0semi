@@ -16,9 +16,88 @@ type ctxKey int
 
 const requestIDCtxKey ctxKey = iota
 
-// withRequestID is the only middleware both planes share: it assigns a request
-// id, echoes it on the response, and puts it in the context so the problem
-// writer can include it.
+// Security response headers. They are applied to every response on both planes,
+// for the same reason request ids are: the rule is identical on either side and
+// has no plane-specific shape. (The error *writers* are the opposite: each plane
+// must render its own format, which is why they are not shared.)
+//
+// The values are chosen for an OAuth 2.0 server specifically, not copied from a
+// generic checklist:
+//
+//   - Referrer-Policy: no-referrer. Authorization, consent and bind URLs carry
+//     `client_id`, `redirect_uri`, `state` and, on the way back, `code`. Handing
+//     those to a third party through a Referer header is an OAuth-specific
+//     disclosure, and the default policy leaks the full URL cross-origin.
+//   - frame-ancestors 'none' + X-Frame-Options: DENY. A consent or
+//     device-approval screen rendered inside an attacker's frame is the textbook
+//     clickjacking target, and the button it protects hands out access.
+//   - X-Content-Type-Options: nosniff. The raw proxy passes a source's
+//     Content-Type through verbatim, so the browser must never second-guess it.
+//
+// A handler that needs a different policy for its own response — the HTML plane
+// will need a full `script-src` — calls Header().Set after this middleware has
+// run; Set replaces, so the later value wins.
+const (
+	// cspFrameAncestorsNone is the policy for responses that are not HTML. It is
+	// deliberately not a full policy: a JSON body has no scripts to constrain.
+	cspFrameAncestorsNone = "frame-ancestors 'none'"
+
+	// hstsValue omits includeSubDomains and preload on purpose. Those are
+	// domain-wide commitments that can break unrelated subdomains, so they belong
+	// to the edge/reverse-proxy policy of a deployment, not to this binary. A
+	// deployment that wants them adds them where it terminates TLS.
+	hstsValue = "max-age=31536000"
+)
+
+// withSecurityHeaders sets the defensive headers. It sits outside the limiter
+// and the handlers, so a rejected request carries them too.
+func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", cspFrameAncestorsNone)
+		// HSTS is only meaningful over https, and `secure` is the deployment's
+		// own declaration that this issuer is reached that way (the same fact
+		// that makes the session cookie Secure).
+		if s.secure {
+			h.Set("Strict-Transport-Security", hstsValue)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withBodyLimit caps how large a body a handler can be made to read.
+//
+// Every endpoint here takes something small — a form, or a few hundred bytes of
+// JSON — so the ten megabytes the standard library allows a form is room nobody
+// needs and everyone pays for. It sits inside the rate limiter, because shedding
+// load is cheaper than reading it, and outside every handler.
+//
+// The refusal is rendered per plane, using the same dispatch the limiter uses. A
+// 413 in the wrong shape would be the one response in this service that a client
+// parsing its own plane could not understand.
+func (s *Server) withBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := oauth.LimitFormBody(w, r); err != nil {
+			if isProtocolPath(r.URL.Path) {
+				writeOAuthError(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
+				return
+			}
+			s.writeProblem(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withRequestID assigns a request id, echoes it on the response, and puts it in
+// the context so the problem writer can include it.
+//
+// It is the outermost middleware, so a response produced by the limiter (or by a
+// panic) carries one too: a request id is most needed on exactly the responses
+// that never reach a handler.
 func withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")

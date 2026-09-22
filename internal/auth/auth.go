@@ -13,7 +13,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/safeurl"
 )
 
 // Session keys. Flow state is stored server-side, so mode and return_to cannot
@@ -198,6 +198,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/{provider}/callback", h.handleCallback)
 }
 
+// Providers lists the identity providers this deployment offers, so a frontend can
+// render one login button per configured provider instead of guessing at a fixed
+// set. A deployment that enables only GitHub must not show a Google button that
+// leads to "unknown provider".
+func (h *Handler) Providers() []idp.Provider {
+	return h.registry.Providers()
+}
+
 func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
@@ -232,7 +240,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	h.manager.sessions.Put(ctx, keyFlowState, state)
 	h.manager.sessions.Put(ctx, keyFlowProvider, string(provider))
 	h.manager.sessions.Put(ctx, keyFlowMode, mode)
-	h.manager.sessions.Put(ctx, keyFlowReturnTo, sanitizeReturnTo(r.URL.Query().Get("return_to")))
+	h.manager.sessions.Put(ctx, keyFlowReturnTo, safeurl.RelativePath(r.URL.Query().Get("return_to")))
 	h.manager.sessions.Put(ctx, keyFlowVerifier, verifier)
 	h.manager.sessions.Put(ctx, keyFlowNonce, nonce)
 
@@ -255,7 +263,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := h.manager.sessions.GetString(ctx, keyFlowMode)
-	returnTo := sanitizeReturnTo(h.manager.sessions.GetString(ctx, keyFlowReturnTo))
+	returnTo := safeurl.RelativePath(h.manager.sessions.GetString(ctx, keyFlowReturnTo))
 	verifier := h.manager.sessions.GetString(ctx, keyFlowVerifier)
 	nonce := h.manager.sessions.GetString(ctx, keyFlowNonce)
 	flowProvider := h.manager.sessions.GetString(ctx, keyFlowProvider)
@@ -331,15 +339,6 @@ func (h *Handler) clearFlow(ctx context.Context) {
 	for _, k := range flowKeys {
 		h.manager.sessions.Remove(ctx, k)
 	}
-}
-
-// sanitizeReturnTo only allows same-origin relative paths, preventing open
-// redirects.
-func sanitizeReturnTo(v string) string {
-	if v == "" || !strings.HasPrefix(v, "/") || strings.HasPrefix(v, "//") || strings.Contains(v, "\\") {
-		return "/"
-	}
-	return v
 }
 
 func redirectError(w http.ResponseWriter, r *http.Request, returnTo, code string) {

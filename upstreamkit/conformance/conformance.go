@@ -74,6 +74,7 @@ func Run(ctx context.Context, target string, opts Options) []Finding {
 	r.checkAuthorizeRejectsUnknownClient()
 	r.checkTokenRejectsBadGrant()
 	r.checkRevocationEndpoint()
+	r.checkCascadeEndpoint(disc)
 	r.checkDataPlane(disc)
 	return r.findings
 }
@@ -253,6 +254,39 @@ func (r *runner) checkRevocationEndpoint() {
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		r.err("revoke.present", "revocation endpoint is missing")
+	}
+}
+
+// checkCascadeEndpoint checks the claim, not the effect.
+//
+// Nothing destructive is attempted, on purpose: a conformance run must not sign
+// the person running it out of their own devices. What can be checked without
+// doing harm is that an advertised endpoint exists and is addressed absolutely —
+// because a source that advertises a capability it does not serve is worse than
+// one that stays quiet, and Re0Auth offers "sign out everywhere" only where it is
+// claimed.
+func (r *runner) checkCascadeEndpoint(disc upstreamkit.Discovery) {
+	endpoint := disc.OAuth.CascadeRevocationEndpoint
+	if endpoint == "" {
+		r.skip("cascade.absent", "no cascade revocation advertised; Re0Auth will not offer it")
+		return
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || !parsed.IsAbs() {
+		r.err("cascade.absolute", "cascade_revocation_endpoint is not an absolute URL: %q", endpoint)
+		return
+	}
+
+	form := url.Values{"token": {"conformance-bogus-token"}, "client_id": {"conformance-unknown-client"}}
+	resp, err := r.request(http.MethodPost, parsed.RequestURI(), form.Encode(),
+		map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
+	if err != nil {
+		r.err("cascade.reachable", "request failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		r.err("cascade.present", "advertised but missing: %s", endpoint)
 	}
 }
 

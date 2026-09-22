@@ -84,6 +84,19 @@ type Source struct {
 	// Issuer (/oauth/authorize, /oauth/token).
 	AuthorizationEndpoint string
 	TokenEndpoint         string
+	// RevocationEndpoint overrides the default {Issuer}/oauth/revoke. It is used
+	// when a user unbinds, to tell the source to drop the token it issued.
+	RevocationEndpoint string
+	// CascadeRevocationEndpoint ends the subject's whole upstream session, not
+	// merely the token Re0Auth holds. It overrides the default
+	// {Issuer}/oauth/cascade_revocation.
+	//
+	// **Empty means the source cannot do it, and that is the default.** The
+	// capability is opt-in because most sources cannot, and a default would make
+	// Re0Auth offer a button that fails — the same lie as any other unbacked claim.
+	// Like token_class, this is the operator's declaration: set it only if the
+	// source's discovery document advertises cascade_revocation_endpoint.
+	CascadeRevocationEndpoint string
 }
 
 // bindScopes are the scopes requested when binding: the account scope plus
@@ -134,6 +147,9 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 		if s.TokenEndpoint == "" {
 			s.TokenEndpoint = issuer + "/oauth/token"
 		}
+		if s.RevocationEndpoint == "" {
+			s.RevocationEndpoint = issuer + "/oauth/revoke"
+		}
 		s.Issuer = issuer
 		if s.Status == "" {
 			s.Status = StatusActive
@@ -143,6 +159,27 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 		r.byGame[s.Game] = append(r.byGame[s.Game], s)
 	}
 	return r, nil
+}
+
+// AllSources returns every configured source, ordered by game then name.
+//
+// It exists so the account page can offer what could be connected. Without it, a
+// page whose job is connecting sources could only show the ones already
+// connected — a dead end for anyone who has none.
+func (r *Registry) AllSources() []Source {
+	games := make([]string, 0, len(r.byGame))
+	for game := range r.byGame {
+		games = append(games, game)
+	}
+	sort.Strings(games)
+
+	out := make([]Source, 0, len(r.byKey))
+	for _, game := range games {
+		sources := append([]Source(nil), r.byGame[game]...)
+		sort.Slice(sources, func(i, j int) bool { return sources[i].Name < sources[j].Name })
+		out = append(out, sources...)
+	}
+	return out
 }
 
 // Get returns a source by game and name.

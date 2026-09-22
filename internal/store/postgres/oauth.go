@@ -125,6 +125,60 @@ func (s *Tokens) DeleteRefresh(ctx context.Context, value string) error {
 	return err
 }
 
+// ListBySubject implements oauth.Store.
+//
+// Expired rows are returned as well: the service owns the clock, and filtering
+// here would put "is this still live" in two places, which is how the two
+// answers eventually differ.
+func (s *Tokens) ListBySubject(ctx context.Context, subject string) ([]oauth.GrantRecord, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT client_id, scopes, issued_at, expires_at, is_refresh FROM (
+			SELECT client_id, scopes, issued_at, expires_at, false AS is_refresh
+			  FROM oauth_access_tokens WHERE subject = $1
+			UNION ALL
+			SELECT client_id, scopes, issued_at, expires_at, true AS is_refresh
+			  FROM oauth_refresh_tokens WHERE subject = $1
+		) AS tokens`, subject)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []oauth.GrantRecord
+	for rows.Next() {
+		var (
+			r         oauth.GrantRecord
+			scopes    []string
+			isRefresh bool
+		)
+		if err := rows.Scan(&r.ClientID, &scopes, &r.IssuedAt, &r.ExpiresAt, &isRefresh); err != nil {
+			return nil, err
+		}
+		r.Scopes = scopesFrom(scopes)
+		r.Kind = oauth.TokenKindAccess
+		if isRefresh {
+			r.Kind = oauth.TokenKindRefresh
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteBySubjectClient implements oauth.Store.
+//
+// Both statements run even if the first removes nothing, and neither asks how
+// many rows went away: revoking is idempotent, so the count is not information
+// anyone acts on.
+func (s *Tokens) DeleteBySubjectClient(ctx context.Context, subject, clientID string) error {
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM oauth_access_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM oauth_refresh_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID)
+	return err
+}
+
 // Devices implements oauth.DeviceStore on Postgres. The device code is hashed;
 // the user code is stored canonically and looked up case- and
 // separator-insensitively through an expression index.

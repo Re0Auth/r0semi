@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -48,7 +48,7 @@ func (s *service) storeBindingSecret(ctx context.Context, b Binding, secret bind
 	if err != nil {
 		return fmt.Errorf("federation: encode binding secret: %w", err)
 	}
-	defer zeroize(encoded)
+	defer vault.Scrub(encoded)
 	return s.vault.Enroll(ctx, BindingIdentity(b), encoded, map[string]string{
 		"game": b.Game, "source": b.Source,
 	})
@@ -73,21 +73,15 @@ func (s *service) withAccessToken(ctx context.Context, b Binding, fn func(token 
 	})
 }
 
-// zeroize overwrites a buffer that held credential material.
-//
-//go:noinline
-func zeroize(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-	runtime.KeepAlive(b)
-}
-
-// BindingStore persists source bindings.
+// BindingStore persists binding metadata. It must never hold a credential: the
+// token lives in the vault under BindingIdentity.
 type BindingStore interface {
 	Get(ctx context.Context, user account.UserID, game, source string) (Binding, error)
 	Put(ctx context.Context, b Binding) error
 	Delete(ctx context.Context, user account.UserID, game, source string) error
+	// List returns every binding a user holds, so the account page can show what
+	// is connected and offer to disconnect it.
+	List(ctx context.Context, user account.UserID) ([]Binding, error)
 }
 
 // MemoryBindingStore is a non-durable BindingStore for development and tests.
@@ -121,11 +115,34 @@ func (s *MemoryBindingStore) Put(_ context.Context, b Binding) error {
 }
 
 // Delete implements BindingStore. Deleting an absent binding is not an error.
+// Delete implements BindingStore. Deleting an absent binding is not an error,
+// which keeps unbinding idempotent.
 func (s *MemoryBindingStore) Delete(_ context.Context, user account.UserID, game, source string) error {
 	s.mu.Lock()
 	delete(s.m, bindingKey(user, game, source))
 	s.mu.Unlock()
 	return nil
+}
+
+// List implements BindingStore.
+func (s *MemoryBindingStore) List(_ context.Context, user account.UserID) ([]Binding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]Binding, 0, len(s.m))
+	for _, b := range s.m {
+		if b.User == user {
+			out = append(out, b)
+		}
+	}
+	// Sorted, so the account page does not reorder itself between two loads.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Game != out[j].Game {
+			return out[i].Game < out[j].Game
+		}
+		return out[i].Source < out[j].Source
+	})
+	return out, nil
 }
 
 func bindingKey(user account.UserID, game, source string) string {

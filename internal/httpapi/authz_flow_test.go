@@ -18,6 +18,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/authz"
+	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -38,6 +39,13 @@ func newBrowser(t *testing.T) *http.Client {
 // newFlowEnv assembles the whole stack: oauth AS, session/auth plane, and the
 // authorization-interaction API, backed by a fake GitHub IdP.
 func newFlowEnv(t *testing.T) (base string, accounts *account.MemoryStore) {
+	return newFlowEnvWith(t, nil)
+}
+
+// newFlowEnvWith is newFlowEnv plus an optional federation service, so tests can
+// exercise the binding-aware consent path without every existing test having to
+// stand up a data source.
+func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts *account.MemoryStore) {
 	t.Helper()
 
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +107,7 @@ func newFlowEnv(t *testing.T) (base string, accounts *account.MemoryStore) {
 	api, err := New(Config{
 		Issuer: "https://re0auth.test", AS: as,
 		Sessions: manager, Accounts: accounts, Auth: authHandler, Authz: azSvc,
+		Federation: fed,
 	})
 	if err != nil {
 		t.Fatal(err)

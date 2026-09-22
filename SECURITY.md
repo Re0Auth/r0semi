@@ -7,12 +7,21 @@
 Known and documented limitations (these are *not* vulnerabilities; please do not
 report them):
 
-- The vault's credential store, pending authorization requests, source bindings
-  and session store are still in-memory. **Upstream credentials do not survive a
-  restart.** The server announces each of these at startup.
-- No frontend ships with the server; only the HTTP APIs exist.
-- The reference data source (`referencesource`) is a demonstration. Its demo
-  login is explicitly a stub.
+- With no `DATABASE_URL`, every store falls back to memory and the server says
+  so at startup; a restart then loses sessions, bindings and pending requests.
+  With Postgres set, the nine storage ports and the audit log are durable.
+- The KEK is supplied through the environment and lives in the process. A
+  database dump is useless without it, but a leaked key or a compromised process
+  can read every credential it wrapped. There is no KMS/HSM adapter yet; what
+  that would and would not buy is in `docs/threat-model.md` §6.0.
+- The reference data source (`referencesource`) is a demonstration. Its own
+  vault and sessions are in-memory, and its demo login is a stub.
+- v1 issues plain bearer tokens. DPoP (RFC 9449) is deliberately not offered,
+  and the authorization server metadata does not advertise it.
+- The component runtime in `internal/core` is exercised by its own tests and by
+  `internal/wiring`; the production composition root in `cmd/re0auth` wires the
+  services directly, so its capability-confinement checks are not yet a gate on
+  a real deployment.
 
 We still want reports: a flaw in the design of a credential-holding system is
 worth knowing about before it is deployed anywhere, which is exactly why this
@@ -75,9 +84,10 @@ There is no bug bounty. This is an unfunded project.
   issue is how we *use* a dependency, that is in scope here.
 - Findings that require a compromised host, a malicious operator, or physical
   access. The operators are explicitly outside the trust boundary (see
-  `docs/threat-model.md` §3, B5), and we do not claim to defend against them.
+  `docs/threat-model.md` §3, B6), and we do not claim to defend against them.
 - Missing hardening that is already documented as a known limitation above.
-- Missing rate limits, missing WAF, or the absence of a frontend.
+- Missing rate limits, missing WAF, or the absence of a reverse proxy in front
+  of a public instance.
 - The `referencesource` demo login, which is a stub by design.
 
 ## Design context

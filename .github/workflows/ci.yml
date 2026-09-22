@@ -38,6 +38,34 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Before the Go steps, because internal/webui embeds the result. Without
+      # this, every Go test still passes — against the placeholder, which is
+      # exactly the kind of silent skip this pipeline exists to refuse.
+      - name: build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+          # The placeholder keeps the embed compiling on a machine with no Node;
+          # it does not contain index.html. Its presence is therefore proof that
+          # a real build happened and got embedded.
+          test -f ../internal/webui/dist/index.html || {
+            echo "the frontend did not build; the embedded app is the placeholder"
+            exit 1
+          }
+
+      - name: cache playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
+
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -64,3 +92,15 @@ jobs:
 
       - name: build
         run: go build ./...
+
+      # Last, because it is the slowest and the most end-to-end: it builds its own
+      # re0auth, starts a fake identity provider, and drives a real browser
+      # through the consent and device flows. What it catches that nothing else
+      # can is the class of bug where every layer is individually correct and the
+      # assembled page still does not work — a CSP that blocks the app's own
+      # bootstrap, for instance, which is invisible to a header assertion.
+      - name: browser tests
+        working-directory: web
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test

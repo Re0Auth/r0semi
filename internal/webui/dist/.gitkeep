@@ -1,0 +1,6 @@
+This placeholder exists so that //go:embed all:dist is satisfied on a machine
+without Node, keeping `go build ./...` working for a Go-only contributor.
+
+The real build output is written here by `npm run build` and is not committed.
+Do not delete this file: with it gone and no frontend built, the embed directive
+matches nothing and the whole module stops compiling.

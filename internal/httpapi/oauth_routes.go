@@ -23,7 +23,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
 		return
 	}
-	clientID, clientSecret := clientCredentials(r)
+	clientID, clientSecret := oauth.ClientCredentials(r)
 
 	switch r.PostFormValue("grant_type") {
 	case "authorization_code":
@@ -89,7 +89,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
 		return
 	}
-	clientID, clientSecret := clientCredentials(r)
+	clientID, clientSecret := oauth.ClientCredentials(r)
 	if err := s.as.AuthenticateClient(r.Context(), clientID, clientSecret); err != nil {
 		s.writeProtocolError(w, r, err)
 		return
@@ -117,7 +117,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
 		return
 	}
-	clientID, clientSecret := clientCredentials(r)
+	clientID, clientSecret := oauth.ClientCredentials(r)
 	err := s.as.Revoke(r.Context(), oauth.RevokeRequest{
 		ClientID:      clientID,
 		ClientSecret:  clientSecret,
@@ -187,14 +187,7 @@ func redirectOAuthError(w http.ResponseWriter, r *http.Request, redirectURI, sta
 	if description != "" {
 		params["error_description"] = description
 	}
-	http.Redirect(w, r, buildRedirect(redirectURI, params), http.StatusFound)
-}
-
-func clientCredentials(r *http.Request) (id, secret string) {
-	if u, p, ok := r.BasicAuth(); ok {
-		return u, p
-	}
-	return r.PostFormValue("client_id"), r.PostFormValue("client_secret")
+	http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 }
 
 func parseScopes(s string) []oauth.Scope {

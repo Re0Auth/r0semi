@@ -56,6 +56,11 @@ type AuthorizationCode struct {
 //
 // ConsumeCode and ConsumeRefresh must be atomic: a code is single-use and a
 // refresh token is single-use because it rotates.
+//
+// ListBySubject and DeleteBySubjectClient exist for the grants view, and they are
+// what make "the tokens are the grant" true rather than merely stated: revoking a
+// client is deleting its rows, so a revoked grant cannot survive in a table that
+// the next request does not consult.
 type Store interface {
 	SaveCode(ctx context.Context, value string, c AuthorizationCode) error
 	ConsumeCode(ctx context.Context, value string) (AuthorizationCode, error)
@@ -67,6 +72,12 @@ type Store interface {
 	SaveRefresh(ctx context.Context, value string, t RefreshToken) error
 	ConsumeRefresh(ctx context.Context, value string) (RefreshToken, error)
 	DeleteRefresh(ctx context.Context, value string) error
+
+	// ListBySubject returns every token record for a subject, expired ones
+	// included: the store has no clock, so the service decides what is still live.
+	ListBySubject(ctx context.Context, subject string) ([]GrantRecord, error)
+	// DeleteBySubjectClient removes every token one client holds for one subject.
+	DeleteBySubjectClient(ctx context.Context, subject, clientID string) error
 }
 
 // MemoryStore is a non-durable Store for development and tests.

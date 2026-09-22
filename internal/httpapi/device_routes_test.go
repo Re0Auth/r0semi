@@ -65,7 +65,7 @@ func TestDeviceAuthorizationEndToEnd(t *testing.T) {
 
 	// 3. The user signs in and loads the verification page.
 	signIn(t, browser, base)
-	resp = getURL(t, browser, base+"/device?user_code="+url.QueryEscape(userCode))
+	resp = getURL(t, browser, base+"/v1/device/verification?user_code="+url.QueryEscape(userCode))
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("verification page = %d: %s", resp.StatusCode, body)
@@ -122,14 +122,14 @@ func TestDeviceDecisionIsBoundToBrowser(t *testing.T) {
 	}))
 	codeA, _ := startA["user_code"].(string)
 	signIn(t, mine, base)
-	if resp := getURL(t, mine, base+"/device?user_code="+url.QueryEscape(codeA)); resp.StatusCode != http.StatusOK {
+	if resp := getURL(t, mine, base+"/v1/device/verification?user_code="+url.QueryEscape(codeA)); resp.StatusCode != http.StatusOK {
 		t.Fatalf("mine verification page = %d", resp.StatusCode)
 	} else {
 		resp.Body.Close()
 	}
 
 	// Anonymous access to the verification page is refused.
-	if resp := getURL(t, newBrowser(t), base+"/device?user_code="+url.QueryEscape(codeA)); resp.StatusCode != http.StatusUnauthorized {
+	if resp := getURL(t, newBrowser(t), base+"/v1/device/verification?user_code="+url.QueryEscape(codeA)); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("anonymous verification page = %d, want 401", resp.StatusCode)
 	} else {
 		resp.Body.Close()
@@ -143,7 +143,7 @@ func TestDeviceDecisionIsBoundToBrowser(t *testing.T) {
 	}))
 	codeB, _ := startB["user_code"].(string)
 	signIn(t, other, base)
-	resp := getURL(t, other, base+"/device?user_code="+url.QueryEscape(codeB))
+	resp := getURL(t, other, base+"/v1/device/verification?user_code="+url.QueryEscape(codeB))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("other verification page = %d", resp.StatusCode)
 	}

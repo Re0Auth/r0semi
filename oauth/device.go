@@ -18,6 +18,10 @@ import (
 const (
 	defaultDeviceCodeTTL      = 10 * time.Minute
 	defaultDevicePollInterval = 5 * time.Second
+	// defaultVerificationPath is the path a deployment with no separate frontend
+	// serves the verification page at. A deployment that has one overrides it to
+	// point at a real page.
+	defaultVerificationPath = "/device"
 
 	// userCodeLen is the number of significant characters in a user code.
 	userCodeLen = 8
@@ -193,7 +197,7 @@ func (s *service) BeginDeviceAuthorization(ctx context.Context, req DeviceAuthor
 	}
 
 	s.record(ctx, "oauth.device.begin", "", client.ID, audit.OutcomeOK)
-	verify := strings.TrimRight(s.issuer, "/") + "/device"
+	verify := strings.TrimRight(s.issuer, "/") + s.verifyPath
 	// RFC 8628 §3.2: interval is in seconds and the client must respect it.
 	interval := int64(s.pollInterval / time.Second)
 	if interval < 1 {

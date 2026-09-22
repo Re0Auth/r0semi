@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"runtime"
 )
 
 const (
@@ -36,9 +35,20 @@ type KeyWrapper interface {
 
 // LocalKeyWrapper is an in-process AES-256-GCM KeyWrapper.
 //
-// It is intended for development and tests. In production the KEK must live
-// behind a KMS/HSM so that a compromise of the process or its database alone
-// cannot decrypt stored credentials.
+// It is what every deployment currently uses, and what it gives is narrower than
+// "in production use a KMS" makes it sound:
+//
+//   - A dump of the database alone cannot be decrypted, because the KEK is not in
+//     it. That is the property the envelope design exists for, and it holds.
+//   - A leak of the KEK itself — the environment variable, a memory dump, a
+//     compromised process — exposes everything that KEK wrapped, present and
+//     future. Rotating the KEK bounds that to "whatever existed when it leaked",
+//     and nothing local can undo the rest.
+//
+// A KMS-backed KeyWrapper would keep the key material out of the process and make
+// every unwrap auditable and revocable. It would **not** stop a compromised
+// process from decrypting, because that process can ask the KMS in its own name —
+// a claim this comment used to make, and one not worth repeating.
 type LocalKeyWrapper struct {
 	id   string
 	aead cipher.AEAD
@@ -150,12 +160,6 @@ func openSecret(dek, nonce, ct, aad []byte) ([]byte, error) {
 // compiler cannot elide the clearing of a dead buffer.
 //
 //go:noinline
-func zeroize(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-	runtime.KeepAlive(b)
-}
 
 func readRandom(n int) ([]byte, error) {
 	b := make([]byte, n)

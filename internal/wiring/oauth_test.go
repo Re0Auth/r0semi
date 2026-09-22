@@ -31,6 +31,21 @@ func TestComponentProvidesAS(t *testing.T) {
 	if _, err := KeyAS.Get(app.Root()); err != nil {
 		t.Fatal(err)
 	}
+
+	// Static validation is cheap and catches the two mistakes that would
+	// otherwise show up only as a component that quietly never activates:
+	// a duplicate provider and a dependency cycle. It is asserted here so
+	// `go test` fails on a broken composition rather than at runtime.
+	if errs := app.Check(); len(errs) != 0 {
+		t.Fatalf("App.Check: %v", errs)
+	}
+	// And the composition is actually live: a capability that stayed inactive
+	// would mean the graph is wired but not satisfied.
+	for _, cap := range app.Capabilities() {
+		if cap.State != core.StateActive {
+			t.Errorf("component %s is %s, want active", cap.Name, cap.State)
+		}
+	}
 }
 
 // I5: without the token store the AS never activates.

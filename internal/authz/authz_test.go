@@ -25,6 +25,26 @@ func s256(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
+// criticalScope is a synthetic ExplicitConsent scope.
+//
+// The authorization-interaction tests must not depend on a production scope's
+// semantics: the mechanism and the catalog are separate concerns, and the
+// built-in catalog deliberately has no critical scope today.
+const criticalScope = oauth.Scope("test.critical.read")
+
+// testRegistry is the default catalog plus that synthetic critical scope.
+func testRegistry(t *testing.T) *oauth.Registry {
+	t.Helper()
+	registry := oauth.DefaultRegistry()
+	if err := registry.Register(oauth.Descriptor{
+		Scope: criticalScope, Title: "Test critical scope",
+		Risk: oauth.RiskCritical, ExplicitConsent: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}
+
 func newTestService(t *testing.T, clock *fakeClock, allowed []oauth.Scope) (Service, oauth.Service) {
 	t.Helper()
 	clients := oauth.NewMemoryClientRegistry()
@@ -37,7 +57,7 @@ func newTestService(t *testing.T, clock *fakeClock, allowed []oauth.Scope) (Serv
 	}
 	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
 		Issuer: "https://auth.test",
-		Scopes: oauth.DefaultRegistry(),
+		Scopes: testRegistry(t),
 		Now:    clock.now,
 	})
 	if err != nil {
@@ -163,14 +183,14 @@ func TestApproveIsSingleUse(t *testing.T) {
 // through to the authorization server.
 func TestApproveEnforcesExplicitConsent(t *testing.T) {
 	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	svc, _ := newTestService(t, clock, []oauth.Scope{oauth.ScopeTapTapStoken})
+	svc, _ := newTestService(t, clock, []oauth.Scope{criticalScope})
 	ctx := context.Background()
 
-	req, _ := svc.Begin(ctx, beginInput([]oauth.Scope{oauth.ScopeTapTapStoken}, "verifier"))
-	if _, err := svc.Approve(ctx, req.ID, "usr_1", []oauth.Scope{oauth.ScopeTapTapStoken}, nil); !isOAuthCode(err, "access_denied") {
+	req, _ := svc.Begin(ctx, beginInput([]oauth.Scope{criticalScope}, "verifier"))
+	if _, err := svc.Approve(ctx, req.ID, "usr_1", []oauth.Scope{criticalScope}, nil); !isOAuthCode(err, "access_denied") {
 		t.Fatalf("without explicit consent: %v", err)
 	}
-	if _, err := svc.Approve(ctx, req.ID, "usr_1", []oauth.Scope{oauth.ScopeTapTapStoken}, []oauth.Scope{oauth.ScopeTapTapStoken}); err != nil {
+	if _, err := svc.Approve(ctx, req.ID, "usr_1", []oauth.Scope{criticalScope}, []oauth.Scope{criticalScope}); err != nil {
 		t.Fatalf("with explicit consent: %v", err)
 	}
 }

@@ -62,6 +62,11 @@ Fiber（组件实例）
 
 效果与依赖都经由 context；context 之外的访问一律失败。
 
+> **生产接入状态（如实说明）**：`internal/core` 与 `internal/wiring` 已实现并有测试，但目前
+> 只有 `oauth` 这一个组件被装配进去；`cmd/re0auth` 的生产组合根仍直接 `NewService(...)`。
+> 因此 I1（能力封闭）/ I5（fail-closed）在库层各自成立，但尚未由 core 作为生产部署的门禁。
+> 把组合根整体迁入 core 是 §8 的待决事项。
+
 ## 4. 组件清单与依赖图
 
 | 组件 | 职责 | Provides | Inject |
@@ -112,7 +117,7 @@ Service interface {
 - **信封加密**：每个凭据一个随机 DEK（AES-256-GCM），DEK 由 KEK 包裹
 - **落盘不加密的部分**（PII，见 threat-model §6.1）：`Identity`（查找键）与 `Meta`（上游 openid/unionid）
   按设计明文。它们不是密钥，但属个人数据；需要时把 `Meta` 纳入密文即可（它目前只写不读）。
-  （`KeyWrapper`，生产接 KMS/HSM）；AAD 绑定 `(subject, provider)`，密文无法在身份间搬移。
+  （`KeyWrapper`；默认进程内，KMS 适配器尚未实现，见 threat-model §6.0）；AAD 绑定 `(subject, provider)`，密文无法在身份间搬移。
 - **撤销 = crypto-shredding**：删除被包裹的 DEK，密文即使残留也不可解。
 - **I2**：明文只通过 `Use` 的回调暴露，回调返回后立即零化（无论回调是否出错）。
 - **I3**：`Use` 在把明文交给回调**之前**先落审计；审计不可用则拒绝使用（fail-closed）。
@@ -120,7 +125,7 @@ Service interface {
   + 一个负责该凭据编解码的适配器组件，vault 本身不变。
 
 依赖：`store/credentials`（记录持久化；端口 `vault.Repo` 由 vault 定义，未来的 `store` 组件实现它）
-与 `audit/log`。KEK 通过 `Config.KeyWrapper` 注入，因为它是外部信任边界（KMS/HSM），不是能力。
+与 `audit/log`。KEK 通过 `Config.KeyWrapper` 注入，因为它是**外部信任边界**（可能是 KMS/HSM，默认是本地 KEK），不是能力。
 
 ### 4.2 TapTap 内建账户适配器（已迁至公开包 `tapsign`）
 
@@ -143,9 +148,9 @@ type Credential struct {          // 一个 provider 的私有凭据形态，vau
 关键约束：上游返回 **403 即视为“凭据已死”**（被动失效检测）；`Revoke` 的幂等目标定义为
 “旧 token 已失效”（重试遇 403 即算达成）；绝不在用户未明确同意时触发上游撤销。
 
-实现：公开包 `tapsign`（`NewService(cfg, doer, logger)`）。`Config{BaseURL, AppID, AppKey}` 按
-`config/tapsign.example.toml` 的 cn / global 两套 profile 配置；凭据编解码
-（`Credential.Encode` / `DecodeCredential`）由该包拥有，vault 不感知。
+实现：公开包 `tapsign`（`NewService(cfg, doer, logger)`）。`Config{BaseURL, AppID, AppKey}` 来自参考源的
+`config/referencesource.example.toml`（`[taptap]` 段；cn 为主，global 端点在同段注释里作为备选）；
+凭据编解码（`Credential.Encode` / `DecodeCredential`）由该包拥有，vault 不感知。
 `ErrInvalidCredential` 是 401/403 的统一信号。
 
 ### 4.3 enrollment：设备码换取 sessionToken（已迁至公开包 `taptapoauth`；编排在参考源）
@@ -201,18 +206,20 @@ type Credential struct {          // 一个 provider 的私有凭据形态，vau
 - **设备流（RFC 8628，v1 已实现）**：`BeginDeviceAuthorization` 发 `device_code` + 人类友好 `user_code`
   （`BCDF-GHJK`，去掉元音与易混字符，分隔符不敏感）+ `verification_uri`；`PollDeviceAuthorization` 按
   `interval` 节流，返回 `authorization_pending` / `slow_down` / `access_denied` / `expired_token`；
-  用户在 `/device` 页登录后由 `DecideDeviceAuthorization` 批准或拒绝（可收窄，critical scope 必须逐项勾选）。
+  用户在前端 `/app/device` 页登录后由 `DecideDeviceAuthorization` 批准或拒绝（可收窄，critical scope 必须逐项勾选）。
   **不强制**：授权码流不受影响。设备码状态走独立的 `DeviceStore`，不触碰令牌存储。
 - **撤销 / 自省**：`Revoke` 幂等（RFC 7009）；`Introspect`（RFC 7662）返回 `Active` / subject / scopes。
-- **危险 scope 的强制**：`taptap.stoken.read` 是 `RiskCritical` + `ExplicitConsent`；
-  `Authorize` 要求它必须出现在请求的 `Explicit` 列表中，否则 `access_denied`，且客户端必须被显式
-  注册该 scope。它不是默认能力。
+- **危险 scope 的强制**：`Authorize` 要求任何标记 `ExplicitConsent` 的 scope 必须出现在请求的 `Explicit`
+  列表中，否则 `access_denied`，且客户端必须被显式注册该 scope。
+  **内置目录当前不含此类 scope**（re0auth 不持有上游凭据，无可导出的东西，见 api-design.md §5）；
+  机制保留，并由测试用**合成 scope**覆盖——测试不该依赖产品 scope 的语义。
 
-MVP scope 目录：`account.id`、`taptap.account.id`、`phigros.score.read`、`phigros.b30.read`、
-`taptap.stoken.read`（critical）。provider 包通过 `Registry.Register` 追加自己的 descriptor。
+MVP scope 目录：`account.id`、`taptap.account.id`、`phigros.profile.read`、`phigros.score.read`、
+`phigros.b30.read`。provider 包通过 `Registry.Register` 追加自己的 descriptor。
 
-> 尚未实现：资源服务器（真正返回用户 ID / 代理成绩 / 导出 stoken 的端点）。
+> 尚未实现：资源服务器（真正返回用户 ID / 代理成绩的端点）。
 > AS 只负责签发与校验带 scope 的令牌；资源端点在下一层用 `Introspect` + vault 实现。
+> **不会实现的**：上游凭据导出端点——re0auth 不持有上游凭据，见 api-design.md §5。
 
 ### 4.5 HTTP 层与两平面路由（v1 已实现：`internal/httpapi`）
 
@@ -222,15 +229,83 @@ MVP scope 目录：`account.id`、`taptap.account.id`、`phigros.score.read`、`
 re0auth.r0semi.net
 ├── /.well-known/oauth-authorization-server    RFC 8414
 ├── /.well-known/oauth-protected-resource      RFC 9728
-├── /device     设备流验证页（浏览器；需登录 + 会话绑定）
+├── /app/…     前端 SPA（`go:embed` 进二进制；`/app/consent`、`/app/device`、`/app/grants`、`/app/sources`）
 ├── /oauth/…   协议平面：form 编码 + OAuth 错误 + recoverProtocol
 └── /v1/…      业务平面：JSON + problem+json + recoverBusiness
 ```
 
+**只有三个挂载点，而且前端被钉在自己的前缀上。** 前端是客户端路由，未知路径会回落到 SPA shell 而不是 404，
+所以它一旦挂在 `/`，API 的 404 就会变成 HTML。`/app/` 的前缀也因此**必须**与 `web/vite.config.ts` 的
+`paths.base` 一致——这种不一致不会报错，只会静默路由不到任何东西，所以由测试直接比对那个配置文件。
+
 已实现：`POST /oauth/token`（authorization_code / refresh_token / device_code，支持 Basic 与 post 客户端认证）、
-`POST /oauth/device_authorization` + `GET /device` + `POST /v1/device/decision`（RFC 8628 设备流）、
+`POST /oauth/device_authorization` + `GET /v1/device/verification` + `POST /v1/device/decision`（RFC 8628 设备流）、
 `POST /oauth/introspect`（要求客户端认证）、`POST /oauth/revoke`、`GET /v1/me`（Bearer + scope 校验）、
-两个发现端点。`GET /oauth/authorize` 走 `authz.Begin` → 重定向到同意页。
+`GET /v1/grants` + `DELETE /v1/grants/{client_id}`（会话；下游撤销，见 api-design.md）、
+`GET /v1/sources`（公开）、`GET /v1/bindings` + `DELETE /v1/bindings/{game}/{source}`（会话；断开数据源，
+并尽量让源按 RFC 7009 撤销它签发的令牌）、
+`POST /v1/bindings/{game}/{source}/cascade_revocation`（会话 + 显式确认；请求数据源作废整段上游会话）、
+两个发现端点。`GET /oauth/authorize` 走 `authz.Begin` → 重定向到同意页；`GET /bind` 走 `federate.BeginBind`。
+
+**断开的本地一半总是发生。** 数据源宕机、坏掉或拒不配合，都不能阻止用户把它从自己的账号上摘下来；
+上游那一半是尽力而为，结果（`done` / `unsupported` / `unavailable` / `nothing`）随响应一起回去，
+因为“在这边断开了，但那边还留着”与“已全部清理”是两句不同的话。
+
+**一条授权不是存下来的实体，而是“该账号名下仍有效的令牌按 client_id 聚合”。** 好处是撤销就是删令牌，
+不存在“同意表说已撤销、令牌表还能用”这种两个真相源互相矛盾的状态；代价是列表显示的是**当前访问**而非历史同意，
+某个应用最后的 refresh token 也过期后它会从列表上消失。理由写在 api-design.md。
+
+RFC 8628 的 `verification_uri` 指向**人类页面** `/app/device`（`oauth.Config.VerificationPath`），
+而不是给它供数据的 JSON 端点 `/v1/device/verification`——这两个东西指向同一个对象但没有理由共用路径。
+
+### 4.6 前端（`web/` + `internal/webui`）
+
+SvelteKit 2 + Svelte 5 + Tailwind v4，`adapter-static` 输出到 `internal/webui/dist`，由 `//go:embed` 嵌进二进制，
+挂在 `/app/`。`ssr = false`，纯客户端渲染。
+
+**为什么是纯静态而不是 SSR**：每个页面在 `/v1` 回答之前都是空的，而 `/v1` 要的是浏览器自己的会话 cookie。
+服务端渲染就得转发那个 cookie，也就是在链路上再放一份会话。更根本的是，它会让“同意页到底写了什么”
+有**两处**答案（服务端渲染一处、浏览器获取一处），而两者迟早会不一致——偏偏就是那个靠“关于授予了什么值得信任”
+才能成立的页面。
+
+**为什么前端必须钉在 `/app` 前缀**：它是客户端路由，未知路径回落 SPA shell 而不是 404。挂在 `/` 上，
+API 的每个 404 都会变成 HTML。前缀与 `web/vite.config.ts` 的 `paths.base` 必须一致，而这种不一致不会报错，
+只会静默路由不到任何东西，所以 `internal/webui/webui_test.go` 直接读那个配置文件来比对。
+
+**CSP 分两层，各自拿自己需要的东西**：
+
+| 层 | 谁发 | 内容 | 为什么在那 |
+|---|---|---|---|
+| HTTP 头 | `internal/webui` | `frame-ancestors 'none'` 等 | `frame-ancestors` **在 meta 标签里会被忽略**，所以必须走头 |
+| `<meta>` | SvelteKit（`kit.csp` mode `hash`） | `script-src 'self' 'sha256-…'` | 内联 bootstrap 脚本的 hash 每次构建都变，只有构建方能算出来 |
+
+因此 `script-src` 里**没有** `'unsafe-inline'`。两套策略按**交集**生效。
+
+**未构建前端也不能让 `go build` 失败**：`//go:embed all:dist` 要求目录存在且非空，而 `adapter-static` 会先清空输出目录。
+两者直接冲突——前者要新克隆就能编译，后者要独占那个目录的内容。
+解法是让占位文件由 `npm run build` 在构建后自己重新写回（`web/scripts/restore-dist-placeholder.mjs`），
+而不是做成一个可以被遗忘的独立步骤。占位目录里没有 `index.html`，所以“`index.html` 存在”就是“真的构建过”的证明，CI 据此断言。
+
+### 4.7 浏览器端到端（`web/e2e`，Playwright）
+
+11 个测试，驱动真实 Chromium 跑完同意页与设备流。它们自己 `go build` 一个 re0auth、起一个假身份提供方，
+并把客户端注册的 redirect URI 也交给同一个假服务，这样浏览器给出的授权码能直接从地址栏读出来。
+
+**没有任何测试专用的登录后门。** 假身份提供方是在**网络边界**上假的，不是把登录绕过去：PKCE、码交换、
+建号、会话 cookie、CSRF token、绑定到会话的 handle，全部是发货代码。一个有后门的套件只能证明那条
+永远不跑的登录路径。
+
+它做的事不止“页面看起来对”：每个用例都跟到客户端**最终拿到什么**——同意页点完会把 code 换成 token，
+再用那个 token 调 `/v1/me`。而“取消勾选一个 scope”会同时断言两次：token 里没有它，且同一个路由
+从 409（有 scope、无绑定）变成 403（scope 被拒）——**缩小范围是服务端强制的，不是复选框强制的**。
+
+**它抳出了一个其他所有测试都看不见的 bug**，值得记在这里：
+
+HTTP 头和 `<meta>` 同时存在时，**两个 CSP 都强制执行**。`internal/webui` 原来在头里把整个策略又说了一遗，
+包括不带 hash 的 `script-src 'self'`；SvelteKit 的 meta 用 hash 放行它自己的内联 bootstrap 脚本，头不放行，
+于是头赢了，应用自己的启动脚本被封，页面**全白**。单元测试全程都在看头的值，所以什么也没发现。
+修法就是回到设计本意：头只带 `frame-ancestors 'none'`（因为浏览器在 meta 里忽略它），其余归构建方。
+`internal/httpapi/frontend_test.go` 现在断言头**不得**重述 `script-src` 等指令。
 
 **限流**（`internal/ratelimit`，基于 `golang.org/x/time/rate`）：可选的 `Config.Limiter` 在会话中间件之外
 先拦住超预算的调用方；按客户端地址分桶、空闲驱逐。**两个平面各自的错误形态**：`/oauth/*` 与 `/.well-known/*`
@@ -264,9 +339,13 @@ re0auth.r0semi.net
   把 handle 绑定到当前浏览器会话，302 到前端 `/consent?id=<arq_...>`。
   客户端未知 / 重定向非法 → JSON OAuth 错误；scope 非法 → 302 回客户端 `error=invalid_scope`。
 - `GET /v1/authorization_requests/{id}`（业务平面，需登录 + 会话绑定）：返回客户端名与 scope 描述
-  （含 `risk` / `explicit_consent`）以及 `csrf_token`。
+  （含 `risk` / `explicit_consent`）、`csrf_token`，以及 `missing_bindings`——请求的 scope 中
+  还需要但尚未连接的数据源，每项带服务端拼好的 `bind_url`（`return_to` 指回同一 handle）。
 - `POST /v1/authorization_requests/{id}/decision`（需登录 + CSRF）：`{decision, scopes, explicit}`；
   批准 → `authz.Approve` → `oauth.Authorize` 签发 code → 返回**服务端拼好的** `redirect_to`。
+- **渐进式绑定**：同意页在 `missing_bindings` 非空时禁用批准并引导连接；绑定回调回到同一
+  pending handle（`authorizationRequestTTL` 需长于 federation 的绑定 TTL）。取消勾选某个 scope
+  即可解除它对应的绑定要求。
 - `authz.Approve` 只允许**收窄** scope，并把 `explicit` 交给 AS 复核 critical scope；
   handle 单次使用、短时效、绑定浏览器。
 
@@ -335,38 +414,59 @@ re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个
 
 ### 4.11 组合根与持久化（v1 进行中：`cmd/re0auth` + `internal/store/postgres`）
 
-**`cmd/re0auth` 是组合根**：从环境变量读配置，装配全部组件，起两个 HTTP 平面。它的存在是为了让存储
-适配器有一个**真实调用者**，而不是只被测试调用。启动时把仍在内存的部件**大声说出来**：
+**`cmd/re0auth` 是组合根**：从 TOML 文件 + 环境变量读配置（见 `config/re0auth.example.toml`），
+装配全部组件，起两个 HTTP 平面。它的存在是为了让存储适配器有一个**真实调用者**，而不是只被测试调用。
+启动时把仍在内存的部件**大声说出来**：
 
 ```
-WARNING: DATABASE_URL is not set; using in-memory stores (nothing survives a restart)
-WARNING: the vault's credential store is still in-memory
-WARNING: pending authorization requests are in-memory
-WARNING: bindings and bind flows are in-memory
+WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, bindings and pending requests
+```
+
+设了 `DATABASE_URL` 后，同一行变成：
+
+```
+storage: every port is persistent (accounts, tokens, device authorizations, clients, vault credentials, bindings, bind flows, sessions, authorization requests)
 ```
 
 “哪些部分是持久的”绝不能靠猜。
 
+**配置约定**：文件只放结构（端点、驱动、哪些 provider/源存在），**密钥只来自环境**——文件写的是
+变量名（`*_env`），不是值。优先级为 **环境 > 文件 > 默认值**；校验 fail-closed，缺密钥/缺 issuer/Kek 长度
+不对，都拒绝启动。共享辅助在 `internal/config`，因为密钥解析语义在两个二进制里各写一份必然漂移。
+
 **Postgres 适配器**（`internal/store/postgres`）落在接口包**之外**，因为公开库（`oauth`、`vault`）
-不能依赖数据库驱动。已落地 4 个端口：`account.Store`、`oauth.Store`、`oauth.DeviceStore`、
-`oauth.ClientRegistry`。
+不能依赖数据库驱动。**9 个存储端口全部已落地**：`account.Store`、`oauth.Store`、`oauth.DeviceStore`、
+`oauth.ClientRegistry`、`vault.Repo`、`federation.BindingStore`、`federation.BindFlowStore`、
+`scs.Store`（会话）、`authz.Store`（待授权请求）。**后端持久化到此收尾。**
 
 | 关注点 | 做法 |
 |---|---|
 | 迁移 | `embed.FS` 内嵌 SQL + `schema_migrations` + `pg_advisory_lock`（多实例同时启动不打架） |
-| 令牌落盘 | 全部按键 `sha256(value)`，**明文永不入库**；测试直接查表断言 |
-| 单次使用 | 一条 `DELETE ... RETURNING`（比内存实现**更难写错**） |
+| 令牌落盘 | 全部按键 `sha256(value)`，**明文永不入库**；测试直接查表断言。
+  会话 cookie 同理（`sessions.token_hash`）——否则一张表泄露就是一整套可用会话 |
+| 凭据落盘 | 只存不透明密文材料；测试驱动真实信封加密写表，再把整行 dump 出来搜明文（并防空断言） |
+| 单次使用 | 一条 `DELETE ... RETURNING`（授权码 / refresh / bind flow；比内存实现**更难写错**） |
 | 账号 I-3 隔离 | `UNIQUE (provider, subject)`，唯一冲突 → `ErrIdentityTaken` |
 | 账号 I-2 底线 | 事务内 `SELECT ... FOR UPDATE` 锁用户行后再计数 |
 | 账号 I-1 平权 | `primary_identity` 仅为展示指针，解绑时重指最早的存活身份 |
 | 客户端密钥 | 只存摘要（`bytea`）；`oauth.RestoreClient` 从库里重建 |
+| 绑定表不能持有凭据 | Go 结构体无令牌字段 + 测试从 `information_schema` 断言无 token/secret 类列 |
 
 **测试分层**：单元测试继续用 `Memory*`（任何平台、不需数据库）；Postgres 适配器测试由
 `TEST_DATABASE_URL` 门控，未设则 `t.Skip`；**权威验证跑 Linux CI**（`ubuntu-latest` + `postgres:16` 服务，
-`.github/workflows/ci.yml`）。
+`.github/workflows/ci.yml`）。CI 里若变量缺失则**直接失败**，不允许静默跳过；并单独 verbose 跑一遍，
+让日志逐条证明测试真的执行了（`ok` 在 skip 与 pass 两种情况下长得一样）。
 
-**仍是内存的端口**（下一步）：`vault.Repo`、`authz.Store`、`federation.BindingStore`/`BindFlowStore`、
-`scs.Store`。
+**两个端口刻意不对 handle 做哈希**，因为哈希在那里保护不了什么：`authz_requests.id` 设计上就出现在
+浏览器 URL 与服务器日志里，且 HTTP 层另外把它绑定到创建它的会话，偷到 handle 在别处也无用。
+分类写在各自的迁移注释与 threat-model §6.1 里。
+
+会话额外做了一件事：`scs.Store` 的接口**不带 context**（scs 不传），所以适配器用 `context.Background`；
+过期会话在 `Find` 时按 scs 语义当作“未找到”并顺手删除，另有 15 分钟一次的 `SweepExpired` 定期清理
+（`Find` 只清那些还会被访问的）。待授权请求同样有 sweep。
+
+> 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
+> `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
 
 > 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
 > `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
@@ -415,13 +515,13 @@ critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期
 ## 6. 进程边界与部署
 
 - **进程内（可信）**：`core`、`store`、`vault`、`audit`、`oauth`、`admin`、第一方适配器。
-- **进程外（不可信 / 隔离）**：第三方下游集成、可能被利用的解析类组件、KMS/HSM（外部服务）。
+- **进程外（不可信 / 隔离）**：第三方下游集成、可能被利用的解析类组件、KMS/HSM（**若部署接入**，外部服务）。
 - 跨进程访问按论文 §6.2 设计为**异步契约**；进程外 bridge 在宿主侧是一个普通 fiber，
   其能力可被 attenuation（收窄）。
 
 ## 7. 配置与编排
 
-- 声明式配置（YAML）描述组件树，作为"系统加载了什么"的唯一权威记录。
+- 声明式配置（TOML，见 `config/re0auth.example.toml`）描述服务与数据源，作为"系统加载了什么"的唯一权威记录。
 - 增量 reconcile：按字段变化采取最小扰动操作；不引入 HMR。
 - 禁用某组件 = 该 fiber unload，其 effect 按 LIFO 回滚。
 

@@ -94,6 +94,22 @@ type Login interface {
 	Mount(mux *http.ServeMux, establish Establish)
 }
 
+// UpstreamRevoker is a Login that can end the upstream session itself, not merely
+// the session this source keeps.
+//
+// A source advertises cascade revocation to Re0Auth **exactly when one of its
+// logins implements this**, which is what keeps the advertised capability and the
+// implemented one the same statement.
+type UpstreamRevoker interface {
+	// RevokeUpstream invalidates the upstream session behind credential, the
+	// payload this login stored, and must discard any replacement the upstream
+	// hands back: keeping it would leave the source holding a live session while
+	// the person's own devices are signed out, which is the opposite of what they
+	// asked for. subject is for auditing; the credential is what identifies the
+	// upstream account.
+	RevokeUpstream(ctx context.Context, subject string, credential []byte) error
+}
+
 // Reader serves normalized resources using a subject's native credential. The
 // credential is valid only for the duration of the call: the vault zeroizes it
 // when Read returns.
@@ -123,6 +139,13 @@ type Source struct {
 	reader    Reader
 	logins    []Login
 	sessions  *scs.SessionManager
+	// as is the source's own authorization server. Cascade revocation needs it to
+	// authenticate Re0Auth as a client.
+	as oauth.Service
+	// tokens is that server's store, kept so a cascade request can resolve which
+	// account a token belongs to. The token is the source's own, so the source is
+	// the only party that can answer that.
+	tokens oauth.Store
 }
 
 // New builds the source: it derives the scope catalog from the discovery
@@ -174,7 +197,8 @@ func New(cfg Config, deps Deps) (*Source, error) {
 		return nil, err
 	}
 
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), deps.Logger, oauth.Config{
+	tokens := oauth.NewMemoryStore()
+	as, err := oauth.NewService(clients, tokens, deps.Logger, oauth.Config{
 		Issuer: discovery.OAuth.Issuer,
 		Scopes: registry,
 		Now:    deps.Now,
@@ -197,18 +221,27 @@ func New(cfg Config, deps Deps) (*Source, error) {
 		reader:    deps.Reader,
 		logins:    deps.Logins,
 		sessions:  sessions,
+		as:        as,
+		tokens:    tokens,
 	}
 	resources := make(map[string]upstreamkit.ResourceHandler, len(discovery.Resources))
 	for _, res := range discovery.Resources {
 		resources[res.Name] = s.resourceHandler(res.Name)
 	}
-	kit, err := upstreamkit.New(cfg.Discovery, upstreamkit.Hooks{
+	hooks := upstreamkit.Hooks{
 		OAuth:     as,
 		Scope:     registry,
 		Consent:   s.consent,
 		Account:   s.account,
 		Resources: resources,
-	})
+	}
+	// The capability is wired only when a login can actually deliver it. The kit
+	// then advertises it; with no hook it advertises nothing, so Re0Auth never
+	// offers a button that would fail.
+	if s.upstreamRevoker() != nil {
+		hooks.CascadeRevoke = s.cascadeRevoke
+	}
+	kit, err := upstreamkit.New(cfg.Discovery, hooks)
 	if err != nil {
 		return nil, err
 	}

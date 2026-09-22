@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"net/http"
+
+	"github.com/Re0Auth/r0semi/internal/account"
 )
 
 type identityView struct {
@@ -32,6 +34,19 @@ func (s *Server) handleCurrentSession(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "identity lookup failed")
 		return
 	}
+	views := identityViews(identities)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user_id":             string(record.ID),
+		"primary_identity_id": string(record.PrimaryIdentity),
+		"csrf_token":          s.sessions.CSRFToken(ctx),
+		"identities":          views,
+	})
+}
+
+// identityViews is the one place an account identity becomes its public shape, so
+// the session bootstrap and the identity list cannot drift apart.
+func identityViews(identities []account.Identity) []identityView {
 	views := make([]identityView, len(identities))
 	for i, ident := range identities {
 		views[i] = identityView{
@@ -43,13 +58,7 @@ func (s *Server) handleCurrentSession(w http.ResponseWriter, r *http.Request) {
 			LinkedAt:    ident.LinkedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 		}
 	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":             string(record.ID),
-		"primary_identity_id": string(record.PrimaryIdentity),
-		"csrf_token":          s.sessions.CSRFToken(ctx),
-		"identities":          views,
-	})
+	return views
 }
 
 // handleSignOut destroys the session. It is a write, so it requires the CSRF

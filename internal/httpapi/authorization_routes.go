@@ -1,21 +1,62 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/url"
 
+	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/oauth"
 )
+
+// bindingRequirementView tells the consent screen which data source must be
+// connected before the requested scopes can be served, and where to connect it.
+type bindingRequirementView struct {
+	Game        string   `json:"game"`
+	Source      string   `json:"source"`
+	DisplayName string   `json:"display_name"`
+	Scopes      []string `json:"scopes"`
+	// BindURL is server-built and returns to this consent screen. The frontend
+	// navigates to it verbatim rather than assembling it.
+	BindURL string `json:"bind_url"`
+}
+
+// missingBindingViews is the bridge between the consent screen and the data
+// plane's binding state. It is advisory: approval still consults oauth.Authorize,
+// and every data read still checks the binding.
+func (s *Server) missingBindingViews(ctx context.Context, user account.UserID, scopes []oauth.Scope, id string) ([]bindingRequirementView, error) {
+	views := []bindingRequirementView{}
+	if s.federate == nil {
+		return views, nil
+	}
+	reqs, err := s.federate.MissingBindings(ctx, user, scopeStrings(scopes))
+	if err != nil {
+		return nil, err
+	}
+	// Come back to the pending consent request after the source redirects here.
+	returnTo := s.consent + "?id=" + url.QueryEscape(id)
+	for _, req := range reqs {
+		views = append(views, bindingRequirementView{
+			Game:        req.Game,
+			Source:      req.Source,
+			DisplayName: req.DisplayName,
+			Scopes:      req.Scopes,
+			BindURL:     s.bindURL(req.Game, req.Source, returnTo),
+		})
+	}
+	return views, nil
+}
 
 // handleGetAuthorizationRequest feeds the consent screen. It requires a signed
 // in user and that the handle belongs to this browser's session, so a stolen
 // handle is useless in another browser.
 func (s *Server) handleGetAuthorizationRequest(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.sessions.User(r.Context()); !ok {
+	user, ok := s.sessions.User(r.Context())
+	if !ok {
 		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "sign in to continue")
 		return
 	}
@@ -30,11 +71,18 @@ func (s *Server) handleGetAuthorizationRequest(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	missing, err := s.missingBindingViews(r.Context(), user, req.Scopes, req.ID)
+	if err != nil {
+		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read data source bindings")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":         req.ID,
-		"client":     map[string]string{"id": req.ClientID, "name": req.ClientName},
-		"scopes":     s.scopeViews(req.Scopes),
-		"csrf_token": s.sessions.CSRFToken(r.Context()),
+		"id":               req.ID,
+		"client":           map[string]string{"id": req.ClientID, "name": req.ClientName},
+		"scopes":           s.scopeViews(req.Scopes),
+		"missing_bindings": missing,
+		"csrf_token":       s.sessions.CSRFToken(r.Context()),
 	})
 }
 
@@ -78,7 +126,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 		}
 		s.sessions.Unbind(r.Context(), "authz", id)
 		writeJSON(w, http.StatusOK, map[string]string{
-			"redirect_to": buildRedirect(req.RedirectURI, map[string]string{
+			"redirect_to": oauth.BuildRedirect(req.RedirectURI, map[string]string{
 				"error": "access_denied", "state": req.State,
 			}),
 		})
@@ -91,7 +139,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 		}
 		s.sessions.Unbind(r.Context(), "authz", id)
 		writeJSON(w, http.StatusOK, map[string]string{
-			"redirect_to": buildRedirect(resp.RedirectURI, map[string]string{
+			"redirect_to": oauth.BuildRedirect(resp.RedirectURI, map[string]string{
 				"code": resp.Code, "state": resp.State,
 			}),
 		})
@@ -141,19 +189,4 @@ func toScopes(in []string) []oauth.Scope {
 		}
 	}
 	return out
-}
-
-func buildRedirect(redirectURI string, params map[string]string) string {
-	u, err := url.Parse(redirectURI)
-	if err != nil {
-		return redirectURI
-	}
-	q := u.Query()
-	for k, v := range params {
-		if v != "" {
-			q.Set(k, v)
-		}
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
 }

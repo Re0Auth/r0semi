@@ -27,6 +27,7 @@ type service struct {
 	codeTTL      time.Duration
 	deviceTTL    time.Duration
 	pollInterval time.Duration
+	verifyPath   string
 	now          func() time.Time
 }
 
@@ -61,6 +62,9 @@ func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg C
 	if cfg.DevicePollInterval <= 0 {
 		cfg.DevicePollInterval = defaultDevicePollInterval
 	}
+	if cfg.VerificationPath == "" {
+		cfg.VerificationPath = defaultVerificationPath
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -76,6 +80,7 @@ func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg C
 		codeTTL:      cfg.CodeTTL,
 		deviceTTL:    cfg.DeviceCodeTTL,
 		pollInterval: cfg.DevicePollInterval,
+		verifyPath:   cfg.VerificationPath,
 		now:          cfg.Now,
 	}, nil
 }

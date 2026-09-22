@@ -103,6 +103,7 @@ GET {source_base}/.well-known/re0auth-upstream
 | 精确匹配 redirect_uri | **MUST** | Re0Auth 的回调固定为 `{re0auth_issuer}/auth/upstream/{source}/callback` |
 | Token endpoint | **MUST** | 返回 `access_token`、`token_type`、`expires_in`；可续期时返回 `refresh_token` |
 | Revocation endpoint (RFC 7009) | **MUST** | `token_class=revocable` 时撤销必须生效 |
+| 级联撤销端点 | **MAY** | 能把用户从上游会话登出时才有；声明即承诺（§6.1） |
 | 刷新令牌轮换 | **SHOULD** | `token_class=revocable` 时 |
 | Discovery（RFC 8414） | **MAY** | 允许仅在 re0auth-upstream 文档内联端点 |
 | `account.read` → 账号标识 | **MUST** | 稳定的上游账号标识（openid / subject），用于绑定去重 |
@@ -123,11 +124,49 @@ OAuth 库实现，也可以直接用 Upstream Kit 生成——两者对 Re0Auth 
 | token_class | 含义 | Re0Auth 存储 | 撤销 |
 |---|---|---|---|
 | `revocable` | 有 scope、可过期、可通过 revocation endpoint 吊销 | 存储 refresh token（信封加密） | 调数据源 revocation → 解绑 |
-| `long_lived` | 不可按客户端撤销、长效（等价于万能钥匙） | 存储该令牌（信封加密，高危标注） | 丢弃令牌；如数据源有注销接口则调用 |
+| `long_lived` | 不可按客户端撤销、长效（等价于万能钥匙） | 存储该令牌（信封加密，高危标注） | 丢弃令牌；如数据源有级联撤销则调用（§6.1） |
 
 - 绑定键 = `(usr_, game, source)`。
-- 令牌**永久不返回给下游**（唯一例外是显式的 `critical` 导出 scope，见 [api-design.md](./api-design.md) §5）。
+- 令牌**永久不返回给下游**，没有任何例外。需要上游原生 API 时用 §9 的 raw 透传，而不是交出令牌。
 - 数据源必须**如实**声明 `token_class`；Re0Auth 会在同意页与文档中展示该性质。
+
+### 6.1 级联撤销（可选能力）
+
+RFC 7009 只能让数据源**忘记一个令牌**。有些场景要的是**把这个人从上游账号上登出**——
+旧 session 立即失效、**所有设备都要重新登录**，包括用户手里那台。这是两件事，协议必须分开说。
+
+数据源在 discovery 里声明它具备该能力：
+
+```json
+"oauth": {
+  "revocation_endpoint": "https://api.next-phi.example/oauth/revoke",
+  "cascade_revocation_endpoint": "https://api.next-phi.example/oauth/cascade_revocation"
+}
+```
+
+**只有真的实现了才允许出现这个字段。** 广告了却做不到，与广告 DPoP 却只发普通 Bearer 是同一类谎，
+而 Re0Auth 正是依据它决定要不要给出「登出全部设备」这个按钮。
+
+```
+POST {cascade_revocation_endpoint}
+Content-Type: application/x-www-form-urlencoded
+Authorization: Basic base64(urlencode(client_id):urlencode(client_secret))
+
+token=<Re0Auth 持有的令牌>&token_type_hint=refresh_token
+```
+
+- **请求体与 RFC 7009 同形，效果不同。** 令牌**不是**被撤销的对象，它是「要结束谁的会话」的凭据。
+  数据源从中解出 subject，然后作废**上游的登录本身**。
+- 优先发 refresh token：它标识的是持续授权而不是一小时，而访问令牌可能已经过期。
+- `token_type_hint` **只是提示**。因猜错而拒绝的数据源，会被记在它自己账上。
+- 数据源**可以**消费掉这个令牌——Re0Auth 紧接着就会把绑定删掉。
+- 若上游返回了替代凭据（例如 TapTap 的 `refreshSessionToken` 会返回新 session token），
+  **必须丢弃**。留下它等于：用户在自己所有设备上被登出，而数据源悄悄持有活着的会话——一次伪装成登出的劫持。
+- 上游不可达时**必须返回错误**，不能返回 200。Re0Auth 收到错误时**什么都不删**，
+  因为 vault 里的凭据是重试的唯一手段；此时删掉它，用户就永远做不成他想做的事了。
+
+Kit 侧：`Hooks.CascadeRevoke` 非 nil 时端点与 discovery 字段一起出现，为 nil 时一起消失。
+`referencesource` 的 TapTap 登录实现了它（旋转 session token 并丢弃替代品）。
 
 ## 7. Scope 词汇表
 
@@ -264,6 +303,7 @@ GET /v1/games/{game}/sources/{source}/raw/{path...}     原始透传
 - [ ] 按声明实现规范化资源 schema（§8）
 - [ ] `problem+json` 错误 + 限流头
 - [ ] `token_class` 如实声明；`revocable` 时撤销真正生效
+- [ ] 若声明 `cascade_revocation_endpoint`，该端点确实存在（conformance 的 `cascade.present`）；不声明则 Re0Auth 不提供该操作
 - [ ] （可选）`raw` API + OpenAPI，以支持中立透传（§9）
 - [ ] 通过 conformance suite（§13）
 

@@ -20,6 +20,16 @@ type problem struct {
 	BindURL       string `json:"bind_url,omitempty"`
 }
 
+// problemTitles is the closed catalogue of codes this API can produce. Every key
+// here is emitted by some handler, and the OpenAPI document enumerates exactly
+// this set; a test asserts the two stay equal, so a code can neither be
+// documented without being reachable nor emitted without being documented.
+//
+// Three entries were removed rather than kept as placeholders:
+// `credential_not_found`, `conflict` and `idempotency_key_reused` belonged to the
+// withdrawn credential-export API and to idempotency keys that were never
+// implemented. A catalogue of errors that cannot happen is just a lie with a
+// longer half-life.
 var problemTitles = map[string]string{
 	"invalid_request":           "Invalid request",
 	"unauthenticated":           "Authentication required",
@@ -28,10 +38,9 @@ var problemTitles = map[string]string{
 	"source_not_bound":          "Source not bound",
 	"source_unavailable":        "Source unavailable",
 	"source_retired":            "Source retired",
-	"credential_not_found":      "Credential not found",
+	"cascade_unsupported":       "Upstream session cannot be revoked",
 	"not_found":                 "Not found",
-	"conflict":                  "Conflict",
-	"idempotency_key_reused":    "Idempotency key reused",
+	"last_identity":             "Cannot unlink the last identity",
 	"rate_limited":              "Rate limit exceeded",
 	"upstream_unavailable":      "Upstream unavailable",
 	"explicit_consent_required": "Explicit consent required",

@@ -1,0 +1,97 @@
+@import 'tailwindcss';
+
+/*
+ * Design tokens.
+ *
+ * Deliberately plain CSS variables rather than a component framework's theme:
+ * the frontend has to be reviewable by someone auditing the security of an
+ * OAuth consent screen, and "what colour is this button" should not require
+ * reading a dependency's source.
+ *
+ * The palette is a monochrome one with a single accent. Two constraints shaped
+ * it:
+ *
+ *   - The consent screen must look like *this* service and not like a generic
+ *     sign-in page. Familiar-looking consent screens are the raw material of
+ *     phishing, so the goal is recognisability, not blending in.
+ *   - Nothing may depend on colour alone. Risk levels, source status and scope
+ *     emphasis all carry a word or a glyph as well, so the page still reads
+ *     correctly in greyscale, in high contrast, or with colour blindness.
+ */
+@theme {
+	--color-canvas: oklch(0.99 0 0);
+	--color-surface: oklch(1 0 0);
+	--color-line: oklch(0.91 0 0);
+	--color-line-strong: oklch(0.82 0 0);
+	--color-ink: oklch(0.19 0 0);
+	--color-ink-muted: oklch(0.48 0 0);
+	--color-ink-faint: oklch(0.62 0 0);
+
+	--color-accent: oklch(0.52 0.14 258);
+	--color-accent-ink: oklch(0.98 0 0);
+	--color-accent-soft: oklch(0.96 0.02 258);
+
+	--color-danger: oklch(0.52 0.19 27);
+	--color-danger-soft: oklch(0.96 0.02 27);
+	--color-warn: oklch(0.62 0.13 75);
+	--color-warn-soft: oklch(0.97 0.03 75);
+	--color-ok: oklch(0.56 0.13 150);
+
+	--radius-card: 0.75rem;
+}
+
+:root {
+	color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+	@theme {
+		--color-canvas: oklch(0.16 0 0);
+		--color-surface: oklch(0.21 0 0);
+		--color-line: oklch(0.29 0 0);
+		--color-line-strong: oklch(0.38 0 0);
+		--color-ink: oklch(0.96 0 0);
+		--color-ink-muted: oklch(0.72 0 0);
+		--color-ink-faint: oklch(0.56 0 0);
+
+		--color-accent: oklch(0.72 0.12 258);
+		--color-accent-ink: oklch(0.16 0 0);
+		--color-accent-soft: oklch(0.26 0.04 258);
+
+		--color-danger: oklch(0.7 0.16 27);
+		--color-danger-soft: oklch(0.26 0.04 27);
+		--color-warn: oklch(0.78 0.12 75);
+		--color-warn-soft: oklch(0.26 0.04 75);
+		--color-ok: oklch(0.72 0.12 150);
+	}
+}
+
+html {
+	background: var(--color-canvas);
+	color: var(--color-ink);
+	font-family:
+		ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+		'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+	-webkit-text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	min-height: 100dvh;
+}
+
+/* Visible focus everywhere, because the primary audience is a keyboard and a
+   screen reader as much as a mouse. */
+:focus-visible {
+	outline: 2px solid var(--color-accent);
+	outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		transition-duration: 0.01ms !important;
+	}
+}

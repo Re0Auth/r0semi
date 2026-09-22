@@ -152,17 +152,17 @@ func TestDeviceAuthorizationDeviceCodeIsBoundToClient(t *testing.T) {
 
 func TestDeviceAuthorizationCannotWidenOrSkipExplicit(t *testing.T) {
 	svc, clients, _, _, _ := newTestAS(t)
-	registerClient(t, clients, "cli", ClientPublic, "", []Scope{ScopeAccountID, ScopeTapTapStoken})
+	registerClient(t, clients, "cli", ClientPublic, "", []Scope{ScopeAccountID, testCriticalScope})
 	ctx := context.Background()
 
 	start, err := svc.BeginDeviceAuthorization(ctx, DeviceAuthorizationRequest{
-		ClientID: "cli", Scopes: []Scope{ScopeAccountID, ScopeTapTapStoken},
+		ClientID: "cli", Scopes: []Scope{ScopeAccountID, testCriticalScope},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// ScopeTapTapStoken is critical: approving without ticking it must fail.
+	// A scope marked ExplicitConsent must be ticked individually, or approval fails.
 	if err := svc.DecideDeviceAuthorization(ctx, start.UserCode, "usr_1", true, nil, nil); protocolCode(t, err) != "access_denied" {
 		t.Fatalf("approve without explicit = %v", err)
 	}
@@ -172,7 +172,7 @@ func TestDeviceAuthorizationCannotWidenOrSkipExplicit(t *testing.T) {
 	}
 	// Narrowing to account.id and ticking the critical scope it keeps is fine.
 	if err := svc.DecideDeviceAuthorization(ctx, start.UserCode, "usr_1", true,
-		[]Scope{ScopeAccountID, ScopeTapTapStoken}, []Scope{ScopeTapTapStoken}); err != nil {
+		[]Scope{ScopeAccountID, testCriticalScope}, []Scope{testCriticalScope}); err != nil {
 		t.Fatalf("approve with explicit = %v", err)
 	}
 }

@@ -89,8 +89,8 @@ v1 的处理：
 | `GET` | `/auth/{provider}/callback?code=&state=` | 校验 `state`、兑换 token、拉取用户信息、落地会话、302 回前端 |
 | `GET` | `/v1/sessions/current` | 当前会话与已链接身份（含 `primary_identity_id`） |
 | `POST` | `/v1/sessions/sign_out` | 登出（清 Cookie、失效服务端会话） |
-| `GET` | `/v1/identities` | 列出已链接身份 |
-| `DELETE` | `/v1/identities/{id}` | 解绑（I-2 守护） |
+| `GET` | `/v1/identities` | 列出已链接身份（**已实现**，会话） |
+| `DELETE` | `/v1/identities/{id}` | 解绑（I-2 守护，**已实现**，会话 + CSRF） |
 
 流程状态（`state`、`mode`、`return_to`、PKCE verifier、nonce）**全部存服务端**，
 由 `state` 关联；回调时校验，不接受客户端回传的 `mode`/`return_to`。
@@ -120,10 +120,13 @@ GET /oauth/authorize?...
   ├─ GET /v1/authorization_requests/{id}
   │     401 未登录 → 展示 5 大金刚一键登录 → /auth/{p}/start?mode=login&return_to=/consent?id=...
   │     200 → 渲染同意页（scope 列表，critical 逐项勾选）
+  │           同时返回 missing_bindings：需要但尚未连接的数据源
   │
-  ├─ 若该 usr_ 尚未绑定所需数据源
+  ├─ 若 missing_bindings 非空（且对应 scope 仍被勾选）
+  │     → 同意页显示“需要先连接数据源”，批准按钮禁用
   │     → 走 federation 的绑定流程（/bind → 数据源 authorize → 回调，见 §4.9）
-  │     → 完成后回到同意页
+  │     → 完成后回到同一 handle 的同意页，重新加载后 missing_bindings 消失
+  │     → 取消勾选某个 scope 也可以解除它对应的绑定要求
   │
   └─ POST /v1/authorization_requests/{id}/decision
         {decision:"approve"|"deny", scopes:[...], explicit:[...]}
@@ -135,9 +138,10 @@ GET /oauth/authorize?...
 
 - **所有安全判断在后端**：pending 请求绑定会话，`explicit` 由后端复核，`redirect_to`
   由后端按注册的 `redirect_uri` 生成，前端不得自行拼接。
-- 授权请求 handle 单次使用、短时效、绑定浏览器会话，防止"A 的请求被 B 批准"。
-- 授权时发现缺绑定就地补齐 —— 绑定的是**数据源**（`federation` 的 `/bind` 流程），
-  凭据由数据源自己持有。
+- 授权请求 handle 单次使用、短时效（30 分钟，需长于绑定流程）、绑定浏览器会话，防止"A 的请求被 B 批准"。
+- **渐进式绑定已实现**：`GET /v1/authorization_requests/{id}` 返回 `missing_bindings`（含服务端拼好的
+  `bind_url`），同意页据此提示并禁用批准；绑定后回到同一 handle。绑定的是**数据源**
+  （`federation` 的 `/bind` 流程），凭据由数据源自己持有。
 
 > 已实现：`internal/authz`（pending 请求 + 决策）+ `httpapi` 路由，见 architecture.md §4.7。
 > 扫码托管已迁出 Re0Auth，成为数据源自己的登录面（见 architecture.md §4.10）。

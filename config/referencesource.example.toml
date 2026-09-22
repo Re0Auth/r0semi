@@ -1,0 +1,80 @@
+# Reference Re0Auth data source configuration.
+#
+# Copy to config/referencesource.toml (gitignored) and edit.
+#
+# Same two rules as the server config: secrets are named (`*_env`), never
+# written, and every field has a default. Precedence is
+# environment > this file > built-in default.
+
+[server]
+addr   = "127.0.0.1:8081"
+# Public base URL of *this source*. It becomes the OAuth issuer Re0Auth reads
+# from /.well-known/re0auth-upstream, so it must be reachable by Re0Auth.
+issuer = "http://127.0.0.1:8081"
+# Where Re0Auth lives. The registered redirect URI is derived from it:
+#   {re0auth_base_url}/auth/upstream/{game}/{source}/callback
+re0auth_base_url = "http://127.0.0.1:8080"
+
+[client]
+# The one downstream client this source trusts.
+id = "re0auth"
+# Re0Auth is a confidential client: it holds a secret, and the secret itself is
+# never written here.
+secret_env = "REFERENCE_SOURCE_CLIENT_SECRET"
+
+[source]
+game         = "phigros"
+source       = "taptap-reference"
+display_name = "Phigros (reference source)"
+# "revocable" or "long_lived". Declaring it honestly is what lets Re0Auth
+# describe this source accurately.
+token_class = "revocable"
+contact     = "mailto:admin@example.invalid"
+# Namespaces this source's credentials in its own vault. This is the source's
+# account namespace, not a game account.
+provider = "phigros"
+
+# Resources are normalized: each declares the schema Re0Auth will receive and the
+# canonical scope that protects it.
+[[source.resources]]
+name   = "profile"
+schema = "re0auth.phigros.profile/1"
+scope  = "phigros.profile.read"
+
+[[source.resources]]
+name   = "scores"
+schema = "re0auth.phigros.scores/1"
+scope  = "phigros.score.read"
+
+# Login: TapTap device-code (QR). The user scans a QR code, this source redeems a
+# built-in-account session token, and stores it in its own vault. Re0Auth never
+# sees TapTap.
+#
+# The app id and leancloud app key are embedded in the public game client and are
+# not cryptographic secrets, but they are kept out of source so a deployment can
+# select a region. From TapTap's official SDK; verify before relying on them.
+
+[taptap]
+client_id              = "<leancloud-app-id>"
+leancloud_app_key_env  = "TAPTAP_LEANCLOUD_APP_KEY"
+device_code_endpoint   = "https://www.taptap.com/oauth2/v1/device/code"
+token_endpoint         = "https://www.taptap.cn/oauth2/v1/token"
+user_info_endpoint     = "https://open.tapapis.cn/account/basic-info/v1"
+leancloud_base_url     = "https://rak3ffdi.cloud.tds1.tapapis.cn/1.1"
+
+# Global region instead:
+# device_code_endpoint = "https://www.taptap.io/oauth2/v1/device/code"
+# token_endpoint       = "https://www.taptap.io/oauth2/v1/token"
+# leancloud_base_url   = "https://kviehlel.cloud.ap-sg.tapapis.com/1.1"
+
+# Login: social OAuth. Google and Microsoft are OIDC, so their id_token is
+# verified against the issuer's JWKS. Known names: github, google, discord,
+# microsoft, qq.
+#
+# [social.google]
+# client_id         = "1234.apps.googleusercontent.com"
+# client_secret_env = "GOOGLE_CLIENT_SECRET"
+#
+# [social.github]
+# client_id         = "Ov23li..."
+# client_secret_env = "GITHUB_CLIENT_SECRET"

@@ -1,0 +1,1501 @@
+openapi: 3.1.0
+
+info:
+  title: Re0Auth business API
+  version: 1.0.0
+  summary: The /v1 plane — what a downstream tool, and the Re0Auth frontend, actually call.
+  description: |
+    Re0Auth exposes **two strictly separated planes**, and this document describes
+    only one of them.
+
+    * The **protocol plane** under `/oauth/` (+ `/.well-known/`) speaks OAuth 2.0:
+      form-encoded requests, `{error, error_description}` responses. Its contract
+      is fixed by RFC 6749 / 7009 / 7662 / 8414 / 8628 / 9728, so it is discovered
+      at `/.well-known/oauth-authorization-server` rather than restated here.
+      Restating an RFC in a second place is how the two copies drift apart.
+    * The **business plane** under `/v1/` is this document: JSON in, JSON out, and
+      every failure rendered as RFC 9457 `application/problem+json` with a stable
+      `code`.
+
+    Two rules follow from that split and hold for every operation below:
+
+    1. A business-plane error is **never** an OAuth error object, and vice versa.
+    2. No credential is ever returned. Re0Auth holds a *binding* — an opaque,
+       revocable token issued by a data source — and never hands it downstream.
+       Upstream credentials (a TapTap `stoken`, say) live in the data source's own
+       vault and never reach Re0Auth at all.
+
+    ## Who calls what
+
+    | Caller | Credential | Operations |
+    |---|---|---|
+    | A downstream tool (CLI, desktop, web) | Bearer access token | `federation`, `account` |
+    | The Re0Auth frontend, in a browser | Session cookie + CSRF token | `session`, `authorization`, `device` |
+    | Anybody | none | `GET /v1/games/{game}/sources` |
+
+    The frontend is a same-origin static app. It renders consent and device
+    screens and calls the session-scoped operations here; it never mints a token,
+    never assembles a redirect, and never holds authorization state. Where a
+    decision has a consequence, the **server** returns the exact URL to follow
+    (`redirect_to`), so the browser cannot be told to go somewhere else.
+
+    ## Reserved path segments
+
+    `/v1/games/{game}/sources` is matched before `/v1/games/{game}/{resource}`, so
+    `sources` and `raw` are effectively reserved: a data source may not name a
+    resource either of them. This mirrors the actual router, where the more
+    specific pattern wins.
+
+    ## Reading this document
+
+    `code` is the machine-readable half of an error and is what a client should
+    branch on; `title` and `detail` are for humans and may change. The set of
+    codes below is closed and a test asserts it stays equal to the set the server
+    can actually emit — an error you are told to handle will not turn out to be
+    unreachable, and one you can hit will not turn out to be undocumented.
+  contact:
+    name: Re0Auth
+    url: https://github.com/Re0Auth/r0semi
+  license:
+    name: MPL-2.0
+    identifier: MPL-2.0
+
+servers:
+  - url: https://re0auth.example
+    description: |
+      Placeholder. A deployment's base URL is its OAuth issuer; discover it from
+      `/.well-known/oauth-authorization-server`'s `issuer` field rather than
+      hard-coding a host.
+
+tags:
+  - name: account
+    description: About the caller's own access token.
+  - name: session
+    description: |
+      The browser session. These operations carry a session cookie, so they are
+      same-origin only and are useless to a native client.
+  - name: identity
+    description: How to obtain a session in the first place.
+  - name: authorization
+    description: The consent interaction. Called by the frontend.
+  - name: device
+    description: RFC 8628 user-code verification. Called by the frontend.
+  - name: federation
+    description: Reading a game's data through whichever source is active.
+
+# No global security: GET /v1/games/{game}/sources is public, so each operation
+# states its own requirement.
+security: []
+
+paths:
+  /v1/idp/providers:
+    get:
+      operationId: listIDPProviders
+      tags: [identity]
+      summary: The identity providers this deployment offers.
+      description: |
+        One entry per provider that is configured, so a sign-in page can render
+        exactly the buttons that will work. A guessed button leads to `404` from
+        the login plane, which reads as a broken login rather than as a provider
+        nobody enabled.
+
+        `start_url` is a browser navigation, not an API call: send the browser
+        there and it will return to the app with a session. Re0Auth issues no
+        passwords and stores none, so this list and the linked flows are the only
+        ways an account can come into existence.
+
+        Public on purpose. The set of login options is on every sign-in page
+        anyway, and requiring a session in order to learn how to get one would be
+        circular.
+      responses:
+        '200':
+          description: The offered providers, in a stable order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/IDPProvider' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/me:
+    get:
+      operationId: getMe
+      tags: [account]
+      summary: The account behind the presented access token.
+      description: |
+        The smallest authenticated call, and the one to use as a liveness and
+        scope check. `id` is the downstream account id (`usr_…`), which is
+        Re0Auth's own identifier and deliberately **not** any upstream id.
+      security:
+        - bearerAuth: [account.id]
+      responses:
+        '200':
+          description: The authenticated account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: |
+            The token is valid but does not carry `account.id`. The body names the
+            missing scope in `required_scope`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/grants:
+    get:
+      operationId: listGrants
+      tags: [account]
+      summary: Which applications can still act as this account.
+      description: |
+        One entry per client that currently holds a usable token, with the scopes
+        it holds and whether it can renew on its own.
+
+        A grant is **derived from live tokens rather than stored as a consent
+        record**, and the difference is visible: an application whose last token
+        has expired drops off this list, because it can no longer do anything.
+        The list answers "who can act as me right now", not "who have I ever
+        authorised". A stored consent record would keep showing it; this does not,
+        and that is deliberate — there is no second source of truth that could
+        disagree with what the tokens actually allow.
+
+        Session-scoped, not bearer-scoped. A client asking with its own token
+        would learn about the account's *other* clients, which is neither useful
+        to it nor something the user agreed to share.
+      responses:
+        '200':
+          description: The current grants, ordered by client id.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Grant' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/grants/{client_id}:
+    delete:
+      operationId: revokeGrant
+      tags: [account]
+      summary: Revoke an application's access to this account.
+      description: |
+        Deletes every token the client holds for this account. Its next call
+        fails with `invalid_token` and it must ask for consent again.
+
+        This is the **local** revocation: nothing at any data source changes, no
+        binding is removed, and the account's other clients and devices keep
+        working. Revoking an *upstream* credential is a different and much louder
+        action, and only the data source holding it can perform it — Re0Auth does
+        not have the credential to revoke.
+
+        Idempotent. A 204 means "this client holds nothing now", which is the
+        desired state either way, so a repeated request after a dropped response
+        is not an error.
+      parameters:
+        - name: client_id
+          in: path
+          required: true
+          description: The client whose tokens should be deleted.
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '204':
+          description: This client holds no tokens for this account. No body.
+        '400':
+          description: The client id was empty.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/bindings:
+    get:
+      operationId: listBindings
+      tags: [account]
+      summary: Which data sources are connected to this account.
+      description: |
+        One entry per bound source. A binding is what lets Re0Auth read a game's
+        data on this account's behalf: it is a token the *source* issued, kept in
+        Re0Auth's vault, and it is never shown here or anywhere else.
+
+        `display_name` comes from this deployment's registry rather than from the
+        source, so a source cannot rename itself on a page the user is being asked
+        to trust. `configured: false` means the binding outlived the source's
+        entry in the deployment's configuration — the connection still exists and
+        can still be removed, it just has nothing left to describe it.
+
+        Session-scoped, like grants, and for the same reason.
+      responses:
+        '200':
+          description: The connected sources, ordered by game then source.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Binding' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/bindings/{game}/{source}:
+    delete:
+      operationId: unbindSource
+      tags: [account]
+      summary: Disconnect a data source from this account.
+      description: |
+        Shreds the stored credential and removes the binding. Any later read of
+        that game's data reports `source_not_bound` and sends the user back to the
+        binding flow.
+
+        Re0Auth also asks the source to revoke the token it issued (RFC 7009),
+        because a credential Re0Auth can no longer use is still one the source
+        might honour. That half is best effort, and `upstream` says what happened:
+
+        | value | meaning |
+        |---|---|
+        | `done` | the source accepted the revocation |
+        | `unsupported` | the source declared `token_class: long_lived`, so it cannot revoke per client — the login there survives |
+        | `unavailable` | the source could not be reached or refused; `upstream_error` says why |
+        | `nothing` | there was no credential left to revoke |
+
+        The local removal happens regardless. A source that is down, broken or
+        unwilling must not be able to stop someone cutting it off from their own
+        account.
+
+        **200 with a body, not 204**, unlike revoking a grant. There the outcome
+        was uniform; here it is not, and answering 204 would make the local half
+        look like the whole story.
+      parameters:
+        - $ref: '#/components/parameters/Game'
+        - name: source
+          in: path
+          required: true
+          description: The source's name, as listed in the bindings.
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '200':
+          description: The binding is gone; this says what the source did about it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UnbindResult' }
+        '400':
+          description: A game or source was missing from the path.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown game or source in this deployment.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/bindings/{game}/{source}/cascade_revocation:
+    post:
+      operationId: cascadeRevokeUpstream
+      tags: [account]
+      summary: End this account's upstream session at a data source.
+      description: |
+        The loudest operation in this API, and the only one whose *point* is to
+        affect something outside Re0Auth.
+
+        The data source rotates or destroys the underlying login, so the person is
+        **signed out of every device — including the one in their hand**. Re0Auth
+        cannot do this alone and never pretends to: it has no such credential, so
+        it asks the source, and only a source that advertises
+        `cascade_revocation_endpoint` can be asked at all.
+
+        It is also only possible **while the binding exists**, because the token
+        Re0Auth holds is how the source is told whose session to end. Once a
+        binding is disconnected, this is out of reach until the account connects
+        again.
+
+        Two things distinguish it from `DELETE /v1/bindings/{game}/{source}`:
+
+        | | disconnect | cascade |
+        |---|---|---|
+        | affects | Re0Auth only | the person's logins everywhere |
+        | on failure | the local half happens anyway | **nothing happens** |
+
+        The failure rule is the mirror image of disconnecting, and deliberately
+        so. Disconnecting must not be held hostage by a broken source; cascading
+        has the upstream action as its goal, and the stored credential is the only
+        means of trying again — so destroying it after a failure would leave the
+        person permanently unable to do what they asked for.
+
+        The request must carry `acknowledge`, naming the consequence. It is a
+        speed bump with a label: ending somebody's sessions on every device should
+        not be something a caller can do without writing down that it means that.
+      parameters:
+        - $ref: '#/components/parameters/Game'
+        - name: source
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CascadeRevocation' }
+      responses:
+        '200':
+          description: The source ended the session and the binding is gone.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UnbindResult' }
+        '400':
+          description: |
+            A missing or wrong `acknowledge`, or a malformed body.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown game or source, or nothing connected.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: |
+            `cascade_unsupported` — this deployment has not been told the source can
+            end a session, so it will not pretend to try.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502':
+          description: |
+            The source could not be reached or refused. **Nothing was removed**, so
+            the request can be retried.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/sessions/current:
+    get:
+      operationId: getCurrentSession
+      tags: [session]
+      summary: Who is signed in, and the CSRF token for later writes.
+      description: |
+        The frontend's bootstrap call. It returns the CSRF token that every write
+        in the `session`, `authorization` and `device` groups must echo in
+        `X-CSRF-Token`; the token is bound to this session, so obtaining it
+        requires the session cookie already.
+
+        A `401` here is the frontend's signal to start a login, not an error to
+        show the user.
+      responses:
+        '200':
+          description: The signed-in account and its linked identities.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/sessions/sign_out:
+    post:
+      operationId: signOut
+      tags: [session]
+      summary: Destroy the browser session.
+      description: |
+        Destroys the session server-side; the cookie is worthless afterwards.
+        This is a **local** sign-out: it revokes no data-source binding and
+        touches no upstream account. The player's other devices stay signed in.
+      parameters:
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '204':
+          description: The session was destroyed. No body.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/identities:
+    get:
+      operationId: listIdentities
+      tags: [session]
+      summary: The external identities linked to this account.
+      description: |
+        Every identity that can sign into this account, oldest first. Re0Auth
+        issues no passwords, so these are the whole account: losing all of them
+        would lose the account, which is why the last one cannot be unlinked.
+
+        Session-scoped. A downstream client asking with its own token has no
+        business enumerating the user's other login methods.
+      responses:
+        '200':
+          description: The linked identities, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Identity' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/identities/{id}:
+    delete:
+      operationId: unlinkIdentity
+      tags: [session]
+      summary: Unlink one identity from this account.
+      description: |
+        Removes one way to sign in. The account keeps its other identities, and
+        if the removed one was the display primary, another is nominated (the
+        pointer is cosmetic; every identity is login-equivalent).
+
+        **The last identity cannot be unlinked.** That is enforced by the store,
+        not by the UI, and answers `409 last_identity`. Deleting it would leave an
+        account nobody can sign into.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The identity id from `GET /v1/identities`.
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '204':
+          description: The identity is gone. No body.
+        '400':
+          description: The identity id was empty.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown identity, or one that belongs to another account.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: |
+            `last_identity` — this is the only way to sign in, so it cannot be
+            removed.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/authorization_requests/{id}:
+    get:
+      operationId: getAuthorizationRequest
+      tags: [authorization]
+      summary: The pending consent request, for the frontend to render.
+      description: |
+        `id` is an opaque handle that `/oauth/authorize` created and then bound to
+        this browser session. A handle presented in a different browser is
+        reported as `404`, not `403`: a stolen handle should not confirm that it
+        exists. It is single-use and short-lived.
+      parameters:
+        - $ref: '#/components/parameters/AuthorizationRequestID'
+      responses:
+        '200':
+          description: What the user is being asked to approve.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthorizationRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: Unknown, expired, or belonging to another session.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/authorization_requests/{id}/decision:
+    post:
+      operationId: decideAuthorizationRequest
+      tags: [authorization]
+      summary: Approve or deny, and get back the URL to follow.
+      description: |
+        The one write that grants access, so its rules are the strictest in this
+        document:
+
+        * The request must come from the browser session that created the handle.
+        * `X-CSRF-Token` is required.
+        * `scopes` may only narrow what was requested. Widening it is
+          `400 invalid_request` (`ErrScopeNotRequested`).
+        * Any scope the catalogue marks `explicit_consent` must appear in
+          `explicit` as well as `scopes`, or the call fails with
+          `403 explicit_consent_required`. The built-in catalogue currently has
+          no such scope; the mechanism is what remains.
+
+        On success the handle is consumed and `redirect_to` is the client's
+        `redirect_uri` with `code` and `state` already attached. **The frontend
+        must navigate to that string verbatim** rather than rebuilding it — that
+        is what keeps redirect validation on the server.
+      parameters:
+        - $ref: '#/components/parameters/AuthorizationRequestID'
+        - $ref: '#/components/parameters/CSRFToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuthorizationDecision' }
+      responses:
+        '200':
+          description: The decision was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RedirectResult' }
+        '400':
+          description: |
+            Malformed body, an unknown `decision` value, or a scope that was not
+            requested.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: |
+            Either a bad CSRF token (`invalid_request`) or an `explicit_consent`
+            scope approved without being listed in `explicit`
+            (`explicit_consent_required`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown or expired handle.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/device/verification:
+    get:
+      operationId: getDeviceVerification
+      tags: [device]
+      summary: State of an RFC 8628 user-code verification.
+      description: |
+        Backs the page a player opens on a phone after a console or TV shows them
+        a code. Two shapes come back, discriminated by `state`:
+
+        * `awaiting_code` — no `user_code` was supplied, so the frontend shows the
+          entry form.
+        * `pending` — the code resolved, and it is now **bound to this browser
+          session**. The approval is only accepted from the browser that loaded
+          it, so a code relayed by an attacker cannot be approved from elsewhere.
+
+        This is a business-plane path rather than an `/oauth/` one on purpose: it
+        is a JSON API for our own frontend, not part of the OAuth protocol, which
+        is why its failures are `problem+json`.
+      parameters:
+        - name: user_code
+          in: query
+          required: false
+          description: The code the player was shown. Omitted to render the entry form.
+          schema: { type: string }
+          example: WDJB-MJHT
+      responses:
+        '200':
+          description: The current state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceVerification' }
+        '400':
+          description: The user code was malformed.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: The user code is unknown or has expired.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/device/decision:
+    post:
+      operationId: decideDeviceAuthorization
+      tags: [device]
+      summary: Approve or deny a device-code request.
+      description: |
+        The `user_code` must be one this browser session loaded through
+        `GET /v1/device/verification` first; otherwise `404`. The waiting device learns the answer
+        by polling the token endpoint, so this call returns no redirect — there is
+        no browser to redirect.
+      parameters:
+        - $ref: '#/components/parameters/CSRFToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceDecision' }
+      responses:
+        '200':
+          description: The decision was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceDecisionResult' }
+        '400':
+          description: Malformed body, or a scope problem reported by the AS.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: |
+            Unknown or expired user code, or one this session never loaded.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/sources:
+    get:
+      operationId: listAllSources
+      tags: [federation]
+      summary: Every data source this deployment offers, across games.
+      description: |
+        The same shape as the per-game listing, with `game` repeated on each entry
+        so an entry describes itself. Public, like the per-game listing: none of
+        this is user data.
+
+        It exists so the account page can offer something to connect to. A page
+        whose job is connecting sources and which can only show the ones already
+        connected is a dead end for exactly the people who need it.
+      responses:
+        '200':
+          description: The configured sources, ordered by game then name.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/FederationSource' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/games/{game}/sources:
+    get:
+      operationId: listGameSources
+      tags: [federation]
+      summary: Which sources serve a game, and what they can do.
+      description: |
+        Public discovery that exposes no user data, so it needs no credential.
+        This is how a client learns which `{resource}` names exist and, importantly,
+        how a source describes itself honestly:
+
+        * `token_class` — `revocable` means a scoped, revocable token;
+          `long_lived` means a master-equivalent credential the source cannot
+          revoke per client. A client that cares about blast radius should read it.
+        * `status` — `active` is preferred, `degraded` is used only when nothing
+          active can serve the request, `retired` is never selected and reports
+          `410` if asked for by name.
+        * `raw` — whether the source exposes a native API through the raw proxy.
+      parameters:
+        - $ref: '#/components/parameters/Game'
+      responses:
+        '200':
+          description: The sources serving this game.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameSources' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/games/{game}/{resource}:
+    get:
+      operationId: getGameResource
+      tags: [federation]
+      summary: Read a normalized resource through a bound source.
+      description: |
+        Re0Auth picks a source, decrypts the binding it holds, calls the source,
+        and returns the source's canonical payload. Which source answered is named
+        in the `Re0Auth-Source` response header, and if it was not the preferred
+        one, `Re0Auth-Degraded: true` says so. **A source is never substituted
+        silently**: `?source=` pins an exact source and then fails rather than
+        falling back.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Game'
+        - $ref: '#/components/parameters/Resource'
+        - name: source
+          in: query
+          required: false
+          description: |
+            Pin the answering source. Omit to let Re0Auth arbitrate. A pinned
+            source that is retired, unavailable or unbound produces an error —
+            it is never quietly swapped for another.
+          schema: { type: string }
+      responses:
+        '200':
+          description: |
+            The source's own payload, passed through untouched. Its schema belongs
+            to the source (`schema` in the sources list), not to this document.
+          headers:
+            Re0Auth-Source:
+              description: The source that answered.
+              schema: { type: string }
+            Re0Auth-Degraded:
+              description: |
+                `true` when the preferred source was unavailable and a degraded
+                one answered instead. Absent otherwise.
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema: {}
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: The token does not carry the resource's scope.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown game, source or resource.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: |
+            The player has not bound this source. `game`, `source` and `bind_url`
+            are set, so a client can send them straight to the binding flow.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410':
+          description: The source was retired.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502':
+          description: The source could not be reached.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: |
+            The source answered with an error of its own. Re0Auth does not
+            translate the source's status, so treat this as "upstream said no".
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/games/{game}/sources/{source}/raw/{path}:
+    get:
+      operationId: getGameResourceRaw
+      tags: [federation]
+      summary: Proxy a source's native API verbatim.
+      description: |
+        An escape hatch for a client that needs the upstream's own dialect — the
+        source's own field names, pagination and errors. The status code, content
+        type and body all come from the source unchanged; Re0Auth only adds which
+        source answered.
+
+        It is **not** a way to get a credential. The token stays in the source's
+        vault, and the binding that authorizes this call can be revoked without
+        the client's cooperation.
+
+        A consequence worth knowing before you register a source: because the body
+        is not parsed, a source whose own API returns credentials would have them
+        forwarded. Re0Auth cannot detect that, so it belongs in the review of the
+        source itself.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Game'
+        - name: source
+          in: path
+          required: true
+          schema: { type: string }
+        - name: path
+          in: path
+          required: true
+          description: The remainder of the source path, forwarded as-is.
+          schema: { type: string }
+        - name: query
+          in: query
+          required: false
+          description: |
+            Query parameters are forwarded to the source unchanged, so their names
+            come from the source's own API rather than from this document.
+          schema:
+            type: object
+            additionalProperties:
+              type: string
+          style: form
+          explode: true
+      responses:
+        '200':
+          description: |
+            The source's response, with its own status, content type and body.
+          headers:
+            Re0Auth-Source:
+              description: The source that answered.
+              schema: { type: string }
+          content:
+            '*/*':
+              schema: {}
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: |
+            The token grants none of this source's resource scopes. The raw proxy
+            is gated coarsely by those until a dedicated scope exists.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown game or source, or the source has no native API.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: The player has not bound this source.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410':
+          description: The source was retired.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '502':
+          description: The source could not be reached.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: The source answered with an error of its own.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An opaque access token. It is not a JWT and cannot be introspected by the
+        client — verify it with `POST /oauth/introspect` (RFC 7662).
+
+        DPoP is deliberately not supported in v1, and the authorization server
+        metadata does not advertise it: advertising a proof-of-possession scheme
+        while issuing plain bearer tokens would be a silent downgrade, which is
+        worse than not offering it.
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-r0semi_session
+      description: |
+        The browser session, `HttpOnly` and `SameSite=Lax`. Named
+        `__Host-r0semi_session` on an https deployment and `r0semi_session` on
+        plain-HTTP local development. Those operations also require
+        `X-CSRF-Token`, which is why this scheme alone is never sufficient for a
+        write.
+
+  parameters:
+    CSRFToken:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      description: |
+        The token from `GET /v1/sessions/current`. It is bound to the session, so
+        a cross-site request cannot produce one. Compared in constant time.
+      schema: { type: string }
+    AuthorizationRequestID:
+      name: id
+      in: path
+      required: true
+      description: |
+        The opaque consent handle issued by `/oauth/authorize`. Single-use, short
+        lived, and bound to the browser session that created it.
+      schema: { type: string }
+      example: ar_9f2c1d
+    Game:
+      name: game
+      in: path
+      required: true
+      description: The game namespace, e.g. `phigros`.
+      schema: { type: string }
+      example: phigros
+    Resource:
+      name: resource
+      in: path
+      required: true
+      description: |
+        A resource name from the source's `resources` list. `sources` is reserved
+        by the router and cannot be used as a resource name.
+      schema: { type: string }
+      example: b30
+
+  responses:
+    Unauthenticated:
+      description: |
+        No usable credential. `unauthenticated` when none was presented, or
+        `invalid_token` when the bearer token is unknown, revoked or expired.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: |
+        The caller exceeded its per-address budget. The limiter sits in front of
+        everything else, so this can appear on any operation.
+      headers:
+        Retry-After:
+          description: Whole seconds to wait before retrying.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    InternalError:
+      description: |
+        An unexpected server-side failure. Quote `request_id` in a bug report: it
+        is echoed on every response, including ones no handler produced.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      title: Problem
+      description: |
+        RFC 9457 Problem Details. Business plane only — the protocol plane answers
+        with `{error, error_description}` instead, and the two are never mixed.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: |
+            A documentation URL derived from `code`, of the form
+            `https://r0semi.dev/errors/<code>`.
+        title:
+          type: string
+          description: A short human-readable summary. Stable per `code`; do not parse.
+        status:
+          type: integer
+          description: The HTTP status, repeated for convenience.
+        detail:
+          type: string
+          description: A human-readable explanation of this occurrence.
+        instance:
+          type: string
+          description: The request path.
+        code:
+          type: string
+          description: |
+            The stable, machine-readable identifier for this error. Branch on
+            this, never on `title` or `status`.
+          enum:
+            - cascade_unsupported
+            - explicit_consent_required
+            - internal_error
+            - invalid_request
+            - invalid_token
+            - last_identity
+            - not_found
+            - rate_limited
+            - scope_not_granted
+            - source_not_bound
+            - source_retired
+            - source_unavailable
+            - unauthenticated
+            - upstream_unavailable
+        request_id:
+          type: string
+          description: |
+            Matches the `X-Request-Id` response header. Present whenever the
+            request reached the server.
+        required_scope:
+          type: string
+          description: The scope that would have been needed. Set with `scope_not_granted`.
+        game:
+          type: string
+          description: Set with `source_not_bound`.
+        source:
+          type: string
+          description: Set with `source_not_bound`.
+        bind_url:
+          type: string
+          format: uri
+          description: |
+            Where to send the player to bind the source. Set with
+            `source_not_bound`.
+
+    Me:
+      type: object
+      required: [id, client_id, scopes]
+      properties:
+        id:
+          type: string
+          description: |
+            The downstream account id (`usr_…`). Re0Auth's own identifier — it is
+            not a TapTap id, an openid, or anything the client could correlate.
+          examples: [usr_01H8]
+        client_id:
+          type: string
+          description: The client this token was issued to.
+        scopes:
+          type: array
+          items: { type: string }
+          description: The scopes the token actually carries.
+
+    IDPProvider:
+      type: object
+      required: [id, start_url]
+      description: |
+        One configured identity provider. The human-facing label is deliberately
+        absent: "GitHub" is a translation decision, and a service that returns
+        English strings for its own UI cannot be localised later without changing
+        its API.
+      properties:
+        id:
+          type: string
+          description: The provider identifier, as it appears in the login URLs.
+          enum: [github, google, discord, microsoft, qq]
+        start_url:
+          type: string
+          format: uri
+          description: |
+            Where to navigate the browser to begin signing in. Not an API call:
+            the browser leaves, visits the provider, and returns to the app with
+            a session.
+
+    Binding:
+      type: object
+      required: [game, source, display_name, has_refresh, bindable, configured]
+      description: |
+        One data source connected to one account. Holds no credential: the token
+        lives in Re0Auth's vault, and this is the metadata about it.
+      properties:
+        game: { type: string }
+        source: { type: string }
+        display_name:
+          type: string
+          description: |
+            The name this deployment gave the source. Attested by the server, not
+            by the source, so it cannot rename itself here.
+        token_class:
+          type: string
+          description: |
+            `revocable` or `long_lived`, as the source declared it. `long_lived`
+            is why disconnecting may leave a live login at the source.
+          enum: [revocable, long_lived]
+        status:
+          type: string
+          description: The source's lifecycle state.
+          enum: [active, degraded, retired]
+        has_refresh:
+          type: boolean
+          description: Whether the token can be renewed without asking the user again.
+        expiry:
+          type: string
+          format: date-time
+          description: When the current token lapses, when it has one.
+        bindable:
+          type: boolean
+          description: False for a retired source, which will not be offered again.
+        cascade_revocation:
+          type: boolean
+          description: |
+            Whether this deployment has been told the source can end a whole
+            upstream session. It decides whether the UI offers "sign out
+            everywhere", so a source that cannot do it gets no button rather than
+            a button that fails.
+        configured:
+          type: boolean
+          description: |
+            False when the binding outlived the source's entry in this
+            deployment's configuration. The connection still exists and can still
+            be removed; nothing describes it any more.
+
+    CascadeRevocation:
+      type: object
+      required: [acknowledge]
+      properties:
+        acknowledge:
+          type: string
+          description: |
+            Must be exactly `signs_out_all_devices`. It names the consequence, so
+            the request cannot be made without stating it.
+          enum: [signs_out_all_devices]
+
+    UnbindResult:
+      type: object
+      required: [upstream]
+      properties:
+        upstream:
+          type: string
+          description: |
+            What the source did with the token it issued. The local binding is
+            gone either way.
+          enum: [done, unsupported, unavailable, nothing]
+        upstream_error:
+          type: string
+          description: Diagnostic detail, present only when `upstream` is `unavailable`.
+
+    Grant:
+      type: object
+      required: [client_id, client_name, scopes, has_refresh, issued_at, expires_at]
+      description: |
+        One application's live access to one account.
+      properties:
+        client_id: { type: string }
+        client_name:
+          type: string
+          description: |
+            The name Re0Auth registered for this client, attested by the server
+            rather than supplied by the client.
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/ScopeView' }
+          description: The union of the scopes its live tokens carry.
+        has_refresh:
+          type: boolean
+          description: |
+            Whether the client can obtain new tokens without asking the user
+            again. False means this access lapses on its own at `expires_at`.
+        issued_at: { type: string, format: date-time }
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            When the furthest-out token lapses — that is, when this access ends
+            without anyone doing anything.
+
+    Identity:
+      type: object
+      required: [id, provider, display_name, linked_at]
+      description: |
+        An external account linked to this Re0Auth account. Re0Auth never issues
+        its own passwords, so every account is built from these.
+      properties:
+        id: { type: string }
+        provider:
+          type: string
+          description: Which identity provider this is.
+          enum: [github, google, discord, microsoft, qq]
+        display_name: { type: string }
+        email: { type: string }
+        avatar_url: { type: string, format: uri }
+        linked_at: { type: string, format: date-time }
+
+    Session:
+      type: object
+      required: [user_id, primary_identity_id, csrf_token, identities]
+      properties:
+        user_id: { type: string }
+        primary_identity_id:
+          type: string
+          description: The identity that created the account.
+        csrf_token:
+          type: string
+          description: |
+            Echo this in `X-CSRF-Token` on every write in this document's
+            `session`, `authorization` and `device` groups.
+        identities:
+          type: array
+          items: { $ref: '#/components/schemas/Identity' }
+
+    ScopeView:
+      type: object
+      required: [scope, title, description, risk, explicit_consent]
+      description: |
+        One scope as the consent screen should present it. `title` and
+        `description` are the catalogue's wording, not the client's: a client
+        cannot supply text, a logo or a colour to this screen, so it cannot
+        impersonate another.
+      properties:
+        scope:
+          type: string
+          description: The scope name, e.g. `phigros.b30.read`.
+        title: { type: string }
+        description: { type: string }
+        risk:
+          type: string
+          description: |
+            How much a mistake costs. `critical` exists so a catalogue entry can
+            say so; the built-in catalogue currently has none.
+          enum: [low, medium, high, critical]
+        explicit_consent:
+          type: boolean
+          description: |
+            When true, this scope must be listed in `explicit` as well as
+            `scopes` for an approval to succeed.
+
+    ClientRef:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name:
+          type: string
+          description: |
+            The name Re0Auth registered for this client. Attested by the server,
+            which is why the consent screen can show it.
+
+    AuthorizationRequest:
+      type: object
+      required: [id, client, scopes, csrf_token]
+      properties:
+        id: { type: string, description: The handle, same as the path parameter. }
+        client: { $ref: '#/components/schemas/ClientRef' }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/ScopeView' }
+        missing_bindings:
+          type: array
+          description: |
+            Data sources this account must connect before the requested scopes can
+            actually be served. Empty when nothing is missing, or when this
+            deployment has no federation configured.
+
+            It is advisory: the consent screen uses it to send the player through
+            the binding flow, while approval and every data read still enforce the
+            real rules server-side. `bind_url` is built by the server and returns
+            to this consent screen, so the frontend navigates to it verbatim.
+          items: { $ref: '#/components/schemas/BindingRequirement' }
+        csrf_token: { type: string }
+
+    BindingRequirement:
+      type: object
+      required: [game, source, display_name, scopes, bind_url]
+      properties:
+        game: { type: string }
+        source: { type: string }
+        display_name:
+          type: string
+          description: |
+            The name this deployment gave the source, not the source's own claim.
+        scopes:
+          type: array
+          items: { type: string }
+          description: The requested scopes this one source would make servable.
+        bind_url:
+          type: string
+          format: uri
+          description: |
+            Where to send the player to connect the source. It returns to the
+            pending consent screen, so the request survives the round trip.
+
+    AuthorizationDecision:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [approve, deny]
+          description: Anything else is `400 invalid_request`.
+        scopes:
+          type: array
+          items: { type: string }
+          description: |
+            The subset being granted. Omit to grant exactly what was requested.
+            It may only narrow the request; a scope that was not requested is
+            rejected.
+        explicit:
+          type: array
+          items: { type: string }
+          description: |
+            Scopes the user approved individually. Required for any
+            `explicit_consent` scope in `scopes`.
+
+    RedirectResult:
+      type: object
+      required: [redirect_to]
+      description: |
+        The URL the browser must be sent to. Navigate to it verbatim: it already
+        carries `code` and `state`, and it was validated server-side against the
+        client's registered redirect URIs.
+      properties:
+        redirect_to: { type: string, format: uri }
+
+    DeviceVerification:
+      description: |
+        Discriminated on `state`. `awaiting_code` prompts for a code;
+        `pending` binds the resolved code to this session and shows what is being
+        approved.
+      oneOf:
+        - $ref: '#/components/schemas/DeviceAwaitingCode'
+        - $ref: '#/components/schemas/DevicePending'
+      discriminator:
+        propertyName: state
+        mapping:
+          awaiting_code: '#/components/schemas/DeviceAwaitingCode'
+          pending: '#/components/schemas/DevicePending'
+
+    DeviceAwaitingCode:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, const: awaiting_code }
+
+    DevicePending:
+      type: object
+      required: [state, user_code, client, scopes, expires_at, csrf_token]
+      properties:
+        state: { type: string, const: pending }
+        user_code:
+          type: string
+          description: Normalized for display, e.g. `WDJB-MJHT`.
+        client: { $ref: '#/components/schemas/ClientRef' }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/ScopeView' }
+        expires_at:
+          type: string
+          format: date-time
+          description: When the code stops being approvable.
+        csrf_token: { type: string }
+
+    DeviceDecision:
+      type: object
+      required: [user_code, decision]
+      properties:
+        user_code:
+          type: string
+          description: Must be one this session loaded through `GET /v1/device/verification`.
+        decision:
+          type: string
+          enum: [approve, deny]
+        scopes:
+          type: array
+          items: { type: string }
+        explicit:
+          type: array
+          items: { type: string }
+
+    DeviceDecisionResult:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          description: What was recorded. The device learns it by polling the token endpoint.
+          enum: [approved, denied]
+
+    GameSources:
+      type: object
+      required: [game, data]
+      properties:
+        game: { type: string }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/FederationSource' }
+
+    FederationSource:
+      type: object
+      required: [game, source, display_name, token_class, status, raw, resources]
+      properties:
+        game:
+          type: string
+          description: |
+            The game this source serves. Repeated on each entry so an entry is
+            self-describing, which is what lets one shape serve both listings.
+        source:
+          type: string
+          description: The source's name, used in `?source=` and in raw paths.
+        display_name: { type: string }
+        token_class:
+          type: string
+          description: |
+            `revocable` — the source issues scoped, revocable tokens.
+            `long_lived` — a master-equivalent credential the source cannot revoke
+            per client. Declared by the source operator, not inferred.
+          enum: [revocable, long_lived]
+        status:
+          type: string
+          description: |
+            `active` is preferred. `degraded` is chosen only when no active source
+            can serve the request, and the response then carries
+            `Re0Auth-Degraded: true`. `retired` is never selected automatically.
+          enum: [active, degraded, retired]
+        raw:
+          type: boolean
+          description: Whether the raw proxy is available for this source.
+        resources:
+          type: array
+          items: { $ref: '#/components/schemas/FederationResource' }
+
+    FederationResource:
+      type: object
+      required: [name, schema, scope]
+      properties:
+        name:
+          type: string
+          description: The `{resource}` path segment.
+        schema:
+          type: string
+          description: |
+            The payload's schema identifier, e.g. `re0auth.phigros.scores/1`. It
+            names the shape the source promises; this document does not restate it.
+          examples: [re0auth.phigros.scores/1]
+        scope:
+          type: string
+          description: The scope that grants access to this resource.

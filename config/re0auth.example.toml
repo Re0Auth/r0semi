@@ -1,0 +1,130 @@
+# Re0Auth server configuration.
+#
+# Copy to config/re0auth.toml (which is gitignored) and edit.
+#
+# Two rules shape this file:
+#
+#   1. SECRETS ARE NOT WRITTEN HERE. Wherever a secret is needed, the file names
+#      the environment variable that holds it (`*_env`). That keeps "where does
+#      this key come from" auditable, and means a committed config cannot leak a
+#      credential.
+#   2. EVERY FIELD HAS A DEFAULT. Write only what differs from it.
+#
+# Precedence is: environment > this file > built-in default.
+
+[server]
+# Public base URL. Must be absolute; it is the OAuth issuer and appears in every
+# discovery document. Redirect URIs registered with your identity providers and
+# data sources must point here.
+issuer = "https://re0auth.example"
+addr   = "0.0.0.0:8080"
+# Set true whenever the issuer is https. Leave false only for local plain-HTTP
+# development.
+cookie_secure = true
+
+# A per-client-address limit, for load shedding rather than quota enforcement.
+# "Address" is the peer address only, so everyone behind one NAT shares a bucket;
+# 0 disables the limiter, which is the right answer for a deployment that already
+# has one in front of it. rate_limit_burst is how many may arrive at once.
+rate_limit       = 50
+rate_limit_burst = 100
+
+[storage]
+# "postgres" or "memory". Omit the whole section to use memory (nothing survives
+# a restart; the server says so at startup).
+driver = "postgres"
+# The variable holding the connection string, never the DSN itself.
+dsn_env = "DATABASE_URL"
+
+[vault]
+# The variable holding the 32-byte key encryption key, base64 or hex:
+#   export RE0AUTH_KEK=$(head -c 32 /dev/urandom | base64)
+#
+# What this protects, and what it does not, plainly: a dump of the database alone
+# cannot be decrypted, because the key is not in it. A leak of this variable, or a
+# compromise of the process, exposes every credential this key wrapped. A
+# KMS-backed wrapper would take the key out of the process and make each unwrap
+# auditable and revocable, but it would NOT stop a compromised process from
+# decrypting. See docs/threat-model.md §6.0.
+kek_env = "RE0AUTH_KEK"
+# Labels the key inside stored records. **Change this whenever the key material
+# changes.** It is how a record says which key wrapped it, and reusing the id with
+# new material leaves every existing credential unreadable — the server refuses to
+# start a rotation rather than let that pass quietly.
+kek_id = "kek-1"
+
+# Rotating the key, in three steps:
+#   1. generate the new key, put it in RE0AUTH_KEK, and bump kek_id (say "kek-2");
+#   2. declare the old key below, under the id it had while it was current;
+#   3. run:    re0auth -rotate-keys -config config/re0auth.toml
+#      then remove the block below and restart. The old key is no longer needed.
+#
+# Rotation re-wraps each record's DEK under the new key. It does not decrypt or
+# rewrite payloads, so it is cheap and safe to run again. It cannot undo a leak:
+# if the old key and a copy of the database escaped together, those credentials
+# are compromised and have to be re-enrolled at the source. What rotation does is
+# stop that leak from applying to anything written afterwards.
+#
+# [[vault.retired]]
+# kek_id  = "kek-1"
+# kek_env = "RE0AUTH_KEK_OLD"
+
+[client]
+# The first-party downstream client, seeded on startup if absent.
+id   = "cli"
+name = "First-party client"
+# Omit secret_env for a public client (desktop, CLI, SPA); set it for a
+# confidential one.
+# secret_env = "RE0AUTH_CLIENT_SECRET"
+redirect_uris = ["https://app.example/callback"]
+scopes        = ["account.id", "phigros.profile.read"]
+
+# Identity providers. Only the ones listed here are offered, so a deployment
+# exposes exactly what it configured. Known names: github, google, discord,
+# microsoft, qq.
+#
+# google and microsoft are OIDC: their id_token is verified against the issuer's
+# JWKS, so the issuer must be reachable from this server.
+
+[idp.github]
+client_id         = "Ov23li..."
+client_secret_env = "GITHUB_CLIENT_SECRET"
+
+[idp.google]
+client_id         = "1234.apps.googleusercontent.com"
+client_secret_env = "GOOGLE_CLIENT_SECRET"
+
+# Pointing a provider at a self-hosted or proxied endpoint:
+# [idp.microsoft]
+# client_id         = "..."
+# client_secret_env = "MICROSOFT_CLIENT_SECRET"
+# issuer            = "https://login.microsoftonline.com/<tenant>/v2.0"
+
+# Data sources. Each becomes an OAuth 2.0 client registration for this server:
+# re0auth binds to it per user, and holds the resulting token in the vault.
+#
+# `issuer` must serve /.well-known/re0auth-upstream and be a compliant
+# authorization server (see docs/upstream-protocol.md).
+
+# [[sources]]
+# game         = "phigros"
+# source       = "next-phi"
+# display_name = "Next Phi Backend"
+# issuer       = "https://api.next-phi.example"
+# # "revocable" (scoped, revocable) or "long_lived" (a master key). Declaring it
+# # honestly is what lets Re0Auth describe the source accurately.
+# token_class  = "revocable"
+# # active | degraded | retired
+# status       = "active"
+# raw_base     = "https://api.next-phi.example/v1"
+# # Set this ONLY if the source's discovery document advertises
+# # cascade_revocation_endpoint. Declaring it makes Re0Auth offer "sign out
+# # everywhere" for the source; declaring it wrongly makes that a button that
+# # fails. Omit it and Re0Auth simply does not offer the action.
+# cascade_revocation = "https://api.next-phi.example/oauth/cascade_revocation"
+# client_id    = "re0auth"
+# client_secret_env = "NEXT_PHI_CLIENT_SECRET"
+# resources = [
+#   { name = "profile", schema = "re0auth.phigros.profile/1", scope = "phigros.profile.read" },
+#   { name = "scores",  schema = "re0auth.phigros.scores/1",  scope = "phigros.score.read" },
+# ]

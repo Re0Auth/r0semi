@@ -64,6 +64,9 @@ type FetchResult struct {
 type Service interface {
 	// Sources lists a game's configured sources.
 	Sources(game string) []Source
+	// AllSources lists every configured source, for the page that offers what
+	// could be connected.
+	AllSources() []Source
 	// ResourceScope returns the downstream scope a resource requires.
 	ResourceScope(game, resource string) (string, bool)
 	// Fetch proxies a normalized resource from a bound source.
@@ -74,6 +77,19 @@ type Service interface {
 	BeginBind(ctx context.Context, user account.UserID, game, source, returnTo string) (BindChallenge, error)
 	// CompleteBind finishes a binding and stores it.
 	CompleteBind(ctx context.Context, user account.UserID, state, code string) (Binding, BindFlow, error)
+	// Bindings lists the sources a user has connected.
+	Bindings(ctx context.Context, user account.UserID) ([]Binding, error)
+	// MissingBindings reports which data sources the account must connect before
+	// the requested scopes can actually be served. It is advisory input to the
+	// consent screen; the data plane enforces bindings on every call regardless.
+	MissingBindings(ctx context.Context, user account.UserID, scopes []string) ([]BindingRequirement, error)
+	// Unbind disconnects a source from an account, revoking upstream where the
+	// source can be told to. Its local half always happens.
+	Unbind(ctx context.Context, user account.UserID, game, source string) (RevocationResult, error)
+	// CascadeRevoke ends the subject's whole upstream session at a source, and
+	// then removes the binding. It fails closed: nothing is removed unless the
+	// source confirmed, because the credential is the only means of retrying.
+	CascadeRevoke(ctx context.Context, user account.UserID, game, source string) (RevocationResult, error)
 }
 
 // Config wires the federation service.
@@ -153,6 +169,9 @@ type service struct {
 }
 
 func (s *service) Sources(game string) []Source { return s.registry.Sources(game) }
+
+// AllSources implements Service.
+func (s *service) AllSources() []Source { return s.registry.AllSources() }
 
 func (s *service) ResourceScope(game, resource string) (string, bool) {
 	for _, src := range s.registry.Sources(game) {

@@ -63,8 +63,27 @@ func (db *DB) Tokens() *Tokens { return &Tokens{pool: db.pool} }
 // Devices returns the device-authorization store.
 func (db *DB) Devices() *Devices { return &Devices{pool: db.pool} }
 
+// Vault returns the credential-record repository. Decryption lives in the vault
+// package; this only stores opaque crypto material.
+func (db *DB) Vault() *Vault { return &Vault{pool: db.pool} }
+
+// Bindings returns the source-binding store. It holds metadata only.
+func (db *DB) Bindings() *Bindings { return &Bindings{pool: db.pool} }
+
+// BindFlows returns the pending bind-flow store.
+func (db *DB) BindFlows() *BindFlows { return &BindFlows{pool: db.pool} }
+
+// Sessions returns the HTTP session store.
+func (db *DB) Sessions() *Sessions { return &Sessions{pool: db.pool} }
+
+// Authz returns the pending-authorization-request store.
+func (db *DB) Authz() *Authz { return &Authz{pool: db.pool} }
+
 // Clients returns the downstream-client registry.
 func (db *DB) Clients() *Clients { return &Clients{pool: db.pool} }
+
+// Audit returns the durable audit-log sink.
+func (db *DB) Audit() *AuditLogger { return &AuditLogger{pool: db.pool} }
 
 // Migrate applies every unapplied migration in filename order, each in its own
 // transaction, under an advisory lock so two instances starting at once cannot

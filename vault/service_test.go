@@ -34,7 +34,7 @@ func mustSeal(t *testing.T, w *LocalKeyWrapper, id Identity, secret []byte) Reco
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer zeroize(dek)
+	defer Scrub(dek)
 	wrapped, err := w.Wrap(context.Background(), dek, aad)
 	if err != nil {
 		t.Fatal(err)

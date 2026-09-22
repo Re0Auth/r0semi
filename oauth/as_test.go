@@ -30,6 +30,26 @@ func (c *fakeClock) advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
+// testCriticalScope is a synthetic ExplicitConsent scope.
+//
+// The critical-scope path must not be pinned to a production scope's semantics:
+// the mechanism and the catalog are separate concerns, and the built-in catalog
+// deliberately has no critical scope today.
+const testCriticalScope = Scope("test.critical.read")
+
+// testRegistry is the default catalog plus that synthetic critical scope.
+func testRegistry(t *testing.T) *Registry {
+	t.Helper()
+	registry := DefaultRegistry()
+	if err := registry.Register(Descriptor{
+		Scope: testCriticalScope, Title: "Test critical scope",
+		Risk: RiskCritical, ExplicitConsent: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}
+
 func newTestAS(t *testing.T) (Service, *MemoryClientRegistry, *MemoryStore, *audit.MemoryLogger, *fakeClock) {
 	t.Helper()
 	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
@@ -38,7 +58,7 @@ func newTestAS(t *testing.T) (Service, *MemoryClientRegistry, *MemoryStore, *aud
 	logger := audit.NewMemoryLogger()
 	svc, err := NewService(clients, tokens, logger, Config{
 		Issuer:          "https://auth.test",
-		Scopes:          DefaultRegistry(),
+		Scopes:          testRegistry(t),
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: 24 * time.Hour,
 		CodeTTL:         time.Minute,
@@ -205,14 +225,14 @@ func TestAuthorizeRejectsScopeNotAllowedForClient(t *testing.T) {
 	}
 }
 
-// The dangerous stoken scope must be individually consented to.
+// A scope marked ExplicitConsent must be individually consented to.
 func TestCriticalScopeRequiresExplicitConsent(t *testing.T) {
 	svc, clients, _, _, _ := newTestAS(t)
-	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeTapTapStoken})
+	registerClient(t, clients, "app", ClientPublic, "", []Scope{testCriticalScope})
 	ctx := context.Background()
 	base := AuthorizationRequest{
 		ClientID: "app", RedirectURI: "https://app.example/cb", Subject: "u",
-		Scopes: []Scope{ScopeTapTapStoken}, CodeChallenge: pkceChallenge("v"), CodeChallengeMethod: "S256",
+		Scopes: []Scope{testCriticalScope}, CodeChallenge: pkceChallenge("v"), CodeChallengeMethod: "S256",
 	}
 
 	_, err := svc.Authorize(ctx, base)
@@ -220,7 +240,7 @@ func TestCriticalScopeRequiresExplicitConsent(t *testing.T) {
 		t.Fatalf("without explicit consent: code = %q", got)
 	}
 
-	base.Explicit = []Scope{ScopeTapTapStoken}
+	base.Explicit = []Scope{testCriticalScope}
 	if _, err := svc.Authorize(ctx, base); err != nil {
 		t.Fatalf("with explicit consent: %v", err)
 	}

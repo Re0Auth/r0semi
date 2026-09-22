@@ -59,7 +59,19 @@ type OAuthEndpoints struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
 	RevocationEndpoint    string `json:"revocation_endpoint"`
-	JWKSURI               string `json:"jwks_uri,omitempty"`
+	// CascadeRevocationEndpoint ends the subject's whole upstream session, not
+	// merely the token Re0Auth holds.
+	//
+	// It is a Re0Auth extension: RFC 7009 has no way to ask for this, and the
+	// difference is the point. RFC 7009 forgets a token; this signs the person out
+	// of the account that token came from — including the device in their hand.
+	//
+	// It is **omitted when the source cannot do it**, which is what lets Re0Auth
+	// offer "sign out everywhere" only where it is real. Advertising it without
+	// implementing it would be the same class of lie as advertising DPoP while
+	// issuing plain bearer tokens.
+	CascadeRevocationEndpoint string `json:"cascade_revocation_endpoint,omitempty"`
+	JWKSURI                   string `json:"jwks_uri,omitempty"`
 }
 
 // Discovery is the /.well-known/re0auth-upstream document.

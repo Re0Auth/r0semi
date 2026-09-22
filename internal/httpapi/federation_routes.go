@@ -4,10 +4,10 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/safeurl"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -18,12 +18,50 @@ type federationResourceView struct {
 }
 
 type federationSourceView struct {
+	// Game is repeated on each entry so a source is self-describing. That is what
+	// lets the same shape serve both the per-game listing and the deployment-wide
+	// one.
+	Game        string                   `json:"game"`
 	Source      string                   `json:"source"`
 	DisplayName string                   `json:"display_name"`
 	TokenClass  string                   `json:"token_class"`
 	Status      string                   `json:"status"`
 	Raw         bool                     `json:"raw"`
 	Resources   []federationResourceView `json:"resources"`
+}
+
+// sourceView is the one place a source is turned into its public shape, so the
+// per-game and deployment-wide listings cannot drift apart.
+func sourceView(src federation.Source) federationSourceView {
+	resources := make([]federationResourceView, 0, len(src.Resources))
+	for _, res := range src.Resources {
+		resources = append(resources, federationResourceView{Name: res.Name, Schema: res.Schema, Scope: res.Scope})
+	}
+	return federationSourceView{
+		Game:        src.Game,
+		Source:      src.Name,
+		DisplayName: src.DisplayName,
+		TokenClass:  src.TokenClass,
+		Status:      string(src.Status),
+		Raw:         src.RawBase != "",
+		Resources:   resources,
+	}
+}
+
+// handleAllSources lists every source this deployment offers, across games.
+//
+// It is what lets the account page offer something to connect to. Without it, a
+// page whose job is connecting sources can only show the ones already connected,
+// which is a dead end for exactly the people who need it.
+//
+// Public, like the per-game listing: none of this is user data.
+func (s *Server) handleAllSources(w http.ResponseWriter, _ *http.Request) {
+	sources := s.federate.AllSources()
+	views := make([]federationSourceView, 0, len(sources))
+	for _, src := range sources {
+		views = append(views, sourceView(src))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": views})
 }
 
 // handleGameSources is public discovery: which sources serve a game and what
@@ -34,18 +72,7 @@ func (s *Server) handleGameSources(w http.ResponseWriter, r *http.Request) {
 
 	views := make([]federationSourceView, 0, len(sources))
 	for _, src := range sources {
-		resources := make([]federationResourceView, 0, len(src.Resources))
-		for _, res := range src.Resources {
-			resources = append(resources, federationResourceView{Name: res.Name, Schema: res.Schema, Scope: res.Scope})
-		}
-		views = append(views, federationSourceView{
-			Source:      src.Name,
-			DisplayName: src.DisplayName,
-			TokenClass:  src.TokenClass,
-			Status:      string(src.Status),
-			Raw:         src.RawBase != "",
-			Resources:   resources,
-		})
+		views = append(views, sourceView(src))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"game": game, "data": views})
 }
@@ -208,7 +235,7 @@ func (s *Server) handleBindStart(w http.ResponseWriter, r *http.Request) {
 	}
 	challenge, err := s.federate.BeginBind(r.Context(), user,
 		r.URL.Query().Get("game"), r.URL.Query().Get("source"),
-		sanitizeReturnTo(r.URL.Query().Get("return_to")))
+		safeurl.RelativePath(r.URL.Query().Get("return_to")))
 	if err != nil {
 		s.writeFederationError(w, r, err)
 		return
@@ -238,20 +265,12 @@ func (s *Server) handleBindCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, flow, err := s.federate.CompleteBind(r.Context(), user, state, code)
-	returnTo := sanitizeReturnTo(flow.ReturnTo)
+	returnTo := safeurl.RelativePath(flow.ReturnTo)
 	if err != nil {
 		redirectWithError(w, r, returnTo, "bind_failed")
 		return
 	}
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
-}
-
-// sanitizeReturnTo only allows same-origin relative paths.
-func sanitizeReturnTo(v string) string {
-	if v == "" || !strings.HasPrefix(v, "/") || strings.HasPrefix(v, "//") || strings.Contains(v, "\\") {
-		return "/"
-	}
-	return v
 }
 
 func redirectWithError(w http.ResponseWriter, r *http.Request, returnTo, code string) {

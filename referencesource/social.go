@@ -9,6 +9,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
+	"github.com/Re0Auth/r0semi/vault"
 )
 
 // SocialConfig tunes the source's OAuth social login.
@@ -160,7 +161,7 @@ func (l *SocialLogin) handleCallback(w http.ResponseWriter, r *http.Request, est
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal_error"})
 		return
 	}
-	defer zeroize(credential)
+	defer vault.Scrub(credential)
 
 	subject := string(identity.Provider) + ":" + identity.Subject
 	if err := establish(r.Context(), Principal{

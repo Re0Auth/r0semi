@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/Re0Auth/r0semi/oauth"
@@ -53,8 +52,40 @@ type Hooks struct {
 	Consent ConsentFunc
 	// Account resolves a subject for the account.read scope.
 	Account func(ctx context.Context, subject string) (AccountInfo, error)
+	// CascadeRevoke, when set, ends the subject's whole upstream session.
+	//
+	// Setting it is what makes the source advertise the capability; leaving it nil
+	// is what makes the source honest about not having it. It is the loudest thing
+	// a source can do — it signs the person out of every device, including the one
+	// in their hand — so implement it only where the upstream really allows it, and
+	// discard any replacement credential the upstream hands back.
+	CascadeRevoke func(ctx context.Context, req CascadeRevocationRequest) error
 	// Resources maps a declared resource name to its handler.
 	Resources map[string]ResourceHandler
+}
+
+// cascadeRevocationPath is where the kit serves cascade revocation. Derived
+// rather than configured, so the discovery document and the route cannot disagree.
+const cascadeRevocationPath = "/oauth/cascade_revocation"
+
+// CascadeRevocationRequest asks a source to end the upstream session behind a
+// token it issued.
+//
+// **The token is not what is being revoked.** It identifies whose session this is;
+// the effect lands on the account the token came from. That distinction is why
+// this is not RFC 7009 with a flag: forgetting a token leaves the login standing.
+type CascadeRevocationRequest struct {
+	ClientID     string
+	ClientSecret string
+	// Token is the token Re0Auth holds for this binding — the refresh token when
+	// there is one, because that identifies the durable authorization rather than
+	// an hour of it. The source resolves the subject from it, and MAY consume it:
+	// the binding is removed either way.
+	Token string
+	// TokenTypeHint is "refresh_token" or "access_token", as in RFC 7009. It is a
+	// hint, and a source that refuses because the caller guessed wrong is a source
+	// that will be blamed for it.
+	TokenTypeHint string
 }
 
 // Server mounts the Re0Auth upstream protocol.
@@ -80,6 +111,14 @@ func New(cfg Config, hooks Hooks) (*Server, error) {
 	case hooks.Account == nil:
 		return nil, errors.New("upstreamkit: Hooks.Account is required")
 	}
+	// The hook is the only truth about this capability, so the document is
+	// corrected to match the code rather than the other way round: a source that
+	// sets no hook does not advertise it, whatever its config said.
+	if hooks.CascadeRevoke == nil {
+		discovery.OAuth.CascadeRevocationEndpoint = ""
+	} else {
+		discovery.OAuth.CascadeRevocationEndpoint = discovery.OAuth.Issuer + cascadeRevocationPath
+	}
 	byName := make(map[string]Resource, len(discovery.Resources))
 	for _, res := range discovery.Resources {
 		if _, ok := hooks.Resources[res.Name]; !ok {
@@ -101,9 +140,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /oauth/authorize", s.handleAuthorize)
 	mux.HandleFunc("POST /oauth/token", s.handleToken)
 	mux.HandleFunc("POST /oauth/revoke", s.handleRevoke)
+	mux.HandleFunc("POST "+cascadeRevocationPath, s.handleCascadeRevocation)
 	mux.HandleFunc("GET /account", s.handleAccount)
 	mux.HandleFunc("GET /resources/{name}", s.handleResource)
-	return mux
+	return s.withBodyLimit(mux)
+}
+
+// withBodyLimit caps request bodies at the same size Re0Auth does, and answers in
+// the shape this server speaks.
+//
+// A source is an OAuth authorization server first, so an oversized request to any
+// of its endpoints gets an OAuth error. The alternative — a bare 413 with no body
+// — would be the one response a client could not parse with the same code it uses
+// for everything else here.
+func (s *Server) withBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := oauth.LimitFormBody(w, r); err != nil {
+			writeOAuthError(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
@@ -171,7 +228,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, buildRedirect(resp.RedirectURI, map[string]string{
+	http.Redirect(w, r, oauth.BuildRedirect(resp.RedirectURI, map[string]string{
 		"code": resp.Code, "state": resp.State,
 	}), http.StatusFound)
 }
@@ -181,7 +238,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
 		return
 	}
-	clientID, clientSecret := clientCredentials(r)
+	clientID, clientSecret := oauth.ClientCredentials(r)
 
 	switch r.PostFormValue("grant_type") {
 	case "authorization_code":
@@ -237,11 +294,39 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
 		return
 	}
-	clientID, clientSecret := clientCredentials(r)
+	clientID, clientSecret := oauth.ClientCredentials(r)
 	err := s.hooks.OAuth.Revoke(r.Context(), oauth.RevokeRequest{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		Token:        r.PostFormValue("token"),
+	})
+	if err != nil {
+		writeProtocolError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleCascadeRevocation asks the source to end the upstream session.
+//
+// It answers 404 when no hook is configured, so that "advertised" and
+// "implemented" stay the same statement. A caller should never reach that branch:
+// the endpoint is absent from discovery too.
+func (s *Server) handleCascadeRevocation(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
+		return
+	}
+	if s.hooks.CascadeRevoke == nil {
+		writeOAuthError(w, r, http.StatusNotFound, "invalid_request", "this source does not support cascade revocation")
+		return
+	}
+	clientID, clientSecret := oauth.ClientCredentials(r)
+	err := s.hooks.CascadeRevoke(r.Context(), CascadeRevocationRequest{
+		ClientID:      clientID,
+		ClientSecret:  clientSecret,
+		Token:         r.PostFormValue("token"),
+		TokenTypeHint: r.PostFormValue("token_type_hint"),
 	})
 	if err != nil {
 		writeProtocolError(w, r, err)
@@ -326,13 +411,6 @@ func hasScope(scopes []oauth.Scope, want string) bool {
 	return false
 }
 
-func clientCredentials(r *http.Request) (id, secret string) {
-	if u, p, ok := r.BasicAuth(); ok {
-		return u, p
-	}
-	return r.PostFormValue("client_id"), r.PostFormValue("client_secret")
-}
-
 func parseScopes(s string) []oauth.Scope {
 	if s == "" {
 		return nil
@@ -352,21 +430,6 @@ func bearerToken(r *http.Request) string {
 		return strings.TrimSpace(h[len(prefix):])
 	}
 	return ""
-}
-
-func buildRedirect(redirectURI string, params map[string]string) string {
-	u, err := url.Parse(redirectURI)
-	if err != nil {
-		return redirectURI
-	}
-	q := u.Query()
-	for k, v := range params {
-		if v != "" {
-			q.Set(k, v)
-		}
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

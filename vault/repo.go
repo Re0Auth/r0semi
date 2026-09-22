@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -74,6 +75,13 @@ type Repo interface {
 	Put(ctx context.Context, rec Record) error
 	Get(ctx context.Context, id Identity) (Record, error)
 	Delete(ctx context.Context, id Identity) error
+	// List returns every record, ordered by identity.
+	//
+	// It exists for one caller: key rotation, which has to visit everything. No
+	// read path enumerates credentials, and adding one would be a bigger change to
+	// the privacy story than it looks — the set of records is itself the "who holds
+	// credentials for what" question that Identity is already documented as leaking.
+	List(ctx context.Context) ([]Record, error)
 }
 
 // MemoryRepo is a non-durable Repo for development and tests.
@@ -115,6 +123,24 @@ func (r *MemoryRepo) Delete(_ context.Context, id Identity) error {
 	}
 	delete(r.records, id)
 	return nil
+}
+
+// List implements Repo, ordered by identity so two runs agree.
+func (r *MemoryRepo) List(_ context.Context) ([]Record, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	ids := make([]Identity, 0, len(r.records))
+	for id := range r.records {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+
+	out := make([]Record, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, cloneRecord(r.records[id]))
+	}
+	return out, nil
 }
 
 func cloneRecord(rec Record) Record {

@@ -109,6 +109,13 @@ type Service interface {
 	DecideDeviceAuthorization(ctx context.Context, userCode, subject string, approve bool, scopes, explicit []Scope) error
 	Refresh(ctx context.Context, req RefreshRequest) (TokenResponse, error)
 	Revoke(ctx context.Context, req RevokeRequest) error
+	// Grants lists what each client can still do as this subject, derived from
+	// the tokens that are still live.
+	Grants(ctx context.Context, subject string) ([]Grant, error)
+	// RevokeGrant removes every token a client holds for a subject. It is the
+	// local revocation: no binding is touched and no upstream credential changes,
+	// so the user's other clients and devices are unaffected.
+	RevokeGrant(ctx context.Context, subject, clientID string) error
 	Introspect(ctx context.Context, accessToken string) (TokenInfo, error)
 	// AuthenticateClient checks client credentials. It is used by endpoints
 	// that require a registered client but carry no grant, such as RFC 7662
@@ -135,6 +142,13 @@ type Config struct {
 	DeviceCodeTTL time.Duration
 	// DevicePollInterval defaults to five seconds.
 	DevicePollInterval time.Duration
+	// VerificationPath is the human-facing page that shows a device-flow user
+	// code, e.g. "/app/device". Defaults to "/device".
+	//
+	// It must be a page a person can use. RFC 8628 hands this URI to the user's
+	// browser, so pointing it at a JSON API leaves them staring at a raw object.
+	// The origin comes from Issuer; only the path is set here.
+	VerificationPath string
 	// Now supplies the current time; tests inject a fake clock.
 	Now func() time.Time
 }

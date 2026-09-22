@@ -63,6 +63,27 @@ func newFakeUpstream(t *testing.T) *httptest.Server {
 				"access_token": "up-token", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "rt",
 			})
 
+		case "/oauth/revoke":
+			// RFC 7009. A real source has this endpoint, so the fake has it too —
+			// without it every unbind in these tests would report the source as
+			// unreachable and the success path would never be exercised.
+			_ = r.ParseForm()
+			if r.PostForm.Get("token") == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
+		case "/oauth/cascade_revocation":
+			// The upstream-session revocation. Same shape as RFC 7009, different
+			// effect; the fake only has to prove the call arrives.
+			_ = r.ParseForm()
+			if r.PostForm.Get("token") == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+
 		case "/resources/profile":
 			if r.Header.Get("Authorization") != "Bearer up-token" {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -145,7 +166,10 @@ func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *fede
 	registry, err := federation.NewRegistry(federation.Source{
 		Game: "phigros", Name: "fake", DisplayName: "Fake", Issuer: upstream.URL,
 		ClientID: "cid", ClientSecret: "sec", TokenClass: "revocable",
-		Resources: []federation.Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"}},
+		// Declared, as this deployment would declare it after reading the source's
+		// discovery document. The fake source serves the endpoint.
+		CascadeRevocationEndpoint: upstream.URL + "/oauth/cascade_revocation",
+		Resources:                 []federation.Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"}},
 	})
 	if err != nil {
 		t.Fatal(err)

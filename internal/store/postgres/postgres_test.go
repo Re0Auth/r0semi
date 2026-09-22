@@ -1,15 +1,21 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/authz"
+	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/oauth"
+	"github.com/Re0Auth/r0semi/vault"
 )
 
 // openTestDB connects to TEST_DATABASE_URL and resets the tables.
@@ -36,7 +42,9 @@ func openTestDB(t *testing.T) *DB {
 	if _, err := db.pool.Exec(context.Background(), `
 		TRUNCATE accounts_users, accounts_identities, oauth_codes,
 		         oauth_access_tokens, oauth_refresh_tokens,
-		         oauth_device_authorizations, oauth_clients
+		         oauth_device_authorizations, oauth_clients,
+		         vault_credentials, federation_bindings, federation_bind_flows,
+		         sessions, authz_requests, audit_events
 		CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -273,6 +281,102 @@ func TestTokensAccessRoundTrip(t *testing.T) {
 	}
 }
 
+// The grants view enumerates one subject's tokens and groups them by client;
+// revoking deletes one client's rows for one subject. Both are per (subject,
+// client_id) and both must leave every other row alone, which is exactly what a
+// missing WHERE clause would break.
+func TestTokensListAndDeleteBySubject(t *testing.T) {
+	db := openTestDB(t)
+	tokens := db.Tokens()
+	ctx := context.Background()
+	expiry := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+
+	// Namespaced by test name so a shared database cannot make this read another
+	// test's rows.
+	s1 := t.Name() + "-subject-1"
+	s2 := t.Name() + "-subject-2"
+
+	save := func(value, client, subject string, scopes ...oauth.Scope) {
+		t.Helper()
+		if err := tokens.SaveAccess(ctx, value, oauth.AccessToken{
+			ClientID: client, Subject: subject, Scopes: scopes, ExpiresAt: expiry,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save("grants-a1", "c1", s1, "account.id")
+	save("grants-a2", "c1", s1, "phigros.score.read")
+	save("grants-a3", "c2", s1, "account.id")
+	save("grants-a4", "c1", s2, "account.id")
+	if err := tokens.SaveRefresh(ctx, "grants-r1", oauth.RefreshToken{
+		ClientID: "c1", Subject: s1, Scopes: []oauth.Scope{"account.id"}, ExpiresAt: expiry,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := tokens.ListBySubject(ctx, s1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKind := map[oauth.TokenKind]int{}
+	byClient := map[string]int{}
+	for _, r := range records {
+		byKind[r.Kind]++
+		byClient[r.ClientID]++
+		if r.ExpiresAt.IsZero() {
+			t.Errorf("record for %s lost its expiry: %+v", r.ClientID, r)
+		}
+	}
+	if len(records) != 4 || byKind[oauth.TokenKindAccess] != 3 || byKind[oauth.TokenKindRefresh] != 1 {
+		t.Fatalf("records = %+v, want three access and one refresh", records)
+	}
+	if byClient["c1"] != 3 || byClient["c2"] != 1 {
+		t.Fatalf("records grouped wrongly: %+v", byClient)
+	}
+
+	// An unknown subject is empty, not an error: a fresh account has no grants.
+	if empty, err := tokens.ListBySubject(ctx, t.Name()+"-nobody"); err != nil || len(empty) != 0 {
+		t.Fatalf("unknown subject = %+v, %v", empty, err)
+	}
+
+	if err := tokens.DeleteBySubjectClient(ctx, s1, "c1"); err != nil {
+		t.Fatal(err)
+	}
+
+	remaining, err := tokens.ListBySubject(ctx, s1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 || remaining[0].ClientID != "c2" {
+		t.Fatalf("after revoking c1, remaining = %+v", remaining)
+	}
+
+	// The same client acting for another subject is untouched: revoking is per
+	// account as well as per client.
+	elsewhere, err := tokens.ListBySubject(ctx, s2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(elsewhere) != 1 {
+		t.Fatalf("revoking for one subject removed another's rows: %+v", elsewhere)
+	}
+
+	// And the deleted access tokens are really gone, not merely unlisted.
+	for _, value := range []string{"grants-a1", "grants-a2"} {
+		if _, err := tokens.GetAccess(ctx, value); !errors.Is(err, oauth.ErrTokenNotFound) {
+			t.Errorf("%s survived the revocation: %v", value, err)
+		}
+	}
+	if _, err := tokens.ConsumeRefresh(ctx, "grants-r1"); !errors.Is(err, oauth.ErrTokenNotFound) {
+		t.Errorf("the refresh token survived the revocation: %v", err)
+	}
+
+	// Revoking again is a no-op rather than an error.
+	if err := tokens.DeleteBySubjectClient(ctx, s1, "c1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDevicesRoundTripAndUserCodeLookup(t *testing.T) {
 	db := openTestDB(t)
 	devices := db.Devices()
@@ -330,6 +434,542 @@ func TestDevicesRoundTripAndUserCodeLookup(t *testing.T) {
 	}
 }
 
+// List exists for key rotation, which has to visit everything. It must return the
+// crypto material intact and in a stable order, or a rotation would re-wrap some
+// records and skip others between two runs.
+func TestVaultListIsOrderedAndComplete(t *testing.T) {
+	db := openTestDB(t)
+	repo := db.Vault()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	// Namespaced by test name: the database is shared with the other tests.
+	scope := t.Name()
+	for _, subject := range []string{scope + "-b", scope + "-a"} {
+		if err := repo.Put(ctx, vault.Record{
+			Identity:   vault.Identity{Subject: subject, Provider: "taptap"},
+			Version:    1,
+			WrappedDEK: []byte{0xAA, 0xBB},
+			KEKID:      "kek-1",
+			Nonce:      []byte{1, 2, 3, 4},
+			Ciphertext: []byte{0xCC},
+			Meta:       map[string]string{"openid": subject},
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, err := repo.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := make([]vault.Record, 0, 2)
+	for _, rec := range all {
+		if strings.HasPrefix(rec.Identity.Subject, scope) {
+			mine = append(mine, rec)
+		}
+	}
+	if len(mine) != 2 {
+		t.Fatalf("list returned %d of our records, want 2", len(mine))
+	}
+	if mine[0].Identity.Subject != scope+"-a" || mine[1].Identity.Subject != scope+"-b" {
+		t.Fatalf("list is not ordered by subject: %s, %s",
+			mine[0].Identity.Subject, mine[1].Identity.Subject)
+	}
+	got := mine[0]
+	if !bytes.Equal(got.WrappedDEK, []byte{0xAA, 0xBB}) || got.KEKID != "kek-1" ||
+		!bytes.Equal(got.Nonce, []byte{1, 2, 3, 4}) || !bytes.Equal(got.Ciphertext, []byte{0xCC}) {
+		t.Fatalf("list dropped crypto material: %+v", got)
+	}
+	if got.Meta["openid"] != scope+"-a" || !got.CreatedAt.Equal(now) {
+		t.Fatalf("list dropped metadata: %+v", got)
+	}
+}
+
+func TestVaultRepoRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	repo := db.Vault()
+	ctx := context.Background()
+	stamp := time.Now().UTC().Truncate(time.Microsecond)
+
+	rec := vault.Record{
+		Identity:   vault.Identity{Subject: "usr_1", Provider: "phigros.taptap"},
+		Version:    1,
+		WrappedDEK: []byte{1, 2, 3},
+		KEKID:      "kek-1",
+		Nonce:      []byte{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+		Ciphertext: []byte{0xde, 0xad, 0xbe, 0xef},
+		Meta:       map[string]string{"openid": "o-1", "unionid": "u-1"},
+		CreatedAt:  stamp,
+		UpdatedAt:  stamp,
+	}
+	if err := repo.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.Get(ctx, rec.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != rec.Version || got.KEKID != rec.KEKID ||
+		!bytes.Equal(got.WrappedDEK, rec.WrappedDEK) ||
+		!bytes.Equal(got.Nonce, rec.Nonce) ||
+		!bytes.Equal(got.Ciphertext, rec.Ciphertext) {
+		t.Fatalf("record = %+v", got)
+	}
+	if got.Meta["openid"] != "o-1" || got.Meta["unionid"] != "u-1" {
+		t.Fatalf("meta = %v", got.Meta)
+	}
+	if !got.CreatedAt.Equal(stamp) || !got.UpdatedAt.Equal(stamp) {
+		t.Fatalf("timestamps = %v / %v", got.CreatedAt, got.UpdatedAt)
+	}
+}
+
+func TestVaultPutReplacesAndDeleteIsIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	repo := db.Vault()
+	ctx := context.Background()
+	id := vault.Identity{Subject: "usr_1", Provider: "phigros.taptap"}
+
+	if err := repo.Put(ctx, vault.Record{Identity: id, Version: 1, KEKID: "a", Ciphertext: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Put(ctx, vault.Record{Identity: id, Version: 2, KEKID: "b", Ciphertext: []byte{2}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != 2 || got.KEKID != "b" || !bytes.Equal(got.Ciphertext, []byte{2}) {
+		t.Fatalf("the record was not replaced: %+v", got)
+	}
+	if got.Meta == nil {
+		t.Fatal("meta should come back as an empty map, not nil")
+	}
+
+	if err := repo.Delete(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Delete(ctx, id); err != nil {
+		t.Fatalf("delete is not idempotent: %v", err)
+	}
+	if _, err := repo.Get(ctx, id); !errors.Is(err, vault.ErrNotFound) {
+		t.Fatalf("get after delete = %v, want ErrNotFound", err)
+	}
+}
+
+// The whole point of the vault is that a database dump is useless. This drives
+// the real envelope implementation against the real table and then searches the
+// stored row for the plaintext.
+func TestVaultLeavesNoPlaintextAtRest(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	wrapper, err := vault.NewLocalKeyWrapper("test-kek", bytes.Repeat([]byte{0x42}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := vault.NewService(db.Vault(), wrapper, audit.NewMemoryLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const plaintext = "super-secret-session-token"
+	id := vault.Identity{Subject: "usr_1", Provider: "phigros.taptap"}
+	if err := service.Enroll(ctx, id, []byte(plaintext), map[string]string{"openid": "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var dump string
+	if err := db.pool.QueryRow(ctx,
+		`SELECT coalesce(string_agg(t::text, ' '), '') FROM vault_credentials t`).Scan(&dump); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(dump, plaintext) {
+		t.Fatalf("the plaintext secret is readable at rest: %s", dump)
+	}
+	// Guard against a vacuous pass: the metadata is deliberately readable, so if
+	// it is absent the row was not dumped and the assertion above proved nothing.
+	if !strings.Contains(dump, "o-1") {
+		t.Fatal("the dump did not contain the row; the assertion above is vacuous")
+	}
+
+	var got string
+	if err := service.Use(ctx, id, func(secret []byte) error {
+		got = string(secret)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got != plaintext {
+		t.Fatalf("Use returned %q, want the enrolled secret", got)
+	}
+}
+
+func TestBindingsRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	bindings := db.Bindings()
+	ctx := context.Background()
+	expiry := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+
+	if _, err := bindings.Get(ctx, "usr_1", "phigros", "fake"); !errors.Is(err, federation.ErrNotBound) {
+		t.Fatalf("get before bind = %v, want ErrNotBound", err)
+	}
+
+	want := federation.Binding{
+		User: "usr_1", Game: "phigros", Source: "fake",
+		TokenType: "Bearer", Expiry: expiry, HasRefresh: true, Version: 1,
+	}
+	if err := bindings.Put(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bindings.Get(ctx, "usr_1", "phigros", "fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.User != want.User || got.TokenType != want.TokenType || !got.HasRefresh || got.Version != 1 {
+		t.Fatalf("binding = %+v", got)
+	}
+	if !got.Expiry.Equal(expiry) {
+		t.Fatalf("expiry = %v, want %v", got.Expiry, expiry)
+	}
+}
+
+// The bindings view lists one account's connections and must not reach across to
+// another's, nor reorder itself between two loads of the same page.
+func TestBindingsListIsScopedAndOrdered(t *testing.T) {
+	db := openTestDB(t)
+	bindings := db.Bindings()
+	ctx := context.Background()
+
+	// Namespaced by test name so a shared database cannot mix in other rows.
+	scope := t.Name()
+	mine := []federation.Binding{
+		{User: account.UserID(scope), Game: "phigros", Source: "zulu", Version: 1},
+		{User: account.UserID(scope), Game: "phigros", Source: "alpha", Version: 1},
+		{User: account.UserID(scope), Game: "arcaea", Source: "beta", Version: 1},
+		{User: account.UserID("someone-else-" + scope), Game: "phigros", Source: "theirs", Version: 1},
+	}
+	for _, b := range mine {
+		if err := bindings.Put(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := bindings.List(ctx, account.UserID(scope))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("list = %+v, want this account's three", got)
+	}
+	for _, b := range got {
+		if b.User != account.UserID(scope) {
+			t.Errorf("list included another account's row: %+v", b)
+		}
+	}
+	// game then source, decided by the database so the order is stable.
+	want := []string{"arcaea/beta", "phigros/alpha", "phigros/zulu"}
+	for i, b := range got {
+		if key := b.Game + "/" + b.Source; key != want[i] {
+			t.Errorf("row %d = %s, want %s", i, key, want[i])
+		}
+	}
+
+	// An account with nothing bound gets an empty list, not an error.
+	if none, err := bindings.List(ctx, account.UserID("nobody-"+scope)); err != nil || len(none) != 0 {
+		t.Fatalf("empty list = %+v, %v", none, err)
+	}
+}
+
+// The refresh path detects "someone else already rotated this" by comparing
+// Version, so the store must round-trip it faithfully.
+func TestBindingPutReplacesVersionAndDeleteIsIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	bindings := db.Bindings()
+	ctx := context.Background()
+
+	if err := bindings.Put(ctx, federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindings.Put(ctx, federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 7, HasRefresh: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bindings.Get(ctx, "usr_1", "phigros", "fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != 7 || !got.HasRefresh {
+		t.Fatalf("the binding was not replaced: %+v", got)
+	}
+
+	if err := bindings.Delete(ctx, "usr_1", "phigros", "fake"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindings.Delete(ctx, "usr_1", "phigros", "fake"); err != nil {
+		t.Fatalf("delete is not idempotent: %v", err)
+	}
+	if _, err := bindings.Get(ctx, "usr_1", "phigros", "fake"); !errors.Is(err, federation.ErrNotBound) {
+		t.Fatalf("get after delete = %v, want ErrNotBound", err)
+	}
+}
+
+// A bind flow is single-use: two concurrent callbacks must not both succeed.
+func TestBindFlowsConsumeIsSingleUse(t *testing.T) {
+	db := openTestDB(t)
+	flows := db.BindFlows()
+	ctx := context.Background()
+
+	flow := federation.BindFlow{
+		ID: "bnd_1", State: "st-1", User: "usr_1",
+		Game: "phigros", Source: "fake", Verifier: "verifier-1",
+		ReturnTo: "/dashboard", ExpiresAt: time.Now().Add(10 * time.Minute).UTC().Truncate(time.Microsecond),
+	}
+	if err := flows.Put(ctx, flow); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := flows.Consume(ctx, "st-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != flow.ID || got.User != flow.User || got.Game != flow.Game ||
+		got.Source != flow.Source || got.Verifier != flow.Verifier || got.ReturnTo != flow.ReturnTo {
+		t.Fatalf("flow = %+v", got)
+	}
+	if _, err := flows.Consume(ctx, "st-1"); !errors.Is(err, federation.ErrUnknownBind) {
+		t.Fatalf("second consume = %v, want ErrUnknownBind", err)
+	}
+	if _, err := flows.Consume(ctx, "never-existed"); !errors.Is(err, federation.ErrUnknownBind) {
+		t.Fatalf("unknown state = %v, want ErrUnknownBind", err)
+	}
+}
+
+// The binding table must not be ABLE to hold a credential. The Go struct has no
+// token field; this asserts the database agrees, so a future migration cannot
+// quietly add one.
+func TestBindingTableCannotHoldACredential(t *testing.T) {
+	db := openTestDB(t)
+	rows, err := db.pool.Query(context.Background(), `
+		SELECT column_name FROM information_schema.columns
+		 WHERE table_schema = current_schema() AND table_name = 'federation_bindings'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	// Guard against a vacuous pass: if the table were not found there would be
+	// no columns to inspect and the loop below would prove nothing.
+	if len(columns) == 0 {
+		t.Fatal("federation_bindings has no columns; the check would be vacuous")
+	}
+
+	for _, name := range columns {
+		lower := strings.ToLower(name)
+		for _, forbidden := range []string{"token", "secret", "credential", "password", "verifier"} {
+			if strings.Contains(lower, forbidden) {
+				t.Errorf("federation_bindings.%s could hold a credential", name)
+			}
+		}
+	}
+}
+
+func TestSessionsCommitFindDelete(t *testing.T) {
+	db := openTestDB(t)
+	sessions := db.Sessions()
+	expiry := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+
+	if _, found, err := sessions.Find("tok-1"); err != nil || found {
+		t.Fatalf("find before commit = %v, %v; want not found", found, err)
+	}
+	if err := sessions.Commit("tok-1", []byte("payload"), expiry); err != nil {
+		t.Fatal(err)
+	}
+	data, found, err := sessions.Find("tok-1")
+	if err != nil || !found || string(data) != "payload" {
+		t.Fatalf("find = %q, %v, %v", data, found, err)
+	}
+
+	// A second Commit for the same token overwrites rather than duplicating.
+	if err := sessions.Commit("tok-1", []byte("payload-2"), expiry); err != nil {
+		t.Fatal(err)
+	}
+	if data, _, _ := sessions.Find("tok-1"); string(data) != "payload-2" {
+		t.Fatalf("commit did not overwrite: %q", data)
+	}
+
+	if err := sessions.Delete("tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.Delete("tok-1"); err != nil {
+		t.Fatalf("delete is not idempotent: %v", err)
+	}
+	if _, found, _ := sessions.Find("tok-1"); found {
+		t.Fatal("the session survived deletion")
+	}
+}
+
+// scs defines an expired session as "not found", and the row should not linger.
+func TestSessionsExpiredIsNotFoundAndRemoved(t *testing.T) {
+	db := openTestDB(t)
+	sessions := db.Sessions()
+	ctx := context.Background()
+
+	if err := sessions.Commit("tok-old", []byte("payload"), time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := sessions.Find("tok-old"); err != nil || found {
+		t.Fatalf("expired find = %v, %v; want not found", found, err)
+	}
+
+	var remaining int
+	if err := db.pool.QueryRow(ctx, `SELECT count(*) FROM sessions`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expired rows remaining = %d", remaining)
+	}
+}
+
+func TestSessionsSweepRemovesOnlyExpired(t *testing.T) {
+	db := openTestDB(t)
+	sessions := db.Sessions()
+	ctx := context.Background()
+
+	if err := sessions.Commit("live", []byte("x"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.Commit("dead", []byte("x"), time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := sessions.SweepExpired(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, found, _ := sessions.Find("live"); !found {
+		t.Fatal("the sweep removed a live session")
+	}
+}
+
+// A dumped table must not be a set of usable session cookies.
+func TestSessionsStoreNoPlaintextCookie(t *testing.T) {
+	db := openTestDB(t)
+	sessions := db.Sessions()
+	ctx := context.Background()
+	const token = "the-raw-session-cookie-value"
+
+	if err := sessions.Commit(token, []byte("payload"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	var leaked int
+	if err := db.pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE token_hash = $1`, token).Scan(&leaked); err != nil {
+		t.Fatal(err)
+	}
+	if leaked != 0 {
+		t.Fatal("the session cookie was stored under its plaintext")
+	}
+	var hashed int
+	if err := db.pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE token_hash = $1`, sessionTokenHash(token)).Scan(&hashed); err != nil {
+		t.Fatal(err)
+	}
+	if hashed != 1 {
+		t.Fatalf("rows keyed by the hash = %d, want 1", hashed)
+	}
+}
+
+func TestAuthzRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	store := db.Authz()
+	ctx := context.Background()
+	created := time.Now().UTC().Truncate(time.Microsecond)
+
+	if _, err := store.Get(ctx, "arq_missing"); !errors.Is(err, authz.ErrNotFound) {
+		t.Fatalf("get before put = %v, want ErrNotFound", err)
+	}
+
+	want := authz.Request{
+		ID: "arq_1", ClientID: "cli", ClientName: "CLI",
+		RedirectURI: "https://app.example/cb",
+		Scopes:      []oauth.Scope{"account.id", "phigros.score.read"},
+		State:       "st-1", CodeChallenge: "challenge", CodeChallengeMethod: "S256",
+		CreatedAt: created, ExpiresAt: created.Add(10 * time.Minute),
+	}
+	if err := store.Put(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "arq_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ClientID != want.ClientID || got.ClientName != want.ClientName ||
+		got.RedirectURI != want.RedirectURI || got.State != want.State ||
+		got.CodeChallenge != want.CodeChallenge || got.CodeChallengeMethod != want.CodeChallengeMethod {
+		t.Fatalf("request = %+v", got)
+	}
+	// Scope order is preserved: the consent screen renders it as requested.
+	if len(got.Scopes) != 2 || got.Scopes[0] != "account.id" || got.Scopes[1] != "phigros.score.read" {
+		t.Fatalf("scopes = %v", got.Scopes)
+	}
+
+	if err := store.Delete(ctx, "arq_1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete(ctx, "arq_1"); err != nil {
+		t.Fatalf("delete is not idempotent: %v", err)
+	}
+	if _, err := store.Get(ctx, "arq_1"); !errors.Is(err, authz.ErrNotFound) {
+		t.Fatalf("get after delete = %v, want ErrNotFound", err)
+	}
+}
+
+func TestAuthzSweepRemovesOnlyExpired(t *testing.T) {
+	db := openTestDB(t)
+	store := db.Authz()
+	ctx := context.Background()
+
+	if err := store.Put(ctx, authz.Request{ID: "arq_live", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(ctx, authz.Request{ID: "arq_dead", ExpiresAt: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.SweepExpired(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := store.Get(ctx, "arq_live"); err != nil {
+		t.Fatalf("the sweep removed a live request: %v", err)
+	}
+	if _, err := store.Get(ctx, "arq_dead"); !errors.Is(err, authz.ErrNotFound) {
+		t.Fatalf("the expired request survived: %v", err)
+	}
+}
+
 func TestClientsRoundTripKeepsSecretHashOnly(t *testing.T) {
 	db := openTestDB(t)
 	clients := db.Clients()
@@ -377,5 +1017,62 @@ func TestClientsRoundTripKeepsSecretHashOnly(t *testing.T) {
 
 	if _, err := clients.Get(ctx, "ghost"); !errors.Is(err, oauth.ErrClientNotFound) {
 		t.Fatalf("unknown client = %v, want ErrClientNotFound", err)
+	}
+}
+
+// The audit log is the one remaining in-memory piece when the server runs
+// without a database. With one, every Record must be a durable row and must
+// round-trip its structured detail.
+func TestAuditLoggerPersistsRecord(t *testing.T) {
+	db := openTestDB(t)
+	logger := db.Audit()
+	ctx := context.Background()
+	stamp := time.Now().UTC().Truncate(time.Microsecond)
+
+	if err := logger.Record(ctx, audit.Event{
+		Time:     stamp,
+		Action:   "vault.use",
+		Subject:  "usr_1",
+		Provider: "phigros.taptap",
+		Outcome:  audit.OutcomeOK,
+		Detail:   map[string]string{"client_id": "cli", "request_id": "req_1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		occurredAt                         time.Time
+		action, subject, provider, outcome string
+		detail                             map[string]string
+	)
+	if err := db.pool.QueryRow(ctx, `
+		SELECT occurred_at, action, subject, provider, outcome, detail
+		  FROM audit_events
+		 WHERE subject = $1`, "usr_1").
+		Scan(&occurredAt, &action, &subject, &provider, &outcome, &detail); err != nil {
+		t.Fatal(err)
+	}
+
+	if !occurredAt.Equal(stamp) {
+		t.Fatalf("occurred_at = %v, want %v", occurredAt, stamp)
+	}
+	if action != "vault.use" || subject != "usr_1" || provider != "phigros.taptap" || outcome != audit.OutcomeOK {
+		t.Fatalf("row = %q %q %q %q", action, subject, provider, outcome)
+	}
+	if detail["client_id"] != "cli" || detail["request_id"] != "req_1" {
+		t.Fatalf("detail = %v", detail)
+	}
+
+	// A nil detail is stored as an empty object, never JSON null.
+	if err := logger.Record(ctx, audit.Event{Action: "vault.enroll", Subject: "usr_2", Outcome: audit.OutcomeOK}); err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	if err := db.pool.QueryRow(ctx,
+		`SELECT detail::text FROM audit_events WHERE subject = $1`, "usr_2").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "{}" {
+		t.Fatalf("nil detail stored as %q, want {}", raw)
 	}
 }

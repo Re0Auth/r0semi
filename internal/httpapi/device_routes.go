@@ -20,7 +20,7 @@ func (s *Server) handleDeviceAuthorization(w http.ResponseWriter, r *http.Reques
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
 		return
 	}
-	clientID, _ := clientCredentials(r)
+	clientID, _ := oauth.ClientCredentials(r)
 	resp, err := s.as.BeginDeviceAuthorization(r.Context(), oauth.DeviceAuthorizationRequest{
 		ClientID: clientID,
 		Scopes:   parseScopes(r.PostFormValue("scope")),

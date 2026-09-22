@@ -17,14 +17,20 @@ func TestScopeValid(t *testing.T) {
 
 func TestDefaultRegistryHasMVPScopes(t *testing.T) {
 	r := DefaultRegistry()
-	for _, s := range []Scope{ScopeAccountID, ScopeTapTapAccount, ScopePhigrosProfile, ScopePhigrosScore, ScopePhigrosB30, ScopeTapTapStoken} {
+	for _, s := range []Scope{ScopeAccountID, ScopeTapTapAccount, ScopePhigrosProfile, ScopePhigrosScore, ScopePhigrosB30} {
 		if _, ok := r.Get(s); !ok {
 			t.Errorf("missing scope %s", s)
 		}
 	}
-	stoken, _ := r.Get(ScopeTapTapStoken)
-	if stoken.Risk != RiskCritical || !stoken.ExplicitConsent {
-		t.Fatalf("stoken scope must be critical + explicit consent: %+v", stoken)
+	// Guard against a scope creeping back that re0auth cannot serve. The catalog
+	// must not advertise a capability the broker has no credential to back.
+	if _, ok := r.Get("taptap.stoken.read"); ok {
+		t.Fatal("the catalog advertises an upstream-credential export scope again")
+	}
+	for _, d := range r.Descriptors() {
+		if d.ExplicitConsent {
+			t.Fatalf("the built-in catalog has an ExplicitConsent scope: %s", d.Scope)
+		}
 	}
 }
 

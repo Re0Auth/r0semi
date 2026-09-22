@@ -3,9 +3,13 @@
 // clients so they never hold an upstream credential.
 //
 // Scope names are namespaced -- "<provider>.<resource>.<action>" -- and every
-// scope carries a risk tier. High-risk scopes (notably exporting the raw TapTap
-// session token) require explicit user consent and an explicit per-client
-// allowlist; they are a compatibility escape hatch, not the default.
+// scope carries a risk tier. A descriptor may additionally be ExplicitConsent,
+// which forces the scope to be approved on its own (and optionally restricts it
+// to an allowlist of clients).
+//
+// That mechanism is generic, and the built-in catalog currently marks nothing
+// critical: **re0auth exports no upstream credential at all**, so there is no
+// scope that could justify it. See docs/api-design.md §5.
 package oauth
 
 import (
@@ -62,7 +66,6 @@ var (
 	ScopePhigrosProfile = MustScope("phigros.profile.read")
 	ScopePhigrosScore   = MustScope("phigros.score.read")
 	ScopePhigrosB30     = MustScope("phigros.b30.read")
-	ScopeTapTapStoken   = MustScope("taptap.stoken.read")
 )
 
 // Risk classifies the blast radius of granting a scope.
@@ -120,10 +123,12 @@ func (d Descriptor) allowsClient(id string) bool {
 
 // DefaultDescriptors returns the built-in MVP catalog.
 //
-// ScopeTapTapStoken is deliberately RiskCritical and ExplicitConsent: it
-// exports a long-lived credential that cannot be revoked per client, so it is
-// only ever granted when a client is explicitly allowlisted for it and the user
-// approves it on its own.
+// Nothing here is ExplicitConsent. The mechanism stays, because "the user
+// approved this scope specifically" has to remain expressible and a source-side
+// scope may need it later; the catalog simply has no such scope today. A
+// previous version advertised `taptap.stoken.read` to export the raw TapTap
+// session token; re0auth no longer holds that credential, so the scope was
+// removed rather than left as an endpoint that could not be served.
 func DefaultDescriptors() []Descriptor {
 	return []Descriptor{
 		{
@@ -145,11 +150,6 @@ func DefaultDescriptors() []Descriptor {
 		{
 			Scope: ScopePhigrosB30, Title: "读取 Phigros B30", Risk: RiskMedium,
 			Description: "通过 Re0Auth 代理读取你的 Phigros B30。",
-		},
-		{
-			Scope: ScopeTapTapStoken, Title: "导出 TapTap stoken", Risk: RiskCritical,
-			ExplicitConsent: true,
-			Description:     "导出底层 TapTap session token（长效、无法按客户端撤销、可完全接管账号）。仅在数据 scope 无法满足需求时作为兼容逃生口使用。",
 		},
 	}
 }

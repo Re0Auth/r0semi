@@ -2,6 +2,7 @@
 
 > 状态：已定稿（v1 契约）。实现必须以此为准；偏离需先改本文件。
 > 上游依据：[architecture.md](./architecture.md)、[threat-model.md](./threat-model.md)。
+> **机器可读的 v1 契约是 [openapi.yaml](./openapi.yaml)**（覆盖 `/v1`（含 `/v1/device/verification`））。它与实际路由**双向强一致**，由 `internal/httpapi/openapi_test.go` 断言；本文与它冲突时，以能通过测试的那个为准。
 
 ## 0. v1 已定决策
 
@@ -11,7 +12,7 @@
 | D-2 | **不透明令牌 + Introspect**（RFC 7662）；不做 JWT AT，换取即时撤销 |
 | D-3 | **v1 不做 DPoP**（RFC 9449）：只签发普通 Bearer。曾一度在 AS 元数据里广告 DPoP，已移除——广告了却只发普通 Bearer 是**静默降级**（见 §2.10） |
 | D-4 | **单域名**（如 `re0auth.r0semi.net`），但代码路由树内部**严格划清 `/oauth/` 与 `/v1/` 上下文边界** |
-| D-5 | `taptap.stoken.read` 导出端点：**`POST` + 强制审计 + 默认不授予任何客户端** |
+| D-5 | **不提供上游凭据导出端点**：re0auth 不持有上游凭据，无物可导。需要上游原生 API 时走 `raw` 透传，而不是交出令牌（见 §5） |
 
 ---
 
@@ -89,13 +90,24 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 列表用 `{data, pagination}` 信封；单项直接返回资源对象，不再套壳。
 
 ### 2.6 幂等
-所有写操作（`POST` / `DELETE`）接受 `Idempotency-Key` 头。
+
+**规划中，尚未实现。** 设计意图：写操作（`POST` / `DELETE`）接受 `Idempotency-Key` 头；
 同一键 + 同一请求体 → 重放缓存的响应；同一键 + 不同请求体 → `409 idempotency_key_reused`。
-**撤销、托管、导出 stoken 必须支持幂等重试。**
+
+当前实现**不接受这个头**；`idempotency_key_reused` 这个 code 也已从错误目录中删除——
+一个发不出来的错误码就是一句半衰期很长的谎，和它一起删的还有 `credential_not_found`、`conflict`。
+真正需要它的写端点目前只有两个（`DELETE /v1/grants/{client_id}` 与 `DELETE /v1/bindings/{game}/{source}`）。
+**两个都做了别的选择：** grants 撤销**本来就是幂等的**（删令牌，删两次结果一样，返回 204）；
+断开连接则**必须返回结果体**——数据源那一半做了什么，用户得知道，一个只有状态码的 204 反而会把话说少。
+因此这个机制应当**等一个真正无法天然幂等、且结果单一的写操作出现时再落地**。
 
 ### 2.7 限流
-响应头 `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset`；
-超限 `429`（problem+json）+ `Retry-After`。
+
+超限返回 `429`（业务面 problem+json，协议面则是对应的 OAuth 错误）+ `Retry-After`。
+**目前已实现的只有这一部分。**
+
+`RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` 尚未实现：当前限流器按**客户端地址**
+分桶，而非按已认证的客户端，这三个头的语义因此还没有确定的归属。等按客户端限流落地时再一并加上。
 
 ### 2.8 可观测
 每个响应带 `X-Request-Id`；接受 W3C `traceparent`；problem 回带 `request_id`。
@@ -121,7 +133,7 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | `POST` | `/oauth/revoke` | RFC 7009 | 永远返回 `200`（幂等） |
 | `POST` | `/oauth/introspect` | RFC 7662 | 资源服务器使用 |
 | `POST` | `/oauth/device_authorization` | RFC 8628 §3.1 | CLI/桌面设备码（**已实现**） |
-| `GET` | `/device` | RFC 8628 §3.3 | 设备流验证页：需登录，且把 user code 绑到当前浏览器会话 |
+| `GET` | `/v1/device/verification` | RFC 8628 §3.3 | 设备流验证页：需登录，且把 user code 绑到当前浏览器会话 |
 | `GET` | `/oauth/consent` | — | 同意页（浏览器） |
 | `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 | 授权服务器元数据 |
 | `GET` | `/.well-known/oauth-protected-resource` | RFC 9728 | 资源元数据 |
@@ -131,7 +143,7 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 - PKCE S256 强制；禁 implicit、禁 ROPC；重定向 URI 精确匹配。
 - `authorize` 响应带 `iss`（RFC 9207）防混淆。
 - `token` 响应头：`Cache-Control: no-store`、`Pragma: no-cache`。
-- 同意页必须把 `taptap.stoken.read` 单独列出并要求逐项勾选。
+- 标记 `explicit_consent` 的 scope 必须在同意页单独列出并要求逐项勾选（内置目录当前没有这样的 scope，机制保留）。
 
 ---
 
@@ -142,33 +154,59 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | 方法 | 路径 | scope | 说明 |
 |---|---|---|---|
 | `GET` | `/v1/me` | `account.id` | r0semi 账号（`usr_` id、显示名） |
-| `GET` | `/v1/me/identities` | `taptap.account.id` | 已链接上游身份（openid/unionid） |
+| `GET` | `/v1/identities` | 会话 | 本账号已链接的 IdP 身份 |
+| `DELETE` | `/v1/identities/{id}` | 会话 + CSRF | 解绑一个身份（I-2 守护，最后一个返回 `409 last_identity`） |
 | `GET` | `/v1/games/phigros/me` | `phigros.profile.read` | 游戏内档案（rks 等） |
 | `GET` | `/v1/games/phigros/scores` | `phigros.score.read` | 成绩列表（游标分页） |
 | `GET` | `/v1/games/phigros/b30` | `phigros.b30.read` | B30 |
-| `POST` | `/v1/credentials/taptap/export` | `taptap.stoken.read` | 导出 stoken（critical，见 §5） |
-| `GET` | `/v1/grants` | `account.id` | 本账号已授权的下游 |
-| `DELETE` | `/v1/grants/{client_id}` | `account.id` | 撤销某下游（本地撤销，幂等） |
+| `GET` | `/v1/grants` | 会话 | 本账号当前的授权（**由活着的令牌推导**，见下） |
+| `DELETE` | `/v1/grants/{client_id}` | 会话 + CSRF | 撤销某下游（本地撤销，幂等，204） |
+| `GET` | `/v1/bindings` | 会话 | 本账号已连接的数据源（**不含任何凭据**） |
+| `DELETE` | `/v1/bindings/{game}/{source}` | 会话 + CSRF | 断开某数据源（撕碎 vault 密文 + 删绑定 + 调源撤销），**200 带 body** |
+| `POST` | `/v1/bindings/{game}/{source}/cascade_revocation` | 会话 + CSRF + 显式确认 | 请求数据源**登出全部设备**；源不支持则 409；**失败则什么都不删** |
 | `POST` | `/v1/device/decision` | — （会话 + CSRF + handle 绑定） | 批准/拒绝一个设备流 `user_code`（RFC 8628） |
 
+| `GET` | `/v1/sources` | — （公开） | 本部署提供的全部数据源（供「可连接」列表用） |
 | `GET` | `/v1/games/{game}/sources` | — （公开） | 该游戏的数据源、能力与 `token_class` |
 | `GET` | `/v1/games/{game}/{resource}` | 资源对应 scope | 归一化数据；`?source=` 可 pin（已实现，见 architecture.md §4.9） |
 | `GET` | `/v1/games/{game}/sources/{source}/raw/{path...}` | 该源任一资源 scope（粗粒度） | 逐字透传源的原始 API；状态码/Content-Type/body 不改 |
 
 > 具体游戏的资源名与 scope 由 `/v1/games/{game}/sources` 公布，无需在下游硬编码。
 
+### 授权列表的两个决定
+
+**一、它由令牌推导，不单独存一份同意记录。** 一条授权 = “某客户端此刻还能以你的身份做什么”，
+实现上就是该 subject 名下仍然有效的令牌按 client_id 聚合。
+
+好处是只有一个事实来源：**撤销就是删令牌**，不存在“同意表说已撤销、令牌表还能用”这种可能出现分歧的状态。
+代价要写明：**列表显示的是“当前访问”而不是“历史同意”**。某个应用最后的 refresh token 也过期后，
+它会从列表上消失——因为它确实什么也做不了了。一份存下来的同意记录会继续显示它；这里不会，这是故意的。
+
+**二、它要会话，不要 bearer。** 最初设计写的是 `account.id`，改掉了。用 bearer 调这个端点，
+等于让**一个客户端看到用户的其他客户端**——这对它没有任何用处，用户也从未同意交出这个信息。
+唯一的消费者是账号页，它本来就有会话。
+
 > enrollment / 扫码托管已迁出 Re0Auth，成为**参考数据源**的一部分（见 architecture.md §4.10）。
 
 ---
 
-## 5. `taptap.stoken.read` 导出约定
+## 5. 为什么没有“导出上游凭据”端点
 
-- **`POST` 而非 `GET`**：密钥不得出现在 URL、访问日志、浏览器历史、缓存。
-- `Cache-Control: no-store`。
-- 需要客户端被显式注册该 scope，且用户在同意页逐项勾选（`explicit_consent_required`）。
-- 每次调用强制写审计（subject / client / request_id）。
-- 响应一次性返回明文 stoken；服务端不为其建立任何缓存。
-- **默认不授予任何客户端**；作为"数据 scope 覆盖不了"的兼容逃生口，规划弃用路径。
+曾规划过 `POST /v1/credentials/taptap/export`（critical scope + 逐项同意 + 强制审计），
+把底层 TapTap session token 交给下游。**v1 不实现它，因为这个端点已无物可导。**
+
+架构演进后，**re0auth 不持有任何上游凭据**：上游令牌存进**数据源自己的 vault**，re0auth 侧的绑定
+只存元数据（`token_type` / `expiry` / `has_refresh` / `version`）。本地没有可导出的凭据，
+“导出”只能是虚构的。
+
+需要上游原生 API 的下游走 **raw 透传**（§4 的 `GET /v1/games/{game}/sources/{source}/raw/{path...}`）：
+它给出同样的数据、逐字透传上游语义，**不交出令牌**——令牌始终留在源侧，仍可按绑定撤销。
+
+若将来确有“下游必须直接调数据源”的场景，正确做法是新增一个**按源的**导出 scope
+（形如 `<game>.<source>.token.read`），并配套同意 UI、审计与弃用路径——**而不是复用这个旧名字**。
+
+**机制保留**：`Descriptor.ExplicitConsent` 与 `Risk` 仍在，仍能表达“这个 scope 必须单独勾选”；
+内置目录当前不含此类 scope，`oauth/scope_test.go` 有测试守住这一点（防止一个提供不了的能力又爬回目录）。
 
 ---
 
