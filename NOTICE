@@ -25,29 +25,53 @@ license is available at <https://www.apache.org/licenses/LICENSE-2.0>.
   - github.com/sethvargo/go-retry
     (Ships no NOTICE file; attribution only.)
 
+  - github.com/zitadel/oidc/v3
+    Copyright The zitadel/oidc Contributors
+    (Reproduced from that module's NOTICE, as Apache-2.0 §4(d) requires.)
+
+  - github.com/go-logr/logr
+  - github.com/go-logr/stdr
+  - go.opentelemetry.io/auto/sdk
+  - go.opentelemetry.io/otel
+  - go.opentelemetry.io/otel/metric
+  - go.opentelemetry.io/otel/trace
+    (Ship no NOTICE file; attribution only.)
+
 MIT License
 -----------
 
   - github.com/BurntSushi/toml
   - github.com/alexedwards/scs/v2
+  - github.com/bmatcuk/doublestar/v4
   - github.com/cenkalti/backoff/v4
+  - github.com/cespare/xxhash/v2
+  - github.com/go-chi/chi/v5
   - github.com/jackc/pgx/v5
   - github.com/jackc/puddle/v2
   - github.com/jackc/pgpassfile
   - github.com/jackc/pgservicefile
   - github.com/mfridman/interpolate
   - github.com/pressly/goose/v3
+  - github.com/rs/cors
   - go.uber.org/multierr
 
 BSD 3-Clause License
 --------------------
 
+  - github.com/gorilla/securecookie
+  - github.com/muhlemmer/httpforwarded
+  - github.com/zitadel/schema
   - golang.org/x/oauth2
   - golang.org/x/sync
   - golang.org/x/text
   - golang.org/x/time
 
   Copyright 2009 The Go Authors. All rights reserved.
+
+Unlicense (public domain)
+-------------------------
+
+  - github.com/muhlemmer/gu
 
 ---
 
