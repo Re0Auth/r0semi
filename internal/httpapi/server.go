@@ -14,6 +14,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"net/http"
@@ -69,6 +70,23 @@ type Config struct {
 	// Frontend, when set, is the built single-page app mounted under
 	// webui.BasePath. Pass webui.FS() for an embedded build.
 	Frontend fs.FS
+
+	// OIDC, when set, replaces the hand-rolled protocol plane with the OpenID
+	// Provider handler (internal/oidchttp): /oauth/* and both discovery
+	// documents are served by it. When set, TokenIntrospector is required so the
+	// business plane can validate the OP's tokens; a nil introspector would leave
+	// /v1 unable to accept them, which is why New rejects the combination.
+	OIDC http.Handler
+	// TokenIntrospector validates bearer tokens for the business plane. Defaults
+	// to AS.Introspect; an OP deployment passes the OP-backed introspector.
+	TokenIntrospector TokenIntrospector
+}
+
+// TokenIntrospector resolves a bearer token to its grant. It is the business
+// plane's only dependency on the authorization engine, so the engine can be
+// swapped without the /v1 layer importing it.
+type TokenIntrospector interface {
+	Introspect(ctx context.Context, token string) (oauth.TokenInfo, error)
 }
 
 // Server is the two-plane HTTP surface.
@@ -87,12 +105,16 @@ type Server struct {
 	limiter   *ratelimit.Limiter
 	secure    bool
 	frontend  fs.FS
+	// oidc, when non-nil, is the protocol plane; introspector is always set
+	// (AS when oidc is nil, the OP bridge when it is not).
+	oidc         http.Handler
+	introspector TokenIntrospector
 }
 
 // New validates cfg and returns a Server.
 func New(cfg Config) (*Server, error) {
-	if cfg.AS == nil {
-		return nil, errors.New("httpapi: Config.AS is required")
+	if cfg.AS == nil && cfg.OIDC == nil {
+		return nil, errors.New("httpapi: Config.AS or Config.OIDC is required")
 	}
 	if strings.TrimSpace(cfg.Issuer) == "" {
 		return nil, errors.New("httpapi: Config.Issuer is required")
@@ -121,21 +143,30 @@ func New(cfg Config) (*Server, error) {
 		// deployment that moves the app must move this with it.
 		cfg.ConsentPath = webui.BasePath + "/consent"
 	}
+	if cfg.OIDC != nil && cfg.TokenIntrospector == nil {
+		return nil, errors.New("httpapi: Config.OIDC requires Config.TokenIntrospector (the business plane would not accept OP tokens otherwise)")
+	}
+	introspector := cfg.TokenIntrospector
+	if introspector == nil {
+		introspector = cfg.AS
+	}
 	return &Server{
-		issuer:    strings.TrimRight(cfg.Issuer, "/"),
-		resource:  strings.TrimRight(cfg.Resource, "/"),
-		errorBase: strings.TrimRight(cfg.ErrorBase, "/"),
-		scopes:    cfg.Scopes,
-		as:        cfg.AS,
-		sessions:  cfg.Sessions,
-		accounts:  cfg.Accounts,
-		auth:      cfg.Auth,
-		authz:     cfg.Authz,
-		consent:   cfg.ConsentPath,
-		federate:  cfg.Federation,
-		limiter:   cfg.Limiter,
-		secure:    cfg.Secure,
-		frontend:  cfg.Frontend,
+		issuer:       strings.TrimRight(cfg.Issuer, "/"),
+		resource:     strings.TrimRight(cfg.Resource, "/"),
+		errorBase:    strings.TrimRight(cfg.ErrorBase, "/"),
+		scopes:       cfg.Scopes,
+		as:           cfg.AS,
+		sessions:     cfg.Sessions,
+		accounts:     cfg.Accounts,
+		auth:         cfg.Auth,
+		authz:        cfg.Authz,
+		consent:      cfg.ConsentPath,
+		federate:     cfg.Federation,
+		limiter:      cfg.Limiter,
+		secure:       cfg.Secure,
+		frontend:     cfg.Frontend,
+		oidc:         cfg.OIDC,
+		introspector: introspector,
 	}, nil
 }
 
@@ -223,9 +254,16 @@ func (s *Server) specRoutes() []route {
 }
 func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
-	root.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleASMetadata)
+	if s.oidc != nil {
+		// The OP owns the protocol plane and both discovery documents.
+		root.Handle("GET /.well-known/oauth-authorization-server", s.oidc)
+		root.Handle("GET /.well-known/openid-configuration", s.oidc)
+		root.Handle("/oauth/", s.oidc)
+	} else {
+		root.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleASMetadata)
+		root.Handle("/oauth/", s.protocolPlane())
+	}
 	root.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleResourceMetadata)
-	root.Handle("/oauth/", s.protocolPlane())
 	root.Handle("/v1/", s.businessPlane())
 	if s.auth != nil || s.bindEnabled() {
 		authMux := http.NewServeMux()

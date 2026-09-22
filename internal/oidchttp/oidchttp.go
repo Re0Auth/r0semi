@@ -10,13 +10,17 @@ package oidchttp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 	"golang.org/x/text/language"
+
+	"github.com/Re0Auth/r0semi/oauth"
 )
 
 // Paths owned by the provider. They are all under /oauth/ so the protocol plane
@@ -201,6 +205,37 @@ func (b *bufferedWriter) flush(w http.ResponseWriter, body []byte) {
 	w.Header().Del("Content-Length")
 	w.WriteHeader(b.status)
 	_, _ = w.Write(body)
+}
+
+// Introspect answers the business plane's question about a bearer token. The
+// access token is an encrypted reference (AES-GCM(tokenID:subject)); decrypting
+// it recovers the token ID, and the store then answers whether it is live.
+// It satisfies the narrow interface internal/httpapi expects, so /v1 can accept
+// tokens the OP issued without importing the library.
+func (h *Handler) Introspect(ctx context.Context, token string) (oauth.TokenInfo, error) {
+	plain, err := h.provider.Crypto().Decrypt(token)
+	if err != nil {
+		return oauth.TokenInfo{Active: false}, nil
+	}
+	id, subject, ok := strings.Cut(plain, ":")
+	if !ok {
+		return oauth.TokenInfo{Active: false}, nil
+	}
+	resp := new(oidc.IntrospectionResponse)
+	if err := h.provider.Storage().SetIntrospectionFromToken(ctx, resp, id, subject, ""); err != nil {
+		return oauth.TokenInfo{Active: false}, nil
+	}
+	scopes := make([]oauth.Scope, 0, len(resp.Scope))
+	for _, s := range resp.Scope {
+		scopes = append(scopes, oauth.Scope(s))
+	}
+	return oauth.TokenInfo{
+		Active:    resp.Active,
+		Subject:   resp.Subject,
+		ClientID:  resp.ClientID,
+		Scopes:    scopes,
+		ExpiresAt: time.Unix(int64(resp.Expiration), 0).UTC(),
+	}, nil
 }
 
 type configError string
