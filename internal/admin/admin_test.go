@@ -120,12 +120,49 @@ func TestSuspendHidesClientAndRevokesOnlyItsTokens(t *testing.T) {
 	}
 }
 
-type fakeSessions struct{ remaining int64 }
+type fakeSessions struct {
+	remaining int64
+	subjects  []string
+}
 
 func (f *fakeSessions) RevokeAllSessions(context.Context) (int64, error) {
 	n := f.remaining
 	f.remaining = 0
 	return n, nil
+}
+
+func (f *fakeSessions) RevokeSubjectSessions(_ context.Context, subject string) (int64, error) {
+	f.subjects = append(f.subjects, subject)
+	n := f.remaining
+	f.remaining = 0
+	return n, nil
+}
+
+// A subject target now clears that account's sessions too, which is what makes
+// "everything for this account" true.
+func TestKillSwitchSubjectClearsThatAccountsSessions(t *testing.T) {
+	ctx := context.Background()
+	tokens := oauth.NewMemoryStore()
+	sessions := &fakeSessions{remaining: 2}
+	svc, err := New(Config{
+		Clients: oauth.NewMemoryClientRegistry(), Tokens: tokens,
+		Sessions: sessions, Audit: audit.NewMemoryLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveTokens(t, tokens, "cli_a", "usr_1")
+
+	rep, err := svc.KillSwitch(ctx, "usr_admin", Target{Subject: "usr_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions.subjects) != 1 || sessions.subjects[0] != "usr_1" {
+		t.Fatalf("subject sessions revoked = %v", sessions.subjects)
+	}
+	if rep.SessionsRevoked != 2 {
+		t.Fatalf("sessions_revoked = %d, want 2", rep.SessionsRevoked)
+	}
 }
 
 func TestKillSwitchAllRevokesEverythingAndDropsSessions(t *testing.T) {

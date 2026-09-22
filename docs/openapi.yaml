@@ -1155,9 +1155,10 @@ paths:
         * `client` — every token the named client holds, and the client is
           suspended so it cannot immediately mint more. A binding belongs to a
           person, not to a client, so this target does not touch bindings.
-        * `subject` — every token and every data-source binding the named account
-          holds. Its browser sessions are **not** dropped: sessions are opaque
-          cookies with no subject index, so the account can still sign in again.
+        * `subject` — every token, every data-source binding, and every browser
+          session the named account holds. Dropping the sessions needs the session
+          subject index (see `docs/admin.md`); where a deployment has durable
+          sessions it is present, and the account is signed out everywhere.
         * `bindings` — every data-source binding, and nothing else. This is the
           narrow form: cut data access while everyone stays signed in.
 

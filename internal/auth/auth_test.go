@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -361,5 +362,99 @@ func TestCSRFTokenRoundTrip(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("with token: status = %d, want 204", resp.StatusCode)
+	}
+}
+
+type rememberedToken struct{ token, subject string }
+
+type fakeIndex struct {
+	remembered []rememberedToken
+	forgotten  []string
+}
+
+func (f *fakeIndex) Remember(_ context.Context, token, subject string) error {
+	f.remembered = append(f.remembered, rememberedToken{token: token, subject: subject})
+	return nil
+}
+
+func (f *fakeIndex) Forget(_ context.Context, token string) error {
+	f.forgotten = append(f.forgotten, token)
+	return nil
+}
+
+func sessionCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "r0semi_session" && c.Value != "" && c.MaxAge >= 0 {
+			return c
+		}
+	}
+	t.Fatal("no live session cookie was set")
+	return nil
+}
+
+// Signing in records the new token against the account, and signing out forgets
+// it. Without this, a kill switch could sign the whole deployment out but never
+// one account.
+func TestSignInAndSignOutKeepTheSubjectIndex(t *testing.T) {
+	index := &fakeIndex{}
+	manager := NewManager(Options{Secure: false, Index: index})
+	next := func(after func(ctx context.Context)) http.Handler {
+		return manager.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			after(r.Context())
+		}))
+	}
+
+	rec := httptest.NewRecorder()
+	next(func(ctx context.Context) {
+		if err := manager.SignIn(ctx, "usr_1"); err != nil {
+			t.Errorf("sign in: %v", err)
+		}
+	}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if len(index.remembered) != 1 || index.remembered[0].subject != "usr_1" {
+		t.Fatalf("remembered = %+v", index.remembered)
+	}
+	signedIn := index.remembered[0].token
+	if signedIn == "" {
+		t.Fatal("the index recorded an empty token")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(sessionCookie(t, rec))
+	rec2 := httptest.NewRecorder()
+	next(func(ctx context.Context) {
+		if err := manager.SignOut(ctx); err != nil {
+			t.Errorf("sign out: %v", err)
+		}
+	}).ServeHTTP(rec2, req)
+
+	if len(index.forgotten) != 1 || index.forgotten[0] != signedIn {
+		t.Fatalf("forgotten = %+v, want the signed-in token", index.forgotten)
+	}
+}
+
+// A session that cannot be indexed must not be handed out: an operator has to be
+// able to reach every session an account holds.
+type failingIndex struct{}
+
+func (failingIndex) Remember(context.Context, string, string) error { return errors.New("index down") }
+func (failingIndex) Forget(context.Context, string) error           { return nil }
+
+func TestSignInDestroysTheSessionWhenTheIndexFails(t *testing.T) {
+	manager := NewManager(Options{Secure: false, Index: failingIndex{}})
+	rec := httptest.NewRecorder()
+	var signInErr error
+	manager.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		signInErr = manager.SignIn(r.Context(), "usr_1")
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if signInErr == nil {
+		t.Fatal("SignIn succeeded with a failing index")
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "r0semi_session" && c.Value != "" && c.MaxAge >= 0 {
+			t.Fatal("a live session cookie was written despite the index failure")
+		}
 	}
 }

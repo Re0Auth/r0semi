@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -77,15 +79,61 @@ func (s *Sessions) SweepExpired(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// session_subjects has no foreign key (it is written before the session row
+	// exists), so its orphans are collected here rather than by a cascade.
+	if _, err := s.pool.Exec(ctx, `
+		DELETE FROM session_subjects si
+		 WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash = si.token_hash)`); err != nil {
+		return tag.RowsAffected(), err
+	}
 	return tag.RowsAffected(), nil
 }
 
 // RevokeAllSessions deletes every session, signing everyone out. It is the session
-// half of the Kill Switch. Returns how many were removed.
+// half of the Kill Switch. Returns how many sessions were removed.
 func (s *Sessions) RevokeAllSessions(ctx context.Context) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions`)
 	if err != nil {
 		return 0, err
 	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM session_subjects`); err != nil {
+		return tag.RowsAffected(), err
+	}
 	return tag.RowsAffected(), nil
+}
+
+// RevokeSubjectSessions deletes every session belonging to one account. It needs
+// the subject index: a session cookie carries no subject, and the store cannot
+// read the account out of an encoded payload.
+func (s *Sessions) RevokeSubjectSessions(ctx context.Context, subject string) (int64, error) {
+	if strings.TrimSpace(subject) == "" {
+		return 0, errors.New("postgres: subject is required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM sessions
+		 WHERE token_hash IN (SELECT token_hash FROM session_subjects WHERE subject = $1)`, subject)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM session_subjects WHERE subject = $1`, subject); err != nil {
+		return tag.RowsAffected(), err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// Remember implements auth.SessionIndex. It records which account a session token
+// belongs to, so the Kill Switch can reach that account's sessions later.
+func (s *Sessions) Remember(ctx context.Context, token, subject string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO session_subjects (token_hash, subject)
+		VALUES ($1, $2)
+		ON CONFLICT (token_hash) DO UPDATE SET subject = EXCLUDED.subject`,
+		sessionTokenHash(token), subject)
+	return err
+}
+
+// Forget implements auth.SessionIndex.
+func (s *Sessions) Forget(ctx context.Context, token string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM session_subjects WHERE token_hash = $1`, sessionTokenHash(token))
+	return err
 }

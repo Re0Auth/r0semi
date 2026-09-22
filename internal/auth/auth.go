@@ -47,11 +47,25 @@ type Options struct {
 	Secure     bool
 	CookieName string
 	Store      scs.Store
+	// Index maps a session token to the account it belongs to. Optional: without
+	// it, the Kill Switch can sign the whole deployment out but not one account.
+	Index SessionIndex
+}
+
+// SessionIndex maps a session token to the account it belongs to.
+//
+// scs has no such notion: a session is an opaque cookie and the store sees only
+// encoded bytes. Keeping the mapping here is what lets an operator revoke every
+// session one account holds, rather than everyone's.
+type SessionIndex interface {
+	Remember(ctx context.Context, token, subject string) error
+	Forget(ctx context.Context, token string) error
 }
 
 // Manager owns the browser session.
 type Manager struct {
 	sessions *scs.SessionManager
+	index    SessionIndex
 }
 
 // NewManager builds a session manager with secure cookie defaults.
@@ -88,7 +102,7 @@ func NewManager(opts Options) *Manager {
 	sm.Cookie.Path = "/"
 	sm.Cookie.Persist = true
 
-	return &Manager{sessions: sm}
+	return &Manager{sessions: sm, index: opts.Index}
 }
 
 // LoadAndSave is the session middleware. It must wrap every browser-facing
@@ -108,13 +122,45 @@ func (m *Manager) User(ctx context.Context) (account.UserID, bool) {
 
 // SignIn stores the account and rotates the session id, so a pre-login session
 // cannot be fixated onto the authenticated user.
+//
+// When a SessionIndex is configured, the new token is recorded against the
+// account. A session that cannot be recorded is destroyed rather than left to
+// exist: an operator must be able to reach every session a subject holds, and a
+// session outside the index would be one they cannot.
 func (m *Manager) SignIn(ctx context.Context, user account.UserID) error {
+	// RenewToken deletes the pre-login token; drop its index entry first so it
+	// cannot linger as an orphan.
+	if m.index != nil {
+		if old := m.sessions.Token(ctx); old != "" {
+			_ = m.index.Forget(ctx, old)
+		}
+	}
 	m.sessions.Put(ctx, keyUser, string(user))
-	return m.sessions.RenewToken(ctx)
+	if err := m.sessions.RenewToken(ctx); err != nil {
+		return err
+	}
+	if m.index == nil {
+		return nil
+	}
+	token := m.sessions.Token(ctx)
+	if token == "" {
+		_ = m.sessions.Destroy(ctx)
+		return errors.New("auth: no session token after renewal")
+	}
+	if err := m.index.Remember(ctx, token, string(user)); err != nil {
+		_ = m.sessions.Destroy(ctx)
+		return err
+	}
+	return nil
 }
 
 // SignOut destroys the session.
 func (m *Manager) SignOut(ctx context.Context) error {
+	if m.index != nil {
+		if token := m.sessions.Token(ctx); token != "" {
+			_ = m.index.Forget(ctx, token)
+		}
+	}
 	return m.sessions.Destroy(ctx)
 }
 

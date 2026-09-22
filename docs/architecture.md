@@ -505,7 +505,8 @@ storage: every port is persistent (accounts, tokens, device authorizations, clie
   只有 `GET /v1/admin/clients` 还看得见它。停用先于删令牌，失败方向安全。
 - 每个动作写审计，`Detail["actor"]` 是发起管理员。审计失败**不回滚**已发生的安全动作，只告警。
 - Kill Switch 覆盖令牌、会话与数据源绑定（`all` / `client` / `subject` / `bindings`）；绑定半边对每条绑定
-  本地必断，并尽源所能调撤销/级联，见 admin.md §4.2。
+  本地必断，并尽源所能调撤销/级联，见 admin.md §4.2。按账号清会话需要一个会话→账号索引
+  （`session_subjects`，登录时写入、注销时移除、过期由 sweep 清理）；没有它只能整体清会话。
 
 ## 5. 安全不变量（必须由测试守护）
 

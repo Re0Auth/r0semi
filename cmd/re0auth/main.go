@@ -63,7 +63,10 @@ type storage struct {
 	// sessionRevoker drops every browser session for the Kill Switch. Nil in
 	// memory mode, where sessions cannot be enumerated.
 	sessionRevoker admin.SessionRevoker
-	authzStore     authz.Store
+	// sessionIndex maps a session token to its account, so the Kill Switch can
+	// clear one account's sessions. Nil in memory mode.
+	sessionIndex auth.SessionIndex
+	authzStore   authz.Store
 	// audit is the durable audit-log sink; nil would mean "nobody is auditing",
 	// which must never be a silent state.
 	audit audit.Logger
@@ -191,7 +194,7 @@ func main() {
 		slog.Warn("no identity provider is configured; nobody can sign in")
 	}
 
-	sessions := auth.NewManager(auth.Options{Secure: cfg.CookieSecure, Store: store.sessions})
+	sessions := auth.NewManager(auth.Options{Secure: cfg.CookieSecure, Store: store.sessions, Index: store.sessionIndex})
 	authHandler, err := auth.NewHandler(sessions, idpRegistry, store.accounts)
 	if err != nil {
 		die("auth", err)
@@ -345,8 +348,11 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 		// The concrete store, not the scs.Store interface: only it can drop
 		// every session at once, which is the Kill Switch's session half.
 		sessionRevoker: sessions,
-		authzStore:     authzRequests,
-		audit:          db.Audit(),
+		// The same object, for the auth layer to record which account a session
+		// belongs to.
+		sessionIndex: sessions,
+		authzStore:   authzRequests,
+		audit:        db.Audit(),
 		// Both are swept, and the first error is surfaced: one failing must not
 		// hide the other.
 		sweep: func(ctx context.Context) (int64, error) {

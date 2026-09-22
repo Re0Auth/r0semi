@@ -43,11 +43,15 @@ type Clients interface {
 	oauth.ClientAdmin
 }
 
-// SessionRevoker drops every browser session. It is optional: the in-memory
+// SessionRevoker drops browser sessions. It is optional: the in-memory
 // development store cannot enumerate sessions, and a deployment that has no
 // durable sessions says so by leaving this nil rather than pretending.
 type SessionRevoker interface {
 	RevokeAllSessions(ctx context.Context) (int64, error)
+	// RevokeSubjectSessions drops every session belonging to one account. It needs
+	// the session→subject index; without one the deployment can only sign everyone
+	// out at once, and this method is what makes signing one account out possible.
+	RevokeSubjectSessions(ctx context.Context, subject string) (int64, error)
 }
 
 // Bindings revokes data-source bindings in bulk. It is optional: a deployment
@@ -281,15 +285,26 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 		}
 	}
 
-	if target.All && s.sessions != nil {
-		n, err := s.sessions.RevokeAllSessions(ctx)
-		rep.SessionsRevoked = n
+	// Sessions. `all` clears everyone; `subject` clears one account, which works
+	// only where a session index exists. `client` and `bindings` never touch a
+	// session: a session belongs to a person, not to a client.
+	if s.sessions != nil && (target.All || target.Subject != "") {
+		var (
+			n   int64
+			err error
+		)
+		if target.All {
+			n, err = s.sessions.RevokeAllSessions(ctx)
+		} else {
+			n, err = s.sessions.RevokeSubjectSessions(ctx, target.Subject)
+		}
 		if err != nil {
-			s.record(ctx, actor, "admin.kill_switch", "all", audit.OutcomeError, map[string]string{
+			s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, map[string]string{
 				"tokens_revoked": strconv.Itoa(rep.TokensRevoked),
 			})
 			return rep, err
 		}
+		rep.SessionsRevoked = n
 	}
 
 	// Bindings. `all` and the dedicated `bindings` target sweep the deployment;

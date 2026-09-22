@@ -45,6 +45,7 @@ func openTestDB(t *testing.T) *DB {
 		         oauth_device_authorizations, oauth_clients,
 		         vault_credentials, federation_bindings, federation_bind_flows,
 		         sessions, authz_requests, audit_events,
+		         session_subjects,
 		         oidc_auth_requests, oidc_codes, oidc_access_tokens,
 		         oidc_refresh_tokens, oidc_devices
 		CASCADE`); err != nil {
@@ -1194,6 +1195,9 @@ func TestRevokeAllSessionsDeletesEveryRow(t *testing.T) {
 		if err := store.Commit(token, []byte("data"), time.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
+		if err := store.Remember(ctx, token, "usr_1"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	n, err := store.RevokeAllSessions(ctx)
 	if err != nil || n != 2 {
@@ -1201,6 +1205,72 @@ func TestRevokeAllSessionsDeletesEveryRow(t *testing.T) {
 	}
 	if _, found, _ := store.Find("t1"); found {
 		t.Fatal("a session survived the kill switch")
+	}
+	var left int
+	if err := db.pool.QueryRow(ctx, `SELECT count(*) FROM session_subjects`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Fatalf("%d subject index rows survived", left)
+	}
+}
+
+// Remember is what lets the Kill Switch reach one account's sessions; scs itself
+// has no idea which account a cookie belongs to.
+func TestRememberAndRevokeSubjectSessions(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	store := db.Sessions()
+	for _, token := range []string{"t1", "t2"} {
+		if err := store.Commit(token, []byte("data"), time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Remember(ctx, "t1", "usr_1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Remember(ctx, "t2", "usr_2"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := store.RevokeSubjectSessions(ctx, "usr_1")
+	if err != nil || n != 1 {
+		t.Fatalf("removed %d (%v), want 1", n, err)
+	}
+	if _, found, _ := store.Find("t1"); found {
+		t.Fatal("usr_1's session survived")
+	}
+	if _, found, _ := store.Find("t2"); !found {
+		t.Fatal("usr_2's session was touched")
+	}
+
+	// Idempotent, and an empty subject is refused rather than matching everyone.
+	if n, err := store.RevokeSubjectSessions(ctx, "usr_1"); err != nil || n != 0 {
+		t.Fatalf("second revoke = %d (%v), want 0", n, err)
+	}
+	if _, err := store.RevokeSubjectSessions(ctx, "  "); err == nil {
+		t.Fatal("RevokeSubjectSessions accepted an empty subject")
+	}
+}
+
+// The index has no foreign key, so an entry written for a session that never got
+// committed must be collected by the sweep.
+func TestSweepExpiredClearsOrphanIndexRows(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	store := db.Sessions()
+	if err := store.Remember(ctx, "never-committed", "usr_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SweepExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := db.pool.QueryRow(ctx, `SELECT count(*) FROM session_subjects`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Fatalf("%d orphan index rows survived the sweep", left)
 	}
 }
 

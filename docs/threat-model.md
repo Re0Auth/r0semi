@@ -89,6 +89,7 @@ A2/A3 可撤销、可审计、可细分，**暴露半径小于 stoken**。
   **实现状态（v1）**：`POST /v1/admin/kill_switch` 已实现令牌、会话与**数据源绑定**三部分；
   绑定半边对每条绑定**本地必断**（撕碎 vault 密文 + 删行），并尽源所能调 revocation / 级联撤销，
   源不支持或不可达会如实报告（`bindings.unsupported` / `bindings.unavailable`），不会假装成功。
+  按账号清会话依赖 `session_subjects` 索引（登录时写入、注销时移除），无索引的部署只能整体清会话。
   见 [admin.md](./admin.md) §4.2。
 - **D6 采纳 OIDC**：Re0Auth 升格为 OpenID Provider（身份联邦 + 数据授权），玩家仍由外部 IdP 登录。
   新增 `id_token` / `userinfo` / JWKS / OIDC discovery 与两把新密钥（A8/A9）。决策与契约见
