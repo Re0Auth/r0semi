@@ -89,7 +89,8 @@ subjects = []
 
 # Identity providers. Only the ones listed here are offered, so a deployment
 # exposes exactly what it configured. Known names: github, google, discord,
-# microsoft, qq.
+# microsoft, qq. Any other name is a **custom OIDC provider**: give it an issuer,
+# and Re0Auth discovers its endpoints and verifies id_tokens against its JWKS.
 #
 # google and microsoft are OIDC: their id_token is verified against the issuer's
 # JWKS, so the issuer must be reachable from this server.
@@ -101,6 +102,17 @@ client_secret_env = "GITHUB_CLIENT_SECRET"
 [idp.google]
 client_id         = "1234.apps.googleusercontent.com"
 client_secret_env = "GOOGLE_CLIENT_SECRET"
+
+# A custom OpenID Provider — a self-hosted Keycloak, Authentik, or any OIDC
+# server, including one that signs people in with a Passkey. Only `issuer` is
+# needed: the endpoints and JWKS are discovered from it, and `display_name` is
+# the label the sign-in button shows. The section name (`authentik`) becomes the
+# identity namespace, so it must not collide with a built-in name.
+# [idp.authentik]
+# client_id         = "..."
+# client_secret_env = "AUTHENTIK_CLIENT_SECRET"
+# issuer            = "https://auth.example/application/o/re0auth/"
+# display_name      = "Authentik"
 
 # Pointing a provider at a self-hosted or proxied endpoint:
 # [idp.microsoft]

@@ -102,7 +102,13 @@ type idpSection struct {
 	AuthURL     string `toml:"auth_url"`
 	TokenURL    string `toml:"token_url"`
 	UserInfoURL string `toml:"userinfo_url"`
-	Issuer      string `toml:"issuer"`
+	// Issuer names an OIDC provider. On a built-in provider it overrides the
+	// built-in issuer; on any other name it is required and makes that name a
+	// custom OIDC provider.
+	Issuer string `toml:"issuer"`
+	// DisplayName is the sign-in button's label. Empty falls back to the
+	// built-in name, then to the provider id.
+	DisplayName string `toml:"display_name"`
 }
 
 type sourceSection struct {
@@ -369,11 +375,19 @@ func loadIdP(cfg *settings, sections map[string]idpSection) error {
 	sort.Strings(names) // deterministic order, so startup logs are stable
 
 	for _, name := range names {
-		provider, ok := knownIdP[name]
-		if !ok {
-			return fmt.Errorf("idp.%s: unknown provider (known: %s)", name, strings.Join(knownNames(knownIdP), ", "))
-		}
 		section := sections[name]
+		provider, builtIn := knownIdP[name]
+		if !builtIn {
+			// A custom provider is any OIDC issuer: a self-hosted Keycloak,
+			// Authentik, or a Passkey provider. It must name its issuer; the
+			// registry discovers the endpoints from it.
+			if strings.TrimSpace(section.Issuer) == "" {
+				return fmt.Errorf(
+					"idp.%s: unknown provider (known: %s); a custom provider must set issuer",
+					name, strings.Join(knownNames(knownIdP), ", "))
+			}
+			provider = idp.Provider(name)
+		}
 		if section.ClientID == "" {
 			return fmt.Errorf("idp.%s.client_id is required", name)
 		}
@@ -384,6 +398,7 @@ func loadIdP(cfg *settings, sections map[string]idpSection) error {
 			TokenURL:    section.TokenURL,
 			UserInfoURL: section.UserInfoURL,
 			Issuer:      section.Issuer,
+			DisplayName: section.DisplayName,
 		}
 		if section.ClientSecretEnv != "" {
 			value, err := config.Secret(section.ClientSecretEnv, "idp."+name+".client_secret_env")

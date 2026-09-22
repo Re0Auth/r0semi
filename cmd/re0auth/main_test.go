@@ -76,3 +76,33 @@ func TestOIDCRetiredKeysParsing(t *testing.T) {
 		t.Fatal("malformed retired signing key accepted")
 	}
 }
+
+// A provider name that is not built in is a custom OIDC provider, and must name
+// its issuer. This is how a self-hosted Passkey/Keycloak/Authentik login is
+// configured without a code change.
+func TestLoadIdPAllowsCustomOIDCProvider(t *testing.T) {
+	var cfg settings
+	if err := loadIdP(&cfg, map[string]idpSection{
+		"authentik": {
+			ClientID:    "cid",
+			Issuer:      "https://id.example/application/o/re0auth/",
+			DisplayName: "Authentik",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.idpCredentials) != 1 {
+		t.Fatalf("credentials = %d, want 1", len(cfg.idpCredentials))
+	}
+	c := cfg.idpCredentials[0]
+	if c.Provider != "authentik" || c.Issuer == "" || c.DisplayName != "Authentik" {
+		t.Fatalf("credential = %+v", c)
+	}
+}
+
+func TestLoadIdPRejectsCustomProviderWithoutIssuer(t *testing.T) {
+	var cfg settings
+	if err := loadIdP(&cfg, map[string]idpSection{"mystery": {ClientID: "cid"}}); err == nil {
+		t.Fatal("accepted a custom provider with no issuer")
+	}
+}

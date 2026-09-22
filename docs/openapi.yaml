@@ -1436,17 +1436,21 @@ components:
 
     IDPProvider:
       type: object
-      required: [id, start_url]
+      required: [id, display_name, start_url]
       description: |
-        One configured identity provider. The human-facing label is deliberately
-        absent: "GitHub" is a translation decision, and a service that returns
-        English strings for its own UI cannot be localised later without changing
-        its API.
+        One configured identity provider. `display_name` is operator
+        configuration, not a UI translation: the deployment names its providers
+        (GitHub; a self-hosted "Authentik") and the frontend shows exactly that.
       properties:
         id:
           type: string
-          description: The provider identifier, as it appears in the login URLs.
-          enum: [github, google, discord, microsoft, qq]
+          description: |
+            The provider identifier, as it appears in the login URLs. Either a
+            built-in name or the key of a custom `[idp.<name>]` section.
+          examples: [github, authentik]
+        display_name:
+          type: string
+          description: The label a sign-in button should show.
         start_url:
           type: string
           format: uri

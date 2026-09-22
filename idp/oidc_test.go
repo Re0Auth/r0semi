@@ -2,6 +2,7 @@ package idp
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,5 +127,70 @@ func TestOIDCRequiresIDToken(t *testing.T) {
 	token := &oauth2.Token{AccessToken: "at-1"}
 	if _, err := c.Identity(oidcContext(provider), token, "nonce"); err == nil {
 		t.Fatal("accepted a token response without an id_token")
+	}
+}
+
+// A custom OIDC provider is configured by issuer alone: the built-in table has no
+// entry for it, so its OAuth endpoints come from discovery and its label from
+// configuration. This is how a self-hosted Keycloak/Authentik/Passkey provider is
+// wired without a code change.
+func TestCustomOIDCProviderDiscoversEndpoints(t *testing.T) {
+	provider := testoidc.New()
+	defer provider.Close()
+
+	reg, err := NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		HTTPClient:   provider.Client(),
+		Credentials: []Credentials{{
+			Provider: "authentik", ClientID: "cid", ClientSecret: "sec",
+			Issuer: provider.URL, DisplayName: "Authentik",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := reg.Get("authentik")
+	if !ok {
+		t.Fatal("the custom provider was not registered")
+	}
+	if c.DisplayName() != "Authentik" {
+		t.Fatalf("display name = %q, want the configured label", c.DisplayName())
+	}
+
+	nonce := c.NewNonce()
+	provider.SetNonce(nonce)
+	ctx := oidcContext(provider)
+
+	// No AuthURL was configured, so it must have been discovered.
+	authURL, err := c.AuthCodeURL(ctx, "st", c.NewVerifier(), nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(authURL, provider.URL+"/authorize?") {
+		t.Fatalf("authorization URL = %q, want the discovered endpoint", authURL)
+	}
+
+	token, err := c.Exchange(ctx, "code-1", c.NewVerifier())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident, err := c.Identity(ctx, token, nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ident.Provider != "authentik" || ident.Subject != "oidc-user-1" {
+		t.Fatalf("identity = %+v", ident)
+	}
+}
+
+// A custom name without an issuer is a typo, not a provider: there is no profile
+// mapping to guess and no discovery document to read.
+func TestCustomOIDCProviderNeedsIssuer(t *testing.T) {
+	_, err := NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		Credentials:  []Credentials{{Provider: "authentik", ClientID: "cid"}},
+	})
+	if err == nil {
+		t.Fatal("accepted a custom provider with no issuer")
 	}
 }

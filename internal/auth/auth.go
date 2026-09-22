@@ -252,6 +252,16 @@ func (h *Handler) Providers() []idp.Provider {
 	return h.registry.Providers()
 }
 
+// ProviderLabel is the label a sign-in button should show for a provider. It
+// comes from the deployment's configuration, so a custom OIDC provider is named
+// without a frontend release.
+func (h *Handler) ProviderLabel(p idp.Provider) string {
+	if client, ok := h.registry.Get(p); ok {
+		return client.DisplayName()
+	}
+	return string(p)
+}
+
 func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
@@ -290,7 +300,15 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	h.manager.sessions.Put(ctx, keyFlowVerifier, verifier)
 	h.manager.sessions.Put(ctx, keyFlowNonce, nonce)
 
-	http.Redirect(w, r, client.AuthCodeURL(state, verifier, nonce), http.StatusFound)
+	authURL, err := client.AuthCodeURL(ctx, state, verifier, nonce)
+	if err != nil {
+		// A custom OIDC provider whose discovery is unreachable is a deployment
+		// problem, and the user cannot log in until it is fixed. Say so rather
+		// than redirecting them to a dead address.
+		http.Error(w, "could not start the authorization", http.StatusBadGateway)
+		return
+	}
+	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {

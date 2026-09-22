@@ -12,7 +12,7 @@
 // can read the authorization code straight out of the browser's address bar once
 // consent is given.
 import { execFileSync, spawn } from 'node:child_process';
-import { generateKeyPairSync } from 'node:crypto';
+import { createPublicKey, createSign, generateKeyPairSync } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -61,6 +61,36 @@ function signingKey() {
 		cachedSigningKey = privateKey.toString('base64');
 	}
 	return cachedSigningKey;
+}
+
+// A second key, for the fake generic OIDC provider. re0auth verifies the id_token
+// against the provider's JWKS, so the fake signs with a real key and publishes
+// its real public half — nothing about the custom-provider path is stubbed.
+const oidcKey = generateKeyPairSync('rsa', {
+	modulusLength: 2048,
+	publicKeyEncoding: { type: 'spki', format: 'pem' },
+	privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+});
+const oidcJWK = {
+	...createPublicKey(oidcKey.publicKey).export({ format: 'jwk' }),
+	kid: 'e2e-oidc',
+	alg: 'RS256',
+	use: 'sig'
+};
+// The nonce from the last /oidc/authorize, echoed into the id_token. A single
+// slot is safe for the same reason nextIdentity is: one worker, awaited sign-ins.
+let oidcNonce = '';
+
+function b64url(value) {
+	return Buffer.from(value).toString('base64url');
+}
+
+function signIDToken(claims) {
+	const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: 'e2e-oidc' }));
+	const payload = b64url(JSON.stringify(claims));
+	const signingInput = `${header}.${payload}`;
+	const signature = createSign('RSA-SHA256').update(signingInput).sign(oidcKey.privateKey);
+	return `${signingInput}.${signature.toString('base64url')}`;
 }
 
 function json(res, status, body) {
@@ -116,6 +146,58 @@ const idp = createServer(async (req, res) => {
 				'<!doctype html><meta charset="utf-8"><title>client callback</title><p>client callback'
 			);
 			return;
+
+		// A generic OIDC provider, so the custom [idp.<name>] path is exercised end
+		// to end: discovery, JWKS, a signed id_token and a nonce.
+		case '/oidc/.well-known/openid-configuration':
+			json(res, 200, {
+				issuer: `${idpBase}/oidc`,
+				authorization_endpoint: `${idpBase}/oidc/authorize`,
+				token_endpoint: `${idpBase}/oidc/token`,
+				jwks_uri: `${idpBase}/oidc/jwks`,
+				response_types_supported: ['code'],
+				subject_types_supported: ['public'],
+				id_token_signing_alg_values_supported: ['RS256']
+			});
+			return;
+		case '/oidc/jwks':
+			json(res, 200, { keys: [oidcJWK] });
+			return;
+		case '/oidc/authorize': {
+			oidcNonce = url.searchParams.get('nonce') ?? '';
+			const target = new URL(url.searchParams.get('redirect_uri'));
+			target.searchParams.set('code', 'e2e-oidc-code');
+			target.searchParams.set('state', url.searchParams.get('state') ?? '');
+			res.writeHead(302, { location: target.toString() }).end();
+			return;
+		}
+		case '/oidc/token': {
+			const form = await readForm(req);
+			let clientID = form.get('client_id');
+			if (!clientID) {
+				const auth = req.headers.authorization ?? '';
+				if (auth.startsWith('Basic ')) {
+					clientID = decodeURIComponent(Buffer.from(auth.slice(6), 'base64').toString().split(':')[0]);
+				}
+			}
+			const now = Math.floor(Date.now() / 1000);
+			json(res, 200, {
+				access_token: 'e2e-oidc-at',
+				token_type: 'Bearer',
+				expires_in: 3600,
+				id_token: signIDToken({
+					iss: `${idpBase}/oidc`,
+					sub: String(subjectFor(nextIdentity)),
+					aud: clientID || 'e2e-oidc-client',
+					iat: now,
+					exp: now + 3600,
+					nonce: oidcNonce,
+					name: `OIDC ${nextIdentity}`,
+					email: 'oidc@example.com'
+				})
+			});
+			return;
+		}
 
 		// The data source. Enough of the upstream protocol for a real bind to
 		// succeed against it.
@@ -229,6 +311,15 @@ client_secret_env = "E2E_IDP_SECRET"
 auth_url = "${idpBase}/github/authorize"
 token_url = "${idpBase}/github/token"
 userinfo_url = "${idpBase}/github/user"
+
+# A generic OIDC provider: a self-hosted Authentik/Keycloak/Passkey login, wired
+# with nothing but an issuer. Its endpoints are discovered, and its id_token is
+# verified against the JWKS the fake publishes.
+[idp.authentik]
+client_id = "e2e-oidc-client"
+client_secret_env = "E2E_IDP_SECRET"
+issuer = "${idpBase}/oidc"
+display_name = "Authentik"
 
 # A registered source, so that a scope can be shown to be enforced by the server
 # rather than by a checkbox. Nothing here is ever contacted: the tests never bind,

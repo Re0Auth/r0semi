@@ -94,6 +94,7 @@ export interface Session {
 
 export interface IDPProvider {
 	id: string;
+	display_name: string;
 	start_url: string;
 }
 
@@ -343,22 +344,3 @@ export const api = {
 			{ body: { acknowledge: 'signs_out_all_devices' }, csrf }
 		)
 };
-
-/**
- * Provider labels, for the buttons on the sign-in page.
- *
- * The server returns only identifiers on purpose, because a label is a
- * translation decision rather than a fact about the API. Anything not listed here
- * still gets a button — showing "linear" is worse than showing "Linear" but far
- * better than hiding a provider the operator configured.
- */
-export function providerLabel(id: string): string {
-	const known: Record<string, string> = {
-		github: 'GitHub',
-		google: 'Google',
-		discord: 'Discord',
-		microsoft: 'Microsoft',
-		qq: 'QQ'
-	};
-	return known[id] ?? id;
-}

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api, providerLabel, type IDPProvider } from '$lib/api';
+	import { api, type IDPProvider } from '$lib/api';
 	import Button from './ui/Button.svelte';
 
 	interface Props {
@@ -56,7 +56,7 @@
 	<div class="flex flex-col gap-2">
 		{#each providers as p (p.id)}
 			<Button variant="secondary" loading={leaving === p.id} onclick={() => begin(p)}>
-				使用 {providerLabel(p.id)} 登录
+				使用 {p.display_name} 登录
 			</Button>
 		{/each}
 	</div>

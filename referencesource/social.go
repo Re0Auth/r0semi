@@ -110,7 +110,12 @@ func (l *SocialLogin) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	l.mu.Unlock()
 
-	http.Redirect(w, r, client.AuthCodeURL(state, verifier, nonce), http.StatusFound)
+	authURL, err := client.AuthCodeURL(r.Context(), state, verifier, nonce)
+	if err != nil {
+		http.Error(w, "could not start the authorization", http.StatusBadGateway)
+		return
+	}
+	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 func (l *SocialLogin) handleCallback(w http.ResponseWriter, r *http.Request, establish Establish) {

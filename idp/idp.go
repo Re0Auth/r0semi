@@ -160,6 +160,16 @@ var definitions = map[Provider]definition{
 	},
 }
 
+// providerLabels are the built-in providers' human names. A deployment may
+// override one with Credentials.DisplayName; a custom provider defaults to its id.
+var providerLabels = map[Provider]string{
+	GitHub:    "GitHub",
+	Google:    "Google",
+	Discord:   "Discord",
+	QQ:        "QQ",
+	Microsoft: "Microsoft",
+}
+
 // Credentials configures one provider. AuthURL/TokenURL/Scopes/UserInfoURL
 // override the built-in definition when non-empty, which is how tests (and
 // self-hosted or proxied endpoints) are wired.
@@ -175,7 +185,14 @@ type Credentials struct {
 	// Issuer overrides the built-in OIDC issuer. Setting it on a non-OIDC
 	// provider (GitHub, QQ) makes it OIDC; that is how tests point a provider
 	// at a fake OpenID Provider.
+	//
+	// A provider that is not built in MUST set it: Re0Auth then speaks OIDC to
+	// that issuer and discovers its endpoints, which is how a self-hosted
+	// Keycloak/Authentik/Passkey provider is configured.
 	Issuer string
+	// DisplayName is the label a sign-in button shows. Empty falls back to the
+	// built-in name, then to the provider id.
+	DisplayName string
 }
 
 // RegistryConfig configures a Registry.
@@ -201,16 +218,17 @@ type Registry struct {
 
 // Client drives one provider's authorization-code + PKCE flow.
 type Client struct {
-	provider Provider
-	def      definition
-	issuer   string
-	oauth    oauth2.Config
-	http     *http.Client
+	provider    Provider
+	displayName string
+	def         definition
+	issuer      string
+	oauth       oauth2.Config
+	http        *http.Client
 
-	// oidcMu guards lazy discovery of the OIDC verifier. A failed discovery is
-	// not cached, so it can be retried.
-	oidcMu sync.Mutex
-	oidc   *oidc.IDTokenVerifier
+	// providerMu guards lazy discovery of the issuer's document. A failed
+	// discovery is not cached, so it can be retried on the next request.
+	providerMu sync.Mutex
+	discovered *oidc.Provider
 }
 
 // NewRegistry builds a registry from configuration.
@@ -230,9 +248,21 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 
 	r := &Registry{clients: make(map[Provider]*Client, len(cfg.Credentials))}
 	for _, cred := range cfg.Credentials {
-		baseDef, ok := definitions[cred.Provider]
-		if !ok {
-			return nil, fmt.Errorf("idp: unknown provider %q", cred.Provider)
+		if err := validateProviderName(cred.Provider); err != nil {
+			return nil, err
+		}
+		baseDef, builtIn := definitions[cred.Provider]
+		if !builtIn {
+			// A custom provider must be OIDC. There is no built-in profile mapping
+			// to fall back on, and inventing one for an arbitrary OAuth2 provider
+			// would be a guess presented as a working login.
+			if cred.Issuer == "" {
+				return nil, fmt.Errorf("idp: provider %q is neither built in nor OIDC (set issuer)", cred.Provider)
+			}
+			baseDef = definition{
+				issuer: cred.Issuer,
+				scopes: []string{"openid", "email", "profile"},
+			}
 		}
 		if cred.ClientID == "" {
 			return nil, fmt.Errorf("idp: %s: ClientID is required", cred.Provider)
@@ -255,10 +285,19 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 			def.issuer = cred.Issuer
 		}
 
+		label := cred.DisplayName
+		if label == "" {
+			label = providerLabels[cred.Provider]
+		}
+		if label == "" {
+			label = string(cred.Provider)
+		}
+
 		r.clients[cred.Provider] = &Client{
-			provider: cred.Provider,
-			def:      def,
-			issuer:   def.issuer,
+			provider:    cred.Provider,
+			displayName: label,
+			def:         def,
+			issuer:      def.issuer,
 			oauth: oauth2.Config{
 				ClientID:     cred.ClientID,
 				ClientSecret: cred.ClientSecret,
@@ -270,6 +309,26 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 		}
 	}
 	return r, nil
+}
+
+// validateProviderName keeps a provider name usable as a URL path segment and as
+// an account identity key. The name is operator input, but it ends up in the
+// callback URL and in every stored identity, so it is checked rather than trusted.
+func validateProviderName(p Provider) error {
+	s := string(p)
+	if s == "" {
+		return errors.New("idp: provider name is required")
+	}
+	for i, r := range s {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+		if i == 0 && (r == '-' || r == '_') {
+			valid = false
+		}
+		if !valid {
+			return fmt.Errorf("idp: provider name %q must be lowercase letters, digits, '-' or '_', and start with a letter or digit", s)
+		}
+	}
+	return nil
 }
 
 // Get returns the client for a provider.
@@ -291,6 +350,16 @@ func (r *Registry) Providers() []Provider {
 // Provider returns the client's provider.
 func (c *Client) Provider() Provider { return c.provider }
 
+// DisplayName is the human-facing label for the sign-in button. It comes from the
+// deployment's configuration, so a custom OIDC provider is named without a
+// frontend release.
+func (c *Client) DisplayName() string {
+	if c.displayName != "" {
+		return c.displayName
+	}
+	return string(c.provider)
+}
+
 // NewVerifier generates a PKCE code verifier for one authorization.
 func (c *Client) NewVerifier() string { return oauth2.GenerateVerifier() }
 
@@ -299,17 +368,45 @@ func (c *Client) NewNonce() string { return oauth2.GenerateVerifier() }
 
 // AuthCodeURL builds the provider authorization URL with PKCE S256. nonce is
 // required for an OIDC provider and ignored otherwise.
-func (c *Client) AuthCodeURL(state, verifier, nonce string) string {
+//
+// It takes a context because a custom OIDC provider's endpoints are discovered
+// lazily: a built-in provider carries them statically, but a self-hosted one is
+// known only after reading its discovery document.
+func (c *Client) AuthCodeURL(ctx context.Context, state, verifier, nonce string) (string, error) {
+	cfg, err := c.oauthConfig(ctx)
+	if err != nil {
+		return "", err
+	}
 	opts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(verifier)}
 	if nonce != "" {
 		opts = append(opts, oauth2.SetAuthURLParam("nonce", nonce))
 	}
-	return c.oauth.AuthCodeURL(state, opts...)
+	return cfg.AuthCodeURL(state, opts...), nil
 }
 
 // Exchange redeems an authorization code, proving possession of the verifier.
 func (c *Client) Exchange(ctx context.Context, code, verifier string) (*oauth2.Token, error) {
-	return c.oauth.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+	cfg, err := c.oauthConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+}
+
+// oauthConfig returns the oauth2 configuration with its endpoints resolved. A
+// built-in provider carries AuthURL/TokenURL statically; a custom OIDC provider
+// has them discovered from its issuer.
+func (c *Client) oauthConfig(ctx context.Context) (oauth2.Config, error) {
+	cfg := c.oauth
+	if cfg.Endpoint.AuthURL != "" && cfg.Endpoint.TokenURL != "" {
+		return cfg, nil
+	}
+	provider, err := c.oidcProvider(ctx)
+	if err != nil {
+		return oauth2.Config{}, err
+	}
+	cfg.Endpoint = provider.Endpoint()
+	return cfg, nil
 }
 
 // Identity verifies and canonicalizes the authenticated user.
@@ -393,19 +490,29 @@ func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, n
 	}, nil
 }
 
-// idTokenVerifier discovers the provider once and caches the verifier.
-func (c *Client) idTokenVerifier(ctx context.Context) (*oidc.IDTokenVerifier, error) {
-	c.oidcMu.Lock()
-	defer c.oidcMu.Unlock()
-	if c.oidc != nil {
-		return c.oidc, nil
+// oidcProvider discovers the issuer once and caches the result. It is used both
+// to verify id_tokens and, for a custom provider, to learn the OAuth endpoints.
+func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
+	c.providerMu.Lock()
+	defer c.providerMu.Unlock()
+	if c.discovered != nil {
+		return c.discovered, nil
 	}
 	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, c.http), c.issuer)
 	if err != nil {
 		return nil, fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err)
 	}
-	c.oidc = provider.Verifier(&oidc.Config{ClientID: c.oauth.ClientID})
-	return c.oidc, nil
+	c.discovered = provider
+	return provider, nil
+}
+
+// idTokenVerifier returns a verifier for the issuer's id_tokens.
+func (c *Client) idTokenVerifier(ctx context.Context) (*oidc.IDTokenVerifier, error) {
+	provider, err := c.oidcProvider(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return provider.Verifier(&oidc.Config{ClientID: c.oauth.ClientID}), nil
 }
 
 func firstNonEmpty(a, b string) string {

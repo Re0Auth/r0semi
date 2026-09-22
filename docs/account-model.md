@@ -94,6 +94,13 @@ v1 的处理：
 |---|---|---|
 | `GET` | `/auth/{provider}/start?mode=login\|link&return_to=...` | 服务端记录流程状态，302 到 IdP 授权端点 |
 | `GET` | `/auth/{provider}/callback?code=&state=` | 校验 `state`、兑换 token、拉取用户信息、落地会话、302 回前端 |
+
+`{provider}` 既可以是内置的 `github` / `google` / `discord` / `microsoft` / `qq`，也可以是 `[idp.<name>]`
+里以 `issuer` 声明的**任意 OIDC provider**（自建 Keycloak / Authentik / 任何用 Passkey 登录的 OP）。
+自定义 provider 的端点由 OIDC discovery 得到，`id_token` 用 issuer 的 JWKS 验签，按钮上的名字来自
+`display_name`。**因此“用 Passkey 登录”不需要 Re0Auth 自己实现 Passkey**——把用户交给一个支持
+Passkey 的 OP 即可；Re0Auth 仍不持有也不验证任何密码/密钥。provider 名会被限制为单个 URL 路径段，
+因为它同时是身份命名空间 `(provider, subject)` 的一部分。
 | `GET` | `/v1/sessions/current` | 当前会话与已链接身份（含 `primary_identity_id`） |
 | `POST` | `/v1/sessions/sign_out` | 登出（清 Cookie、失效服务端会话） |
 | `GET` | `/v1/identities` | 列出已链接身份（**已实现**，会话） |
@@ -168,3 +175,5 @@ GET /oauth/authorize?...
 - 多身份策略（如强制要求 ≥2 身份以便找回）作为可选的安全增强，后续再评估。
 - 5 大 IdP 客户端与 `/auth` 平面**已实现**（`idp`、`internal/auth`，见 architecture.md §4.6）；
   账号存储 `internal/account` 已强制 §2 三条不变量。真实 IdP 的 Client ID / Secret 需在部署时配置。
+- 除内置 5 家外，`[idp.<name>]` + `issuer` 可接**任意 OIDC provider**（自建 Passkey / Keycloak /
+  Authentik）：端点走 discovery，`id_token` 走 JWKS 验签，不验密码。

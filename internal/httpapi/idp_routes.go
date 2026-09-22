@@ -6,13 +6,13 @@ import (
 
 // idpProviderView is one offered identity provider.
 //
-// Only the identifier and the URL are returned. The human-facing label is left to
-// the caller: "GitHub" is a translation decision, and a service that returns
-// English strings for its own UI is a service that cannot be localised later
-// without changing its API.
+// DisplayName is operator configuration, not a UI translation: the deployment
+// names its providers (GitHub; a self-hosted "Authentik") and the frontend shows
+// exactly that. The service does not invent English strings for its own UI.
 type idpProviderView struct {
-	ID       string `json:"id"`
-	StartURL string `json:"start_url"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	StartURL    string `json:"start_url"`
 }
 
 // handleIDPProviders lists the identity providers this deployment offers.
@@ -29,7 +29,8 @@ func (s *Server) handleIDPProviders(w http.ResponseWriter, _ *http.Request) {
 	views := make([]idpProviderView, 0, len(providers))
 	for _, p := range providers {
 		views = append(views, idpProviderView{
-			ID: string(p),
+			ID:          string(p),
+			DisplayName: s.auth.ProviderLabel(p),
 			// Same origin, and relative to the issuer so that a deployment behind
 			// a path prefix is described correctly.
 			StartURL: s.issuer + "/auth/" + string(p) + "/start",

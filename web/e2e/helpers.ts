@@ -36,15 +36,18 @@ export function authorizeURL(opts: { challenge: string; scopes?: string; state?:
  * The identity defaults to the test's own title, so every test gets its own
  * account and cannot see another test's grants. Pass one explicitly when a test
  * *wants* two browsers to be the same account.
+ *
+ * `provider` is the button label, which is the deployment's display name for that
+ * IdP; the default is the built-in GitHub.
  */
-export async function signIn(page: Page, identity: string = test.info().title) {
+export async function signIn(page: Page, identity: string = test.info().title, provider = 'GitHub') {
 	// Tell the provider who this sign-in is, before starting it. This is the fake's
 	// own control channel; nothing in re0auth knows about it.
 	const tell = await fetch(`${idpBase}/__identity/${encodeURIComponent(identity)}`, { method: 'POST' });
 	expect(tell.ok, `the fake provider refused the identity: ${tell.status}`).toBe(true);
 
 	await page.goto('/app/');
-	const button = page.getByRole('button', { name: /使用 GitHub 登录/ });
+	const button = page.getByRole('button', { name: `使用 ${provider} 登录` });
 	try {
 		await button.click({ timeout: 10_000 });
 	} catch {

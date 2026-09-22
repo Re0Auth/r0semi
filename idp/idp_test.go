@@ -21,6 +21,13 @@ func TestNewRegistryValidation(t *testing.T) {
 	if _, err := NewRegistry(RegistryConfig{RedirectBase: "https://x", Credentials: []Credentials{{Provider: GitHub}}}); err == nil {
 		t.Fatal("accepted a provider without a client id")
 	}
+	// The provider name ends up in the callback URL and in every stored identity,
+	// so a name that is not one URL path segment is rejected rather than trusted.
+	if _, err := NewRegistry(RegistryConfig{RedirectBase: "https://x", Credentials: []Credentials{
+		{Provider: "bad/name", ClientID: "cid", Issuer: "https://id.example"},
+	}}); err == nil {
+		t.Fatal("accepted a provider name that is not a URL path segment")
+	}
 }
 
 func TestAuthCodeURLCarriesPKCE(t *testing.T) {
@@ -37,7 +44,10 @@ func TestAuthCodeURLCarriesPKCE(t *testing.T) {
 	}
 
 	verifier := c.NewVerifier()
-	raw := c.AuthCodeURL("state123", verifier, "nonce123")
+	raw, err := c.AuthCodeURL(context.Background(), "state123", verifier, "nonce123")
+	if err != nil {
+		t.Fatal(err)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		t.Fatal(err)

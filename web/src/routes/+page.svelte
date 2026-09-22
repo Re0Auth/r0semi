@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { base } from '$app/paths';
-	import { api, ApiError, providerLabel, type IDPProvider, type Session } from '$lib/api';
+	import { api, ApiError, type IDPProvider, type Session } from '$lib/api';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
@@ -175,7 +175,7 @@
 							<Button
 								variant="secondary"
 								loading={linking === p.id}
-								onclick={() => link(p)}>绑定 {providerLabel(p.id)}</Button
+								onclick={() => link(p)}>绑定 {p.display_name}</Button
 							>
 						{/each}
 					</div>

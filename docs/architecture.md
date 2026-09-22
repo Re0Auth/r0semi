@@ -345,6 +345,9 @@ HTTP 头和 `<meta>` 同时存在时，**两个 CSP 都强制执行**。`interna
   audience、过期与 **nonce**（调用方必须把 `AuthCodeURL` 的 nonce 回传给 `Identity`）；
   无 `id_token` 则**失败关闭**，绝不退回 userinfo。非 OIDC 提供方（GitHub / QQ）继续用 userinfo，
   QQ 走 JSONP + 非标准 profile API。发现（discovery）懒加载并缓存，失败不缓存。
+  除内置 5 家外，`[idp.<name>]` + `issuer` 可声明**任意 OIDC provider**（自建 Keycloak / Authentik /
+  任何用 Passkey 登录的 OP）：端点从 discovery 得到，`id_token` 用 issuer 的 JWKS 验签，按钮名来自
+  `display_name`。provider 名会被校验为单个 URL 路径段，因为它同时是身份命名空间。
 - `internal/account`：`usr_` 的唯一分配者，强制三条账号不变量（平权 / 底线 / 隔离，见 account-model.md §2）。
 - `internal/auth`：基于 `alexedwards/scs` 的服务端会话（`__Host-` HttpOnly Cookie + 登录时轮换）、
   CSRF（会话内同步令牌 + `X-CSRF-Token`）、`/auth/{provider}/start|callback` 处理器。
