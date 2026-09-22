@@ -22,6 +22,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
+	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
@@ -54,6 +55,9 @@ type Config struct {
 	// Authz, when set with Sessions, enables the authorization-interaction API
 	// and turns /oauth/authorize into a real browser flow.
 	Authz authz.Service
+	// Authorization, when set, is the consent interaction (OP mode). When unset
+	// it is built from Authz, so the old engine keeps working unchanged.
+	Authorization authorization.Interaction
 	// ConsentPath is the frontend route /oauth/authorize redirects to. It must be a
 	// route the mounted frontend actually serves. Defaults to
 	// webui.BasePath + "/consent".
@@ -108,20 +112,21 @@ type DeviceStore interface {
 
 // Server is the two-plane HTTP surface.
 type Server struct {
-	issuer    string
-	resource  string
-	errorBase string
-	scopes    *oauth.Registry
-	as        oauth.Service
-	sessions  *auth.Manager
-	accounts  account.Store
-	auth      *auth.Handler
-	authz     authz.Service
-	consent   string
-	federate  federation.Service
-	limiter   *ratelimit.Limiter
-	secure    bool
-	frontend  fs.FS
+	issuer       string
+	resource     string
+	errorBase    string
+	scopes       *oauth.Registry
+	as           oauth.Service
+	sessions     *auth.Manager
+	accounts     account.Store
+	auth         *auth.Handler
+	authz        authz.Service
+	authInteract authorization.Interaction
+	consent      string
+	federate     federation.Service
+	limiter      *ratelimit.Limiter
+	secure       bool
+	frontend     fs.FS
 	// oidc, when non-nil, is the protocol plane; introspector is always set
 	// (AS when oidc is nil, the OP bridge when it is not).
 	oidc         http.Handler
@@ -156,6 +161,16 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Authz != nil && cfg.Sessions == nil {
 		return nil, errors.New("httpapi: Config.Authz requires Config.Sessions")
 	}
+	if cfg.Authorization != nil && cfg.Sessions == nil {
+		return nil, errors.New("httpapi: Config.Authorization requires Config.Sessions")
+	}
+	var authInteract authorization.Interaction
+	switch {
+	case cfg.Authorization != nil:
+		authInteract = cfg.Authorization
+	case cfg.Authz != nil:
+		authInteract = authzInteraction{svc: cfg.Authz}
+	}
 	if cfg.ConsentPath == "" {
 		// The consent screen is a frontend route, so its default is derived from
 		// where the frontend is mounted rather than invented separately. A
@@ -187,6 +202,7 @@ func New(cfg Config) (*Server, error) {
 		accounts:     cfg.Accounts,
 		auth:         cfg.Auth,
 		authz:        cfg.Authz,
+		authInteract: authInteract,
 		consent:      cfg.ConsentPath,
 		federate:     cfg.Federation,
 		limiter:      cfg.Limiter,
@@ -236,7 +252,7 @@ func (s *Server) specRoutes() []route {
 			route{http.MethodGet, "/v1/device/verification", s.handleDeviceVerification},
 		)
 	}
-	if s.sessions != nil && s.authz != nil {
+	if s.sessions != nil && s.authInteract != nil {
 		routes = append(routes,
 			route{http.MethodGet, "/v1/authorization_requests/{id}", s.handleGetAuthorizationRequest},
 			route{http.MethodPost, "/v1/authorization_requests/{id}/decision", s.handleAuthorizationDecision},

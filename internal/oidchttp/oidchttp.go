@@ -21,6 +21,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 	"golang.org/x/text/language"
 
+	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -75,13 +76,9 @@ type ConsentStore interface {
 	CompleteLogin(ctx context.Context, id, subject string, scopes []string) error
 }
 
-// ConsentRequest is the consent screen's view of a pending authorization.
-type ConsentRequest struct {
-	ID         string
-	ClientID   string
-	ClientName string
-	Scopes     []oauth.Scope
-}
+// ValidID implements authorization.Interaction. OP auth request ids are opaque
+// random strings, not the old engine's arq_ handle.
+func (h *Handler) ValidID(id string) bool { return id != "" && len(id) <= 128 }
 
 // Handler is the protocol plane.
 type Handler struct {
@@ -268,17 +265,17 @@ func (h *Handler) Introspect(ctx context.Context, token string) (oauth.TokenInfo
 	}, nil
 }
 
-// DescribeAuthorization returns the pending request for the consent screen.
-func (h *Handler) DescribeAuthorization(ctx context.Context, id string) (ConsentRequest, error) {
+// DescribeAuthorization implements authorization.Interaction.
+func (h *Handler) DescribeAuthorization(ctx context.Context, id string) (authorization.View, error) {
 	ar, err := h.provider.Storage().AuthRequestByID(ctx, id)
 	if err != nil {
-		return ConsentRequest{}, err
+		return authorization.View{}, err
 	}
 	client, err := h.clients.Get(ctx, ar.GetClientID())
 	if err != nil {
-		return ConsentRequest{}, err
+		return authorization.View{}, err
 	}
-	return ConsentRequest{
+	return authorization.View{
 		ID:         id,
 		ClientID:   client.ID,
 		ClientName: client.Name,
