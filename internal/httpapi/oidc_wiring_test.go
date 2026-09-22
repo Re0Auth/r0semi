@@ -85,6 +85,8 @@ func TestOIDCWiringEndToEnd(t *testing.T) {
 		Issuer:            "http://issuer.example",
 		OIDC:              opHandler,
 		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.New: %v", err)

@@ -69,7 +69,8 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 | P1 | 生产 `op.Storage` 适配现有 Postgres 端口（`oidc_*` 表、客户端接缝、scope 门禁、审计） | ✅ 已完成 |
 | P2a | `internal/oidchttp`：协议面 handler（端点对齐 `/oauth/*`、OIDC discovery + RFC 8414 别名、JWKS、userinfo、id_token 门控）+ 端到端测试 | ✅ 已完成 |
 | P2b | 接入 `internal/httpapi`：`Config.OIDC` 替换协议面 + 业务面 introspection 桥（OP 令牌经 `/v1/me` 验证）+ 端到端测试 | ✅ 已完成 |
-| P3 | 前端同意流改 login-URL / callback；`/v1/device/*` 与 `/v1/grants` 改走 OP 存储；`cmd/re0auth` 翻转默认引擎 | 待办 |
+| P3a | `/v1/device/*` 与 `/v1/grants` 改走 OP 存储（`GrantStore` / `DeviceStore` 接缝）+ 测试 | ✅ 已完成 |
+| P3b | 前端同意流改 login-URL / callback；`cmd/re0auth` 装配 OP 并翻转默认引擎 | 待办 |
 | P4 | 下线手写 `oauth/` 引擎；更新 README / NOTICE | 待办 |
 
 ## 7. 受影响文档

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
@@ -709,4 +710,190 @@ func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
 	}
 	s.record(ctx, "oidc.device.deny", "", "", audit.OutcomeDenied)
 	return nil
+}
+
+// --- engine-neutral business-plane surface (same shapes as oauth.Service) ---
+
+// Grants lists what each client can still do as this subject, derived from the
+// OP token tables. It is the OP-backed counterpart of oauth.Service.Grants.
+func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, error) {
+	if subject == "" {
+		return nil, errors.New("postgres: subject is required")
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT client_id, scopes, issued_at, expires_at, false
+		  FROM oidc_access_tokens WHERE subject = $1 AND expires_at > now()
+		UNION ALL
+		SELECT client_id, scopes, issued_at, expires_at, true
+		  FROM oidc_refresh_tokens WHERE subject = $1 AND expires_at > now()`, subject)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list grants: %w", err)
+	}
+	defer rows.Close()
+
+	byClient := make(map[string]*oauth.Grant)
+	for rows.Next() {
+		var (
+			clientID string
+			scopes   []string
+			issued   time.Time
+			expires  time.Time
+			hasRT    bool
+		)
+		if err := rows.Scan(&clientID, &scopes, &issued, &expires, &hasRT); err != nil {
+			return nil, err
+		}
+		g, ok := byClient[clientID]
+		if !ok {
+			g = &oauth.Grant{ClientID: clientID, IssuedAt: issued, ExpiresAt: expires}
+			if c, err := s.clients.Get(ctx, clientID); err == nil {
+				g.ClientName = c.Name
+			}
+			byClient[clientID] = g
+		}
+		for _, sc := range scopes {
+			g.Scopes = appendScopeUnique(g.Scopes, oauth.Scope(sc))
+		}
+		if issued.Before(g.IssuedAt) {
+			g.IssuedAt = issued
+		}
+		if expires.After(g.ExpiresAt) {
+			g.ExpiresAt = expires
+		}
+		if hasRT {
+			g.HasRefresh = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]oauth.Grant, 0, len(byClient))
+	for _, g := range byClient {
+		sort.Slice(g.Scopes, func(i, j int) bool { return g.Scopes[i] < g.Scopes[j] })
+		out = append(out, *g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ClientID < out[j].ClientID })
+	return out, nil
+}
+
+// RevokeGrant removes every OP token a client holds for a subject. It is the
+// local revocation and is idempotent.
+func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) error {
+	if subject == "" || clientID == "" {
+		return errors.New("postgres: subject and client id are required")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM oidc_access_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM oidc_refresh_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.record(ctx, "oidc.grant.revoke", subject, clientID, audit.OutcomeOK)
+	return nil
+}
+
+// DescribeDeviceAuthorization is the device verification page's view of a
+// pending device grant (OP-backed counterpart of the same oauth.Service method).
+func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error) {
+	st, err := s.DeviceByUserCode(ctx, userCode)
+	if err != nil || st.Done || st.Denied || time.Now().After(st.Expires) {
+		return oauth.DeviceAuthorization{}, oauth.ErrDeviceNotFound
+	}
+	client, err := s.clients.Get(ctx, st.ClientID)
+	if err != nil {
+		return oauth.DeviceAuthorization{}, oauth.ErrDeviceNotFound
+	}
+	descriptors, err := s.registry.Resolve(stringsToScopes(st.Scopes), st.ClientID)
+	if err != nil {
+		return oauth.DeviceAuthorization{}, err
+	}
+	return oauth.DeviceAuthorization{
+		UserCode:  userCode,
+		Client:    client,
+		Scopes:    descriptors,
+		ExpiresAt: st.Expires,
+	}, nil
+}
+
+// DecideDeviceAuthorization records the user's approval or denial, narrowing
+// scopes and enforcing explicit consent exactly like the interactive flow.
+func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, subject string, approve bool, scopes, explicit []oauth.Scope) error {
+	if subject == "" {
+		return &oauth.Error{Code: "access_denied", Description: "user is not authenticated"}
+	}
+	st, err := s.DeviceByUserCode(ctx, userCode)
+	if err != nil || st.Done || st.Denied || time.Now().After(st.Expires) {
+		return oauth.ErrDeviceNotFound
+	}
+	if !approve {
+		return s.DenyDevice(ctx, userCode)
+	}
+
+	granted := st.Scopes
+	if len(scopes) > 0 {
+		for _, sc := range scopes {
+			if !containsStr(st.Scopes, sc.String()) {
+				return &oauth.Error{Code: "invalid_scope", Description: "the decision cannot widen the requested scope"}
+			}
+		}
+		granted = scopeStrings(scopes)
+	}
+	descriptors, err := s.registry.Resolve(stringsToScopes(granted), st.ClientID)
+	if err != nil {
+		return err
+	}
+	ticked := make(map[oauth.Scope]struct{}, len(explicit))
+	for _, sc := range explicit {
+		ticked[sc] = struct{}{}
+	}
+	for _, d := range descriptors {
+		if d.ExplicitConsent {
+			if _, ok := ticked[d.Scope]; !ok {
+				return &oauth.Error{Code: "access_denied", Description: "explicit consent is required for " + d.Scope.String()}
+			}
+		}
+	}
+	return s.ApproveDevice(ctx, userCode, subject, granted)
+}
+
+func containsStr(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func scopeStrings(scopes []oauth.Scope) []string {
+	out := make([]string, len(scopes))
+	for i, s := range scopes {
+		out[i] = s.String()
+	}
+	return out
+}
+
+func stringsToScopes(in []string) []oauth.Scope {
+	out := make([]oauth.Scope, len(in))
+	for i, s := range in {
+		out[i] = oauth.Scope(s)
+	}
+	return out
+}
+
+func appendScopeUnique(dst []oauth.Scope, s oauth.Scope) []oauth.Scope {
+	for _, have := range dst {
+		if have == s {
+			return dst
+		}
+	}
+	return append(dst, s)
 }

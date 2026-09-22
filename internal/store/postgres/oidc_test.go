@@ -251,3 +251,86 @@ func TestOIDCDeviceFlow(t *testing.T) {
 		t.Fatalf("duplicate user code = %v, want ErrDuplicateUserCode", err)
 	}
 }
+
+// The grants view, derived from the OP token tables.
+func TestOIDCGrantsAndRevoke(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	ar := newAuthRequest(t, ctx, store)
+	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_1", []string{"account.id", "phigros.score.read"}); err != nil {
+		t.Fatal(err)
+	}
+	ar, err := store.AuthRequestByID(ctx, ar.GetID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.CreateAccessAndRefreshTokens(ctx, ar, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	grants, err := store.Grants(ctx, "usr_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants) != 1 {
+		t.Fatalf("grants = %+v", grants)
+	}
+	g := grants[0]
+	if g.ClientID != "oidc-web" || !g.HasRefresh || len(g.Scopes) != 2 {
+		t.Fatalf("grant = %+v", g)
+	}
+	if g.IssuedAt.IsZero() || g.ExpiresAt.IsZero() || !g.ExpiresAt.After(g.IssuedAt) {
+		t.Fatalf("grant times = %v / %v", g.IssuedAt, g.ExpiresAt)
+	}
+
+	if err := store.RevokeGrant(ctx, "usr_1", "oidc-web"); err != nil {
+		t.Fatal(err)
+	}
+	if grants, err = store.Grants(ctx, "usr_1"); err != nil || len(grants) != 0 {
+		t.Fatalf("grants after revoke = %+v (%v)", grants, err)
+	}
+	// Revoking again is success.
+	if err := store.RevokeGrant(ctx, "usr_1", "oidc-web"); err != nil {
+		t.Fatalf("revoke is not idempotent: %v", err)
+	}
+}
+
+// The device verification surface: describe, reject widening, approve, deny.
+func TestOIDCDeviceDescribeAndDecide(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	expires := time.Now().Add(5 * time.Minute)
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "dev-desc-1", "GHJK-BCDF", expires,
+		[]string{"account.id", "phigros.score.read"}); err != nil {
+		t.Fatal(err)
+	}
+
+	auth, err := store.DescribeDeviceAuthorization(ctx, "ghjkbcdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.Client.ID != "oidc-device" || len(auth.Scopes) != 2 {
+		t.Fatalf("describe = %+v", auth)
+	}
+
+	// A decision cannot widen the request.
+	if err := store.DecideDeviceAuthorization(ctx, "GHJK-BCDF", "usr_1", true,
+		[]oauth.Scope{oauth.ScopePhigrosB30}, nil); err == nil {
+		t.Fatal("widening decision accepted")
+	}
+
+	if err := store.DecideDeviceAuthorization(ctx, "GHJK-BCDF", "usr_1", true,
+		[]oauth.Scope{oauth.ScopeAccountID}, nil); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "dev-desc-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Done || st.Subject != "usr_1" || len(st.Scopes) != 1 {
+		t.Fatalf("state = %+v", st)
+	}
+
+	// Once decided, it is no longer describable.
+	if _, err := store.DescribeDeviceAuthorization(ctx, "GHJK-BCDF"); !errors.Is(err, oauth.ErrDeviceNotFound) {
+		t.Fatalf("describe after decision = %v, want ErrDeviceNotFound", err)
+	}
+}

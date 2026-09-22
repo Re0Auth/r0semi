@@ -80,6 +80,11 @@ type Config struct {
 	// TokenIntrospector validates bearer tokens for the business plane. Defaults
 	// to AS.Introspect; an OP deployment passes the OP-backed introspector.
 	TokenIntrospector TokenIntrospector
+	// GrantStore and DeviceStore route the business-plane grants and device views
+	// to the engine. They default to AS; an OP deployment passes the OP-backed
+	// store so the views reflect the tokens the OP actually issued.
+	GrantStore  GrantStore
+	DeviceStore DeviceStore
 }
 
 // TokenIntrospector resolves a bearer token to its grant. It is the business
@@ -87,6 +92,18 @@ type Config struct {
 // swapped without the /v1 layer importing it.
 type TokenIntrospector interface {
 	Introspect(ctx context.Context, token string) (oauth.TokenInfo, error)
+}
+
+// GrantStore is the grants view's engine seam (a subset of oauth.Service).
+type GrantStore interface {
+	Grants(ctx context.Context, subject string) ([]oauth.Grant, error)
+	RevokeGrant(ctx context.Context, subject, clientID string) error
+}
+
+// DeviceStore is the device verification page's engine seam.
+type DeviceStore interface {
+	DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error)
+	DecideDeviceAuthorization(ctx context.Context, userCode, subject string, approve bool, scopes, explicit []oauth.Scope) error
 }
 
 // Server is the two-plane HTTP surface.
@@ -109,6 +126,8 @@ type Server struct {
 	// (AS when oidc is nil, the OP bridge when it is not).
 	oidc         http.Handler
 	introspector TokenIntrospector
+	grants       GrantStore
+	devices      DeviceStore
 }
 
 // New validates cfg and returns a Server.
@@ -143,12 +162,20 @@ func New(cfg Config) (*Server, error) {
 		// deployment that moves the app must move this with it.
 		cfg.ConsentPath = webui.BasePath + "/consent"
 	}
-	if cfg.OIDC != nil && cfg.TokenIntrospector == nil {
-		return nil, errors.New("httpapi: Config.OIDC requires Config.TokenIntrospector (the business plane would not accept OP tokens otherwise)")
+	if cfg.OIDC != nil && (cfg.TokenIntrospector == nil || cfg.GrantStore == nil || cfg.DeviceStore == nil) {
+		return nil, errors.New("httpapi: Config.OIDC requires Config.TokenIntrospector, Config.GrantStore and Config.DeviceStore")
 	}
 	introspector := cfg.TokenIntrospector
 	if introspector == nil {
 		introspector = cfg.AS
+	}
+	grants := cfg.GrantStore
+	if grants == nil {
+		grants = cfg.AS
+	}
+	devices := cfg.DeviceStore
+	if devices == nil {
+		devices = cfg.AS
 	}
 	return &Server{
 		issuer:       strings.TrimRight(cfg.Issuer, "/"),
@@ -167,6 +194,8 @@ func New(cfg Config) (*Server, error) {
 		frontend:     cfg.Frontend,
 		oidc:         cfg.OIDC,
 		introspector: introspector,
+		grants:       grants,
+		devices:      devices,
 	}, nil
 }
 
