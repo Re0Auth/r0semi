@@ -16,6 +16,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zitadel/oidc/v3/pkg/oidc"
+	"github.com/zitadel/oidc/v3/pkg/op"
+
 	"github.com/Re0Auth/r0semi/internal/store/postgres"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -32,6 +35,7 @@ func randSuffix() string {
 
 type fixture struct {
 	server   *httptest.Server
+	handler  *Handler
 	store    *postgres.OIDCStore
 	webID    string
 	deviceID string
@@ -104,13 +108,16 @@ func newFixture(t *testing.T) fixture {
 		CryptoKeyID:   "test",
 		Scopes:        scopes,
 		AllowInsecure: true,
+		Clients:       db.Clients(),
+		Registry:      oauth.DefaultRegistry(),
+		Consent:       store,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return fixture{server: srv, store: store, webID: webID, deviceID: deviceID}
+	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID}
 }
 
 func get(t *testing.T, client *http.Client, u string) *http.Response {
@@ -295,5 +302,71 @@ func TestUserinfoReturnsOnlySub(t *testing.T) {
 	}
 	if len(claims) != 1 {
 		t.Fatalf("userinfo leaked claims: %v", claims)
+	}
+}
+
+// The consent interaction: describe, narrow on approve, and deny with a proper
+// error redirect.
+func TestConsentInteraction(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	newReq := func() op.AuthRequest {
+		ar, err := f.store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+			ClientID:     f.webID,
+			RedirectURI:  "https://client.example/cb",
+			ResponseType: oidc.ResponseTypeCode,
+			Scopes:       oidc.SpaceDelimitedArray{"account.id", "phigros.score.read"},
+			State:        "state-1234567890",
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ar
+	}
+
+	described := newReq()
+	view, err := f.handler.DescribeAuthorization(ctx, described.GetID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ClientID != f.webID || view.ClientName == "" || len(view.Scopes) != 2 {
+		t.Fatalf("view = %+v", view)
+	}
+
+	// Approval cannot widen the requested scopes.
+	if _, err := f.handler.ApproveAuthorization(ctx, described.GetID(), "usr_1",
+		[]oauth.Scope{oauth.ScopePhigrosB30}, nil); err == nil {
+		t.Fatal("widening approval accepted")
+	}
+
+	redirect, err := f.handler.ApproveAuthorization(ctx, described.GetID(), "usr_1",
+		[]oauth.Scope{oauth.ScopeAccountID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(redirect, "/oauth/authorize/callback?id=") {
+		t.Fatalf("approve redirect = %q", redirect)
+	}
+	done, err := f.store.AuthRequestByID(ctx, described.GetID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !done.Done() || done.GetSubject() != "usr_1" || len(done.GetScopes()) != 1 {
+		t.Fatalf("completed request = done=%v subject=%q scopes=%v", done.Done(), done.GetSubject(), done.GetScopes())
+	}
+
+	// Denial redirects to the client with the error and state, and discards the
+	// request.
+	denied := newReq()
+	denyRedirect, err := f.handler.DenyAuthorization(ctx, denied.GetID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(denyRedirect, "error=access_denied") || !strings.Contains(denyRedirect, "state=state-1234567890") {
+		t.Fatalf("deny redirect = %q", denyRedirect)
+	}
+	if _, err := f.store.AuthRequestByID(ctx, denied.GetID()); err == nil {
+		t.Fatal("denied request was not discarded")
 	}
 }

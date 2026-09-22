@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -59,11 +60,35 @@ type Config struct {
 	DeviceUserFormPath string
 	// AllowInsecure permits an http issuer. Tests set it; production must not.
 	AllowInsecure bool
+	// Clients and Registry are needed by the consent interaction (client name and
+	// scope descriptors). Optional for the protocol plane alone.
+	Clients  oauth.ClientRegistry
+	Registry *oauth.Registry
+	// Consent completes an authorization request after the user decides. It is
+	// the postgres OIDCStore. Optional for the protocol plane alone.
+	Consent ConsentStore
+}
+
+// ConsentStore is what the consent screen needs beyond op.Storage: marking an
+// auth request complete with the approved scopes.
+type ConsentStore interface {
+	CompleteLogin(ctx context.Context, id, subject string, scopes []string) error
+}
+
+// ConsentRequest is the consent screen's view of a pending authorization.
+type ConsentRequest struct {
+	ID         string
+	ClientID   string
+	ClientName string
+	Scopes     []oauth.Scope
 }
 
 // Handler is the protocol plane.
 type Handler struct {
 	provider *op.Provider
+	clients  oauth.ClientRegistry
+	registry *oauth.Registry
+	consent  ConsentStore
 }
 
 // New builds the provider.
@@ -112,7 +137,12 @@ func New(cfg Config) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Handler{provider: provider}, nil
+	return &Handler{
+		provider: provider,
+		clients:  cfg.Clients,
+		registry: cfg.Registry,
+		consent:  cfg.Consent,
+	}, nil
 }
 
 // ServeHTTP routes the protocol plane.
@@ -236,6 +266,101 @@ func (h *Handler) Introspect(ctx context.Context, token string) (oauth.TokenInfo
 		Scopes:    scopes,
 		ExpiresAt: time.Unix(int64(resp.Expiration), 0).UTC(),
 	}, nil
+}
+
+// DescribeAuthorization returns the pending request for the consent screen.
+func (h *Handler) DescribeAuthorization(ctx context.Context, id string) (ConsentRequest, error) {
+	ar, err := h.provider.Storage().AuthRequestByID(ctx, id)
+	if err != nil {
+		return ConsentRequest{}, err
+	}
+	client, err := h.clients.Get(ctx, ar.GetClientID())
+	if err != nil {
+		return ConsentRequest{}, err
+	}
+	return ConsentRequest{
+		ID:         id,
+		ClientID:   client.ID,
+		ClientName: client.Name,
+		Scopes:     toScopeList(ar.GetScopes()),
+	}, nil
+}
+
+// ApproveAuthorization records the user's approval (narrowed scopes, explicit
+// consent enforced) and returns the browser's next URL: the OP authorize
+// callback, which issues the code and redirects to the client.
+func (h *Handler) ApproveAuthorization(ctx context.Context, id, subject string, scopes, explicit []oauth.Scope) (string, error) {
+	if h.consent == nil || h.registry == nil {
+		return "", errConfig("ApproveAuthorization requires Consent and Registry")
+	}
+	ar, err := h.provider.Storage().AuthRequestByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	requested := ar.GetScopes()
+	granted := requested
+	if len(scopes) > 0 {
+		granted = make([]string, 0, len(scopes))
+		for _, sc := range scopes {
+			if !containsString(requested, sc.String()) {
+				return "", &oauth.Error{Code: "invalid_scope", Description: "the decision cannot widen the requested scope"}
+			}
+			granted = append(granted, sc.String())
+		}
+	}
+	descriptors, err := h.registry.Resolve(toScopeList(granted), ar.GetClientID())
+	if err != nil {
+		return "", err
+	}
+	ticked := make(map[oauth.Scope]struct{}, len(explicit))
+	for _, sc := range explicit {
+		ticked[sc] = struct{}{}
+	}
+	for _, d := range descriptors {
+		if d.ExplicitConsent {
+			if _, ok := ticked[d.Scope]; !ok {
+				return "", &oauth.Error{Code: "access_denied", Description: "explicit consent is required for " + d.Scope.String()}
+			}
+		}
+	}
+	if err := h.consent.CompleteLogin(ctx, id, subject, granted); err != nil {
+		return "", err
+	}
+	return h.provider.AuthorizationEndpoint().Relative() + "/callback?id=" + url.QueryEscape(id), nil
+}
+
+// DenyAuthorization returns the redirect that sends the browser back to the
+// client with error=access_denied, and discards the request.
+func (h *Handler) DenyAuthorization(ctx context.Context, id string) (string, error) {
+	ar, err := h.provider.Storage().AuthRequestByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	e := oidc.ErrAccessDenied().WithDescription("the user denied the request")
+	e.State = ar.GetState()
+	redirect, err := op.AuthResponseURL(ar.GetRedirectURI(), ar.GetResponseType(), ar.GetResponseMode(), e, h.provider.Encoder())
+	if err != nil {
+		return "", err
+	}
+	_ = h.provider.Storage().DeleteAuthRequest(ctx, id)
+	return redirect, nil
+}
+
+func toScopeList(in []string) []oauth.Scope {
+	out := make([]oauth.Scope, len(in))
+	for i, s := range in {
+		out[i] = oauth.Scope(s)
+	}
+	return out
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 type configError string
