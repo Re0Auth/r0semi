@@ -31,6 +31,10 @@ go.work.sum
 config/*.local.*
 config/*.secret.*
 *.local.toml
+# The default config path. It holds deployment-specific settings and may name the
+# environment variables holding secrets, so it must never be committed. (The
+# example file already tells operators it is ignored; this makes that true.)
+config/re0auth.toml
 
 # Editor/IDE
 # .idea/
