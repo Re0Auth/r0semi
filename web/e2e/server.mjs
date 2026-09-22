@@ -12,6 +12,7 @@
 // can read the authorization code straight out of the browser's address bar once
 // consent is given.
 import { execFileSync, spawn } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -46,6 +47,20 @@ const identities = new Map();
 function subjectFor(identity) {
 	if (!identities.has(identity)) identities.set(identity, identities.size + 1000);
 	return identities.get(identity);
+}
+
+// A generated RS256 key for the OpenID Provider run. re0auth now requires it
+// (fail-closed), so the harness cannot lean on an ephemeral key any more.
+let cachedSigningKey = '';
+function signingKey() {
+	if (!cachedSigningKey) {
+		const { privateKey } = generateKeyPairSync('rsa', {
+			modulusLength: 2048,
+			privateKeyEncoding: { type: 'pkcs8', format: 'der' }
+		});
+		cachedSigningKey = privateKey.toString('base64');
+	}
+	return cachedSigningKey;
 }
 
 function json(res, status, body) {
@@ -270,10 +285,11 @@ const app = spawn(bin, ['-config', configFile()], {
 		RE0AUTH_KEK: Buffer.alloc(32, 7).toString('base64'),
 		E2E_IDP_SECRET: 'e2e-secret',
 		E2E_SOURCE_SECRET: 'e2e-source-secret',
-		// A fixed token key keeps the run deterministic; the signing key stays
-		// ephemeral, which is fine for one run.
+		// Fixed keys keep the run deterministic. The signing key is only needed on
+		// the OpenID Provider path (durable storage), where re0auth now refuses to
+		// start without it.
 		RE0AUTH_OIDC_TOKEN_KEY: Buffer.alloc(32, 9).toString('base64'),
-		...(dbUrl ? { DATABASE_URL: dbUrl } : {})
+		...(dbUrl ? { DATABASE_URL: dbUrl, RE0AUTH_OIDC_SIGNING_KEY: signingKey() } : {})
 	},
 	stdio: 'inherit'
 });

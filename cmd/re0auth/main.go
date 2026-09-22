@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -20,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -421,7 +421,15 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 	if err != nil {
 		return nil, nil, err
 	}
+	retiredTokens, err := oidcRetiredTokenKeys()
+	if err != nil {
+		return nil, nil, err
+	}
 	signer, err := oidcSigningKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	retiredSigning, err := oidcRetiredSigningKeys()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -432,7 +440,7 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 	}
 	oidcStore, err := store.db.OIDC(store.clients, postgres.OIDCOptions{
 		Registry: registry,
-		Signer:   postgres.NewOIDCSigner("re0auth", signer),
+		Signer:   postgres.NewOIDCSigner("re0auth", signer).WithRetired(retiredSigning...),
 		Audit:    logger,
 		Login: func(ctx context.Context, id string) string {
 			// Bind the request to the browser that started it, so a relayed id
@@ -446,15 +454,16 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 		return nil, nil, err
 	}
 	handler, err := oidchttp.New(oidchttp.Config{
-		Issuer:        cfg.Issuer,
-		Storage:       oidcStore,
-		CryptoKey:     tokenKey,
-		CryptoKeyID:   "re0auth",
-		Scopes:        scopes,
-		AllowInsecure: !cfg.CookieSecure,
-		Clients:       store.clients,
-		Registry:      registry,
-		Consent:       oidcStore,
+		Issuer:           cfg.Issuer,
+		Storage:          oidcStore,
+		CryptoKey:        tokenKey,
+		CryptoKeyID:      "re0auth",
+		Scopes:           scopes,
+		AllowInsecure:    !cfg.CookieSecure,
+		Clients:          store.clients,
+		Registry:         registry,
+		Consent:          oidcStore,
+		RetiredTokenKeys: retiredTokens,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -462,47 +471,101 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 	return handler, oidcStore, nil
 }
 
-// oidcTokenKey reads the 32-byte bearer-token encryption key. An ephemeral key
-// is a real trade-off: existing access tokens become unreadable on restart.
+// oidcTokenKey reads the 32-byte bearer-token encryption key.
+//
+// It is required, not defaulted. Minting an ephemeral key when the operator
+// forgot one would turn a restart into a fleet-wide logout (every opaque access
+// token becomes unreadable), which is exactly the kind of silent degradation
+// this project refuses. Fail closed, like the KEK and the issuer.
 func oidcTokenKey() ([32]byte, error) {
 	var key [32]byte
-	if v := os.Getenv("RE0AUTH_OIDC_TOKEN_KEY"); v != "" {
-		b, err := base64.StdEncoding.DecodeString(v)
-		if err != nil || len(b) != 32 {
-			return key, errors.New("RE0AUTH_OIDC_TOKEN_KEY must be base64 of exactly 32 bytes")
-		}
-		copy(key[:], b)
-		return key, nil
+	v := strings.TrimSpace(os.Getenv("RE0AUTH_OIDC_TOKEN_KEY"))
+	if v == "" {
+		return key, errors.New("RE0AUTH_OIDC_TOKEN_KEY is required (32 bytes, base64)")
 	}
-	if _, err := rand.Read(key[:]); err != nil {
-		return key, err
+	b, err := base64.StdEncoding.DecodeString(v)
+	if err != nil || len(b) != 32 {
+		return key, errors.New("RE0AUTH_OIDC_TOKEN_KEY must be base64 of exactly 32 bytes")
 	}
-	slog.Warn("RE0AUTH_OIDC_TOKEN_KEY is not set; using an ephemeral token key",
-		"consequence", "access tokens become unreadable across restarts")
+	copy(key[:], b)
 	return key, nil
 }
 
-// oidcSigningKey reads the RS256 key (base64 PKCS#8 DER), or generates an
-// ephemeral one. An ephemeral key invalidates id_tokens across restarts.
-func oidcSigningKey() (*rsa.PrivateKey, error) {
-	if v := os.Getenv("RE0AUTH_OIDC_SIGNING_KEY"); v != "" {
-		der, err := base64.StdEncoding.DecodeString(v)
-		if err != nil {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_SIGNING_KEY: %w", err)
-		}
-		parsed, err := x509.ParsePKCS8PrivateKey(der)
-		if err != nil {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_SIGNING_KEY: %w", err)
-		}
-		key, ok := parsed.(*rsa.PrivateKey)
-		if !ok {
-			return nil, errors.New("RE0AUTH_OIDC_SIGNING_KEY must be an RSA private key")
-		}
-		return key, nil
+// oidcRetiredTokenKeys parses "id:base64,id:base64" old token keys. They decrypt
+// only, so a rotation can overlap without invalidating live access tokens.
+func oidcRetiredTokenKeys() ([]oidchttp.RetiredTokenKey, error) {
+	v := strings.TrimSpace(os.Getenv("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS"))
+	if v == "" {
+		return nil, nil
 	}
-	slog.Warn("RE0AUTH_OIDC_SIGNING_KEY is not set; generating an ephemeral RS256 key",
-		"consequence", "id_tokens become invalid across restarts")
-	return rsa.GenerateKey(rand.Reader, 2048)
+	var out []oidchttp.RetiredTokenKey
+	for _, part := range strings.Split(v, ",") {
+		id, encoded, ok := strings.Cut(strings.TrimSpace(part), ":")
+		if !ok || id == "" {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS entry %q must be id:base64", part)
+		}
+		b, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(b) != 32 {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS entry %q must be 32 bytes base64", id)
+		}
+		var key [32]byte
+		copy(key[:], b)
+		out = append(out, oidchttp.RetiredTokenKey{ID: id, Key: key})
+	}
+	return out, nil
+}
+
+// oidcSigningKey reads the RS256 key (base64 PKCS#8 DER). Required: an ephemeral
+// key would invalidate every id_token across a restart, so it fails closed.
+func oidcSigningKey() (*rsa.PrivateKey, error) {
+	v := strings.TrimSpace(os.Getenv("RE0AUTH_OIDC_SIGNING_KEY"))
+	if v == "" {
+		return nil, errors.New("RE0AUTH_OIDC_SIGNING_KEY is required (PKCS#8 DER, base64)")
+	}
+	der, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		return nil, fmt.Errorf("RE0AUTH_OIDC_SIGNING_KEY: %w", err)
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(der)
+	if err != nil {
+		return nil, fmt.Errorf("RE0AUTH_OIDC_SIGNING_KEY: %w", err)
+	}
+	key, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("RE0AUTH_OIDC_SIGNING_KEY must be an RSA private key")
+	}
+	return key, nil
+}
+
+// oidcRetiredSigningKeys parses "kid:base64, kid:base64" old public keys
+// (PKIX DER). They are published in the JWKS so id_tokens signed with them still
+// verify during a rotation.
+func oidcRetiredSigningKeys() ([]postgres.RetiredSigningKey, error) {
+	v := strings.TrimSpace(os.Getenv("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS"))
+	if v == "" {
+		return nil, nil
+	}
+	var out []postgres.RetiredSigningKey
+	for _, part := range strings.Split(v, ",") {
+		id, encoded, ok := strings.Cut(strings.TrimSpace(part), ":")
+		if !ok || id == "" {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q must be kid:base64", part)
+		}
+		der, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q: %w", id, err)
+		}
+		pub, err := x509.ParsePKIXPublicKey(der)
+		if err != nil {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q: %w", id, err)
+		}
+		rsaPub, ok := pub.(*rsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q must be an RSA public key", id)
+		}
+		out = append(out, postgres.RetiredSigningKey{ID: id, Public: rsaPub})
+	}
+	return out, nil
 }
 
 // seedClient registers the first-party downstream client if it is not already

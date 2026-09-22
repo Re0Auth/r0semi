@@ -55,6 +55,9 @@ type Config struct {
 	CryptoKey [32]byte
 	// CryptoKeyID names the encryption key.
 	CryptoKeyID string
+	// RetiredTokenKeys lets a token-key rotation overlap: old keys still decrypt
+	// tokens issued before the rotation, but only the current key encrypts.
+	RetiredTokenKeys []RetiredTokenKey
 	// Scopes is advertised in discovery (scopes_supported). Optional.
 	Scopes []string
 	// DeviceUserFormPath is the human verification page (default /app/device).
@@ -74,6 +77,14 @@ type Config struct {
 // auth request complete with the approved scopes.
 type ConsentStore interface {
 	CompleteLogin(ctx context.Context, id, subject string, scopes []string) error
+}
+
+// RetiredTokenKey is an old 32-byte token-encryption key kept for decryption
+// only. It is how a token-key rotation overlaps without invalidating every live
+// access token at once.
+type RetiredTokenKey struct {
+	ID  string
+	Key [32]byte
 }
 
 // ValidID implements authorization.Interaction. OP auth request ids are opaque
@@ -129,6 +140,17 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.AllowInsecure {
 		options = append(options, op.WithAllowInsecure())
 	}
+
+	// Encrypt with the current key, decrypt with it or any retired key. This is
+	// the token-key half of a rotation; the signing half is in the storage's
+	// KeySet.
+	currentCrypto := op.NewAES256GCMCrypto(cfg.CryptoKey, cfg.CryptoKeyID)
+	decrypters := make([]op.Decrypter, 0, 1+len(cfg.RetiredTokenKeys))
+	decrypters = append(decrypters, currentCrypto)
+	for _, r := range cfg.RetiredTokenKeys {
+		decrypters = append(decrypters, op.NewAES256GCMCrypto(r.Key, r.ID))
+	}
+	options = append(options, op.WithCrypto(op.NewCompositeCrypto(currentCrypto, decrypters)))
 
 	provider, err := op.NewProvider(oconfig, cfg.Storage, issuer, options...)
 	if err != nil {

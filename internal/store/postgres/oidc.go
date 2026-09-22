@@ -85,16 +85,33 @@ func (db *DB) OIDC(clients oauth.ClientRegistry, opts OIDCOptions) (*OIDCStore, 
 	return NewOIDCStore(db.pool, clients, opts)
 }
 
-// OIDCSigner is the OP's RS256 signing key. Key material is injected by the
-// composition root; the store never generates or persists it.
+// OIDCSigner is the OP's RS256 signing key plus any retired public keys that
+// must still verify previously issued id_tokens during a rotation.
+// Key material is injected by the composition root; the store never generates
+// or persists it.
 type OIDCSigner struct {
-	id  string
-	key *rsa.PrivateKey
+	id      string
+	key     *rsa.PrivateKey
+	retired []RetiredSigningKey
+}
+
+// RetiredSigningKey is an old signing key kept for verification only.
+type RetiredSigningKey struct {
+	ID     string
+	Public *rsa.PublicKey
 }
 
 // NewOIDCSigner wraps a private key.
 func NewOIDCSigner(id string, key *rsa.PrivateKey) *OIDCSigner {
 	return &OIDCSigner{id: id, key: key}
+}
+
+// WithRetired adds public keys that are published in the JWKS but never used to
+// sign. They let a rotation overlap: new tokens use the current key, old ones
+// still verify.
+func (s *OIDCSigner) WithRetired(keys ...RetiredSigningKey) *OIDCSigner {
+	s.retired = append(s.retired, keys...)
+	return s
 }
 
 // ID implements op.SigningKey.
@@ -106,11 +123,31 @@ func (s *OIDCSigner) SignatureAlgorithm() jose.SignatureAlgorithm { return jose.
 // Key implements op.SigningKey (private key).
 func (s *OIDCSigner) Key() any { return s.key }
 
+// KeySet returns the current public key followed by every retired public key.
+func (s *OIDCSigner) KeySet() []op.Key {
+	out := make([]op.Key, 0, 1+len(s.retired))
+	out = append(out, oidcPublicKey{s})
+	for _, r := range s.retired {
+		out = append(out, oidcRetiredPublicKey{id: r.ID, pub: r.Public})
+	}
+	return out
+}
+
 type oidcPublicKey struct{ *OIDCSigner }
 
 func (p oidcPublicKey) Algorithm() jose.SignatureAlgorithm { return jose.RS256 }
 func (p oidcPublicKey) Use() string                        { return "sig" }
 func (p oidcPublicKey) Key() any                           { return &p.key.PublicKey }
+
+type oidcRetiredPublicKey struct {
+	id  string
+	pub *rsa.PublicKey
+}
+
+func (k oidcRetiredPublicKey) ID() string                         { return k.id }
+func (k oidcRetiredPublicKey) Algorithm() jose.SignatureAlgorithm { return jose.RS256 }
+func (k oidcRetiredPublicKey) Use() string                        { return "sig" }
+func (k oidcRetiredPublicKey) Key() any                           { return k.pub }
 
 // opClient adapts oauth.Client to op.Client. Secret verification stays in
 // oauth.Client.Authenticate (SHA-256); the library never sees the hash.
@@ -531,7 +568,7 @@ func (s *OIDCStore) SignatureAlgorithms(context.Context) ([]jose.SignatureAlgori
 
 // KeySet implements op.Storage.
 func (s *OIDCStore) KeySet(context.Context) ([]op.Key, error) {
-	return []op.Key{oidcPublicKey{s.signer}}, nil
+	return s.signer.KeySet(), nil
 }
 
 // --- op.OPStorage ---

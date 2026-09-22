@@ -377,3 +377,30 @@ func TestOIDCLoginHookReceivesRequestContext(t *testing.T) {
 		t.Fatalf("login hook got %v", got)
 	}
 }
+
+// A rotated signing key must stay in the JWKS so id_tokens signed with it still
+// verify.
+func TestOIDCSignerKeySetIncludesRetired(t *testing.T) {
+	current, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := NewOIDCSigner("cur", current).
+		WithRetired(RetiredSigningKey{ID: "old", Public: &old.PublicKey}).
+		KeySet()
+	if len(keys) != 2 {
+		t.Fatalf("keys = %d, want 2", len(keys))
+	}
+	if keys[0].ID() != "cur" || keys[1].ID() != "old" {
+		t.Fatalf("key order = %s,%s", keys[0].ID(), keys[1].ID())
+	}
+	for _, k := range keys {
+		if k.Use() != "sig" || k.Algorithm() == "" {
+			t.Fatalf("key %s is not a usable signing key", k.ID())
+		}
+	}
+}

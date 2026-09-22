@@ -129,6 +129,26 @@ KMS 买到的不是"防止解密"，而是另外三样：
 而用户无感知。**自托管不需要它；官方公共实例需要。**
 - 明文在内存中的生命周期最小化，用后立即擦除。
 
+### 6.0.1 OpenID Provider 的两把密钥（A9）
+
+OP 另有两把密钥，**与 KEK 同级**，且有数据库时**强制要求配置**（缺一即拒绝启动，与 KEK / issuer 同样 fail-closed）：
+
+| 密钥 | 环境变量 | 作用 | 泄露后果 |
+|---|---|---|---|
+| RS256 签名私钥 | `RE0AUTH_OIDC_SIGNING_KEY`（PKCS#8 DER，base64） | 签 `id_token` | 可伪造任意 `id_token` |
+| 令牌加密密钥（32B AES-GCM） | `RE0AUTH_OIDC_TOKEN_KEY`（base64） | 加密不透明 access token（`tokenID:subject`） | 可解出 access token 的引用 ID |
+
+**不设则拒绝启动。** 临时生成会让一次重启把全部 access token 变成不可读、全部 `id_token` 失效——那是静默降级，不是容错。
+
+**轮换是双密钥重叠，不是就地替换：**
+
+- 签名私钥：新 key 签发，旧**公钥**继续在 JWKS 发布（`RE0AUTH_OIDC_RETIRED_SIGNING_KEYS=kid:base64PKIX,...`），
+  因此存量 `id_token` 仍可验证。等最长 `id_token` 寿命过去后移除旧公钥。
+- 令牌加密密钥：新 key 加密，旧 key 继续解密（`RE0AUTH_OIDC_RETIRED_TOKEN_KEYS=id:base64,...`），
+  因此存量 access token 仍可 introspect。等最长 access token 寿命过去后移除旧 key。
+
+两者都只是**让泄露不再适用于之后写入的东西**，不能撤销已泄露的旧密钥对存量令牌的影响——与 KEK 轮换的边界一致（§6.0）。
+
 ### 6.1 落盘时不加密的部分（PII 定性）
 
 凭据记录里有两块**按设计不加密**，因为它们要在没有 KEK 的情况下可用：
