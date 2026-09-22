@@ -35,6 +35,9 @@ check:
 	@unformatted=$$(gofmt -l .); \
 	if [ -n "$$unformatted" ]; then echo "not gofmt'd:"; echo "$$unformatted"; exit 1; fi
 	go vet ./...
+	# The dependency firewall. `go test ./...` also runs it; here it is explicit
+	# so `make check` fails on a layering violation without running the full suite.
+	go test ./internal/archtest/
 	cd web && npm run check
 
 # Frontend dev server on :5173, proxying nothing: it talks to a re0auth already

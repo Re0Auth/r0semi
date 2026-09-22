@@ -92,6 +92,10 @@ A2/A3 可撤销、可审计、可细分，**暴露半径小于 stoken**。
 - **D6 采纳 OIDC**：Re0Auth 升格为 OpenID Provider（身份联邦 + 数据授权），玩家仍由外部 IdP 登录。
   新增 `id_token` / `userinfo` / JWKS / OIDC discovery 与两把新密钥（A8/A9）。决策与契约见
   [oidc-decision.md](./oidc-decision.md)（ADR-0001）。
+- **D7 能力封闭的生产边界（ADR-0002）**：`core` 的运行时能力封闭在 v1 **不是生产门禁**，只是库层属性，
+  且只覆盖**能力键访问**，不是沙箱（进程内第三方本就被拒绝，见 [architecture.md](./architecture.md) §2）。
+  生产里被机器强制的同类约束是**包级依赖方向**（`internal/archtest`）。见
+  [core-runtime-decision.md](./core-runtime-decision.md)。
 
 ## 6. 密钥层级
 

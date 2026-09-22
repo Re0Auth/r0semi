@@ -41,6 +41,27 @@ CI 在 Linux 上带 Postgres 服务跑全量（含集成测试）。**"我机器
 - **凭据绝不返回给下游**（唯一例外是显式 `critical` 导出 scope）。
 - **元数据不能撒谎**：`/.well-known/*` 里广告的能力必须真的实现。曾出现过广告了 DPoP 却不校验的情况，现已用测试锁死。
 
+## 分层与依赖方向（机器强制，不是自觉）
+
+代码落在哪一层由依赖方向决定，边界由 `internal/archtest` 在 `go test ./...` / `make check` 里强制：
+
+- **公开库**（`audit`、`httpclient`、`idp`、`oauth`、`upstreamkit`(+`conformance`)、`vault`、`tapsign`、`taptapoauth`、`referencesource`）：
+  可被**进程外的独立服务**导入。它们（含传递依赖）**不得** import `internal/`。
+- **内部实现**（`internal/...`）：只在本模块内使用。
+- **组合根**（`cmd/*`）：唯一允许认识所有人的地方，也是唯一允许导入 `internal/store/postgres` 的地方。
+- **`internal/core`**：依赖图的底，不得依赖任何内部包；v1 **不承载生产装配**——见
+  [`docs/core-runtime-decision.md`](docs/core-runtime-decision.md)（ADR-0002）。
+
+新增业务模块的落点（照做即可）：
+
+1. 领域逻辑与**端口**（`interface`）放 `internal/<domain>/`；
+2. 存储实现在 `internal/store/postgres/`，实现该端口；
+3. HTTP 路由挂 `internal/httpapi/`，把新依赖塞进 `Config`；
+4. 在 `cmd/re0auth` 组合根装配——**普通构造函数，不需要是 `core.Component`**。
+
+新增**顶层包**时，必须同步登记到 `internal/archtest/deps_test.go` 的 `publicLibraries`，否则 CI 直接失败
+（"先更新表再合并"）。
+
 ## 提交
 
 - 一个 PR 做一件事。重构和功能分开。

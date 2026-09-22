@@ -20,8 +20,10 @@ report them):
   and the authorization server metadata does not advertise it.
 - The component runtime in `internal/core` is exercised by its own tests and by
   `internal/wiring`; the production composition root in `cmd/re0auth` wires the
-  services directly, so its capability-confinement checks are not yet a gate on
-  a real deployment.
+  services directly, so its capability-confinement checks are **by decision**
+  (ADR-0002, `docs/core-runtime-decision.md`) not a gate on a real deployment.
+  The dependency direction that *is* machine-enforced is the package-level
+  firewall in `internal/archtest`.
 
 We still want reports: a flaw in the design of a credential-holding system is
 worth knowing about before it is deployed anywhere, which is exactly why this

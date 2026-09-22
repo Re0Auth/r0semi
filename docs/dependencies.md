@@ -37,7 +37,7 @@
 | `oauth` 的 PKCE 校验、令牌生成 | `crypto/sha256` + `crypto/subtle` + `crypto/rand`，标准做法 |
 | `internal/auth` CSRF | 会话内同步令牌 + 常数时间比较，标准模式；无需 `gorilla/csrf` |
 | `taptapoauth` MAC 签名、QQ JSONP | **上游方言**，无库可用 |
-| `internal/core` 组件运行时 | 研究产物（能力封闭 / effect-LIFO）；换 `fx` / `wire` 会丢掉正是要论证的性质 |
+| `internal/core` 组件运行时 | 研究产物（能力封闭 / effect-LIFO）；换 `fx` / `wire` 会丢掉正是要论证的性质。**v1 不接入生产**，见 [core-runtime-decision.md](./core-runtime-decision.md)（ADR-0002） |
 | `problem+json` | 无主流 Go 库，手写可 |
 | 运行日志 | 标准库 `log/slog`。级别、结构化字段、handler 可换，都是它本来就有的；
 **与 `audit.Logger` 刻意不合并**——审计是领域记录（有完整性要求），日志是运维诊断，

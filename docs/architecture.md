@@ -28,6 +28,12 @@
 | 形式化 calculus / 元理论 | **拒绝** | 只取工程模式，不引入形式系统 |
 | 第三方组件进程内运行 | **拒绝** | 语言级 confinement 对恶意代码无效（论文 §6.3 自陈） |
 
+> **两种裁剪（Go vs Rust）**：同一篇论文在姊妹项目 r0semi-mp（Rust）里被裁到编译期——
+> 空间可组合性用 trait 契约 + 组合根 + 依赖方向矩阵，时间可组合性用 RAII + 重启即换，运行时成本为零。
+> 本项目**采纳了运行时机制**，因为 Go 没有 RAII/Drop，也没有类型级封闭（只有包级 `internal/`）。
+> 但采纳运行时 ≠ 生产必须启用它：`core` 的生产接入决策见
+> [core-runtime-decision.md](./core-runtime-decision.md)（ADR-0002）。
+
 ## 3. 核心抽象（v1 已实现：`internal/core`）
 
 ```
@@ -65,7 +71,9 @@ Fiber（组件实例）
 > **生产接入状态（如实说明）**：`internal/core` 与 `internal/wiring` 已实现并有测试，但目前
 > 只有 `oauth` 这一个组件被装配进去；`cmd/re0auth` 的生产组合根仍直接 `NewService(...)`。
 > 因此 I1（能力封闭）/ I5（fail-closed）在库层各自成立，但尚未由 core 作为生产部署的门禁。
-> 把组合根整体迁入 core 是 §8 的待决事项。
+> 把组合根整体迁入 core 是 §8 的待决事项；**该决策已定：ADR-0002 决定 v1 不迁入**，
+> 改由 `internal/archtest` 强制依赖方向，重新评估的触发条件见
+> [core-runtime-decision.md](./core-runtime-decision.md) §5。
 
 ## 4. 组件清单与依赖图
 
@@ -96,10 +104,15 @@ audit ────────────────────> oauth
 > 已迁出 Re0Auth：它们现在属于**参考数据源**（`referencesource`），并作为公开库
 > （`vault` / `tapsign` / `taptapoauth`）供任何数据源复用。**Re0Auth 自身不再持有任何凭据。**
 
-> **包分层（v1 公开化）**：`audit`、`httpclient`、`idp`、`oauth`、`upstreamkit`(+`conformance`)、`vault`、`tapsign`、`taptapoauth`
+> **包分层（v1 公开化）**：`audit`、`httpclient`、`idp`、`oauth`、`upstreamkit`(+`conformance`)、`vault`、`tapsign`、`taptapoauth`、`referencesource`
 > 是**公开库**，不依赖 `internal/`，可被**进程外的独立服务**（数据源）导入。Re0Auth 自己的库（`oauth`）
 > 不自带能力键——key 与 `core.Component` 装配统一声明在 `internal/wiring`，因为**库不该耦合 DI 容器**。
-> 已验证：外部模块 import 这些库编译通过，且传递依赖中无 `internal/`。
+>
+> 这条边界**不是自觉，是机器强制的**：`internal/archtest` 用 `go list` 读真实导入图，在 `go test ./...`
+> 与 `make check` 里断言——公开库（含传递依赖）不得触及 `internal/`；`internal/store/postgres` 只许
+> 组合根 `cmd/*` 导入；`internal/core` 不依赖任何内部包；**新增顶层包必须在 `internal/archtest` 登记**，
+> 否则 CI 直接失败（"先更新表再合并"）。新增业务模块的落点见
+> [core-runtime-decision.md](./core-runtime-decision.md) §7。
 
 ### 4.1 vault（已迁至公开包 `vault`，供参考源使用）
 
@@ -495,15 +508,18 @@ storage: every port is persistent (accounts, tokens, device authorizations, clie
 
 ## 5. 安全不变量（必须由测试守护）
 
-- **I1 能力封闭**：未声明的 key 访问必须报错；CI 中静态审计每个组件的 `Inject` 集合。
+- **I1 能力封闭**：未声明的 key 访问必须报错。**实测边界**：运行时校验位于 `core`（由 `core` 测试守护），
+  但 `core` 在 v1 **不承载生产装配**（ADR-0002），所以它是**库层属性**；生产里被机器强制的同类约束是
+  **包级依赖方向**，由 `internal/archtest` 在 CI 执行。两者粒度不同：前者管"能力键"，后者管"谁 import 谁"。
 - **I2 明文零化**：所有解密出的明文 stoken 必须登记为 effect，其 inverse 为零化；禁止明文离开 acquire 作用域。
 - **I3 先审计后 emit**：跨越 emission 边界前先持久化审计（withholding）。
 - **I4 补偿幂等**：跨边界动作必须提供幂等补偿（如撤销级联到 TapTap）；补偿失败必须可见、可重试。
 - **I5 fail-closed**：依赖不可用 → 组件 INACTIVE，绝不降级放行。
 - **I6 无动态代码**：v1 不加载运行时第三方代码；第三方适配器走进程外 gRPC。
 
-`go test ./...` 共 204 项（本机默认）+ 11 项 Postgres 集成测试（未设 `TEST_DATABASE_URL` 时跳过，在 Linux CI 执行），
-覆盖的安全不变量：
+`go test ./...` 共 204+ 项（本机默认）+ 11 项 Postgres 集成测试（未设 `TEST_DATABASE_URL` 时跳过，在 Linux CI 执行），
+覆盖的安全不变量。**注意**：I1 / I5 的**运行时**守护在 `core`，而 `core` 未进生产（ADR-0002）；
+生产里被机器强制的是**包级依赖方向**，见 `internal/archtest`：
 
 | 不变量 | 测试 |
 |---|---|
@@ -512,6 +528,7 @@ storage: every port is persistent (accounts, tokens, device authorizations, clie
 | I3 | `vault`: `TestUseAuditsBeforeCallback`, `TestUseFailsClosedWhenAuditFails`；`tapsign`: `TestRotateReturnsReplacement`, `TestRevokeDiscardsReplacement` |
 | I4 | `tapsign`: `TestRevokeIsIdempotentOnInvalid`（目标 = 旧 token 已失效，403 即达成） |
 | I5 | `core`: `TestFailClosedMissingProvider`, `TestReactiveActivationAndDeactivation`, `TestDuplicateProviderFailsClosed`, `TestCycleStaysInactive`, `TestPanicInApplyFailsClosed`；`vault`: `TestComponentInactiveWithoutRepo`, `TestComponentFailsWithoutKeyWrapper`；`tapsign`: `TestComponentInactiveWithoutHTTP`, `TestComponentFailsWithoutConfig`；`wiring`: `TestComponentInactiveWithoutTokens`, `TestComponentFailsWithoutIssuer` |
+| 依赖方向 | `internal/archtest`: `TestPublicLibrariesDoNotDependOnInternal`, `TestDatabaseAdapterIsConfinedToCompositionRoots`, `TestKernelHasNoInternalDependencies`, `TestEveryModulePackageIsRegistered` |
 | 平面隔离 | `httpapi`: `TestTokenErrorUsesOAuthFormat`, `TestBusinessErrorUsesProblemFormat`, `TestUnknownEndpointsArePlaneSpecific`, `TestInsufficientScopeIsForbidden` |
 | 账号 I-1/I-2/I-3 | `account`: `TestUnlinkRejectsLastIdentity`, `TestLinkRejectsIdentityOwnedByAnotherUser`；`auth`: `TestLinkRejectsTakenIdentity`, `TestLinkAddsIdentityToCurrentUser` |
 | 授权交互 | `authz`: `TestApproveIssuesUsableCode`, `TestApproveCannotWidenScope`, `TestApproveEnforcesExplicitConsent`, `TestApproveIsSingleUse`；`httpapi`: `TestAuthorizationInteractionEndToEnd`, `TestAuthorizationHandleIsBoundToBrowser`, `TestDecisionRequiresCSRF` |
@@ -553,10 +570,14 @@ critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期
 
 1. **core 自研**：实现为 `internal/core` 的极薄内核，只做 Effect + Provide/Inject + 生命周期
    + 能力封闭校验；拒绝 HMR、运行时加载代码、通用插件系统。见 §3。
+   **生产接入决策：v1 不接入**，见 [core-runtime-decision.md](./core-runtime-decision.md)（ADR-0002）。
 2. **Key 身份**：强类型泛型 `Key[T]` 包装 `(namespace, name)`；`reflect.Type` 不参与身份，
    避免同一能力的多个声明点因类型不同而分裂。
 3. **不做动态拦截**：v1 仅静态能力声明（`Provides` / `Inject`）；`Isolate` / `Intercept`
    留待后续版本。
+4. **依赖方向机器闸门**：`internal/archtest` 强制公开库 ⊥ `internal/`、数据库适配器只许组合根导入、
+   `core` 不依赖内部包、新增顶层包须登记。见 §4 与
+   [core-runtime-decision.md](./core-runtime-decision.md) §7。
 
 **待决**：
 
@@ -564,6 +585,8 @@ critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期
 2. 补偿动作（TapTap 撤销）的幂等键与重试队列设计。
 3. isolation / interception 的引入时机与形态。
 4. core 的可观测性：fiber 状态是否导出为指标，`App.Check` 结果是否作为 CI 门禁。
+   **部分已决**：依赖方向的 CI 门禁已由 `internal/archtest` 落地；`core` 自身的可观测性随其生产接入
+   一并推迟（ADR-0002），接入前不再是待办。
 
 ## 9. 参考
 
