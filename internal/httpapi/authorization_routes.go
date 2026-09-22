@@ -106,7 +106,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	id := r.PathValue("id")
-	if authz.InvalidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
+	if !s.authInteract.ValidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown authorization request")
 		return
 	}
