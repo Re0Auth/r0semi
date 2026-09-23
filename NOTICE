@@ -59,6 +59,9 @@ BSD 3-Clause License
 --------------------
 
   - github.com/gorilla/securecookie
+  - github.com/klauspost/compress
+    Copyright (c) 2012 The Go Authors. All rights reserved.
+    Copyright (c) 2016 Klaus Post. All rights reserved.
   - github.com/muhlemmer/httpforwarded
   - github.com/zitadel/schema
   - golang.org/x/oauth2

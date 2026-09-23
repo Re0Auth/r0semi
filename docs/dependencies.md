@@ -17,6 +17,7 @@
 | `github.com/pressly/goose/v3` | `internal/store/postgres` 的迁移执行 | 成熟的 SQL 迁移库：标准 `-- +goose Up/Down` 注解、按版本排序与乱序检测、advisory-lock session locker，并自带 `goose_db_version` 版本表。**不校验已应用迁移文件的内容**（goose 无 checksum），所以它换掉的是手写 runner，不是"内容完整性"保证 |
 | `github.com/zitadel/oidc/v3` | `internal/store/postgres` 的 `op.Storage`（ADR-0001：OpenID Provider） | OIDC 原生：设备码流（RFC 8628）内置、不透明引用令牌模型、`AuthRequest` 由实现者拥有（scope 收窄/同意可挂载）。**稳定 API 是 legacy `Storage`，新版 `Server` API 到 v4 前 experimental**。仍只用 `go-jose/v4`，不引第二套 JOSE（对照 fosite 见 [oidc-decision.md](./oidc-decision.md)） |
 | `github.com/BurntSushi/toml` | `internal/config` 与 `cmd/*` 加载 `config/*.toml` | TOML 的事实标准。配置来源只有文件和环境变量两类，不需要 koanf 那样的多来源合并层 |
+| `github.com/klauspost/compress` | `internal/compress`（HTTP `zstd` 内容编码） | zstd 不在 Go 标准库；这是纯 Go、无 cgo 的事实标准实现。**只为 zstd 引入**：gzip 用标准库（`compress/gzip`），br 暂缓（见 §3） |
 | `gopkg.in/yaml.v3` | **仅测试**：`internal/httpapi` 解析 `docs/openapi.yaml`，断言 spec 与实际路由双向一致 | YAML 的事实标准。**只在 `_test.go` 里被引用，不进任何二进制** |
 
 关于 `yaml.v3` 的两点交代：
@@ -53,6 +54,7 @@
 | `github.com/awnumar/memguard` | 解决"Go 无法保证清零"。目前 `zeroize` + `runtime.KeepAlive` 是尽力而为，**这一限制应在 threat-model 中如实承认** |
 | `jackc/pgx/v5` + `sqlc` | **已引入 `pgx`**（`internal/store/postgres`）。尚未引入 `sqlc`：目前查询不多，手写 pgx 更直接；查询量上来后再上代码生成 |
 | `knadh/koanf` | 评估过的配置库。最终选了 `BurntSushi/toml`（见 §1）：配置来源只有文件和环境变量，koanf 的多来源合并是这一层不需要的 |
+| brotli（`andybalholm/brotli`） | HTTP 内容编码的另一个候选，**暂缓**。支持 zstd + gzip 已覆盖全部客户端（能收 zstd 的都收 zstd，其余收 gzip），而 br 相比 zstd 在 API 报文上的收益边际、却要多一个 direct dep。等有实测或明确的 br-only 消费者再上，接入点已预留（`internal/compress.Encoding`） |
 
 ## 4. 反面教训（写下来避免重犯）
 

@@ -34,7 +34,9 @@
 ## 2. 业务平面风格指南（`/v1`）
 
 ### 2.1 传输与编码
-- 仅 HTTPS；`Content-Type: application/json`；响应启用 gzip / br。
+- 仅 HTTPS；`Content-Type: application/json`；响应按 `Accept-Encoding` 协商 **zstd / gzip**
+  （br 暂缓），服务端偏好 `zstd > gzip`，客户端 q 值优先；低于 1 KiB 不压。
+  **协议面（`/oauth/*`）不压**：报文小、必须 `no-store`，且 token 响应含秘密不可变换（BREACH）。
 - 请求体 UTF-8，字段一律 `snake_case`。
 
 ### 2.2 ID
@@ -76,6 +78,7 @@
 | `conflict` | 409 | 状态冲突 |
 | `idempotency_key_reused` | 409 | 幂等键复用于不同请求体 |
 | `rate_limited` | 429 | 限流 |
+| `not_acceptable` | 406 | 客户端拒绝了所有可用内容编码且禁止 identity |
 | `upstream_unavailable` | 502 | 上游不可用 |
 | `explicit_consent_required` | 403 | critical scope 未逐项同意 |
 | `internal_error` | 500 | 服务端内部错误 |

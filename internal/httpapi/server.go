@@ -24,6 +24,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/authorization"
+	"github.com/Re0Auth/r0semi/internal/compress"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/internal/webui"
@@ -136,6 +137,8 @@ type Server struct {
 	adminSvc admin.Service
 	// adminAllowed is the allowlist of account subjects that may call it.
 	adminAllowed map[account.UserID]bool
+	// compressor negotiates and applies the response content coding.
+	compressor *compress.Compressor
 }
 
 // New validates cfg and returns a Server.
@@ -183,7 +186,7 @@ func New(cfg Config) (*Server, error) {
 	for _, a := range cfg.Admins {
 		adminAllowed[a] = true
 	}
-	return &Server{
+	srv := &Server{
 		issuer:       strings.TrimRight(cfg.Issuer, "/"),
 		resource:     strings.TrimRight(cfg.Resource, "/"),
 		errorBase:    strings.TrimRight(cfg.ErrorBase, "/"),
@@ -203,7 +206,24 @@ func New(cfg Config) (*Server, error) {
 		devices:      cfg.DeviceStore,
 		adminSvc:     cfg.Admin,
 		adminAllowed: adminAllowed,
-	}, nil
+	}
+	compressor, err := compress.New(compress.Config{
+		Encodings: compress.Default(),
+		// The protocol plane stays uncompressed: its responses are tiny, must not
+		// be cached, and a token response must never be transformed (BREACH). The
+		// business plane and the frontend assets are where compression pays.
+		Eligible: func(r *http.Request) bool {
+			return !strings.HasPrefix(r.URL.Path, "/oauth/")
+		},
+		OnNotAcceptable: func(w http.ResponseWriter, r *http.Request) {
+			srv.writeProblem(w, r, http.StatusNotAcceptable, "not_acceptable", "no acceptable content coding")
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	srv.compressor = compressor
+	return srv, nil
 }
 
 // route is one documented endpoint.
@@ -361,6 +381,10 @@ func (s *Server) Handler() http.Handler {
 	//	4. the body limit   -- cap what a handler can be made to read, which is a
 	//	                      different question from how often it may ask.
 	//	5. session loading  -- wraps the whole tree; /auth and /v1 both need it.
+	//
+	// Compression sits just inside the request id so every eligible response can
+	// be negotiated, and outside the header/limit middleware so their output is
+	// compressed too. It declines the protocol plane itself (see New).
 	var h http.Handler = root
 	if s.sessions != nil {
 		h = s.sessions.LoadAndSave(h)
@@ -368,6 +392,9 @@ func (s *Server) Handler() http.Handler {
 	h = s.withBodyLimit(h)
 	h = s.withRateLimit(h)
 	h = s.withSecurityHeaders(h)
+	if s.compressor != nil {
+		h = s.compressor.Handler(h)
+	}
 	return withRequestID(h)
 }
 

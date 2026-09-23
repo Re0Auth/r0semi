@@ -9,9 +9,11 @@ require (
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/klauspost/compress v1.19.2
 	github.com/pressly/goose/v3 v3.28.0
 	github.com/zitadel/oidc/v3 v3.51.3
 	golang.org/x/oauth2 v0.37.0
+	golang.org/x/text v0.41.0
 	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -40,5 +42,4 @@ require (
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
 )

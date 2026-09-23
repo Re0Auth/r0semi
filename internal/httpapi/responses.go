@@ -42,6 +42,7 @@ var problemTitles = map[string]string{
 	"not_found":                 "Not found",
 	"last_identity":             "Cannot unlink the last identity",
 	"rate_limited":              "Rate limit exceeded",
+	"not_acceptable":            "Not acceptable",
 	"upstream_unavailable":      "Upstream unavailable",
 	"explicit_consent_required": "Explicit consent required",
 	"internal_error":            "Internal error",

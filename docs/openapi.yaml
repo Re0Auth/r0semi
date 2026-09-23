@@ -1387,6 +1387,7 @@ components:
             - invalid_request
             - invalid_token
             - last_identity
+            - not_acceptable
             - not_found
             - rate_limited
             - scope_not_granted
