@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { base } from '$app/paths';
 	import { api, ApiError, type IDPProvider, type Session } from '$lib/api';
+	import { messageOf } from '$lib/errors';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
@@ -42,7 +43,7 @@
 				phase = 'anonymous';
 				return;
 			}
-			detail = err instanceof Error ? err.message : String(err);
+			detail = messageOf(err);
 			phase = 'failed';
 		}
 	});
@@ -78,7 +79,7 @@
 			session = null;
 			phase = 'anonymous';
 		} catch (err) {
-			detail = err instanceof Error ? err.message : String(err);
+			detail = messageOf(err);
 			phase = 'failed';
 		} finally {
 			signingOut = false;
@@ -98,7 +99,7 @@
 			session = await api.currentSession();
 			confirmingUnlink = null;
 		} catch (err) {
-			authError = err instanceof Error ? err.message : String(err);
+			authError = messageOf(err);
 		} finally {
 			unlinking = null;
 		}

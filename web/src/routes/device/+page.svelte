@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api, ApiError, type DevicePending } from '$lib/api';
+	import { messageOf } from '$lib/errors';
 	import ScopeList from '$lib/components/ScopeList.svelte';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
@@ -57,7 +58,7 @@
 				phase = 'invalid';
 				return;
 			}
-			detail = err instanceof Error ? err.message : String(err);
+			detail = messageOf(err);
 			phase = 'failed';
 		} finally {
 			checking = false;
@@ -126,7 +127,7 @@
 				phase = 'invalid';
 				return;
 			}
-			actionError = err instanceof Error ? err.message : String(err);
+			actionError = messageOf(err);
 		}
 	}
 </script>

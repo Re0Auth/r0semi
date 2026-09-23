@@ -6,6 +6,7 @@
 		type AuthorizationRequest,
 		type BindingRequirement
 	} from '$lib/api';
+	import { messageOf } from '$lib/errors';
 	import ScopeList from '$lib/components/ScopeList.svelte';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
@@ -66,7 +67,7 @@
 			phase = 'gone';
 			return;
 		}
-		detail = err instanceof Error ? err.message : String(err);
+		detail = messageOf(err);
 		phase = 'failed';
 	}
 
@@ -123,7 +124,7 @@
 				actionError = '有一个需要单独确认的权限没有被勾选。请逐项确认，或取消它。';
 				return;
 			}
-			actionError = err instanceof Error ? err.message : String(err);
+			actionError = messageOf(err);
 		}
 	}
 </script>

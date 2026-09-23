@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { api, type IDPProvider } from '$lib/api';
+	import { messageOf } from '$lib/errors';
 	import Button from './ui/Button.svelte';
 
 	interface Props {
@@ -22,7 +23,7 @@
 				if (!cancelled) providers = res.data;
 			})
 			.catch((err) => {
-				if (!cancelled) failed = err instanceof Error ? err.message : String(err);
+				if (!cancelled) failed = messageOf(err);
 			})
 			.finally(() => {
 				if (!cancelled) loading = false;

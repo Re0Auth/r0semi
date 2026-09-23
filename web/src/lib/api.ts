@@ -19,12 +19,19 @@
  *      out with the session and which this module only ever forwards.
  */
 
-/** Codes the server can produce. Exhaustive; see docs/openapi.yaml. */
+/**
+ * Codes the server can produce. Exhaustive; see docs/openapi.yaml.
+ * TestFrontendProblemCodesMatchCatalogue in internal/httpapi fails the build if
+ * this list and the server's catalogue disagree.
+ */
 export type ProblemCode =
+	| 'cascade_unsupported'
 	| 'explicit_consent_required'
 	| 'internal_error'
 	| 'invalid_request'
 	| 'invalid_token'
+	| 'last_identity'
+	| 'not_acceptable'
 	| 'not_found'
 	| 'rate_limited'
 	| 'scope_not_granted'

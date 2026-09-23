@@ -8,6 +8,7 @@
 		type FederationSource,
 		type UpstreamRevocation
 	} from '$lib/api';
+	import { messageOf } from '$lib/errors';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
 	import Badge from '$lib/components/ui/Badge.svelte';
@@ -55,7 +56,7 @@
 				phase = 'anonymous';
 				return;
 			}
-			detail = err instanceof Error ? err.message : String(err);
+			detail = messageOf(err);
 			phase = 'failed';
 		}
 	}
@@ -101,7 +102,7 @@
 				phase = 'anonymous';
 				return;
 			}
-			actionError = err instanceof Error ? err.message : String(err);
+			actionError = messageOf(err);
 		} finally {
 			working = null;
 		}
@@ -148,7 +149,7 @@
 			// like a partial success.
 			actionError =
 				'没有登出：' +
-				(err instanceof Error ? err.message : String(err)) +
+				(messageOf(err)) +
 				'。你的数据源连接仍然是连接着的，可以重试。';
 		} finally {
 			working = null;

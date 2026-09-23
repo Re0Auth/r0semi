@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { base } from '$app/paths';
 	import { api, ApiError, type Grant } from '$lib/api';
+	import { messageOf } from '$lib/errors';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
 	import Badge from '$lib/components/ui/Badge.svelte';
@@ -37,7 +38,7 @@
 				phase = 'anonymous';
 				return;
 			}
-			detail = err instanceof Error ? err.message : String(err);
+			detail = messageOf(err);
 			phase = 'failed';
 		}
 	}
@@ -56,7 +57,7 @@
 				phase = 'anonymous';
 				return;
 			}
-			actionError = err instanceof Error ? err.message : String(err);
+			actionError = messageOf(err);
 		} finally {
 			revoking = null;
 		}
