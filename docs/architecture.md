@@ -240,8 +240,14 @@ type Credential struct {          // 一个 provider 的私有凭据形态，vau
 MVP scope 目录：`account.id`、`taptap.account.id`、`phigros.profile.read`、`phigros.score.read`、
 `phigros.b30.read`。provider 包通过 `Registry.Register` 追加自己的 descriptor。
 
-> 尚未实现：资源服务器（真正返回用户 ID / 代理成绩的端点）。
-> AS 只负责签发与校验带 scope 的令牌；资源端点在下一层用 `Introspect` + vault 实现。
+> **资源服务器（数据面）已实现**：`GET /v1/me` 返回身份，`GET /v1/games/{game}/{resource}`
+> 代理读取源侧的归一化载荷，`GET /v1/games/{game}/sources/{source}/raw/{path...}` 逐字透传源的
+> 原生 API；两者都要求 Bearer + 对应 scope。实现落在 `internal/federation`（绑定 / 取回 / 刷新）
+> 与 `internal/httpapi`（路由 / 门禁），不是「下一层」。
+>
+> **但它只代理、不拥有数据**：没有配置源、或用户尚未绑定该源时，数据面什么都不给
+> （`source_not_bound` / 空列表），所谓「代理成绩」是把源的 JSON 原样返回。上游凭据由数据源
+> 自己持有，re0auth 只托管源签发的令牌。
 > **不会实现的**：上游凭据导出端点——re0auth 不持有上游凭据，见 api-design.md §5。
 
 ### 4.5 HTTP 层与两平面路由（v1 已实现：`internal/httpapi`）
