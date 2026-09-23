@@ -167,7 +167,7 @@ OP 另有两把密钥，**与 KEK 同级**，且有数据库时**强制要求配
 | `Identity{Subject, Provider}` | `usr_` / 源账号 + 数据源命名（如 `phigros.next-phi`） | **非密钥，但属个人数据** | 泄露"某人绑定了哪些游戏 / 数据源" |
 | `Record.Meta` | 上游 openid / unionid / LeanCloud objectId | **非密钥，但属 PII** | 泄露上游身份标识，可与其它泄露关联 |
 | `federation_bind_flows.pkce_verifier` | 绑定时的一次性 PKCE verifier | **短期密钥（无法哈希）** | **单独无用**：还需授权码，而授权码只发给已注册的 redirect URI。TTL ≤ 绑定 TTL（默认 10 分钟）、单次使用、`DELETE ... RETURNING` 取走即删 |
-| `authz_requests.id` | 待授权请求的 handle | **不是密钥** | 设计上就出现在浏览器 URL 与服务器日志里，且被绑定到创建它的会话 |
+| `oidc_auth_requests.id` | OP 授权请求的 handle | **不是密钥** | 设计上就出现在浏览器 URL 与服务器日志里，且被绑定到创建它的会话 |
 
 **绑定表本身不能持有凭据**：`federation_bindings` 只存元数据（`token_type` / `expiry` / `has_refresh` /
 `version`），Go 结构体里也没有令牌字段，并有测试从 `information_schema` 断言表里不存在

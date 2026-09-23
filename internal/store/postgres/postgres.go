@@ -80,9 +80,6 @@ func (db *DB) BindFlows() *BindFlows { return &BindFlows{pool: db.pool} }
 // Sessions returns the HTTP session store.
 func (db *DB) Sessions() *Sessions { return &Sessions{pool: db.pool} }
 
-// Authz returns the pending-authorization-request store.
-func (db *DB) Authz() *Authz { return &Authz{pool: db.pool} }
-
 // Clients returns the downstream-client registry.
 func (db *DB) Clients() *Clients { return &Clients{pool: db.pool} }
 

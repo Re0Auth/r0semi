@@ -11,13 +11,10 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
-	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -71,18 +68,6 @@ func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: "https://re0auth.test",
-		Scopes: oauth.DefaultRegistry(),
-		// Effectively no poll throttle, so a test can poll twice without
-		// sleeping. One millisecond was not enough: two in-process HTTP round
-		// trips can complete inside it, which made this test flaky. The slow_down
-		// path is covered in the oauth package.
-		DevicePollInterval: time.Nanosecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	registry, err := idp.NewRegistry(idp.RegistryConfig{
 		RedirectBase: "https://re0auth.test",
@@ -102,14 +87,18 @@ func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts
 	if err != nil {
 		t.Fatal(err)
 	}
-	azSvc, err := authz.NewService(as, authz.NewMemoryStore(), authz.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, manager)
 	api, err := New(Config{
-		Issuer: "https://re0auth.test", AS: as,
-		Sessions: manager, Accounts: accounts, Auth: authHandler, Authz: azSvc,
-		Federation: fed,
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Authorization:     opHandler,
+		Sessions:          manager,
+		Accounts:          accounts,
+		Auth:              authHandler,
+		Federation:        fed,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -184,8 +173,8 @@ func authorize(t *testing.T, c *http.Client, base, verifier, scope, state string
 	loc, _ := url.Parse(resp.Header.Get("Location"))
 	resp.Body.Close()
 	handle := loc.Query().Get("id")
-	if !strings.HasPrefix(handle, "arq_") {
-		t.Fatalf("consent handle = %q", handle)
+	if handle == "" {
+		t.Fatalf("consent handle not in %q", loc)
 	}
 	return handle
 }
@@ -233,13 +222,27 @@ func TestAuthorizationInteractionEndToEnd(t *testing.T) {
 	}
 	decision := decodeResp(t, resp)
 	redirectTo, _ := decision["redirect_to"].(string)
-	ru, err := url.Parse(redirectTo)
-	if err != nil {
+	if redirectTo == "" {
 		t.Fatalf("redirect_to = %q", redirectTo)
 	}
+	// In OP mode redirect_to is the provider callback; following it is what
+	// issues the code and redirects to the client.
+	if strings.HasPrefix(redirectTo, "/") {
+		redirectTo = base + redirectTo
+	}
+	cbResp := getURL(t, browser, redirectTo)
+	if cbResp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(cbResp.Body)
+		t.Fatalf("callback status = %d body = %s", cbResp.StatusCode, body)
+	}
+	ru, err := url.Parse(cbResp.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("callback location: %v", err)
+	}
+	cbResp.Body.Close()
 	code := ru.Query().Get("code")
 	if code == "" || ru.Query().Get("state") != "st-1" {
-		t.Fatalf("redirect_to = %q", redirectTo)
+		t.Fatalf("redirect_to = %q", ru)
 	}
 
 	// Exchange the code.

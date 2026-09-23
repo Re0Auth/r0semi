@@ -12,14 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"testing"
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 
-	"github.com/Re0Auth/r0semi/internal/store/postgres"
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
+	"github.com/Re0Auth/r0semi/internal/store/memory"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -36,31 +36,19 @@ func randSuffix() string {
 type fixture struct {
 	server   *httptest.Server
 	handler  *Handler
-	store    *postgres.OIDCStore
+	store    *memory.OIDCStore
 	webID    string
 	deviceID string
 }
 
 func newFixture(t *testing.T) fixture {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		if os.Getenv("CI") != "" {
-			t.Fatal("TEST_DATABASE_URL is required in CI")
-		}
-		t.Skip("TEST_DATABASE_URL is not set; skipping Postgres-backed OIDC tests")
-	}
-
 	ctx := context.Background()
-	db, err := postgres.Open(ctx, dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(db.Close)
 
 	suffix := randSuffix()
 	webID, deviceID := "http-web-"+suffix, "http-device-"+suffix
 
+	clients := oauth.NewMemoryClientRegistry()
 	web, err := oauth.NewClient(webID, "Web", oauth.ClientConfidential, "s3cret",
 		[]string{"https://client.example/cb"},
 		[]oauth.Scope{oauth.ScopeAccountID, oauth.ScopePhigrosScore})
@@ -74,7 +62,7 @@ func newFixture(t *testing.T) fixture {
 		t.Fatal(err)
 	}
 	for _, c := range []oauth.Client{web, device} {
-		if err := db.Clients().Create(ctx, c); err != nil {
+		if err := clients.Create(ctx, c); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -83,9 +71,10 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.OIDC(db.Clients(), postgres.OIDCOptions{
+	store, err := memory.NewOIDCStore(memory.OIDCOptions{
+		Clients:  clients,
 		Registry: oauth.DefaultRegistry(),
-		Signer:   postgres.NewOIDCSigner("http-test", key),
+		Signer:   oidcstore.NewSigner("http-test", key),
 		Login: func(_ context.Context, id string) string {
 			return "/login?authRequestID=" + url.QueryEscape(id)
 		},
@@ -108,7 +97,7 @@ func newFixture(t *testing.T) fixture {
 		CryptoKeyID:   "test",
 		Scopes:        scopes,
 		AllowInsecure: true,
-		Clients:       db.Clients(),
+		Clients:       clients,
 		Registry:      oauth.DefaultRegistry(),
 		Consent:       store,
 	})
@@ -226,6 +215,11 @@ func TestDiscoveryAndKeys(t *testing.T) {
 		if !strings.HasSuffix(got, suffix) {
 			t.Fatalf("%s = %q, want suffix %q", key, got, suffix)
 		}
+	}
+	// O-9: RP-initiated logout is deliberately not offered, so it must not be
+	// advertised either. The library would advertise it by default.
+	if _, ok := disc["end_session_endpoint"]; ok {
+		t.Fatal("discovery advertises end_session_endpoint, which ADR-0001 O-9 says is out of contract")
 	}
 
 	rfcResp := get(t, noRedirect, f.server.URL+RFC8414Path)

@@ -206,12 +206,15 @@ type Credential struct {          // 一个 provider 的私有凭据形态，vau
 
 ### 4.4 授权服务器（OpenID Provider）（已实现）
 
-> **ADR-0001：Re0Auth 是 OpenID Provider。** 有数据库时本层由
-> `github.com/zitadel/oidc/v3/pkg/op` 提供（`internal/oidchttp` + `internal/store/postgres` 的 `OIDCStore`）；
-> 无数据库的内存模式退回手写 `oauth` 引擎，**仅用于开发与 e2e**。契约见 [oidc-decision.md](./oidc-decision.md)：
+> **ADR-0001：Re0Auth 是 OpenID Provider。** 本层由
+> `github.com/zitadel/oidc/v3/pkg/op` 提供（`internal/oidchttp` + OP store）。**生产与内存模式都走 OP**
+> （ADR-0001 P4b）：有数据库时 state 落在 `internal/store/postgres` 的 `OIDCStore`，无数据库时落在
+> `internal/store/memory`；两者共享 `internal/oidcstore` 的签名密钥、客户端适配与同意策略。契约见
+> [oidc-decision.md](./oidc-decision.md)：
 > `id_token`（**仅请求 `openid` 时**）、`userinfo`、JWKS、OIDC discovery；`offline_access` 作为兼容性空操作；
-> 两把密钥（RS256 签名私钥、32B 令牌加密密钥）由 `RE0AUTH_OIDC_SIGNING_KEY` / `RE0AUTH_OIDC_TOKEN_KEY` 配置。
-> 手写 `oauth` 包仍是 **Upstream Kit（数据源侧）** 的 AS 引擎，不属于本次替换范围。
+> 两把密钥（RS256 签名私钥、32B 令牌加密密钥）由 `RE0AUTH_OIDC_SIGNING_KEY` / `RE0AUTH_OIDC_TOKEN_KEY` 配置，
+> **两种模式都必填**（缺一拒绝启动）。
+> 手写 `oauth` 包仍是 **Upstream Kit（数据源侧）** 的 AS 引擎，不再是 re0auth 的授权引擎。
 
 对下的核心契约。MVP 采用**不透明 access token + introspect**（而非 JWT）：即时可撤销，无需 JWT
 密钥轮换，且资源服务器与 AS 是同一服务。**唯一的 JWT 是 `id_token`。**
@@ -265,7 +268,7 @@ re0auth.r0semi.net
 `GET /v1/sources`（公开）、`GET /v1/bindings` + `DELETE /v1/bindings/{game}/{source}`（会话；断开数据源，
 并尽量让源按 RFC 7009 撤销它签发的令牌）、
 `POST /v1/bindings/{game}/{source}/cascade_revocation`（会话 + 显式确认；请求数据源作废整段上游会话）、
-两个发现端点。`GET /oauth/authorize` 走 `authz.Begin` → 重定向到同意页；`GET /bind` 走 `federate.BeginBind`。
+两个发现端点。`GET /oauth/authorize` 由 OP（`internal/oidchttp`）处理，经 `Login` 钩子重定向到同意页；`GET /bind` 走 `federate.BeginBind`。
 
 **断开的本地一半总是发生。** 数据源宕机、坏掉或拒不配合，都不能阻止用户把它从自己的账号上摘下来；
 上游那一半是尽力而为，结果（`done` / `unsupported` / `unavailable` / `nothing`）随响应一起回去，
@@ -354,23 +357,26 @@ HTTP 头和 `<meta>` 同时存在时，**两个 CSP 都强制执行**。`interna
 - `httpapi` 在配置 `Sessions` / `Accounts` / `Auth` 时挂载 `/auth/`、包上会话中间件，
   并提供 `GET /v1/sessions/current`、`POST /v1/sessions/sign_out`。
 
-### 4.7 授权交互 API（v1 已实现：`internal/authz` + `httpapi`）
+### 4.7 授权交互 API（v1 已实现：`internal/oidchttp` + `internal/authorization` + `httpapi`）
 
-把 `/oauth/authorize` 从 stub 变成真实浏览器流程，同时把安全判断全部留在服务端：
+把 `/oauth/authorize` 变成真实浏览器流程，同时把安全判断全部留在服务端。`/oauth/authorize` 本身由
+OP（`internal/oidchttp`，zitadel 引擎）处理，`httpapi` 只负责同意页三个端点：
 
-- `GET /oauth/authorize`（协议平面）：校验并 `authz.Begin` 建立服务端 pending 请求（handle），
-  把 handle 绑定到当前浏览器会话，302 到前端 `/consent?id=<arq_...>`。
-  客户端未知 / 重定向非法 → JSON OAuth 错误；scope 非法 → 302 回客户端 `error=invalid_scope`。
+- `GET /oauth/authorize`（协议平面，OP）：校验客户端与 redirect_uri，建立服务端 pending auth request，
+  经 `Login` 钩子把 handle 绑定到当前浏览器会话，302 到前端 `/app/consent?id=<opaque>`。
+  未知 scope → 302 回客户端 `error=invalid_scope`（`internal/oidchttp` 在库静默丢弃前先拒绝，O-7）；
+  客户端未知 / 重定向非法 → JSON OAuth 错误。
 - `GET /v1/authorization_requests/{id}`（业务平面，需登录 + 会话绑定）：返回客户端名与 scope 描述
   （含 `risk` / `explicit_consent`）、`csrf_token`，以及 `missing_bindings`——请求的 scope 中
   还需要但尚未连接的数据源，每项带服务端拼好的 `bind_url`（`return_to` 指回同一 handle）。
 - `POST /v1/authorization_requests/{id}/decision`（需登录 + CSRF）：`{decision, scopes, explicit}`；
-  批准 → `authz.Approve` → `oauth.Authorize` 签发 code → 返回**服务端拼好的** `redirect_to`。
+  批准 → `oidchttp.ApproveAuthorization`（收窄 scope + 复核 critical scope）→ `CompleteLogin` →
+  返回 **服务端拼好的** `redirect_to`（指向 OP callback，由它签发 code 并 302 回客户端）。
 - **渐进式绑定**：同意页在 `missing_bindings` 非空时禁用批准并引导连接；绑定回调回到同一
   pending handle（`authorizationRequestTTL` 需长于 federation 的绑定 TTL）。取消勾选某个 scope
   即可解除它对应的绑定要求。
-- `authz.Approve` 只允许**收窄** scope，并把 `explicit` 交给 AS 复核 critical scope；
-  handle 单次使用、短时效、绑定浏览器。
+- handle 单次使用、短时效、绑定浏览器；收窄规则由 `internal/oidcstore` 的 `NarrowScopes` /
+  `RequireExplicitConsent` 统一实现，两种 OP store 共用一份。
 
 ### 4.8 Upstream Kit 与一致性测试（v1 已实现：`upstreamkit`）
 
@@ -448,19 +454,25 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 设了 `DATABASE_URL` 后，同一行变成：
 
 ```
-storage: every port is persistent (accounts, tokens, device authorizations, clients, vault credentials, bindings, bind flows, sessions, authorization requests)
+storage: every port is persistent (accounts, clients, vault credentials, bindings, bind flows, sessions, OP tokens, OP device authorizations)
 ```
 
-“哪些部分是持久的”绝不能靠猜。
+“哪些部分是持久的”绝不能靠猜。内存模式下**引擎不变**（仍是 OpenID Provider），只是 OP 的 state
+（授权请求、code、令牌、设备授权）落在内存：
+
+```
+WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, bindings and pending requests
+```
 
 **配置约定**：文件只放结构（端点、驱动、哪些 provider/源存在），**密钥只来自环境**——文件写的是
 变量名（`*_env`），不是值。优先级为 **环境 > 文件 > 默认值**；校验 fail-closed，缺密钥/缺 issuer/Kek 长度
 不对，都拒绝启动。共享辅助在 `internal/config`，因为密钥解析语义在两个二进制里各写一份必然漂移。
 
 **Postgres 适配器**（`internal/store/postgres`）落在接口包**之外**，因为公开库（`oauth`、`vault`）
-不能依赖数据库驱动。**9 个存储端口全部已落地**：`account.Store`、`oauth.Store`、`oauth.DeviceStore`、
-`oauth.ClientRegistry`、`vault.Repo`、`federation.BindingStore`、`federation.BindFlowStore`、
-`scs.Store`（会话）、`authz.Store`（待授权请求）。**后端持久化到此收尾。**
+不能依赖数据库驱动。存储端口（全部已落地）：`account.Store`、`oauth.ClientRegistry`、`vault.Repo`、
+`federation.BindingStore`、`federation.BindFlowStore`、`scs.Store`（会话），以及 OpenID Provider 的
+`op.Storage` + `op.DeviceAuthorizationStorage`（其 Postgres 与内存两个实现共享 `internal/oidcstore` 的
+签名密钥、客户端适配与同意策略）。**后端持久化到此收尾。**
 
 | 关注点 | 做法 |
 |---|---|
@@ -480,16 +492,13 @@ storage: every port is persistent (accounts, tokens, device authorizations, clie
 `.github/workflows/ci.yml`）。CI 里若变量缺失则**直接失败**，不允许静默跳过；并单独 verbose 跑一遍，
 让日志逐条证明测试真的执行了（`ok` 在 skip 与 pass 两种情况下长得一样）。
 
-**两个端口刻意不对 handle 做哈希**，因为哈希在那里保护不了什么：`authz_requests.id` 设计上就出现在
+**OP 的 auth request id 刻意不对 handle 做哈希**，因为哈希在那里保护不了什么：`oidc_auth_requests.id` 设计上就出现在
 浏览器 URL 与服务器日志里，且 HTTP 层另外把它绑定到创建它的会话，偷到 handle 在别处也无用。
-分类写在各自的迁移注释与 threat-model §6.1 里。
+分类写在迁移注释与 threat-model §6.1 里。
 
 会话额外做了一件事：`scs.Store` 的接口**不带 context**（scs 不传），所以适配器用 `context.Background`；
 过期会话在 `Find` 时按 scs 语义当作“未找到”并顺手删除，另有 15 分钟一次的 `SweepExpired` 定期清理
-（`Find` 只清那些还会被访问的）。待授权请求同样有 sweep。
-
-> 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
-> `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
+（`Find` 只清那些还会被访问的）。OP 的过期授权请求 / code / 设备授权在读取时按过期处理，不另起 sweep。
 
 > 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
 > `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
@@ -536,7 +545,7 @@ storage: every port is persistent (accounts, tokens, device authorizations, clie
 | 依赖方向 | `internal/archtest`: `TestPublicLibrariesDoNotDependOnInternal`, `TestDatabaseAdapterIsConfinedToCompositionRoots`, `TestKernelHasNoInternalDependencies`, `TestEveryModulePackageIsRegistered` |
 | 平面隔离 | `httpapi`: `TestTokenErrorUsesOAuthFormat`, `TestBusinessErrorUsesProblemFormat`, `TestUnknownEndpointsArePlaneSpecific`, `TestInsufficientScopeIsForbidden` |
 | 账号 I-1/I-2/I-3 | `account`: `TestUnlinkRejectsLastIdentity`, `TestLinkRejectsIdentityOwnedByAnotherUser`；`auth`: `TestLinkRejectsTakenIdentity`, `TestLinkAddsIdentityToCurrentUser` |
-| 授权交互 | `authz`: `TestApproveIssuesUsableCode`, `TestApproveCannotWidenScope`, `TestApproveEnforcesExplicitConsent`, `TestApproveIsSingleUse`；`httpapi`: `TestAuthorizationInteractionEndToEnd`, `TestAuthorizationHandleIsBoundToBrowser`, `TestDecisionRequiresCSRF` |
+| 授权交互 | `oidchttp`: `TestConsentInteraction`, `TestIDTokenGating`, `TestUserinfoReturnsOnlySub`；`oidcstore`: `NarrowScopes` / `RequireExplicitConsent` 由两个 store 共用；`httpapi`: `TestAuthorizationInteractionEndToEnd`, `TestAuthorizationHandleIsBoundToBrowser`, `TestDecisionRequiresCSRF` |
 | 上游协议 | `upstreamkit`: `TestReferenceUpstreamPassesConformance`, `TestKitAuthorizeFlow`；`conformance`: `TestMissingAccountScopeIsAnError`, `TestBadTokenClassIsAnError`, `TestAuthorizeRedirectingUnknownClientIsAnError`, `TestTokenAcceptingBadGrantIsAnError` |
 | 数据联邦 | `federation`: `TestFetchReturnsSourcePayload`, `TestBindFlow`, `TestFetchRefreshesExpiredBinding`, `TestConcurrentRefreshHappensOnce`, `TestFetchFallsBackAndMarksDegraded`, `TestPinnedSourceIsNotSubstituted`, `TestRawPassthroughIsVerbatim`, `TestActiveBeatsDegraded`；`httpapi`: `TestGameResourceDataPlane`, `TestSourceBindingEndToEnd`, `TestGameRawAndDegraded` |
 | 其他 | 信封 / 身份绑定 / provider 隔离；403 被动失效检测；MAC 签名（`TestMACAuthorizationSignsDocumentedString`） |
@@ -592,6 +601,11 @@ critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期
 4. core 的可观测性：fiber 状态是否导出为指标，`App.Check` 结果是否作为 CI 门禁。
    **部分已决**：依赖方向的 CI 门禁已由 `internal/archtest` 落地；`core` 自身的可观测性随其生产接入
    一并推迟（ADR-0002），接入前不再是待办。
+5. 旧引擎在 Postgres 侧的遗留表与适配器：`oauth_codes` / `oauth_access_tokens` /
+   `oauth_refresh_tokens` / `oauth_device_authorizations`（迁移 0001 / 0006）以及
+   `internal/store/postgres` 的 `Tokens` / `Devices`，在 P4b 之后已无生产调用者。
+   删除它们需要一次丢表的迁移与对应测试的调整，留待下一次存储清理；
+   `Authz` 与 `authz_requests`（迁移 0005）已在 P4b 一并删除。
 
 ## 9. 参考
 

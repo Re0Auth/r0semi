@@ -11,10 +11,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
+	"github.com/Re0Auth/r0semi/internal/oidchttp"
+	"github.com/Re0Auth/r0semi/internal/store/memory"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -22,25 +23,26 @@ const testIssuer = "https://auth.test"
 
 type testEnv struct {
 	srv     *Server
-	as      oauth.Service
+	store   *memory.OIDCStore
+	handler *oidchttp.Handler
 	clients *oauth.MemoryClientRegistry
 }
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	clients := oauth.NewMemoryClientRegistry()
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: testIssuer,
-		Scopes: oauth.DefaultRegistry(),
+	handler, store := newOPBackend(t, testIssuer, clients, nil)
+	srv, err := New(Config{
+		Issuer:            testIssuer,
+		OIDC:              handler,
+		TokenIntrospector: handler,
+		GrantStore:        store,
+		DeviceStore:       store,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Config{Issuer: testIssuer, AS: as})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &testEnv{srv: srv, as: as, clients: clients}
+	return &testEnv{srv: srv, store: store, handler: handler, clients: clients}
 }
 
 func (e *testEnv) register(t *testing.T, id string, typ oauth.ClientType, secret string, scopes []oauth.Scope) {
@@ -59,22 +61,50 @@ func pkce(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-// issueCode drives the service-side authorize step; the browser consent UI does
-// not exist yet.
+// issueCode drives the OpenID Provider's authorize step up to the code: it
+// starts the request, completes the login (as the consent screen would), and
+// follows the OP callback to the client redirect.
 func (e *testEnv) issueCode(t *testing.T, clientID string, scopes []oauth.Scope, verifier string) string {
 	t.Helper()
-	resp, err := e.as.Authorize(context.Background(), oauth.AuthorizationRequest{
-		ClientID:            clientID,
-		RedirectURI:         "https://app.example/cb",
-		Subject:             "user-1",
-		Scopes:              scopes,
-		CodeChallenge:       pkce(verifier),
-		CodeChallengeMethod: "S256",
-	})
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {"https://app.example/cb"},
+		"scope":                 {strings.Join(scopeStrings(scopes), " ")},
+		"state":                 {"st"},
+		"code_challenge":        {pkce(verifier)},
+		"code_challenge_method": {"S256"},
+	}
+	rec := httptest.NewRecorder()
+	e.srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("authorize = %d: %s", rec.Code, rec.Body.String())
+	}
+	loc, err := url.Parse(rec.Header().Get("Location"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return resp.Code
+	id := loc.Query().Get("authRequestID")
+	if id == "" {
+		t.Fatalf("no authRequestID in %q", loc)
+	}
+	if err := e.store.CompleteLogin(context.Background(), id, "user-1", scopeStrings(scopes)); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	e.srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/authorize/callback?id="+url.QueryEscape(id), nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("callback = %d: %s", rec.Code, rec.Body.String())
+	}
+	cb, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := cb.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in %q", cb)
+	}
+	return code
 }
 
 func (e *testEnv) do(method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -330,8 +360,13 @@ func TestIntrospectRequiresClientAuth(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if body := decodeJSON(t, rec); body["error"] != "invalid_client" {
-		t.Fatalf("body = %v", body)
+	// The provider writes this particular error as text, but it is still the
+	// protocol plane: it must not be problem+json, and it must name the failure.
+	if ct := rec.Header().Get("Content-Type"); strings.Contains(ct, "problem+json") {
+		t.Fatalf("protocol plane leaked problem+json: %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_client") {
+		t.Fatalf("body = %q, want it to name invalid_client", rec.Body.String())
 	}
 }
 
@@ -358,17 +393,6 @@ func TestConfidentialTokenUsesBasicAuth(t *testing.T) {
 	}
 }
 
-func TestAuthorizeEndpointIsTemporarilyUnavailable(t *testing.T) {
-	env := newTestEnv(t)
-	rec := env.do(http.MethodGet, "/oauth/authorize", "", nil)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d", rec.Code)
-	}
-	if body := decodeJSON(t, rec); body["error"] != "temporarily_unavailable" {
-		t.Fatalf("body = %v", body)
-	}
-}
-
 // Without session configuration the session and /auth routes are absent.
 func TestSessionRoutesAbsentWithoutConfig(t *testing.T) {
 	env := newTestEnv(t)
@@ -388,13 +412,6 @@ func TestSessionRoutesAbsentWithoutConfig(t *testing.T) {
 }
 
 func TestSessionRoutesMountedWithConfig(t *testing.T) {
-	as, err := oauth.NewService(oauth.NewMemoryClientRegistry(), oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: testIssuer,
-		Scopes: oauth.DefaultRegistry(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	accounts := account.NewMemoryStore()
 	manager := auth.NewManager(auth.Options{Secure: false})
 	registry, err := idp.NewRegistry(idp.RegistryConfig{
@@ -404,11 +421,22 @@ func TestSessionRoutesMountedWithConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := auth.NewHandler(manager, registry, accounts)
+	authHandler, err := auth.NewHandler(manager, registry, accounts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Config{Issuer: testIssuer, AS: as, Sessions: manager, Accounts: accounts, Auth: handler})
+	opHandler, store := newOPBackend(t, testIssuer, oauth.NewMemoryClientRegistry(), manager)
+	srv, err := New(Config{
+		Issuer:            testIssuer,
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Authorization:     opHandler,
+		Sessions:          manager,
+		Accounts:          accounts,
+		Auth:              authHandler,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,14 +463,15 @@ func TestSessionRoutesMountedWithConfig(t *testing.T) {
 }
 
 func TestAuthRequiresSessions(t *testing.T) {
-	as, err := oauth.NewService(oauth.NewMemoryClientRegistry(), oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: testIssuer,
-		Scopes: oauth.DefaultRegistry(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := New(Config{Issuer: testIssuer, AS: as, Auth: &auth.Handler{}}); err == nil {
+	opHandler, store := newOPBackend(t, testIssuer, oauth.NewMemoryClientRegistry(), nil)
+	if _, err := New(Config{
+		Issuer:            testIssuer,
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Auth:              &auth.Handler{},
+	}); err == nil {
 		t.Fatal("accepted Auth without Sessions")
 	}
 }

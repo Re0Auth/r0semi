@@ -31,10 +31,23 @@ rate_limit_burst = 100
 
 [storage]
 # "postgres" or "memory". Omit the whole section to use memory (nothing survives
-# a restart; the server says so at startup).
+# a restart; the server says so at startup). **Either way the authorization engine
+# is the OpenID Provider** (ADR-0001 P4b); a DSN only moves the OP's state from
+# memory to Postgres.
 driver = "postgres"
 # The variable holding the connection string, never the DSN itself.
 dsn_env = "DATABASE_URL"
+
+# The OpenID Provider's two keys. They are environment-only and **required in
+# both storage modes**, because id_tokens and opaque access tokens must survive a
+# restart even when nothing else does:
+#
+#   export RE0AUTH_OIDC_TOKEN_KEY=$(head -c 32 /dev/urandom | base64)
+#   export RE0AUTH_OIDC_SIGNING_KEY=$(openssl genpkey -algorithm RSA \
+#     -pkeyopt rsa_keygen_bits:2048 -outform DER 2>/dev/null | base64 -w0)
+#
+# Rotation overlaps: RE0AUTH_OIDC_RETIRED_TOKEN_KEYS=id:base64,...  (decrypt only)
+# and RE0AUTH_OIDC_RETIRED_SIGNING_KEYS=kid:base64PKIX,...  (publish only).
 
 [vault]
 # The variable holding the 32-byte key encryption key, base64 or hex:

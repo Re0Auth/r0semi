@@ -5,33 +5,88 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
-	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/store/memory"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
 const fedRedirect = "https://app.example/cb"
 
-func mintToken(t *testing.T, as oauth.Service, clientID, subject string, scopes ...oauth.Scope) string {
+// mintToken issues an OP access token for a subject by driving the real
+// authorization-code flow through the server's own handler. There is no shortcut:
+// the token the data plane accepts is the token a client would really get.
+func mintToken(t *testing.T, h http.Handler, store *memory.OIDCStore, clientID, subject string, scopes ...oauth.Scope) string {
 	t.Helper()
 	const verifier = "verifier-verifier-verifier-verifier-verifier"
-	auth, err := as.Authorize(context.Background(), oauth.AuthorizationRequest{
-		ClientID: clientID, RedirectURI: fedRedirect, Subject: subject, Scopes: scopes,
-		CodeChallenge: pkce(verifier), CodeChallengeMethod: "S256",
-	})
+	// offline_access makes the OP issue a refresh token as well; Re0Auth treats it
+	// as a compatibility no-op and never surfaces it in the scope list.
+	requested := append(scopeStrings(scopes), "offline_access")
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {fedRedirect},
+		"scope":                 {strings.Join(requested, " ")},
+		"state":                 {"st"},
+		"code_challenge":        {pkce(verifier)},
+		"code_challenge_method": {"S256"},
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("authorize = %d: %s", rec.Code, rec.Body.String())
+	}
+	loc, err := url.Parse(rec.Header().Get("Location"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, err := as.Exchange(context.Background(), oauth.CodeExchangeRequest{
-		ClientID: clientID, Code: auth.Code, RedirectURI: fedRedirect, CodeVerifier: verifier,
-	})
+	id := loc.Query().Get("authRequestID")
+	if id == "" {
+		id = loc.Query().Get("id")
+	}
+	if id == "" {
+		t.Fatalf("no auth request id in %q", loc)
+	}
+	if err := store.CompleteLogin(context.Background(), id, subject, requested); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/authorize/callback?id="+url.QueryEscape(id), nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("callback = %d: %s", rec.Code, rec.Body.String())
+	}
+	cb, err := url.Parse(rec.Header().Get("Location"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tok.AccessToken
+	code := cb.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in %q", cb)
+	}
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {clientID},
+		"code":          {code},
+		"redirect_uri":  {fedRedirect},
+		"code_verifier": {verifier},
+	}
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("token = %d: %s", rec.Code, rec.Body.String())
+	}
+	tok := decodeJSON(t, rec)
+	at, _ := tok["access_token"].(string)
+	if at == "" {
+		t.Fatalf("no access token: %v", tok)
+	}
+	return at
 }
 
 func authedGet(t *testing.T, target, token string) *http.Response {
@@ -93,20 +148,22 @@ func TestGameResourceDataPlane(t *testing.T) {
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: "https://re0auth.test", Scopes: oauth.DefaultRegistry(),
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, nil)
+	api, err := New(Config{
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Federation:        fed,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	api, err := New(Config{Issuer: "https://re0auth.test", AS: as, Federation: fed})
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(api.Handler())
 	defer srv.Close()
 
-	at := mintToken(t, as, "cli", "usr_test", oauth.ScopePhigrosProfile)
+	at := mintToken(t, api.Handler(), store, "cli", "usr_test", oauth.ScopePhigrosProfile)
 
 	// Normalized fetch, with provenance.
 	resp := authedGet(t, srv.URL+"/v1/games/phigros/profile", at)
@@ -137,7 +194,7 @@ func TestGameResourceDataPlane(t *testing.T) {
 	}
 
 	// Scope is enforced before any upstream call.
-	atB30 := mintToken(t, as, "cli", "usr_test", oauth.ScopePhigrosB30)
+	atB30 := mintToken(t, api.Handler(), store, "cli", "usr_test", oauth.ScopePhigrosB30)
 	resp = authedGet(t, srv.URL+"/v1/games/phigros/profile", atB30)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("scope status = %d, want 403", resp.StatusCode)
@@ -226,21 +283,23 @@ func TestGameRawAndDegraded(t *testing.T) {
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: "https://re0auth.test", Scopes: oauth.DefaultRegistry(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	api, err := New(Config{Issuer: "https://re0auth.test", AS: as, Federation: fed})
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, nil)
+	api, err := New(Config{
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Federation:        fed,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(api.Handler())
 	defer srv.Close()
 
-	at := mintToken(t, as, "cli", "usr_test", oauth.ScopePhigrosProfile)
+	at := mintToken(t, api.Handler(), store, "cli", "usr_test", oauth.ScopePhigrosProfile)
 
 	// a-src fails, b-src answers, and the response says so.
 	resp := authedGet(t, srv.URL+"/v1/games/phigros/profile", at)

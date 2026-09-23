@@ -49,7 +49,8 @@ type Config struct {
 	// Issuer is the public identifier. When empty it is derived from the
 	// request Host, which is what tests and dynamic deployments want.
 	Issuer string
-	// Storage is the op.Storage (production: internal/store/postgres OIDCStore).
+	// Storage is the op.Storage: internal/store/postgres.OIDCStore when durable,
+	// internal/store/memory.OIDCStore otherwise (ADR-0001 P4b).
 	Storage op.Storage
 	// CryptoKey encrypts opaque bearer tokens. 32 bytes.
 	CryptoKey [32]byte
@@ -169,11 +170,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == RFC8414Path:
 		// O-1: identical content, one source. Rewrite to the OIDC document.
-		clone := r.Clone(r.Context())
-		clone.URL.Path = OIDCDiscoveryPath
-		h.provider.ServeHTTP(w, clone)
+		h.serveDiscovery(w, r, OIDCDiscoveryPath)
 	case r.URL.Path == OIDCDiscoveryPath:
-		h.provider.ServeHTTP(w, r)
+		h.serveDiscovery(w, r, OIDCDiscoveryPath)
 	case strings.HasPrefix(r.URL.Path, "/oauth/"):
 		h.serveOAuth(w, r)
 	default:
@@ -181,9 +180,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serveOAuth delegates to the provider, except that token responses are passed
-// through the id_token gate.
+// serveDiscovery serves a discovery document with the capabilities Re0Auth has
+// decided not to offer removed. The library advertises end_session because it
+// implements it; O-9 says Re0Auth does not offer RP-initiated logout, and an
+// advertised endpoint that is out of contract is worse than a missing one.
+func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path string) {
+	clone := r.Clone(r.Context())
+	clone.URL.Path = path
+	bw := newBufferedWriter()
+	h.provider.ServeHTTP(bw, clone)
+	bw.flush(w, stripUnsupportedDiscoveryFields(bw.body.Bytes()))
+}
+
+// stripUnsupportedDiscoveryFields removes advertised capabilities that are
+// deliberately out of contract (ADR-0001 O-9).
+func stripUnsupportedDiscoveryFields(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	changed := false
+	for _, key := range []string{"end_session_endpoint", "end_session_encryption_alg_values_supported"} {
+		if _, ok := payload[key]; ok {
+			delete(payload, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// serveOAuth delegates to the provider, except for two contract points the
+// library leaves open: the authorize scope gate (O-7) and the token response's
+// no-store headers (RFC 6749 §5.1).
 func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
+	if !knownOAuthPath(r.URL.Path) {
+		writeOAuthJSONError(w, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/"+pathAuthorize {
+		if h.validateAuthorize(w, r) {
+			return
+		}
+	}
+
 	const tokenPath = "/" + pathToken
 	if r.Method != http.MethodPost || r.URL.Path != tokenPath {
 		h.provider.ServeHTTP(w, r)
@@ -196,7 +242,103 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	if bw.status == http.StatusOK {
 		body = sanitizeTokenResponse(body)
 	}
+	// RFC 6749 §5.1 requires these on every token response, error included: a
+	// cached token (or error) is a cached secret.
+	bw.header.Set("Cache-Control", "no-store")
+	bw.header.Set("Pragma", "no-cache")
 	bw.flush(w, body)
+}
+
+// validateAuthorize refuses an authorize request the library would answer either
+// by silently dropping scopes (op.ValidateAuthReqScopes) or with a plain-text
+// body (AuthRequestError for a redirect-disabled error). It returns true when it
+// has already written the response.
+//
+// Two contract points depend on this: O-7 (an unknown or disallowed scope must
+// be an error, not a silent narrowing) and the protocol plane's promise to speak
+// OAuth errors. A missing scope, an unknown client and an unregistered redirect
+// URI are all errors the resource owner must see, so none of them may redirect.
+func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool {
+	if h.clients == nil || h.registry == nil {
+		return false
+	}
+	q := r.URL.Query()
+	clientID := q.Get("client_id")
+	if clientID == "" {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
+		return true
+	}
+	client, err := h.clients.Get(r.Context(), clientID)
+	if err != nil {
+		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client", "unknown client")
+		return true
+	}
+	redirectURI := q.Get("redirect_uri")
+	if redirectURI == "" || !client.AllowsRedirect(redirectURI) {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "the redirect_uri is not registered for this client")
+		return true
+	}
+	rawScope := q.Get("scope")
+	if rawScope == "" {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "scope is required")
+		return true
+	}
+	for _, scope := range strings.Fields(rawScope) {
+		if standardOIDCScope(scope) {
+			continue
+		}
+		s := oauth.Scope(scope)
+		if _, known := h.registry.Get(s); known && client.AllowsScope(s) {
+			continue
+		}
+		params := map[string]string{"error": "invalid_scope", "state": q.Get("state")}
+		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+		return true
+	}
+	return false
+}
+
+// writeOAuthJSONError keeps the protocol plane's error format uniform even where
+// the library would otherwise write plain text.
+func writeOAuthJSONError(w http.ResponseWriter, status int, code, description string) {
+	if status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", `Basic realm="oauth"`)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_description": description})
+}
+
+// knownOAuthPath reports whether path is an endpoint this provider serves. It
+// exists so an unknown /oauth/ path is an OAuth error rather than the library's
+// plain-text 404, keeping the protocol plane's error format uniform.
+func knownOAuthPath(path string) bool {
+	switch path {
+	case "/" + pathAuthorize,
+		"/" + pathAuthorize + "/callback",
+		"/" + pathToken,
+		"/" + pathIntrospection,
+		"/" + pathRevocation,
+		"/" + pathUserinfo,
+		"/" + pathKeys,
+		"/" + pathDeviceAuthz:
+		return true
+	default:
+		return false
+	}
+}
+
+// standardOIDCScope reports whether scope is one the library always accepts
+// without consulting the catalog. offline_access is included because Re0Auth
+// treats it as a compatibility no-op (ADR-0001 O-6).
+func standardOIDCScope(scope string) bool {
+	switch scope {
+	case oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeAddress, oidc.ScopeOfflineAccess:
+		return true
+	default:
+		return false
+	}
 }
 
 // sanitizeTokenResponse enforces two contract points the library does not:

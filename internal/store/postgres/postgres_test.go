@@ -12,7 +12,6 @@ import (
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
-	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/oauth"
 	"github.com/Re0Auth/r0semi/vault"
@@ -44,7 +43,7 @@ func openTestDB(t *testing.T) *DB {
 		         oauth_access_tokens, oauth_refresh_tokens,
 		         oauth_device_authorizations, oauth_clients,
 		         vault_credentials, federation_bindings, federation_bind_flows,
-		         sessions, authz_requests, audit_events,
+		         sessions, audit_events,
 		         session_subjects,
 		         oidc_auth_requests, oidc_codes, oidc_access_tokens,
 		         oidc_refresh_tokens, oidc_devices
@@ -911,78 +910,6 @@ func TestSessionsStoreNoPlaintextCookie(t *testing.T) {
 	}
 	if hashed != 1 {
 		t.Fatalf("rows keyed by the hash = %d, want 1", hashed)
-	}
-}
-
-func TestAuthzRoundTrip(t *testing.T) {
-	db := openTestDB(t)
-	store := db.Authz()
-	ctx := context.Background()
-	created := time.Now().UTC().Truncate(time.Microsecond)
-
-	if _, err := store.Get(ctx, "arq_missing"); !errors.Is(err, authz.ErrNotFound) {
-		t.Fatalf("get before put = %v, want ErrNotFound", err)
-	}
-
-	want := authz.Request{
-		ID: "arq_1", ClientID: "cli", ClientName: "CLI",
-		RedirectURI: "https://app.example/cb",
-		Scopes:      []oauth.Scope{"account.id", "phigros.score.read"},
-		State:       "st-1", CodeChallenge: "challenge", CodeChallengeMethod: "S256",
-		CreatedAt: created, ExpiresAt: created.Add(10 * time.Minute),
-	}
-	if err := store.Put(ctx, want); err != nil {
-		t.Fatal(err)
-	}
-	got, err := store.Get(ctx, "arq_1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ClientID != want.ClientID || got.ClientName != want.ClientName ||
-		got.RedirectURI != want.RedirectURI || got.State != want.State ||
-		got.CodeChallenge != want.CodeChallenge || got.CodeChallengeMethod != want.CodeChallengeMethod {
-		t.Fatalf("request = %+v", got)
-	}
-	// Scope order is preserved: the consent screen renders it as requested.
-	if len(got.Scopes) != 2 || got.Scopes[0] != "account.id" || got.Scopes[1] != "phigros.score.read" {
-		t.Fatalf("scopes = %v", got.Scopes)
-	}
-
-	if err := store.Delete(ctx, "arq_1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Delete(ctx, "arq_1"); err != nil {
-		t.Fatalf("delete is not idempotent: %v", err)
-	}
-	if _, err := store.Get(ctx, "arq_1"); !errors.Is(err, authz.ErrNotFound) {
-		t.Fatalf("get after delete = %v, want ErrNotFound", err)
-	}
-}
-
-func TestAuthzSweepRemovesOnlyExpired(t *testing.T) {
-	db := openTestDB(t)
-	store := db.Authz()
-	ctx := context.Background()
-
-	if err := store.Put(ctx, authz.Request{ID: "arq_live", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Put(ctx, authz.Request{ID: "arq_dead", ExpiresAt: time.Now().Add(-time.Minute)}); err != nil {
-		t.Fatal(err)
-	}
-
-	removed, err := store.SweepExpired(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
-	}
-	if _, err := store.Get(ctx, "arq_live"); err != nil {
-		t.Fatalf("the sweep removed a live request: %v", err)
-	}
-	if _, err := store.Get(ctx, "arq_dead"); !errors.Is(err, authz.ErrNotFound) {
-		t.Fatalf("the expired request survived: %v", err)
 	}
 }
 

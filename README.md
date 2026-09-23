@@ -19,10 +19,16 @@ cp config/re0auth.example.toml config/re0auth.toml
 export RE0AUTH_KEK=$(head -c 32 /dev/urandom | base64)
 export DATABASE_URL='postgres://user:pass@localhost:5432/re0auth?sslmode=disable'
 export RE0AUTH_OIDC_TOKEN_KEY=$(head -c 32 /dev/urandom | base64)
+export RE0AUTH_OIDC_SIGNING_KEY=$(openssl genpkey -algorithm RSA \
+  -pkeyopt rsa_keygen_bits:2048 -outform DER 2>/dev/null | base64 -w0)
 
 go build ./cmd/re0auth
 ./re0auth -config config/re0auth.toml
 ```
+
+不设 `DATABASE_URL` 也能跑：状态全部在内存，重启即丢；**但授权引擎仍然是 OpenID Provider**
+（ADR-0001 P4b），只是存储从 Postgres 换成内存。无论哪种模式，两把 OP 密钥都必填
+（`RE0AUTH_OIDC_TOKEN_KEY`、`RE0AUTH_OIDC_SIGNING_KEY`），缺一即拒绝启动。
 
 ```sh
 RE0AUTH_ISSUER=https://re0auth.example \

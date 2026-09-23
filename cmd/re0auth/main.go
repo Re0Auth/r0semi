@@ -23,18 +23,20 @@ import (
 	"time"
 
 	"github.com/alexedwards/scs/v2"
+	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
-	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/config"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/httpapi"
 	"github.com/Re0Auth/r0semi/internal/oidchttp"
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
+	"github.com/Re0Auth/r0semi/internal/store/memory"
 	"github.com/Re0Auth/r0semi/internal/store/postgres"
 	"github.com/Re0Auth/r0semi/internal/webui"
 	"github.com/Re0Auth/r0semi/oauth"
@@ -51,8 +53,6 @@ var (
 // five return values through every call.
 type storage struct {
 	accounts account.Store
-	tokens   oauth.Store
-	devices  oauth.DeviceStore
 	clients  admin.Clients
 	// credentials is the vault's repository: the one place a decrypted secret
 	// never reaches.
@@ -66,7 +66,6 @@ type storage struct {
 	// sessionIndex maps a session token to its account, so the Kill Switch can
 	// clear one account's sessions. Nil in memory mode.
 	sessionIndex auth.SessionIndex
-	authzStore   authz.Store
 	// audit is the durable audit-log sink; nil would mean "nobody is auditing",
 	// which must never be a silent state.
 	audit audit.Logger
@@ -170,18 +169,6 @@ func main() {
 		die("seed client", err)
 	}
 
-	as, err := oauth.NewService(store.clients, store.tokens, logger, oauth.Config{
-		Issuer:  cfg.Issuer,
-		Scopes:  oauth.DefaultRegistry(),
-		Devices: store.devices,
-		// RFC 8628 hands this URI to the user's browser, so it must be the
-		// frontend's page, not the JSON endpoint that backs it.
-		VerificationPath: webui.BasePath + "/device",
-	})
-	if err != nil {
-		die("authorization server", err)
-	}
-
 	idpRegistry, err := idp.NewRegistry(idp.RegistryConfig{
 		RedirectBase: cfg.Issuer,
 		HTTPClient:   &http.Client{Timeout: 10 * time.Second},
@@ -201,12 +188,7 @@ func main() {
 	}
 
 	// The handle must outlive the upstream binding round trip; see
-	// authorizationRequestTTL.
-	authzService, err := authz.NewService(as, store.authzStore, authz.Config{TTL: authorizationRequestTTL})
-	if err != nil {
-		die("authz", err)
-	}
-
+	// authorizationRequestTTL. The OP store owns it now, in both storage modes.
 	registry, err := federation.NewRegistry(cfg.sources...)
 	if err != nil {
 		die("sources", err)
@@ -234,32 +216,23 @@ func main() {
 		// One switch for "this issuer is https": Secure cookies and HSTS.
 		Secure: cfg.CookieSecure,
 	}
-	var tokenRevoker oauth.TokenAdmin
-	if store.db != nil {
-		// Durable storage means the OpenID Provider can run (ADR-0001).
-		oidcHandler, oidcStore, err := openOIDC(cfg, store, sessions, logger)
-		if err != nil {
-			die("oidc", err)
-		}
-		apiConfig.OIDC = oidcHandler
-		apiConfig.TokenIntrospector = oidcHandler
-		apiConfig.GrantStore = oidcStore
-		apiConfig.DeviceStore = oidcStore
-		apiConfig.Authorization = oidcHandler
-		// The OP owns the tokens in this mode, so it is also what revokes them.
-		tokenRevoker = oidcStore
-		slog.Info("authorization engine", "engine", "openid-provider")
+	// Every deployment runs the OpenID Provider (ADR-0001 P4b). The only thing a
+	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
+	oidcHandler, oidcStore, err := openOIDC(cfg, store, sessions, logger)
+	if err != nil {
+		die("oidc", err)
+	}
+	apiConfig.OIDC = oidcHandler
+	apiConfig.TokenIntrospector = oidcHandler
+	apiConfig.GrantStore = oidcStore
+	apiConfig.DeviceStore = oidcStore
+	apiConfig.Authorization = oidcHandler
+	// The OP owns the tokens, so it is also what revokes them.
+	tokenRevoker := oauth.TokenAdmin(oidcStore)
+	if store.durable {
+		slog.Info("authorization engine", "engine", "openid-provider", "store", "postgres")
 	} else {
-		// Without a database the OP store has nowhere to live, so the in-memory
-		// hand-rolled engine remains. This is the only mode where it does.
-		apiConfig.AS = as
-		apiConfig.Authz = authzService
-		memTokens, ok := store.tokens.(oauth.TokenAdmin)
-		if !ok {
-			die("admin", errors.New("the in-memory token store cannot revoke tokens in bulk"))
-		}
-		tokenRevoker = memTokens
-		slog.Warn("authorization engine", "engine", "built-in (in-memory)", "reason", "no database")
+		slog.Info("authorization engine", "engine", "openid-provider", "store", "memory")
 	}
 
 	// The operator plane. It is mounted only when a deployment names at least one
@@ -311,13 +284,10 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 	if cfg.DatabaseURL == "" {
 		store = storage{
 			accounts:    account.NewMemoryStore(),
-			tokens:      oauth.NewMemoryStore(),
-			devices:     oauth.NewMemoryDeviceStore(),
 			clients:     oauth.NewMemoryClientRegistry(),
 			credentials: vault.NewMemoryRepo(),
 			bindings:    federation.NewMemoryBindingStore(),
 			bindFlows:   federation.NewMemoryBindFlowStore(),
-			authzStore:  authz.NewMemoryStore(),
 			audit:       audit.NewMemoryLogger(),
 			// A nil session store makes auth.NewManager fall back to its
 			// in-memory one.
@@ -334,12 +304,9 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 	}
 	slog.Info("storage ready", "driver", "postgres", "migrated", true)
 	sessions := db.Sessions()
-	authzRequests := db.Authz()
 	return storage{
 		db:          db,
 		accounts:    db.Accounts(),
-		tokens:      db.Tokens(),
-		devices:     db.Devices(),
 		clients:     db.Clients(),
 		credentials: db.Vault(),
 		bindings:    db.Bindings(),
@@ -351,18 +318,9 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 		// The same object, for the auth layer to record which account a session
 		// belongs to.
 		sessionIndex: sessions,
-		authzStore:   authzRequests,
 		audit:        db.Audit(),
-		// Both are swept, and the first error is surfaced: one failing must not
-		// hide the other.
 		sweep: func(ctx context.Context) (int64, error) {
-			removedSessions, errSessions := sessions.SweepExpired(ctx)
-			removedRequests, errRequests := authzRequests.SweepExpired(ctx)
-			removed := removedSessions + removedRequests
-			if errSessions != nil {
-				return removed, errSessions
-			}
-			return removed, errRequests
+			return sessions.SweepExpired(ctx)
 		},
 		durable: true,
 		close:   db.Close,
@@ -371,8 +329,9 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 
 // persistentPorts names every storage port that survives a restart, so the
 // startup line says which ones rather than only how many.
-const persistentPorts = "accounts, tokens, device authorizations, clients, " +
-	"vault credentials, bindings, bind flows, sessions, authorization requests"
+const persistentPorts = "accounts, clients, " +
+	"vault credentials, bindings, bind flows, sessions, " +
+	"OP authorization requests, OP tokens, OP device authorizations"
 
 // reportDurability states plainly what survives a restart. Silence here would
 // read as "everything is durable", which is the one thing this project must not
@@ -458,9 +417,23 @@ func rotateAndReport(ctx context.Context, v vault.Service) {
 	}
 }
 
-// openOIDC builds the OpenID Provider store and HTTP handler on the durable
-// database.
-func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.Logger) (*oidchttp.Handler, *postgres.OIDCStore, error) {
+// oidcBackend is the OP store surface the composition root needs. Both
+// storage adapters satisfy it, so the rest of main does not care which one ran.
+type oidcBackend interface {
+	op.Storage
+	op.DeviceAuthorizationStorage
+	CompleteLogin(ctx context.Context, id, subject string, scopes []string) error
+	Grants(ctx context.Context, subject string) ([]oauth.Grant, error)
+	RevokeGrant(ctx context.Context, subject, clientID string) error
+	RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error)
+	DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error)
+	DecideDeviceAuthorization(ctx context.Context, userCode, subject string, approve bool, scopes, explicit []oauth.Scope) error
+}
+
+// openOIDC builds the OpenID Provider store and HTTP handler. The store is
+// Postgres when a database is configured and in-memory otherwise (ADR-0001 P4b);
+// the handler and every policy around it are identical either way.
+func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.Logger) (*oidchttp.Handler, oidcBackend, error) {
 	tokenKey, err := oidcTokenKey()
 	if err != nil {
 		return nil, nil, err
@@ -469,7 +442,7 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 	if err != nil {
 		return nil, nil, err
 	}
-	signer, err := oidcSigningKey()
+	key, err := oidcSigningKey()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -482,18 +455,34 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 	for _, d := range registry.Descriptors() {
 		scopes = append(scopes, d.Scope.String())
 	}
-	oidcStore, err := store.db.OIDC(store.clients, postgres.OIDCOptions{
-		Registry: registry,
-		Signer:   postgres.NewOIDCSigner("re0auth", signer).WithRetired(retiredSigning...),
-		Audit:    logger,
-		Login: func(ctx context.Context, id string) string {
-			// Bind the request to the browser that started it, so a relayed id
-			// cannot be approved elsewhere. GetClientByClientID hands us the
-			// request context, which is where the session lives.
-			sessions.Bind(ctx, "authz", id)
-			return webui.BasePath + "/consent?id=" + url.QueryEscape(id)
-		},
-	})
+	signer := oidcstore.NewSigner("re0auth", key).WithRetired(retiredSigning...)
+	login := func(ctx context.Context, id string) string {
+		// Bind the request to the browser that started it, so a relayed id cannot
+		// be approved elsewhere. GetClientByClientID hands us the request context,
+		// which is where the session lives.
+		sessions.Bind(ctx, "authz", id)
+		return webui.BasePath + "/consent?id=" + url.QueryEscape(id)
+	}
+
+	var oidcStore oidcBackend
+	if store.db != nil {
+		oidcStore, err = store.db.OIDC(store.clients, postgres.OIDCOptions{
+			Registry:   registry,
+			Signer:     signer,
+			Audit:      logger,
+			Login:      login,
+			RequestTTL: authorizationRequestTTL,
+		})
+	} else {
+		oidcStore, err = memory.NewOIDCStore(memory.OIDCOptions{
+			Clients:    store.clients,
+			Registry:   registry,
+			Signer:     signer,
+			Audit:      logger,
+			Login:      login,
+			RequestTTL: authorizationRequestTTL,
+		})
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -584,12 +573,12 @@ func oidcSigningKey() (*rsa.PrivateKey, error) {
 // oidcRetiredSigningKeys parses "kid:base64, kid:base64" old public keys
 // (PKIX DER). They are published in the JWKS so id_tokens signed with them still
 // verify during a rotation.
-func oidcRetiredSigningKeys() ([]postgres.RetiredSigningKey, error) {
+func oidcRetiredSigningKeys() ([]oidcstore.RetiredSigningKey, error) {
 	v := strings.TrimSpace(os.Getenv("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS"))
 	if v == "" {
 		return nil, nil
 	}
-	var out []postgres.RetiredSigningKey
+	var out []oidcstore.RetiredSigningKey
 	for _, part := range strings.Split(v, ",") {
 		id, encoded, ok := strings.Cut(strings.TrimSpace(part), ":")
 		if !ok || id == "" {
@@ -607,7 +596,7 @@ func oidcRetiredSigningKeys() ([]postgres.RetiredSigningKey, error) {
 		if !ok {
 			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q must be an RSA public key", id)
 		}
-		out = append(out, postgres.RetiredSigningKey{ID: id, Public: rsaPub})
+		out = append(out, oidcstore.RetiredSigningKey{ID: id, Public: rsaPub})
 	}
 	return out, nil
 }

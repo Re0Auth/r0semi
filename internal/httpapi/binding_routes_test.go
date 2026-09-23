@@ -64,7 +64,7 @@ func bindingsOf(t *testing.T, base string, client *http.Client) []map[string]any
 // The bindings view names the account's connections. A client asking with its own
 // token has no business reading it.
 func TestBindingsRequireASession(t *testing.T) {
-	base, _, _, _, _, _ := newBindEnv(t)
+	base, _, _, _, _, _, _ := newBindEnv(t)
 	resp := getURL(t, newBrowser(t), base+"/v1/bindings")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -73,7 +73,7 @@ func TestBindingsRequireASession(t *testing.T) {
 }
 
 func TestBindingsShowWhatIsConnected(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 
 	// Nothing connected: an empty array, not null.
@@ -110,7 +110,7 @@ func TestBindingsShowWhatIsConnected(t *testing.T) {
 }
 
 func TestUnbindRequiresCSRF(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 	connectSource(t, base, client)
 
@@ -126,7 +126,7 @@ func TestUnbindRequiresCSRF(t *testing.T) {
 }
 
 func TestUnbindDisconnectsAndReportsTheSource(t *testing.T) {
-	base, client, accounts, _, as, _ := newBindEnv(t)
+	base, client, accounts, _, h, store, _ := newBindEnv(t)
 	signIn(t, client, base)
 	connectSource(t, base, client)
 
@@ -134,7 +134,7 @@ func TestUnbindDisconnectsAndReportsTheSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	at := mintToken(t, as, "cli", string(uid), oauth.ScopePhigrosProfile)
+	at := mintToken(t, h, store, "cli", string(uid), oauth.ScopePhigrosProfile)
 
 	// The data plane works while connected.
 	if resp := authedGet(t, base+"/v1/games/phigros/profile", at); resp.StatusCode != http.StatusOK {
@@ -174,7 +174,7 @@ func TestUnbindDisconnectsAndReportsTheSource(t *testing.T) {
 }
 
 func TestUnbindUnknownSourceAndUnknownBinding(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 	csrf := sessionCSRF(t, base, client)
 

@@ -160,7 +160,7 @@ GET /oauth/authorize?...
   `bind_url`），同意页据此提示并禁用批准；绑定后回到同一 handle。绑定的是**数据源**
   （`federation` 的 `/bind` 流程），凭据由数据源自己持有。
 
-> 已实现：`internal/authz`（pending 请求 + 决策）+ `httpapi` 路由，见 architecture.md §4.7。
+> 已实现：`internal/oidchttp`（OP 授权请求 + 同意决策，state 存 OP store）+ `httpapi` 路由，见 architecture.md §4.7。
 > 扫码托管已迁出 Re0Auth，成为数据源自己的登录面（见 architecture.md §4.10）。
 > 数据源的绑定流程（`/bind` → 上游 authorize → `/auth/upstream/.../callback`）同样已实现（§4.9）。
 

@@ -13,7 +13,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
-	"github.com/Re0Auth/r0semi/internal/authz"
+	"github.com/Re0Auth/r0semi/internal/store/memory"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -21,7 +21,8 @@ type adminEnv struct {
 	base    string
 	adminID account.UserID
 	clients *oauth.MemoryClientRegistry
-	tokens  *oauth.MemoryStore
+	store   *memory.OIDCStore
+	handler http.Handler
 }
 
 // revokingBindings stands in for the federation service in the operator tests.
@@ -64,13 +65,6 @@ func newAdminEnv(t *testing.T, allow bool) adminEnv {
 	if err := clients.Create(ctx, client); err != nil {
 		t.Fatal(err)
 	}
-	tokens := oauth.NewMemoryStore()
-	as, err := oauth.NewService(clients, tokens, audit.NewMemoryLogger(), oauth.Config{
-		Issuer: "https://re0auth.test", Scopes: oauth.DefaultRegistry(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	registry, err := idp.NewRegistry(idp.RegistryConfig{
 		RedirectBase: "https://re0auth.test",
@@ -94,12 +88,9 @@ func newAdminEnv(t *testing.T, allow bool) adminEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	azSvc, err := authz.NewService(as, authz.NewMemoryStore(), authz.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, manager)
 	adminSvc, err := admin.New(admin.Config{
-		Clients: clients, Tokens: tokens, Bindings: &revokingBindings{total: 2}, Audit: audit.NewMemoryLogger(),
+		Clients: clients, Tokens: store, Bindings: &revokingBindings{total: 2}, Audit: audit.NewMemoryLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -110,16 +101,24 @@ func newAdminEnv(t *testing.T, allow bool) adminEnv {
 		admins = []account.UserID{user.ID}
 	}
 	api, err := New(Config{
-		Issuer: "https://re0auth.test", AS: as,
-		Sessions: manager, Accounts: accounts, Auth: authHandler, Authz: azSvc,
-		Admin: adminSvc, Admins: admins,
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Authorization:     opHandler,
+		Sessions:          manager,
+		Accounts:          accounts,
+		Auth:              authHandler,
+		Admin:             adminSvc,
+		Admins:            admins,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(api.Handler())
 	t.Cleanup(server.Close)
-	return adminEnv{base: server.URL, adminID: user.ID, clients: clients, tokens: tokens}
+	return adminEnv{base: server.URL, adminID: user.ID, clients: clients, store: store, handler: api.Handler()}
 }
 
 // adminJSON sends a JSON body with the session's CSRF token. An empty csrf omits
@@ -252,12 +251,10 @@ func TestAdminKillSwitchReportsWhatItCut(t *testing.T) {
 	csrf := sessionCSRF(t, env.base, browser)
 
 	ctx := context.Background()
-	if err := env.tokens.SaveAccess(ctx, "at-1", oauth.AccessToken{ClientID: "cli", Subject: "usr_1"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := env.tokens.SaveRefresh(ctx, "rt-1", oauth.RefreshToken{ClientID: "cli", Subject: "usr_1"}); err != nil {
-		t.Fatal(err)
-	}
+	_ = ctx
+	// One authorization-code exchange yields an access and a refresh token, so
+	// the store holds two records for the subject.
+	mintToken(t, env.handler, env.store, "cli", "usr_1", oauth.ScopeAccountID)
 
 	resp := adminJSON(t, browser, http.MethodPost, env.base+"/v1/admin/kill_switch", csrf, map[string]any{"target": "all"})
 	if resp.StatusCode != http.StatusOK {
@@ -267,8 +264,8 @@ func TestAdminKillSwitchReportsWhatItCut(t *testing.T) {
 	if rep["tokens_revoked"].(float64) != 2 {
 		t.Fatalf("tokens_revoked = %v, want 2", rep["tokens_revoked"])
 	}
-	if len(mustRecords(t, env.tokens, "usr_1")) != 0 {
-		t.Fatal("tokens survived the kill switch")
+	if n := grantCount(t, env.store, "usr_1"); n != 0 {
+		t.Fatalf("grants survived the kill switch: %d", n)
 	}
 }
 
@@ -294,9 +291,8 @@ func TestAdminKillSwitchBindingsTarget(t *testing.T) {
 	csrf := sessionCSRF(t, env.base, browser)
 
 	ctx := context.Background()
-	if err := env.tokens.SaveAccess(ctx, "at-1", oauth.AccessToken{ClientID: "cli", Subject: "usr_1"}); err != nil {
-		t.Fatal(err)
-	}
+	_ = ctx
+	mintToken(t, env.handler, env.store, "cli", "usr_1", oauth.ScopeAccountID)
 
 	resp := adminJSON(t, browser, http.MethodPost, env.base+"/v1/admin/kill_switch", csrf, map[string]any{"target": "bindings"})
 	if resp.StatusCode != http.StatusOK {
@@ -312,11 +308,11 @@ func TestAdminKillSwitchBindingsTarget(t *testing.T) {
 	}
 }
 
-func mustRecords(t *testing.T, s *oauth.MemoryStore, subject string) []oauth.GrantRecord {
+func grantCount(t *testing.T, s *memory.OIDCStore, subject string) int {
 	t.Helper()
-	recs, err := s.ListBySubject(context.Background(), subject)
+	scopes, err := s.Grants(context.Background(), subject)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return recs
+	return len(scopes)
 }

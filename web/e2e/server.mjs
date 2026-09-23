@@ -54,7 +54,7 @@ function subjectFor(identity) {
 // inside re0auth: the provider itself refuses, exactly as a real one would.
 let nextError = '';
 
-// A generated RS256 key for the OpenID Provider run. re0auth now requires it
+// A generated RS256 key for the OpenID Provider run. re0auth requires it
 // (fail-closed), so the harness cannot lean on an ephemeral key any more.
 let cachedSigningKey = '';
 function signingKey() {
@@ -409,11 +409,12 @@ const app = spawn(bin, ['-config', configFile()], {
 		RE0AUTH_KEK: Buffer.alloc(32, 7).toString('base64'),
 		E2E_IDP_SECRET: 'e2e-secret',
 		E2E_SOURCE_SECRET: 'e2e-source-secret',
-		// Fixed keys keep the run deterministic. The signing key is only needed on
-		// the OpenID Provider path (durable storage), where re0auth now refuses to
-		// start without it.
+		// Fixed keys keep the run deterministic. Every deployment runs the OpenID
+		// Provider now (ADR-0001 P4b), memory mode included, so the signing key is
+		// required whether or not a database is configured.
 		RE0AUTH_OIDC_TOKEN_KEY: Buffer.alloc(32, 9).toString('base64'),
-		...(dbUrl ? { DATABASE_URL: dbUrl, RE0AUTH_OIDC_SIGNING_KEY: signingKey() } : {})
+		RE0AUTH_OIDC_SIGNING_KEY: signingKey(),
+		...(dbUrl ? { DATABASE_URL: dbUrl } : {})
 	},
 	stdio: 'inherit'
 });

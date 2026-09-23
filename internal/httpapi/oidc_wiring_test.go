@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/Re0Auth/r0semi/internal/oidchttp"
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/internal/store/postgres"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -60,7 +61,7 @@ func TestOIDCWiringEndToEnd(t *testing.T) {
 	}
 	store, err := db.OIDC(db.Clients(), postgres.OIDCOptions{
 		Registry: oauth.DefaultRegistry(),
-		Signer:   postgres.NewOIDCSigner("wiring", key),
+		Signer:   oidcstore.NewSigner("wiring", key),
 		Login: func(_ context.Context, id string) string {
 			return "/login?authRequestID=" + url.QueryEscape(id)
 		},

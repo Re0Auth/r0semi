@@ -12,6 +12,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"github.com/Re0Auth/r0semi/audit"
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -45,7 +46,7 @@ func oidcFixture(t *testing.T) (*OIDCStore, *audit.MemoryLogger, context.Context
 	logger := audit.NewMemoryLogger()
 	store, err := db.OIDC(db.Clients(), OIDCOptions{
 		Registry: oauth.DefaultRegistry(),
-		Signer:   NewOIDCSigner("test-key", key),
+		Signer:   oidcstore.NewSigner("test-key", key),
 		Audit:    logger,
 	})
 	if err != nil {
@@ -326,8 +327,8 @@ func TestOIDCDeviceDescribeAndDecide(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !st.Done || st.Subject != "usr_1" ||
-		!containsStr(st.Scopes, "account.id") ||
-		!containsStr(st.Scopes, oidc.ScopeOfflineAccess) {
+		!oidcstore.HasScope(st.Scopes, "account.id") ||
+		!oidcstore.HasScope(st.Scopes, oidc.ScopeOfflineAccess) {
 		t.Fatalf("state = %+v", st)
 	}
 
@@ -357,7 +358,7 @@ func TestOIDCLoginHookReceivesRequestContext(t *testing.T) {
 	var got []string
 	store, err := db.OIDC(db.Clients(), OIDCOptions{
 		Registry: oauth.DefaultRegistry(),
-		Signer:   NewOIDCSigner("hook", key),
+		Signer:   oidcstore.NewSigner("hook", key),
 		Login: func(_ context.Context, id string) string {
 			got = append(got, id)
 			return "/consent?id=" + id
@@ -389,8 +390,8 @@ func TestOIDCSignerKeySetIncludesRetired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keys := NewOIDCSigner("cur", current).
-		WithRetired(RetiredSigningKey{ID: "old", Public: &old.PublicKey}).
+	keys := oidcstore.NewSigner("cur", current).
+		WithRetired(oidcstore.RetiredSigningKey{ID: "old", Public: &old.PublicKey}).
 		KeySet()
 	if len(keys) != 2 {
 		t.Fatalf("keys = %d, want 2", len(keys))

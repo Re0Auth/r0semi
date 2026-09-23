@@ -33,7 +33,12 @@ func grantFlow(t *testing.T, browser *http.Client, base, verifier, scope string)
 	decided := decodeResp(t, doReq(t, browser, req))
 
 	redirectTo, _ := decided["redirect_to"].(string)
-	target, err := url.Parse(redirectTo)
+	if strings.HasPrefix(redirectTo, "/") {
+		redirectTo = base + redirectTo
+	}
+	cbResp := getURL(t, browser, redirectTo)
+	target, err := url.Parse(cbResp.Header.Get("Location"))
+	cbResp.Body.Close()
 	if err != nil || target.Query().Get("code") == "" {
 		t.Fatalf("no authorization code in %q (error %v)", redirectTo, err)
 	}

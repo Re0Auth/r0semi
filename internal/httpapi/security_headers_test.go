@@ -58,7 +58,14 @@ func TestSecurityHeadersCoverBothPlanes(t *testing.T) {
 // HSTS is advertised only when the deployment declares itself https.
 func TestHSTSOnlyOnSecureDeployments(t *testing.T) {
 	env := newTestEnv(t)
-	secure, err := New(Config{Issuer: testIssuer, AS: env.as, Secure: true})
+	secure, err := New(Config{
+		Issuer:            testIssuer,
+		OIDC:              env.handler,
+		TokenIntrospector: env.handler,
+		GrantStore:        env.store,
+		DeviceStore:       env.store,
+		Secure:            true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,9 +93,12 @@ func TestHSTSOnlyOnSecureDeployments(t *testing.T) {
 func TestSecurityHeadersOnRateLimitedResponse(t *testing.T) {
 	env := newTestEnv(t)
 	limited, err := New(Config{
-		Issuer:  testIssuer,
-		AS:      env.as,
-		Limiter: ratelimit.New(0.001, 1), // one token, effectively no refill
+		Issuer:            testIssuer,
+		OIDC:              env.handler,
+		TokenIntrospector: env.handler,
+		GrantStore:        env.store,
+		DeviceStore:       env.store,
+		Limiter:           ratelimit.New(0.001, 1), // one token, effectively no refill
 	})
 	if err != nil {
 		t.Fatal(err)

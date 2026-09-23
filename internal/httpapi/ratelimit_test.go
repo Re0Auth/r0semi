@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -27,16 +26,14 @@ func newLimitedServer(t *testing.T) *httptest.Server {
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: "https://re0auth.test", Scopes: oauth.DefaultRegistry(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, nil)
 	api, err := New(Config{
-		Issuer:  "https://re0auth.test",
-		AS:      as,
-		Limiter: ratelimit.New(0.001, 1), // effectively one request per client address
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Limiter:           ratelimit.New(0.001, 1), // effectively one request per client address
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -9,7 +9,6 @@ import (
 	"net/url"
 
 	"github.com/Re0Auth/r0semi/internal/account"
-	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -148,8 +147,6 @@ func (s *Server) writeDecisionError(w http.ResponseWriter, r *http.Request, err 
 		s.writeProblem(w, r, http.StatusForbidden, "explicit_consent_required", oe.Description)
 	case errors.As(err, &oe):
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", oe.Description)
-	case errors.Is(err, authz.ErrScopeNotRequested):
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "approved scope was not requested")
 	default:
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "authorization request expired")
 	}

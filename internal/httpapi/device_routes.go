@@ -12,34 +12,6 @@ import (
 // deviceBindKind namespaces the browser session binding for device approvals.
 const deviceBindKind = "device"
 
-// handleDeviceAuthorization implements RFC 8628 §3.1/§3.2. The client asks for
-// a device_code and receives the user_code and verification URI to show the
-// user. The device_code is returned exactly once and never again.
-func (s *Server) handleDeviceAuthorization(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
-		return
-	}
-	clientID, _ := oauth.ClientCredentials(r)
-	resp, err := s.as.BeginDeviceAuthorization(r.Context(), oauth.DeviceAuthorizationRequest{
-		ClientID: clientID,
-		Scopes:   parseScopes(r.PostFormValue("scope")),
-	})
-	if err != nil {
-		s.writeProtocolError(w, r, err)
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{
-		"device_code":               resp.DeviceCode,
-		"user_code":                 resp.UserCode,
-		"verification_uri":          resp.VerificationURI,
-		"verification_uri_complete": resp.VerificationURIComplete,
-		"expires_in":                resp.ExpiresIn,
-		"interval":                  resp.Interval,
-	})
-}
-
 // handleDeviceVerification is the browser page the user reaches after entering
 // the user_code. It requires a signed-in user and binds the code to this
 // browser's session, so a code relayed by an attacker cannot be approved from

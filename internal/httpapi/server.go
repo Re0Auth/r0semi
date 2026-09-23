@@ -24,7 +24,6 @@ import (
 	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/authorization"
-	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/internal/webui"
@@ -43,8 +42,6 @@ type Config struct {
 	ErrorBase string
 	// Scopes is the scope catalog used by discovery. Defaults to the built-in.
 	Scopes *oauth.Registry
-	// AS is the authorization server core. Required.
-	AS oauth.Service
 
 	// Sessions, when set, enables the browser-session endpoints under /v1 and
 	// wraps the whole tree with session loading.
@@ -53,11 +50,8 @@ type Config struct {
 	Accounts account.Store
 	// Auth, when set, mounts the IdP login plane under /auth.
 	Auth *auth.Handler
-	// Authz, when set with Sessions, enables the authorization-interaction API
-	// and turns /oauth/authorize into a real browser flow.
-	Authz authz.Service
-	// Authorization, when set, is the consent interaction (OP mode). When unset
-	// it is built from Authz, so the old engine keeps working unchanged.
+	// Authorization, when set, is the consent interaction. It is what the OP
+	// handler implements; the consent screen renders through it.
 	Authorization authorization.Interaction
 	// ConsentPath is the frontend route /oauth/authorize redirects to. It must be a
 	// route the mounted frontend actually serves. Defaults to
@@ -76,18 +70,17 @@ type Config struct {
 	// webui.BasePath. Pass webui.FS() for an embedded build.
 	Frontend fs.FS
 
-	// OIDC, when set, replaces the hand-rolled protocol plane with the OpenID
-	// Provider handler (internal/oidchttp): /oauth/* and both discovery
-	// documents are served by it. When set, TokenIntrospector is required so the
-	// business plane can validate the OP's tokens; a nil introspector would leave
-	// /v1 unable to accept them, which is why New rejects the combination.
+	// OIDC is the OpenID Provider handler (internal/oidchttp): /oauth/* and both
+	// discovery documents are served by it. It is required (ADR-0001 P4b): there
+	// is no second engine, in production or in memory mode. TokenIntrospector,
+	// GrantStore and DeviceStore are required with it, because the OP issues the
+	// tokens the business plane must then accept, list and revoke.
 	OIDC http.Handler
-	// TokenIntrospector validates bearer tokens for the business plane. Defaults
-	// to AS.Introspect; an OP deployment passes the OP-backed introspector.
+	// TokenIntrospector validates bearer tokens for the business plane. An OP
+	// deployment passes the OP-backed introspector.
 	TokenIntrospector TokenIntrospector
 	// GrantStore and DeviceStore route the business-plane grants and device views
-	// to the engine. They default to AS; an OP deployment passes the OP-backed
-	// store so the views reflect the tokens the OP actually issued.
+	// to the OP store, so the views reflect the tokens the OP actually issued.
 	GrantStore  GrantStore
 	DeviceStore DeviceStore
 
@@ -124,19 +117,17 @@ type Server struct {
 	resource     string
 	errorBase    string
 	scopes       *oauth.Registry
-	as           oauth.Service
 	sessions     *auth.Manager
 	accounts     account.Store
 	auth         *auth.Handler
-	authz        authz.Service
 	authInteract authorization.Interaction
 	consent      string
 	federate     federation.Service
 	limiter      *ratelimit.Limiter
 	secure       bool
 	frontend     fs.FS
-	// oidc, when non-nil, is the protocol plane; introspector is always set
-	// (AS when oidc is nil, the OP bridge when it is not).
+	// oidc is the protocol plane; introspector, grants and devices are the
+	// OP-backed business-plane seams.
 	oidc         http.Handler
 	introspector TokenIntrospector
 	grants       GrantStore
@@ -149,8 +140,8 @@ type Server struct {
 
 // New validates cfg and returns a Server.
 func New(cfg Config) (*Server, error) {
-	if cfg.AS == nil && cfg.OIDC == nil {
-		return nil, errors.New("httpapi: Config.AS or Config.OIDC is required")
+	if cfg.OIDC == nil {
+		return nil, errors.New("httpapi: Config.OIDC is required")
 	}
 	if strings.TrimSpace(cfg.Issuer) == "" {
 		return nil, errors.New("httpapi: Config.Issuer is required")
@@ -170,39 +161,17 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Sessions != nil && cfg.Accounts == nil {
 		return nil, errors.New("httpapi: Config.Sessions requires Config.Accounts")
 	}
-	if cfg.Authz != nil && cfg.Sessions == nil {
-		return nil, errors.New("httpapi: Config.Authz requires Config.Sessions")
-	}
 	if cfg.Authorization != nil && cfg.Sessions == nil {
 		return nil, errors.New("httpapi: Config.Authorization requires Config.Sessions")
 	}
-	var authInteract authorization.Interaction
-	switch {
-	case cfg.Authorization != nil:
-		authInteract = cfg.Authorization
-	case cfg.Authz != nil:
-		authInteract = authzInteraction{svc: cfg.Authz}
+	if cfg.TokenIntrospector == nil || cfg.GrantStore == nil || cfg.DeviceStore == nil {
+		return nil, errors.New("httpapi: Config.TokenIntrospector, Config.GrantStore and Config.DeviceStore are required with Config.OIDC")
 	}
 	if cfg.ConsentPath == "" {
 		// The consent screen is a frontend route, so its default is derived from
 		// where the frontend is mounted rather than invented separately. A
 		// deployment that moves the app must move this with it.
 		cfg.ConsentPath = webui.BasePath + "/consent"
-	}
-	if cfg.OIDC != nil && (cfg.TokenIntrospector == nil || cfg.GrantStore == nil || cfg.DeviceStore == nil) {
-		return nil, errors.New("httpapi: Config.OIDC requires Config.TokenIntrospector, Config.GrantStore and Config.DeviceStore")
-	}
-	introspector := cfg.TokenIntrospector
-	if introspector == nil {
-		introspector = cfg.AS
-	}
-	grants := cfg.GrantStore
-	if grants == nil {
-		grants = cfg.AS
-	}
-	devices := cfg.DeviceStore
-	if devices == nil {
-		devices = cfg.AS
 	}
 	if cfg.Admin != nil && len(cfg.Admins) == 0 {
 		return nil, errors.New("httpapi: Config.Admin requires a non-empty Config.Admins")
@@ -219,21 +188,19 @@ func New(cfg Config) (*Server, error) {
 		resource:     strings.TrimRight(cfg.Resource, "/"),
 		errorBase:    strings.TrimRight(cfg.ErrorBase, "/"),
 		scopes:       cfg.Scopes,
-		as:           cfg.AS,
 		sessions:     cfg.Sessions,
 		accounts:     cfg.Accounts,
 		auth:         cfg.Auth,
-		authz:        cfg.Authz,
-		authInteract: authInteract,
+		authInteract: cfg.Authorization,
 		consent:      cfg.ConsentPath,
 		federate:     cfg.Federation,
 		limiter:      cfg.Limiter,
 		secure:       cfg.Secure,
 		frontend:     cfg.Frontend,
 		oidc:         cfg.OIDC,
-		introspector: introspector,
-		grants:       grants,
-		devices:      devices,
+		introspector: cfg.TokenIntrospector,
+		grants:       cfg.GrantStore,
+		devices:      cfg.DeviceStore,
 		adminSvc:     cfg.Admin,
 		adminAllowed: adminAllowed,
 	}, nil
@@ -337,15 +304,11 @@ func (s *Server) specRoutes() []route {
 }
 func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
-	if s.oidc != nil {
-		// The OP owns the protocol plane and both discovery documents.
-		root.Handle("GET /.well-known/oauth-authorization-server", s.oidc)
-		root.Handle("GET /.well-known/openid-configuration", s.oidc)
-		root.Handle("/oauth/", s.oidc)
-	} else {
-		root.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleASMetadata)
-		root.Handle("/oauth/", s.protocolPlane())
-	}
+	// The OP owns the protocol plane and both discovery documents. It is always
+	// present (ADR-0001 P4b).
+	root.Handle("GET /.well-known/oauth-authorization-server", s.oidc)
+	root.Handle("GET /.well-known/openid-configuration", s.oidc)
+	root.Handle("/oauth/", s.oidc)
 	root.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleResourceMetadata)
 	root.Handle("/v1/", s.businessPlane())
 	if s.auth != nil || s.bindEnabled() {
@@ -406,19 +369,6 @@ func (s *Server) Handler() http.Handler {
 	h = s.withRateLimit(h)
 	h = s.withSecurityHeaders(h)
 	return withRequestID(h)
-}
-
-func (s *Server) protocolPlane() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /oauth/token", s.handleToken)
-	mux.HandleFunc("POST /oauth/device_authorization", s.handleDeviceAuthorization)
-	mux.HandleFunc("POST /oauth/introspect", s.handleIntrospect)
-	mux.HandleFunc("POST /oauth/revoke", s.handleRevoke)
-	mux.HandleFunc("GET /oauth/authorize", s.handleAuthorize)
-	mux.HandleFunc("/oauth/", func(w http.ResponseWriter, r *http.Request) {
-		writeOAuthError(w, r, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
-	})
-	return recoverProtocol(mux)
 }
 
 func (s *Server) businessPlane() http.Handler {

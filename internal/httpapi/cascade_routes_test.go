@@ -28,7 +28,7 @@ func cascade(t *testing.T, base string, client *http.Client, csrf string, body a
 // The acknowledgment is the point: an operation that signs somebody out of every
 // device should not be reachable without writing down that it means that.
 func TestCascadeRequiresAnAcknowledgement(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 	connectSource(t, base, client)
 	csrf := sessionCSRF(t, base, client)
@@ -53,7 +53,7 @@ func TestCascadeRequiresAnAcknowledgement(t *testing.T) {
 }
 
 func TestCascadeRequiresCSRF(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 	connectSource(t, base, client)
 
@@ -70,7 +70,7 @@ func TestCascadeRequiresCSRF(t *testing.T) {
 // The happy path, and the part that matters: the session ends, the binding goes,
 // and the client's token stops working because the authorization behind it did.
 func TestCascadeEndsTheSessionAndReportsIt(t *testing.T) {
-	base, client, accounts, _, as, _ := newBindEnv(t)
+	base, client, accounts, _, h, store, _ := newBindEnv(t)
 	signIn(t, client, base)
 	connectSource(t, base, client)
 	csrf := sessionCSRF(t, base, client)
@@ -79,7 +79,7 @@ func TestCascadeEndsTheSessionAndReportsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	at := mintToken(t, as, "cli", string(uid), oauth.ScopePhigrosProfile)
+	at := mintToken(t, h, store, "cli", string(uid), oauth.ScopePhigrosProfile)
 	if resp := authedGet(t, base+"/v1/games/phigros/profile", at); resp.StatusCode != http.StatusOK {
 		t.Fatalf("profile before cascade = %d", resp.StatusCode)
 	} else {
@@ -109,7 +109,7 @@ func TestCascadeEndsTheSessionAndReportsIt(t *testing.T) {
 // told whose session to end. Answering 200 here would claim a logout that never
 // happened.
 func TestCascadeWithoutAConnection(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 	csrf := sessionCSRF(t, base, client)
 
@@ -123,7 +123,7 @@ func TestCascadeWithoutAConnection(t *testing.T) {
 // The capability is reported per binding, so the account page can leave out an
 // action that would fail.
 func TestBindingsReportTheCascadeCapability(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 	connectSource(t, base, client)
 

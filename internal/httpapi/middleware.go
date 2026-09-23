@@ -168,18 +168,6 @@ func isProtocolPath(path string) bool {
 	return strings.HasPrefix(path, "/oauth/") || strings.HasPrefix(path, "/.well-known/")
 }
 
-// recoverProtocol turns a panic into an OAuth-format 500.
-func recoverProtocol(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if rec := recover(); rec != nil {
-				writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error")
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
 // recoverBusiness turns a panic into a problem+json 500.
 func recoverBusiness(s *Server, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

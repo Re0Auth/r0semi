@@ -2,10 +2,7 @@ package postgres
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,12 +15,14 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"github.com/Re0Auth/r0semi/audit"
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
 // OIDCStore is the production op.Storage + op.DeviceAuthorizationStorage for the
-// OpenID Provider (ADR-0001). It replaces the hand-rolled oauth.Store once the
-// migration completes; until then both coexist.
+// OpenID Provider (ADR-0001). It is the durable half of the engine: the
+// in-memory half lives in internal/store/memory, and both share oidcstore for
+// the signing key, the client adapter and the consent policy.
 //
 // It owns the *policy* the OP cannot: which scopes exist (via the oauth.Registry
 // in the client adapter), and an audit trail for every token it issues or
@@ -33,7 +32,7 @@ type OIDCStore struct {
 	clients  oauth.ClientRegistry
 	registry *oauth.Registry
 	login    func(ctx context.Context, authRequestID string) string
-	signer   *OIDCSigner
+	signer   *oidcstore.Signer
 	audit    audit.Logger
 
 	accessTTL  time.Duration
@@ -50,9 +49,13 @@ type OIDCOptions struct {
 	// auth request to the browser session before the consent screen loads it.
 	Login func(ctx context.Context, authRequestID string) string
 	// Signer signs id_tokens. Required.
-	Signer *OIDCSigner
+	Signer *oidcstore.Signer
 	// Audit records token issuance and revocation. Optional.
 	Audit audit.Logger
+	// RequestTTL is how long a pending consent handle stays valid. It must
+	// outlive the federation bind flow, which sends the user to the source and
+	// back. Defaults to 30 minutes.
+	RequestTTL time.Duration
 }
 
 // NewOIDCStore builds the store on an existing pool.
@@ -76,8 +79,15 @@ func NewOIDCStore(pool *pgxpool.Pool, clients oauth.ClientRegistry, opts OIDCOpt
 		audit:      opts.Audit,
 		accessTTL:  time.Hour,
 		refreshTTL: 30 * 24 * time.Hour,
-		requestTTL: 30 * time.Minute,
+		requestTTL: requestTTL(opts.RequestTTL),
 	}, nil
+}
+
+func requestTTL(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return 30 * time.Minute
 }
 
 // OIDC returns the OpenID Provider storage on the migrated database.
@@ -85,225 +95,12 @@ func (db *DB) OIDC(clients oauth.ClientRegistry, opts OIDCOptions) (*OIDCStore, 
 	return NewOIDCStore(db.pool, clients, opts)
 }
 
-// OIDCSigner is the OP's RS256 signing key plus any retired public keys that
-// must still verify previously issued id_tokens during a rotation.
-// Key material is injected by the composition root; the store never generates
-// or persists it.
-type OIDCSigner struct {
-	id      string
-	key     *rsa.PrivateKey
-	retired []RetiredSigningKey
-}
-
-// RetiredSigningKey is an old signing key kept for verification only.
-type RetiredSigningKey struct {
-	ID     string
-	Public *rsa.PublicKey
-}
-
-// NewOIDCSigner wraps a private key.
-func NewOIDCSigner(id string, key *rsa.PrivateKey) *OIDCSigner {
-	return &OIDCSigner{id: id, key: key}
-}
-
-// WithRetired adds public keys that are published in the JWKS but never used to
-// sign. They let a rotation overlap: new tokens use the current key, old ones
-// still verify.
-func (s *OIDCSigner) WithRetired(keys ...RetiredSigningKey) *OIDCSigner {
-	s.retired = append(s.retired, keys...)
-	return s
-}
-
-// ID implements op.SigningKey.
-func (s *OIDCSigner) ID() string { return s.id }
-
-// SignatureAlgorithm implements op.SigningKey.
-func (s *OIDCSigner) SignatureAlgorithm() jose.SignatureAlgorithm { return jose.RS256 }
-
-// Key implements op.SigningKey (private key).
-func (s *OIDCSigner) Key() any { return s.key }
-
-// KeySet returns the current public key followed by every retired public key.
-func (s *OIDCSigner) KeySet() []op.Key {
-	out := make([]op.Key, 0, 1+len(s.retired))
-	out = append(out, oidcPublicKey{s})
-	for _, r := range s.retired {
-		out = append(out, oidcRetiredPublicKey{id: r.ID, pub: r.Public})
-	}
-	return out
-}
-
-type oidcPublicKey struct{ *OIDCSigner }
-
-func (p oidcPublicKey) Algorithm() jose.SignatureAlgorithm { return jose.RS256 }
-func (p oidcPublicKey) Use() string                        { return "sig" }
-func (p oidcPublicKey) Key() any                           { return &p.key.PublicKey }
-
-type oidcRetiredPublicKey struct {
-	id  string
-	pub *rsa.PublicKey
-}
-
-func (k oidcRetiredPublicKey) ID() string                         { return k.id }
-func (k oidcRetiredPublicKey) Algorithm() jose.SignatureAlgorithm { return jose.RS256 }
-func (k oidcRetiredPublicKey) Use() string                        { return "sig" }
-func (k oidcRetiredPublicKey) Key() any                           { return k.pub }
-
-// opClient adapts oauth.Client to op.Client. Secret verification stays in
-// oauth.Client.Authenticate (SHA-256); the library never sees the hash.
-type opClient struct {
-	c        oauth.Client
-	registry *oauth.Registry
-	login    func(string) string
-}
-
-func (c opClient) GetID() string                    { return c.c.ID }
-func (c opClient) RedirectURIs() []string           { return c.c.RedirectURIs }
-func (c opClient) PostLogoutRedirectURIs() []string { return nil }
-func (c opClient) AccessTokenType() op.AccessTokenType {
-	return op.AccessTokenTypeBearer
-}
-func (c opClient) IDTokenLifetime() time.Duration       { return time.Hour }
-func (c opClient) DevMode() bool                        { return false }
-func (c opClient) IDTokenUserinfoClaimsAssertion() bool { return false }
-func (c opClient) ClockSkew() time.Duration             { return 0 }
-func (c opClient) RestrictAdditionalIdTokenScopes() func([]string) []string {
-	return func(s []string) []string { return s }
-}
-func (c opClient) RestrictAdditionalAccessTokenScopes() func([]string) []string {
-	return func(s []string) []string { return s }
-}
-
-func (c opClient) ApplicationType() op.ApplicationType {
-	if c.c.Type == oauth.ClientPublic {
-		return op.ApplicationTypeNative
-	}
-	return op.ApplicationTypeWeb
-}
-
-func (c opClient) AuthMethod() oidc.AuthMethod {
-	if c.c.Type == oauth.ClientPublic {
-		return oidc.AuthMethodNone
-	}
-	return oidc.AuthMethodBasic
-}
-
-func (c opClient) ResponseTypes() []oidc.ResponseType {
-	return []oidc.ResponseType{oidc.ResponseTypeCode}
-}
-
-func (c opClient) GrantTypes() []oidc.GrantType {
-	return []oidc.GrantType{oidc.GrantTypeCode, oidc.GrantTypeRefreshToken, oidc.GrantTypeDeviceCode}
-}
-
-func (c opClient) LoginURL(id string) string {
-	if c.login == nil {
-		return "/login?authRequestID=" + id
-	}
-	return c.login(id)
-}
-
-// IsScopeAllowed is the real scope gate: only scopes in the registry are legal.
-// This is what makes the OP's own scope validation consult our catalog instead
-// of silently dropping unknown scopes.
-func (c opClient) IsScopeAllowed(scope string) bool {
-	if c.registry == nil {
-		return false
-	}
-	_, ok := c.registry.Get(oauth.Scope(scope))
-	return ok
-}
-
-// oidcAuthRequest implements op.AuthRequest from a database row. It is the
-// consent record, so scopes can be narrowed here before the code is issued.
-type oidcAuthRequest struct {
-	id            string
-	clientID      string
-	redirectURI   string
-	responseType  oidc.ResponseType
-	responseMode  oidc.ResponseMode
-	scopes        []string
-	state         string
-	nonce         string
-	codeChallenge *oidc.CodeChallenge
-	subject       string
-	done          bool
-	authTime      *time.Time
-}
-
-func (a *oidcAuthRequest) GetID() string         { return a.id }
-func (a *oidcAuthRequest) GetACR() string        { return "" }
-func (a *oidcAuthRequest) GetAMR() []string      { return nil }
-func (a *oidcAuthRequest) GetAudience() []string { return []string{a.clientID} }
-func (a *oidcAuthRequest) GetAuthTime() time.Time {
-	if a.authTime == nil {
-		return time.Time{}
-	}
-	return *a.authTime
-}
-func (a *oidcAuthRequest) GetClientID() string                   { return a.clientID }
-func (a *oidcAuthRequest) GetCodeChallenge() *oidc.CodeChallenge { return a.codeChallenge }
-func (a *oidcAuthRequest) GetNonce() string                      { return a.nonce }
-func (a *oidcAuthRequest) GetRedirectURI() string                { return a.redirectURI }
-func (a *oidcAuthRequest) GetResponseType() oidc.ResponseType    { return a.responseType }
-func (a *oidcAuthRequest) GetResponseMode() oidc.ResponseMode    { return a.responseMode }
-func (a *oidcAuthRequest) GetScopes() []string                   { return a.scopes }
-func (a *oidcAuthRequest) GetState() string                      { return a.state }
-func (a *oidcAuthRequest) GetSubject() string                    { return a.subject }
-func (a *oidcAuthRequest) Done() bool                            { return a.done }
-
-// oidcRefreshRequest implements op.RefreshTokenRequest from a refresh row.
-type oidcRefreshRequest struct {
-	idHash   string
-	clientID string
-	subject  string
-	scopes   []string
-	amr      []string
-	audience []string
-	authTime *time.Time
-}
-
-func (r *oidcRefreshRequest) GetAMR() []string      { return r.amr }
-func (r *oidcRefreshRequest) GetAudience() []string { return r.audience }
-func (r *oidcRefreshRequest) GetAuthTime() time.Time {
-	if r.authTime == nil {
-		return time.Time{}
-	}
-	return *r.authTime
-}
-func (r *oidcRefreshRequest) GetClientID() string         { return r.clientID }
-func (r *oidcRefreshRequest) GetScopes() []string         { return r.scopes }
-func (r *oidcRefreshRequest) GetSubject() string          { return r.subject }
-func (r *oidcRefreshRequest) SetCurrentScopes(s []string) { r.scopes = s }
-
 func hashValue(v string) string {
 	sum := sha256.Sum256([]byte(v))
 	return hex.EncodeToString(sum[:])
 }
 
-// nonNil keeps a text[] parameter from being sent as SQL NULL: every array
-// column is NOT NULL, and "no scopes" is an empty array, not a missing one.
-func nonNil(s []string) []string {
-	if s == nil {
-		return []string{}
-	}
-	return s
-}
-
-func randomValue() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-func clientIDOf(request op.TokenRequest) string {
-	if c, ok := request.(interface{ GetClientID() string }); ok {
-		return c.GetClientID()
-	}
-	return ""
-}
+func clientIDOf(request op.TokenRequest) string { return oidcstore.ClientIDOf(request) }
 
 func (s *OIDCStore) record(ctx context.Context, action, subject, clientID, outcome string) {
 	if s.audit == nil {
@@ -319,7 +116,7 @@ func (s *OIDCStore) record(ctx context.Context, action, subject, clientID, outco
 
 // CreateAuthRequest implements op.Storage.
 func (s *OIDCStore) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
-	id, err := randomValue()
+	id, err := oidcstore.RandomValue()
 	if err != nil {
 		return nil, err
 	}
@@ -336,16 +133,16 @@ func (s *OIDCStore) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest
 			 code_challenge, code_challenge_method, subject, done, created_at, expires_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13)`,
 		id, req.ClientID, req.RedirectURI, string(req.ResponseType), string(req.ResponseMode),
-		nonNil([]string(req.Scopes)), req.State, req.Nonce, challenge, method, userID, now, now.Add(s.requestTTL),
+		oidcstore.NonNil([]string(req.Scopes)), req.State, req.Nonce, challenge, method, userID, now, now.Add(s.requestTTL),
 	); err != nil {
 		return nil, fmt.Errorf("postgres: create auth request: %w", err)
 	}
-	return &oidcAuthRequest{
-		id: id, clientID: req.ClientID, redirectURI: req.RedirectURI,
-		responseType: req.ResponseType, responseMode: req.ResponseMode,
-		scopes: append([]string(nil), req.Scopes...), state: req.State, nonce: req.Nonce,
-		codeChallenge: codeChallenge(req.CodeChallenge, method),
-		subject:       userID,
+	return &oidcstore.AuthRequest{
+		ID: id, ClientID: req.ClientID, RedirectURI: req.RedirectURI,
+		ResponseType: req.ResponseType, ResponseMode: req.ResponseMode,
+		Scopes: append([]string(nil), req.Scopes...), State: req.State, Nonce: req.Nonce,
+		CodeChallenge: codeChallenge(req.CodeChallenge, method),
+		Subject:       userID,
 	}, nil
 }
 
@@ -376,19 +173,19 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 
 func (s *OIDCStore) scanAuthRequest(ctx context.Context, query string, args ...any) (op.AuthRequest, error) {
 	var (
-		a         oidcAuthRequest
+		a         oidcstore.AuthRequest
 		challenge string
 		method    string
 		authTime  *time.Time
 	)
 	if err := s.pool.QueryRow(ctx, query, args...).Scan(
-		&a.id, &a.clientID, &a.redirectURI, &a.responseType, &a.responseMode, &a.scopes,
-		&a.state, &a.nonce, &challenge, &method, &a.subject, &a.done, &authTime,
+		&a.ID, &a.ClientID, &a.RedirectURI, &a.ResponseType, &a.ResponseMode, &a.Scopes,
+		&a.State, &a.Nonce, &challenge, &method, &a.Subject, &a.IsDone, &authTime,
 	); err != nil {
 		return nil, fmt.Errorf("postgres: auth request: %w", err)
 	}
-	a.codeChallenge = codeChallenge(challenge, method)
-	a.authTime = authTime
+	a.CodeChallenge = codeChallenge(challenge, method)
+	a.AuthTime = authTime
 	return &a, nil
 }
 
@@ -422,7 +219,7 @@ func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 // CreateAccessToken implements op.Storage. The token ID is ours; only its hash
 // is persisted, and the library encrypts the ID into the bearer token.
 func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenRequest) (string, time.Time, error) {
-	id, err := randomValue()
+	id, err := oidcstore.RandomValue()
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -430,7 +227,7 @@ func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenReque
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)
 		VALUES ($1,$2,$3,$4,$5)`,
-		hashValue(id), clientIDOf(request), request.GetSubject(), nonNil(withoutOfflineAccess(request.GetScopes())), expires); err != nil {
+		hashValue(id), clientIDOf(request), request.GetSubject(), oidcstore.NonNil(oidcstore.WithoutOfflineAccess(request.GetScopes())), expires); err != nil {
 		return "", time.Time{}, fmt.Errorf("postgres: create access token: %w", err)
 	}
 	s.record(ctx, "oidc.token", request.GetSubject(), clientIDOf(request), audit.OutcomeOK)
@@ -458,11 +255,11 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	if r, ok := request.(interface{ GetAudience() []string }); ok {
 		audience = r.GetAudience()
 	}
-	scopes := nonNil(withoutOfflineAccess(request.GetScopes()))
-	amr = nonNil(amr)
-	audience = nonNil(audience)
+	scopes := oidcstore.NonNil(oidcstore.WithoutOfflineAccess(request.GetScopes()))
+	amr = oidcstore.NonNil(amr)
+	audience = oidcstore.NonNil(audience)
 
-	value, err := randomValue()
+	value, err := oidcstore.RandomValue()
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
@@ -488,17 +285,17 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 // TokenRequestByRefreshToken implements op.Storage.
 func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string) (op.RefreshTokenRequest, error) {
 	var (
-		r        oidcRefreshRequest
+		r        oidcstore.RefreshRequest
 		authTime *time.Time
 	)
 	if err := s.pool.QueryRow(ctx, `
 		SELECT id_hash, client_id, subject, scopes, amr, audience, auth_time
 		  FROM oidc_refresh_tokens WHERE token_hash = $1`, hashValue(value)).Scan(
-		&r.idHash, &r.clientID, &r.subject, &r.scopes, &r.amr, &r.audience, &authTime,
+		&r.IDHash, &r.ClientID, &r.Subject, &r.Scopes, &r.AMR, &r.Audience, &authTime,
 	); err != nil {
 		return nil, errors.New("postgres: invalid refresh token")
 	}
-	r.authTime = authTime
+	r.AuthTime = authTime
 	return &r, nil
 }
 
@@ -579,9 +376,12 @@ func (s *OIDCStore) KeySet(context.Context) ([]op.Key, error) {
 func (s *OIDCStore) GetClientByClientID(ctx context.Context, clientID string) (op.Client, error) {
 	c, err := s.clients.Get(ctx, clientID)
 	if err != nil {
+		if errors.Is(err, oauth.ErrClientNotFound) {
+			return nil, oidc.ErrInvalidClient()
+		}
 		return nil, err
 	}
-	return opClient{c: c, registry: s.registry, login: func(id string) string {
+	return oidcstore.ProviderClient{Client: c, Registry: s.registry, Login: func(id string) string {
 		if s.login == nil {
 			return "/login?authRequestID=" + id
 		}
@@ -593,10 +393,13 @@ func (s *OIDCStore) GetClientByClientID(ctx context.Context, clientID string) (o
 func (s *OIDCStore) AuthorizeClientIDSecret(ctx context.Context, clientID, clientSecret string) error {
 	c, err := s.clients.Get(ctx, clientID)
 	if err != nil {
+		if errors.Is(err, oauth.ErrClientNotFound) {
+			return oidc.ErrInvalidClient()
+		}
 		return err
 	}
 	if c.Type == oauth.ClientConfidential && !c.Authenticate(clientSecret) {
-		return errors.New("postgres: invalid client secret")
+		return oidc.ErrInvalidClient().WithDescription("invalid client secret")
 	}
 	return nil
 }
@@ -706,7 +509,7 @@ func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scope
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oidc_auth_requests
 		   SET subject = $2, scopes = $3, done = true, auth_time = now()
-		 WHERE id = $1`, id, subject, nonNil(scopes))
+		 WHERE id = $1`, id, subject, oidcstore.NonNil(scopes))
 	if err != nil {
 		return fmt.Errorf("postgres: complete login: %w", err)
 	}
@@ -866,7 +669,7 @@ func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode st
 	if err != nil {
 		return oauth.DeviceAuthorization{}, oauth.ErrDeviceNotFound
 	}
-	descriptors, err := s.registry.Resolve(stringsToScopes(st.Scopes), st.ClientID)
+	descriptors, err := s.registry.Resolve(oidcstore.Scopes(st.Scopes), st.ClientID)
 	if err != nil {
 		return oauth.DeviceAuthorization{}, err
 	}
@@ -892,59 +695,21 @@ func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, sub
 		return s.DenyDevice(ctx, userCode)
 	}
 
-	granted := st.Scopes
-	if len(scopes) > 0 {
-		for _, sc := range scopes {
-			if !containsStr(st.Scopes, sc.String()) {
-				return &oauth.Error{Code: "invalid_scope", Description: "the decision cannot widen the requested scope"}
-			}
-		}
-		granted = scopeStrings(scopes)
-	}
-	descriptors, err := s.registry.Resolve(stringsToScopes(granted), st.ClientID)
+	granted, err := oidcstore.NarrowScopes(st.Scopes, scopes)
 	if err != nil {
 		return err
 	}
-	ticked := make(map[oauth.Scope]struct{}, len(explicit))
-	for _, sc := range explicit {
-		ticked[sc] = struct{}{}
+	descriptors, err := s.registry.Resolve(oidcstore.Scopes(granted), st.ClientID)
+	if err != nil {
+		return err
 	}
-	for _, d := range descriptors {
-		if d.ExplicitConsent {
-			if _, ok := ticked[d.Scope]; !ok {
-				return &oauth.Error{Code: "access_denied", Description: "explicit consent is required for " + d.Scope.String()}
-			}
-		}
+	if err := oidcstore.RequireExplicitConsent(descriptors, explicit); err != nil {
+		return err
 	}
 	// ADR-0001 O-6 (revised): a device authorization always yields a refresh
 	// token, so offline_access is granted implicitly.
-	granted = appendOfflineAccess(granted)
+	granted = oidcstore.WithOfflineAccess(granted)
 	return s.ApproveDevice(ctx, userCode, subject, granted)
-}
-
-func containsStr(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
-}
-
-func scopeStrings(scopes []oauth.Scope) []string {
-	out := make([]string, len(scopes))
-	for i, s := range scopes {
-		out[i] = s.String()
-	}
-	return out
-}
-
-func stringsToScopes(in []string) []oauth.Scope {
-	out := make([]oauth.Scope, len(in))
-	for i, s := range in {
-		out[i] = oauth.Scope(s)
-	}
-	return out
 }
 
 func appendScopeUnique(dst []oauth.Scope, s oauth.Scope) []oauth.Scope {
@@ -954,26 +719,4 @@ func appendScopeUnique(dst []oauth.Scope, s oauth.Scope) []oauth.Scope {
 		}
 	}
 	return append(dst, s)
-}
-
-// appendOfflineAccess appends the OIDC offline_access scope if absent, so the
-// OP issues a refresh token (ADR-0001 O-6, revised).
-func appendOfflineAccess(scopes []string) []string {
-	if containsStr(scopes, oidc.ScopeOfflineAccess) {
-		return scopes
-	}
-	return append(scopes, oidc.ScopeOfflineAccess)
-}
-
-// withoutOfflineAccess removes offline_access before a scope list is stored or
-// shown. Re0Auth always issues a refresh token, so offline_access is an internal
-// trigger, not a scope the client should see (ADR-0001 O-6, revised).
-func withoutOfflineAccess(scopes []string) []string {
-	out := make([]string, 0, len(scopes))
-	for _, s := range scopes {
-		if s != oidc.ScopeOfflineAccess {
-			out = append(out, s)
-		}
-	}
-	return out
 }

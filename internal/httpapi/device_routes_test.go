@@ -42,7 +42,7 @@ func TestDeviceAuthorizationEndToEnd(t *testing.T) {
 	if deviceCode == "" || userCode == "" {
 		t.Fatalf("device_authorization = %v", start)
 	}
-	if start["verification_uri"] != "https://re0auth.test/device" {
+	if start["verification_uri"] != "https://re0auth.test/app/device" {
 		t.Fatalf("verification_uri = %v", start["verification_uri"])
 	}
 	complete, _ := start["verification_uri_complete"].(string)

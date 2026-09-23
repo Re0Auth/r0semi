@@ -14,7 +14,6 @@ import (
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
-	"github.com/Re0Auth/r0semi/internal/authz"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/oauth"
 	"gopkg.in/yaml.v3"
@@ -79,16 +78,7 @@ func newFullConfig(t *testing.T) Config {
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: "https://re0auth.test", Scopes: oauth.DefaultRegistry(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	azSvc, err := authz.NewService(as, authz.NewMemoryStore(), authz.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, manager)
 
 	sources, err := federation.NewRegistry(federation.Source{
 		Game: "phigros", Name: "fake", DisplayName: "Fake", Issuer: upstream.URL,
@@ -113,7 +103,7 @@ func newFullConfig(t *testing.T) Config {
 
 	adminSvc, err := admin.New(admin.Config{
 		Clients: clients,
-		Tokens:  oauth.NewMemoryStore(),
+		Tokens:  store,
 		Audit:   audit.NewMemoryLogger(),
 	})
 	if err != nil {
@@ -121,10 +111,18 @@ func newFullConfig(t *testing.T) Config {
 	}
 
 	return Config{
-		Issuer: "https://re0auth.test", AS: as,
-		Sessions: manager, Accounts: accounts, Auth: authHandler,
-		Authz: azSvc, Federation: fed,
-		Admin: adminSvc, Admins: []account.UserID{"usr_admin"},
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Authorization:     opHandler,
+		Sessions:          manager,
+		Accounts:          accounts,
+		Auth:              authHandler,
+		Federation:        fed,
+		Admin:             adminSvc,
+		Admins:            []account.UserID{"usr_admin"},
 	}
 }
 

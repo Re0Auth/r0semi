@@ -13,11 +13,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/store/memory"
 	"github.com/Re0Auth/r0semi/oauth"
 	"github.com/Re0Auth/r0semi/vault"
 )
@@ -100,9 +100,10 @@ func newFakeUpstream(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// newBindEnv wires the IdP login plane, the OAuth AS, and the federation plane
-// against a fake IdP and a fake upstream source.
-func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *federation.MemoryBindingStore, oauth.Service, vault.Service) {
+// newBindEnv wires the IdP login plane, the OpenID Provider, and the federation
+// plane against a fake IdP and a fake upstream source. It returns the run
+// handler and OP store so a test can mint a token through the real code flow.
+func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *federation.MemoryBindingStore, http.Handler, *memory.OIDCStore, vault.Service) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -156,12 +157,6 @@ func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *fede
 	if err := clients.Create(ctx, apiClient); err != nil {
 		t.Fatal(err)
 	}
-	as, err := oauth.NewService(clients, oauth.NewMemoryStore(), audit.NewMemoryLogger(), oauth.Config{
-		Issuer: srv.URL, Scopes: oauth.DefaultRegistry(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	registry, err := federation.NewRegistry(federation.Source{
 		Game: "phigros", Name: "fake", DisplayName: "Fake", Issuer: upstream.URL,
@@ -183,9 +178,18 @@ func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *fede
 		t.Fatal(err)
 	}
 
+	opHandler, store := newOPBackend(t, srv.URL, clients, manager)
 	api, err := New(Config{
-		Issuer: srv.URL, AS: as,
-		Sessions: manager, Accounts: accounts, Auth: authHandler, Federation: fed,
+		Issuer:            srv.URL,
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Authorization:     opHandler,
+		Sessions:          manager,
+		Accounts:          accounts,
+		Auth:              authHandler,
+		Federation:        fed,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -202,13 +206,13 @@ func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *fede
 			return http.ErrUseLastResponse
 		},
 	}
-	return srv.URL, client, accounts, bindings, as, v
+	return srv.URL, client, accounts, bindings, handler, store, v
 }
 
 // The full bind journey: sign in -> /bind -> upstream authorizes -> callback ->
 // the binding exists -> the data plane works.
 func TestSourceBindingEndToEnd(t *testing.T) {
-	base, client, accounts, bindings, as, v := newBindEnv(t)
+	base, client, accounts, bindings, h, store, v := newBindEnv(t)
 	signIn(t, client, base)
 
 	uid, err := accounts.FindByIdentity(context.Background(), idp.GitHub, "42")
@@ -258,7 +262,7 @@ func TestSourceBindingEndToEnd(t *testing.T) {
 	}
 
 	// The data plane now works.
-	at := mintToken(t, as, "cli", string(uid), oauth.ScopePhigrosProfile)
+	at := mintToken(t, h, store, "cli", string(uid), oauth.ScopePhigrosProfile)
 	resp = authedGet(t, base+"/v1/games/phigros/profile", at)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("profile status = %d", resp.StatusCode)
@@ -269,7 +273,7 @@ func TestSourceBindingEndToEnd(t *testing.T) {
 }
 
 func TestBindRequiresSignIn(t *testing.T) {
-	base, _, _, _, _, _ := newBindEnv(t)
+	base, _, _, _, _, _, _ := newBindEnv(t)
 	resp := getURL(t, newBrowser(t), base+"/bind?game=phigros&source=fake")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -278,7 +282,7 @@ func TestBindRequiresSignIn(t *testing.T) {
 }
 
 func TestBindCallbackRejectsUnknownState(t *testing.T) {
-	base, client, _, _, _, _ := newBindEnv(t)
+	base, client, _, _, _, _, _ := newBindEnv(t)
 	signIn(t, client, base)
 
 	resp := getURL(t, client, base+"/auth/upstream/phigros/fake/callback?code=x&state=forged")
