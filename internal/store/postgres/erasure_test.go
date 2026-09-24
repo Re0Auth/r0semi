@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -72,16 +73,50 @@ func TestAccountDeletionLeavesNoOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The binding revoker is the federation service, as in the composition root.
+	// Its registry is empty, so a seeded binding's source is unknown and the
+	// revoke is the local half the erasure must not skip: shred the secret, then
+	// delete the row. The vault service wraps the same repository the erasure
+	// wipes, and the audit sink is required by both.
+	wrapper, err := vault.NewLocalKeyWrapper("erase-kek", make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultService, err := vault.NewService(db.Vault(), wrapper, audit.NewMemoryLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := federation.NewRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	federationService, err := federation.NewService(federation.Config{
+		Registry: sources,
+		Bindings: db.Bindings(),
+		Flows:    db.BindFlows(),
+		Vault:    vaultService,
+		Doer:     http.DefaultClient,
+		BaseURL:  "http://re0auth.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	deleter, err := lifecycle.New(lifecycle.Config{
 		Accounts: accounts,
-		// The OP owns the tokens, so it is both the token revoker and the OP-state
-		// purger, exactly as the composition root wires it.
-		Tokens: oidcStore,
-		Vault:  db.Vault(),
-		OIDC:   oidcStore,
-		Flows:  db.BindFlows(),
-		Legacy: db.Tokens(),
-		Audit:  audit.NewMemoryLogger(),
+		// Tokens live in two engines here, as they do in a deployment migrated
+		// from the retired hand-rolled engine: the OP owns the tokens it issued,
+		// and the tables that engine left behind still hold rows. The composition
+		// root revokes in both, so the test must too, or it would prove a
+		// narrower erasure than the one that ships.
+		Tokens:   oauth.TokenAdmins{oidcStore, db.Tokens()},
+		Vault:    db.Vault(),
+		Bindings: eraseBindings{fed: federationService},
+		Sessions: db.Sessions(),
+		OIDC:     oidcStore,
+		Flows:    db.BindFlows(),
+		Legacy:   db.Tokens(),
+		Audit:    audit.NewMemoryLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +139,21 @@ func TestAccountDeletionLeavesNoOrphans(t *testing.T) {
 	if remaining != 0 {
 		t.Error("the account row survives the erasure")
 	}
+}
+
+// eraseBindings adapts the federation service to the erasure's binding port,
+// mirroring the composition root's adapter: the erasure reports only a count, so
+// the operator plane's richer summary is trimmed here. Kept local to the test
+// because it is the adapter, not the service, that the erasure depends on.
+type eraseBindings struct{ fed federation.Service }
+
+func (e eraseBindings) RevokeUserBindings(ctx context.Context, user account.UserID) (lifecycle.BindingOutcome, error) {
+	summary, err := e.fed.RevokeUserBindings(ctx, user)
+	return lifecycle.BindingOutcome{
+		Total:   summary.Total,
+		Revoked: summary.Revoked,
+		Failed:  summary.Failed,
+	}, err
 }
 
 // seedEveryAccountTable writes one row per account-linked table, so the orphan

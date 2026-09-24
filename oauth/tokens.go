@@ -112,6 +112,30 @@ type TokenAdmin interface {
 	RevokeTokens(ctx context.Context, f TokenFilter) (int, error)
 }
 
+// TokenAdmins fans a revocation out across several stores, because a deployment
+// can run more than one token engine: the OpenID Provider, and — for one
+// migrated from the retired hand-rolled engine — the token tables that engine
+// left behind. Revoking in only one of them would report success while leaving
+// tokens alive in the other.
+type TokenAdmins []TokenAdmin
+
+// RevokeTokens implements TokenAdmin. Every store is asked even when one fails: a
+// store that holds nothing must not hide one that errored. The removed counts are
+// summed and the first error is returned, so the caller still learns that
+// something went wrong and — revocation being idempotent — can retry.
+func (a TokenAdmins) RevokeTokens(ctx context.Context, f TokenFilter) (int, error) {
+	total := 0
+	var firstErr error
+	for _, store := range a {
+		n, err := store.RevokeTokens(ctx, f)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return total, firstErr
+}
+
 // MemoryStore is a non-durable Store for development and tests.
 type MemoryStore struct {
 	mu      sync.Mutex

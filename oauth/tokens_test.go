@@ -75,6 +75,47 @@ func keys[V any](m map[string]V) map[string]bool {
 	return out
 }
 
+// stubRevoker stands in for one engine's token store: it records the filter it
+// was handed and returns canned results.
+type stubRevoker struct {
+	count int
+	err   error
+	calls []TokenFilter
+}
+
+func (s *stubRevoker) RevokeTokens(_ context.Context, filter TokenFilter) (int, error) {
+	s.calls = append(s.calls, filter)
+	return s.count, s.err
+}
+
+// A revocation reaches every engine, and the counts are summed. A store that
+// fails must not stop the others: a store holding nothing cannot be allowed to
+// hide one that errored, and revocation is idempotent, so the caller retries.
+func TestTokenAdminsRevokesInEveryStore(t *testing.T) {
+	boom := errors.New("engine down")
+	first := &stubRevoker{count: 2}
+	second := &stubRevoker{count: 3, err: boom}
+	third := &stubRevoker{count: 1}
+
+	filter := TokenFilter{Subject: "usr_1"}
+	total, err := TokenAdmins{first, second, third}.RevokeTokens(context.Background(), filter)
+	if total != 6 {
+		t.Fatalf("total = %d, want 6", total)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the first failure", err)
+	}
+	for i, store := range []*stubRevoker{first, second, third} {
+		if len(store.calls) != 1 || store.calls[0] != filter {
+			t.Fatalf("store %d was not asked to revoke %+v: %+v", i, filter, store.calls)
+		}
+	}
+
+	if n, err := (TokenAdmins{}).RevokeTokens(context.Background(), filter); n != 0 || err != nil {
+		t.Fatalf("empty fan-out = %d, %v", n, err)
+	}
+}
+
 // Lookups must still work end to end after the hashing change.
 func TestMemoryStoreLookupsStillWork(t *testing.T) {
 	store := NewMemoryStore()

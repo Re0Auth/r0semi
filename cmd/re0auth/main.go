@@ -322,8 +322,16 @@ func main() {
 	apiConfig.GrantStore = oidcStore
 	apiConfig.DeviceStore = oidcStore
 	apiConfig.Authorization = oidcHandler
-	// The OP owns the tokens, so it is also what revokes them.
-	tokenRevoker := oauth.TokenAdmin(oidcStore)
+	// Tokens can live in two engines: the OP's tables, and — for a deployment
+	// migrated from the retired hand-rolled engine — the token tables it left
+	// behind. Both are revoked by the same step, so neither an erasure nor the
+	// Kill Switch can report success while leaving a token alive in the other. The
+	// legacy store advertises the capability; a deployment without one adds none.
+	revokers := oauth.TokenAdmins{oidcStore}
+	if legacyTokens, ok := store.legacy.(oauth.TokenAdmin); ok {
+		revokers = append(revokers, legacyTokens)
+	}
+	tokenRevoker := oauth.TokenAdmin(revokers)
 	if store.durable {
 		slog.Info("authorization engine", "engine", "openid-provider", "store", "postgres")
 	} else {
