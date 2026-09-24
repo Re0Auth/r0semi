@@ -546,7 +546,16 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 		return store, nil
 	}
 
-	db, err := postgres.Open(ctx, cfg.DatabaseURL)
+	// The pool is sized from configuration rather than left to the driver's
+	// defaults, which are chosen for a general-purpose program. The lifetimes
+	// that PoolOptions also carries are left at their defaults here; they are not
+	// knobs a deployment has needed to turn.
+	db, err := postgres.Open(ctx, cfg.DatabaseURL, postgres.PoolOptions{
+		MaxConns:         cfg.Pool.MaxConns,
+		MinConns:         cfg.Pool.MinConns,
+		ConnectTimeout:   cfg.Pool.ConnectTimeout,
+		StatementTimeout: cfg.Pool.StatementTimeout,
+	})
 	if err != nil {
 		return storage{}, err
 	}

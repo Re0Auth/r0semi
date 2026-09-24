@@ -8,12 +8,14 @@ import (
 	"net/netip"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/config"
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/store/postgres"
 )
 
 // The server configuration has two layers:
@@ -74,6 +76,29 @@ type storageSection struct {
 	Driver string `toml:"driver"`
 	// DSNEnv names the variable holding the connection string, never the DSN.
 	DSNEnv string `toml:"dsn_env"`
+
+	// Pool sizing. Pointers so "absent" (take the default) is distinguishable
+	// from an explicit zero, the same reason server.rate_limit is a pointer: a
+	// pool of zero connections is not a configuration anyone means, and treating
+	// it as "unset" would hide the mistake behind a working default.
+	//
+	// The durations are strings in Go's own form ("5s", "30s") rather than
+	// numbers, because a bare number has no unit and guessing one is how a
+	// 30-second timeout becomes 30 nanoseconds.
+	MaxConns         *int    `toml:"max_conns"`
+	MinConns         *int    `toml:"min_conns"`
+	ConnectTimeout   *string `toml:"connect_timeout"`
+	StatementTimeout *string `toml:"statement_timeout"`
+}
+
+// poolSettings bounds the Postgres connection pool. It mirrors the shape of the
+// file section with real types, so the composition root passes values the driver
+// can use without parsing.
+type poolSettings struct {
+	MaxConns         int32
+	MinConns         int32
+	ConnectTimeout   time.Duration
+	StatementTimeout time.Duration
 }
 
 type vaultSection struct {
@@ -169,6 +194,10 @@ type settings struct {
 	// InternalAddr is the address of the operational listener that serves metrics
 	// and profiling. Empty means it is not served at all.
 	InternalAddr string
+	// Pool bounds the Postgres connection pool. Meaningless in memory mode; it is
+	// still resolved and validated there, so a typo is reported rather than
+	// discovered the day the deployment grows a database.
+	Pool poolSettings
 
 	clientID        string
 	clientName      string
@@ -241,7 +270,6 @@ func loadConfig(path string) (settings, error) {
 	if !strings.HasPrefix(cfg.Issuer, "http://") && !strings.HasPrefix(cfg.Issuer, "https://") {
 		return settings{}, fmt.Errorf("server.issuer %q must be an absolute http(s) URL", cfg.Issuer)
 	}
-
 	// Rate limiting. Resolved before anything else that could fail, so a typo in
 	// these numbers is reported rather than quietly replaced by a default.
 	rateLimit := defaultRateLimit
@@ -316,6 +344,13 @@ func loadConfig(path string) (settings, error) {
 		}
 	default:
 		return settings{}, fmt.Errorf("storage.driver %q must be \"memory\" or \"postgres\"", driver)
+	}
+
+	// The connection pool. Resolved even in memory mode, where nothing uses it, so
+	// a typo is reported now rather than on the day a deployment grows a database.
+	cfg.Pool, err = resolvePool(f.Storage)
+	if err != nil {
+		return settings{}, err
 	}
 
 	// Vault: the KEK is required, and its length is checked here so a bad key
@@ -573,4 +608,108 @@ func parseTrustedProxies(values []string) ([]netip.Prefix, error) {
 		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
 	}
 	return out, nil
+}
+
+// resolvePool merges the defaults, the storage section and the environment into
+// the pool the composition root hands to the driver. The precedence is the one
+// the whole file promises: environment > file > default.
+//
+// It validates rather than clamps. postgres.Open will bend a contradictory
+// configuration into something runnable — it has to, because it cannot know
+// whether it was handed a bug or a deliberate minimum — but a server that starts
+// with numbers the operator did not choose is the failure mode this project
+// consistently refuses. Say what is wrong and do not start.
+func resolvePool(section storageSection) (poolSettings, error) {
+	defaults := postgres.DefaultPoolOptions()
+	out := poolSettings{
+		MaxConns:         defaults.MaxConns,
+		MinConns:         defaults.MinConns,
+		ConnectTimeout:   defaults.ConnectTimeout,
+		StatementTimeout: defaults.StatementTimeout,
+	}
+	if section.MaxConns != nil {
+		out.MaxConns = int32(*section.MaxConns)
+	}
+	if section.MinConns != nil {
+		out.MinConns = int32(*section.MinConns)
+	}
+	if section.ConnectTimeout != nil {
+		d, err := parseDuration(*section.ConnectTimeout, "storage.connect_timeout")
+		if err != nil {
+			return poolSettings{}, err
+		}
+		out.ConnectTimeout = d
+	}
+	if section.StatementTimeout != nil {
+		d, err := parseDuration(*section.StatementTimeout, "storage.statement_timeout")
+		if err != nil {
+			return poolSettings{}, err
+		}
+		out.StatementTimeout = d
+	}
+
+	var err error
+	if out.MaxConns, err = envInt32("RE0AUTH_STORAGE_MAX_CONNS", out.MaxConns); err != nil {
+		return poolSettings{}, err
+	}
+	if out.MinConns, err = envInt32("RE0AUTH_STORAGE_MIN_CONNS", out.MinConns); err != nil {
+		return poolSettings{}, err
+	}
+	if out.ConnectTimeout, err = envDuration("RE0AUTH_STORAGE_CONNECT_TIMEOUT", out.ConnectTimeout); err != nil {
+		return poolSettings{}, err
+	}
+	if out.StatementTimeout, err = envDuration("RE0AUTH_STORAGE_STATEMENT_TIMEOUT", out.StatementTimeout); err != nil {
+		return poolSettings{}, err
+	}
+
+	switch {
+	case out.MaxConns < 1:
+		return poolSettings{}, errors.New("storage.max_conns must be at least 1")
+	case out.MinConns < 0:
+		return poolSettings{}, errors.New("storage.min_conns cannot be negative (use 0 for no warm connections)")
+	case out.MinConns > out.MaxConns:
+		return poolSettings{}, errors.New(
+			"storage.min_conns cannot exceed storage.max_conns: a warm set larger than the cap is a contradiction, not a preference")
+	case out.ConnectTimeout <= 0:
+		return poolSettings{}, errors.New(`storage.connect_timeout must be positive (e.g. "5s")`)
+	case out.StatementTimeout < 0:
+		return poolSettings{}, errors.New(
+			`storage.statement_timeout cannot be negative (use "0s" to leave the server's setting alone)`)
+	}
+	return out, nil
+}
+
+// envInt32 overrides a value from an environment variable, so a deployment that
+// configures by environment alone can still size its pool.
+func envInt32(name string, target int32) (int32, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return target, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%s %q is not an integer", name, raw)
+	}
+	return int32(n), nil
+}
+
+// envDuration is envInt32 for a Go duration string.
+func envDuration(name string, target time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return target, nil
+	}
+	return parseDuration(raw, name)
+}
+
+// parseDuration parses a Go duration ("5s", "1m30s"). A value that does not parse
+// is an error rather than a silently ignored setting: a timeout that was typed
+// and not applied is worse than one that was never typed, because the operator
+// believes it is in force.
+func parseDuration(raw, what string) (time.Duration, error) {
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%s %q is not a duration (e.g. \"5s\", \"1m\")", what, raw)
+	}
+	return d, nil
 }

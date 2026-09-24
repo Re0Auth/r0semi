@@ -32,7 +32,7 @@ func openTestDB(t *testing.T) *DB {
 		}
 		t.Skip("TEST_DATABASE_URL is not set; skipping Postgres integration tests")
 	}
-	db, err := Open(context.Background(), dsn)
+	db, err := Open(context.Background(), dsn, DefaultPoolOptions())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

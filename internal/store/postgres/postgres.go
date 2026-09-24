@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -33,26 +34,163 @@ type DB struct {
 	pool *pgxpool.Pool
 	// dsn is kept so goose can open its own database/sql handle for migrations.
 	dsn string
+	// connectTimeout bounds establishing the migration connection, which is
+	// deliberately not taken from the pool. See Migrate.
+	connectTimeout time.Duration
+}
+
+// PoolOptions bounds the connection pool and the statements that run on it.
+//
+// They are options rather than constants because the right numbers are a
+// deployment fact, not a code fact: pgxpool keeps its semaphore per process, so
+// "how many connections may this instance hold" has to be answered together with
+// "how many instances are there", and the answer must leave room under Postgres's
+// max_connections for migrations and for a human with psql. A pool that is too
+// large does not fail loudly; it makes the database refuse a connection to
+// something that needs one.
+type PoolOptions struct {
+	// MaxConns caps connections held by this process.
+	MaxConns int32
+	// MinConns is how many connections are kept warm. Zero lets the pool shrink
+	// to nothing, so the request after an idle period pays a full connect.
+	MinConns int32
+	// ConnectTimeout bounds establishing a single connection. It is what turns an
+	// unreachable host into a startup failure instead of a hang.
+	ConnectTimeout time.Duration
+	// StatementTimeout is applied as the session's statement_timeout, so no query
+	// outlives the request that issued it. A non-positive value leaves the
+	// server's setting alone (which is the default: no timeout).
+	StatementTimeout time.Duration
+	// MaxConnLifetime retires a connection after this long, so a DNS change or a
+	// failover is picked up without a restart.
+	MaxConnLifetime time.Duration
+	// MaxConnIdleTime releases a connection that has gone unused, returning its
+	// backend to the server.
+	MaxConnIdleTime time.Duration
+	// HealthCheckPeriod is how often an idle connection is checked, so one that
+	// died in the interim is not handed to a caller.
+	HealthCheckPeriod time.Duration
+}
+
+// DefaultPoolOptions is the configuration a deployment gets when it tunes
+// nothing. Every value is overridable; see cmd/re0auth/config.go for the keys.
+func DefaultPoolOptions() PoolOptions {
+	return PoolOptions{
+		MaxConns:          16,
+		MinConns:          2,
+		ConnectTimeout:    5 * time.Second,
+		StatementTimeout:  30 * time.Second,
+		MaxConnLifetime:   time.Hour,
+		MaxConnIdleTime:   30 * time.Minute,
+		HealthCheckPeriod: time.Minute,
+	}
+}
+
+// normalized replaces a value that cannot mean anything with its default, so the
+// zero PoolOptions is a usable configuration rather than a silently unbounded
+// one.
+//
+// Two fields are passed through untouched, because for them zero is a choice
+// rather than an omission: MinConns = 0 is "keep no connection warm", and a
+// non-positive StatementTimeout is "leave the server's setting alone". Both have
+// non-zero defaults, so a caller who wants the house values names them
+// (DefaultPoolOptions) instead of leaving the fields out.
+func (o PoolOptions) normalized() PoolOptions {
+	d := DefaultPoolOptions()
+	if o.MaxConns <= 0 {
+		o.MaxConns = d.MaxConns
+	}
+	if o.MinConns < 0 {
+		o.MinConns = 0
+	}
+	if o.MinConns > o.MaxConns {
+		o.MinConns = o.MaxConns
+	}
+	if o.ConnectTimeout <= 0 {
+		o.ConnectTimeout = d.ConnectTimeout
+	}
+	if o.MaxConnLifetime <= 0 {
+		o.MaxConnLifetime = d.MaxConnLifetime
+	}
+	if o.MaxConnIdleTime <= 0 {
+		o.MaxConnIdleTime = d.MaxConnIdleTime
+	}
+	if o.HealthCheckPeriod <= 0 {
+		o.HealthCheckPeriod = d.HealthCheckPeriod
+	}
+	return o
 }
 
 // Open connects, verifies the connection, and applies pending migrations. It is
 // the only constructor: there is no supported way to use the stores against an
 // unmigrated database.
-func Open(ctx context.Context, dsn string) (*DB, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+//
+// opts is parsed rather than passed to pgxpool.New, because the defaults pgx
+// would otherwise apply are for a general-purpose program, not for one whose
+// every query is on a request's critical path. See PoolOptions for what each
+// bound buys.
+func Open(ctx context.Context, dsn string, opts PoolOptions) (*DB, error) {
+	opts = opts.normalized()
+	cfg, err := poolConfig(dsn, opts)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
+	// The initial reachability check is bounded by the same connect budget, so a
+	// host that accepts nothing answers at startup rather than holding the
+	// process open. The pool itself is lazy; without this, "connected" would only
+	// be discovered on the first request.
+	pingCtx, cancel := context.WithTimeout(ctx, opts.ConnectTimeout)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("postgres: ping: %w", err)
 	}
-	db := &DB{pool: pool, dsn: dsn}
+	db := &DB{pool: pool, dsn: dsn, connectTimeout: opts.ConnectTimeout}
 	if err := db.Migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// poolConfig turns a DSN and the pool options into the driver's configuration.
+//
+// It is a separate function so that "did these bounds actually reach the driver"
+// can be asserted without a database. Every one of these settings is invisible
+// when it is wrong — a missing statement timeout looks exactly like a query that
+// happened to be fast — so the mapping is pinned by a test rather than by
+// reading it.
+//
+// opts is expected already normalized; a zero value here would leave MaxConns at
+// the driver's default rather than this package's.
+func poolConfig(dsn string, opts PoolOptions) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+	}
+	cfg.MaxConns = opts.MaxConns
+	cfg.MinConns = opts.MinConns
+	cfg.MaxConnLifetime = opts.MaxConnLifetime
+	cfg.MaxConnIdleTime = opts.MaxConnIdleTime
+	cfg.HealthCheckPeriod = opts.HealthCheckPeriod
+	cfg.ConnConfig.ConnectTimeout = opts.ConnectTimeout
+	if opts.StatementTimeout > 0 {
+		// Sent in the startup packet, so it is a property of every connection the
+		// pool opens rather than something each caller has to remember to set. A
+		// statement that outlives its request holds a backend, and possibly a lock,
+		// while the caller has already given up — which is how one slow query
+		// becomes an outage.
+		if cfg.ConnConfig.RuntimeParams == nil {
+			cfg.ConnConfig.RuntimeParams = make(map[string]string, 1)
+		}
+		cfg.ConnConfig.RuntimeParams["statement_timeout"] =
+			strconv.FormatInt(opts.StatementTimeout.Milliseconds(), 10)
+	}
+	return cfg, nil
 }
 
 // Close releases the pool.
@@ -104,12 +242,30 @@ func (db *DB) Audit(key []byte) (*AuditLogger, error) {
 // rows are copied into goose's version table (preserving the applied_at
 // timestamps), then it is dropped. A database that has never run a migration
 // simply gets a fresh goose_db_version.
+//
+// The lock is held on a connection of its own rather than one borrowed from the
+// pool, for two reasons that both come from the pool's statement_timeout:
+//
+//   - waiting for another instance to finish migrating is legitimate and can take
+//     longer than any request should, so it must not inherit a bound meant for
+//     serving traffic;
+//   - pgxpool does not reset session state when a connection is released, so a
+//     `SET statement_timeout = 0` here would leak back into the pool and quietly
+//     disable the bound for every later request. A standalone connection has
+//     nothing to leak into, and is closed when the migration finishes.
 func (db *DB) Migrate(ctx context.Context) error {
-	conn, err := db.pool.Acquire(ctx)
+	connCfg, err := pgx.ParseConfig(db.dsn)
 	if err != nil {
-		return fmt.Errorf("postgres: migrate: acquire: %w", err)
+		return fmt.Errorf("postgres: migrate: parse dsn: %w", err)
 	}
-	defer conn.Release()
+	if db.connectTimeout > 0 {
+		connCfg.ConnectTimeout = db.connectTimeout
+	}
+	conn, err := pgx.ConnectConfig(ctx, connCfg)
+	if err != nil {
+		return fmt.Errorf("postgres: migrate: connect: %w", err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
 		return fmt.Errorf("postgres: migrate: lock: %w", err)

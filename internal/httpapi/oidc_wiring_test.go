@@ -36,7 +36,7 @@ func TestOIDCWiringEndToEnd(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	db, err := postgres.Open(ctx, dsn)
+	db, err := postgres.Open(ctx, dsn, postgres.PoolOptions{})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

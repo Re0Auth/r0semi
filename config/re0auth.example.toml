@@ -64,6 +64,27 @@ driver = "postgres"
 # The variable holding the connection string, never the DSN itself.
 dsn_env = "DATABASE_URL"
 
+# Connection pool. Every field has a default (shown below), so write only what
+# differs. **max_conns is per process, not per database**: Postgres allocates a
+# backend for each connection, so max_conns multiplied by the number of instances
+# must stay under the server's own max_connections with room left for migrations
+# and for a human with psql. A pool that is too large does not fail loudly — it
+# makes the database refuse a connection to something that needs one.
+#
+#   max_conns         = 16      # cap for this process        RE0AUTH_STORAGE_MAX_CONNS
+#   min_conns         = 2       # connections kept warm       RE0AUTH_STORAGE_MIN_CONNS
+#   connect_timeout   = "5s"    # establishing one connection RE0AUTH_STORAGE_CONNECT_TIMEOUT
+#   statement_timeout = "30s"   # per-statement bound         RE0AUTH_STORAGE_STATEMENT_TIMEOUT
+#
+# statement_timeout is applied to every connection the pool opens, so no query
+# outlives the request that issued it. It is deliberately NOT applied to the
+# migration connection: waiting for another instance's migration is legitimate and
+# may take longer than any request should. Set it to "0s" to leave the server's
+# own setting alone.
+#
+# min_conns must not exceed max_conns, and a malformed duration refuses startup
+# rather than being silently ignored.
+
 # The OpenID Provider's two keys. They are environment-only and **required in
 # both storage modes**, because id_tokens and opaque access tokens must survive a
 # restart even when nothing else does:
