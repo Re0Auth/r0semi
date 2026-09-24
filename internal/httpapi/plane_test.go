@@ -46,10 +46,17 @@ var protocolPaths = []string{
 	"/.well-known",
 }
 
-// protocolPostOnly names the endpoints that only accept POST, so the walk below
-// asks each one the way a client would. A method mismatch is answered by the
-// router, which is a different question from the plane's error shape.
-var protocolPostOnly = map[string]bool{
+// protocolAnyMethod names the endpoints the library serves without a method
+// constraint: it reads `r.Form`, which a GET's query string satisfies just as a
+// POST body does. The walk reaches each of these by both methods, because the
+// wrapper's contract has to hold for the request the library actually accepts.
+//
+// A POST-only assumption is not cosmetic: it is exactly how the token endpoint's
+// response sanitising (no `id_token` without `openid`, `Cache-Control: no-store`)
+// and the device endpoint's scope pre-flight were each skipped on a reachable
+// path, so the walk that used the "expected" method could not see either.
+var protocolAnyMethod = map[string]bool{
+	"/oauth/authorize":            true,
 	"/oauth/token":                true,
 	"/oauth/revoke":               true,
 	"/oauth/introspect":           true,
@@ -105,22 +112,22 @@ func TestErrorFormatNeverCrossesPlanes(t *testing.T) {
 		})
 	}
 
-	// Each endpoint is asked the way a client would reach it. `POST
-	// /oauth/authorize` is in this walk on purpose: the library registers that
-	// endpoint without a method constraint and reads `r.Form`, so a walk that
-	// issued only GETs would not notice a pre-flight that only ran for GET — which
-	// is exactly the gap that let a confidential client obtain a code with no
-	// PKCE and let an unknown client answer in the library's plain-text shape.
+	// Each endpoint is asked the way a client would reach it — and the ones the
+	// library serves without a method constraint (see protocolAnyMethod) by both
+	// methods. `POST /oauth/authorize` is in this walk on purpose: the library
+	// registers that endpoint without a method constraint and reads `r.Form`, so a
+	// walk that issued only GETs would not notice a pre-flight that only ran for
+	// GET — which is exactly the gap that let a confidential client obtain a code
+	// with no PKCE and let an unknown client answer in the library's plain-text
+	// shape.
 	type attempt struct{ method, path string }
-	attempts := make([]attempt, 0, len(protocolPaths)+1)
+	attempts := make([]attempt, 0, len(protocolPaths)*2)
 	for _, p := range protocolPaths {
-		m := http.MethodGet
-		if protocolPostOnly[p] {
-			m = http.MethodPost
+		attempts = append(attempts, attempt{http.MethodGet, p})
+		if protocolAnyMethod[p] {
+			attempts = append(attempts, attempt{http.MethodPost, p})
 		}
-		attempts = append(attempts, attempt{m, p})
 	}
-	attempts = append(attempts, attempt{http.MethodPost, "/oauth/authorize"})
 
 	for _, a := range attempts {
 		t.Run("oauth "+a.method+" "+a.path, func(t *testing.T) {

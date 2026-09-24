@@ -65,8 +65,13 @@ type Config struct {
 	DeviceUserFormPath string
 	// AllowInsecure permits an http issuer. Tests set it; production must not.
 	AllowInsecure bool
-	// Clients and Registry are needed by the consent interaction (client name and
-	// scope descriptors). Optional for the protocol plane alone.
+	// Clients and Registry are required, not optional. Every pre-flight this
+	// wrapper adds — the client-scope allowance on authorize and on the device
+	// endpoint, the registration lookup, PKCE for confidential clients — reads one
+	// of them. Leaving them nil silently disabled all of it and handed the request
+	// to the library's own defaults, which is precisely the state the pre-flights
+	// exist to correct. A protocol plane without them is not a smaller plane; it is
+	// an unguarded one, so it fails here instead.
 	Clients  oauth.ClientRegistry
 	Registry *oauth.Registry
 	// Consent completes an authorization request after the user decides. It is
@@ -104,6 +109,12 @@ type Handler struct {
 func New(cfg Config) (*Handler, error) {
 	if cfg.Storage == nil {
 		return nil, errConfig("Storage is required")
+	}
+	if cfg.Clients == nil {
+		return nil, errConfig("Clients is required: without it the author and device scope, redirect and PKCE pre-flights are disabled")
+	}
+	if cfg.Registry == nil {
+		return nil, errConfig("Registry is required: without it the scope catalogue cannot be checked")
 	}
 	if cfg.DeviceUserFormPath == "" {
 		cfg.DeviceUserFormPath = "/app/device"
@@ -220,11 +231,13 @@ func stripUnsupportedDiscoveryFields(body []byte) []byte {
 // library leaves open: the authorize and device-authorization pre-flights (O-7),
 // and the token response's no-store headers (RFC 6749 §5.1).
 //
-// The method is deliberately not part of the authorize condition. The library
-// registers its authorize endpoint without a method constraint and reads
-// `r.Form`, which includes a POST body, so a check that only ran for GET let a
-// POST through with no client, redirect, PKCE or scope validation at all — which
-// is how a confidential client could obtain a code with no `code_challenge`.
+// The method is deliberately not part of any of these conditions. The library
+// registers its endpoints without a method constraint and reads `r.Form`, which
+// includes a POST body on a GET's query string, so a check that only ran for one
+// method let the other through with no client, redirect, PKCE or scope
+// validation at all — which is how a confidential client could obtain a code
+// with no `code_challenge`, and how a GET could mint a device authorization for a
+// scope the client was never registered for.
 func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	if !knownOAuthPath(r.URL.Path) {
 		writeOAuthJSONError(w, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
@@ -238,14 +251,20 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if r.Method == http.MethodPost && r.URL.Path == "/"+pathDeviceAuthz {
+	// Also method-independent: see the note on this function.
+	if r.URL.Path == "/"+pathDeviceAuthz {
 		if h.validateDeviceAuthorization(w, r) {
 			return
 		}
 	}
 
 	const tokenPath = "/" + pathToken
-	isToken := r.Method == http.MethodPost && r.URL.Path == tokenPath
+	// Path-only, not POST-only. `op.Exchange` dispatches on the `grant_type` it
+	// reads from `r.Form`, so a GET is a working code exchange; gating the
+	// response contract on POST meant a GET token response skipped both the
+	// `id_token` / `offline_access` sanitising (O-2, O-6) and the
+	// `Cache-Control: no-store` RFC 6749 §5.1 requires on every token response.
+	isToken := r.URL.Path == tokenPath
 
 	// Everything the provider writes is buffered, so a failure it wrote without an
 	// OAuth body can be normalised before it reaches the client. The protocol
@@ -268,6 +287,15 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		bw.header.Set("Pragma", "no-cache")
 	case bw.status >= 400 && !isOAuthErrorBody(bw.header.Get("Content-Type"), body):
 		body = normalizeOAuthFailure(bw, r.URL.Path)
+	}
+	// RFC 6750 §3: a protected resource's 401 must carry a Bearer challenge, so a
+	// standard RP can tell "this token is no good, refresh it" from a transport
+	// error. userinfo is that resource. The library writes no challenge, and this
+	// package's own 401 writer sets a Basic one because it is for client
+	// authentication — neither is right here.
+	if bw.status == http.StatusUnauthorized && r.URL.Path == "/"+pathUserinfo &&
+		bw.header.Get("WWW-Authenticate") == "" {
+		bw.header.Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 	}
 	bw.flush(w, body)
 }
@@ -413,9 +441,6 @@ func (h *Handler) scopeProblem(client oauth.Client, scopes []string) string {
 // OAuth errors. A missing scope, an unknown client and an unregistered redirect
 // URI are all errors the resource owner must see, so none of them may redirect.
 func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool {
-	if h.clients == nil || h.registry == nil {
-		return false
-	}
 	q := requestParams(r)
 	clientID := q.Get("client_id")
 	if clientID == "" {
@@ -474,9 +499,6 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 // endpoint instead of the authorize endpoint. The answer is a JSON OAuth error
 // rather than a redirect: this endpoint has no redirect_uri to send it to.
 func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Request) bool {
-	if h.clients == nil || h.registry == nil {
-		return false
-	}
 	form := requestParams(r)
 
 	clientID := form.Get("client_id")
@@ -647,7 +669,10 @@ func (b *bufferedWriter) flush(w http.ResponseWriter, body []byte) {
 func (h *Handler) Introspect(ctx context.Context, token string) (oauth.TokenInfo, error) {
 	plain, err := h.provider.Crypto().Decrypt(token)
 	if err != nil {
-		return oauth.TokenInfo{Active: false}, nil
+		// A token this server cannot decrypt was not issued by it, so the
+		// honest answer to "is this active" is no — not an error. Returning one
+		// would turn a routine invalid token into a 500.
+		return oauth.TokenInfo{Active: false}, nil //nolint:nilerr // unusable token means "inactive", not "error"
 	}
 	id, subject, ok := strings.Cut(plain, ":")
 	if !ok {
@@ -655,7 +680,11 @@ func (h *Handler) Introspect(ctx context.Context, token string) (oauth.TokenInfo
 	}
 	resp := new(oidc.IntrospectionResponse)
 	if err := h.provider.Storage().SetIntrospectionFromToken(ctx, resp, id, subject, ""); err != nil {
-		return oauth.TokenInfo{Active: false}, nil
+		// An unknown or expired token is reported here as an error. Fail closed
+		// and answer "inactive": the routine invalid token and a storage fault
+		// are not distinguishable from this call, and the safe answer to both is
+		// to refuse the token.
+		return oauth.TokenInfo{Active: false}, nil //nolint:nilerr // unknown token means "inactive", not "error"
 	}
 	scopes := make([]oauth.Scope, 0, len(resp.Scope))
 	for _, s := range resp.Scope {
