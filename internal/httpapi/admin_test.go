@@ -23,6 +23,9 @@ type adminEnv struct {
 	clients *oauth.MemoryClientRegistry
 	store   *memory.OIDCStore
 	handler http.Handler
+	// audit is the stub behind the audit read endpoints, exposed so a test can
+	// script its answer and inspect the query the handler built.
+	audit *stubAuditReader
 }
 
 // revokingBindings stands in for the federation service in the operator tests.
@@ -100,6 +103,7 @@ func newAdminEnv(t *testing.T, allow bool) adminEnv {
 	if allow {
 		admins = []account.UserID{user.ID}
 	}
+	auditStub := &stubAuditReader{}
 	api, err := New(Config{
 		Issuer:            "https://re0auth.test",
 		OIDC:              opHandler,
@@ -112,13 +116,17 @@ func newAdminEnv(t *testing.T, allow bool) adminEnv {
 		Auth:              authHandler,
 		Admin:             adminSvc,
 		Admins:            admins,
+		Audit:             auditStub,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(api.Handler())
 	t.Cleanup(server.Close)
-	return adminEnv{base: server.URL, adminID: user.ID, clients: clients, store: store, handler: api.Handler()}
+	return adminEnv{
+		base: server.URL, adminID: user.ID, clients: clients,
+		store: store, handler: api.Handler(), audit: auditStub,
+	}
 }
 
 // adminJSON sends a JSON body with the session's CSRF token. An empty csrf omits

@@ -46,9 +46,21 @@ func openTestDB(t *testing.T) *DB {
 		         sessions, audit_events,
 		         session_subjects,
 		         oidc_auth_requests, oidc_codes, oidc_access_tokens,
-		         oidc_refresh_tokens, oidc_devices
+		         oidc_refresh_tokens, oidc_devices,
+		         -- The audit chain's head and the subject keys are state OUTSIDE
+		         -- audit_events, so truncating that table alone leaves a stale head:
+		         -- the next appended row carries a non-empty prev_hash and Verify
+		         -- rejects it as "does not point at the genesis hash", which fails
+		         -- every audit test after the first one in the package.
+		         audit_chain, audit_subject_keys
 		CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
+	}
+	// The chain head row is seeded by migration 0013; truncating removed it, so put
+	// the genesis back.
+	if _, err := db.pool.Exec(context.Background(),
+		`INSERT INTO audit_chain (only_row, head_hash) VALUES (true, '\x'::bytea)`); err != nil {
+		t.Fatalf("reseed chain head: %v", err)
 	}
 	return db
 }
@@ -725,6 +737,49 @@ func TestBindingPutReplacesVersionAndDeleteIsIdempotent(t *testing.T) {
 	}
 }
 
+// PutIfVersion is the compare-and-swap two processes refresh a binding through:
+// only the writer that still sees the version it read may advance it.
+func TestBindingPutIfVersionIsAtomic(t *testing.T) {
+	db := openTestDB(t)
+	bindings := db.Bindings()
+	ctx := context.Background()
+
+	if err := bindings.Put(ctx, federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stale expectation loses and must not overwrite.
+	won, err := bindings.PutIfVersion(ctx,
+		federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 2, TokenType: "Bearer"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won {
+		t.Fatal("a stale expectation won the compare-and-swap")
+	}
+	if got, _ := bindings.Get(ctx, "usr_1", "phigros", "fake"); got.Version != 1 {
+		t.Fatalf("version = %d after a losing write, want 1", got.Version)
+	}
+
+	// The matching expectation wins.
+	won, err = bindings.PutIfVersion(ctx,
+		federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 2, TokenType: "Bearer"}, 1)
+	if err != nil || !won {
+		t.Fatalf("matching expectation: won=%v err=%v", won, err)
+	}
+	if got, _ := bindings.Get(ctx, "usr_1", "phigros", "fake"); got.Version != 2 || got.TokenType != "Bearer" {
+		t.Fatalf("binding = %+v, want the written row", got)
+	}
+
+	// An absent binding is not created: refreshing one that is gone is a lost
+	// race, not an insert.
+	won, err = bindings.PutIfVersion(ctx,
+		federation.Binding{User: "usr_1", Game: "phigros", Source: "gone", Version: 1}, 0)
+	if err != nil || won {
+		t.Fatalf("absent binding: won=%v err=%v, want false", won, err)
+	}
+}
+
 // A bind flow is single-use: two concurrent callbacks must not both succeed.
 func TestBindFlowsConsumeIsSingleUse(t *testing.T) {
 	db := openTestDB(t)
@@ -756,50 +811,48 @@ func TestBindFlowsConsumeIsSingleUse(t *testing.T) {
 	}
 }
 
-// The binding table must not be ABLE to hold a credential. The Go struct has no
-// token field; this asserts the database agrees, so a future migration cannot
-// quietly add one.
-func TestBindingTableCannotHoldACredential(t *testing.T) {
+// The live schema must not be ABLE to hold a credential anywhere, not only in the
+// binding table.
+//
+// TestNoColumnCanHoldACredential makes the same claim against the migration files,
+// with no database. This is the half that cannot be fooled by a schema the
+// migrations do not describe: a column added by hand, or by a migration that never
+// made it into the embedded set, still shows up in `information_schema`.
+func TestNoColumnInTheLiveSchemaCanHoldACredential(t *testing.T) {
 	db := openTestDB(t)
 	rows, err := db.pool.Query(context.Background(), `
-		SELECT column_name FROM information_schema.columns
-		 WHERE table_schema = current_schema() AND table_name = 'federation_bindings'`)
+		SELECT table_name, column_name FROM information_schema.columns
+		 WHERE table_schema = current_schema()
+		 ORDER BY table_name, column_name`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
 
-	var columns []string
+	inspected := 0
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var table, column string
+		if err := rows.Scan(&table, &column); err != nil {
 			t.Fatal(err)
 		}
-		columns = append(columns, name)
+		inspected++
+		lower := strings.ToLower(column)
+		if _, ok := credentialColumnAllowed[table+"."+lower]; ok {
+			continue
+		}
+		for _, word := range credentialColumnWords {
+			if strings.Contains(lower, word) {
+				t.Errorf("%s.%s can hold a credential (%q)", table, column, word)
+				break
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	// Guard against a vacuous pass: if the table were not found there would be
-	// no columns to inspect and the loop below would prove nothing.
-	if len(columns) == 0 {
-		t.Fatal("federation_bindings has no columns; the check would be vacuous")
-	}
-
-	for _, name := range columns {
-		lower := strings.ToLower(name)
-		// The table is allowed exactly one token-ish column: token_type, which
-		// holds the upstream token's *class* (revocable / long_lived), not the
-		// token. Matching the bare substring "token" would reject it while
-		// proving nothing; every other token-ish name is still forbidden.
-		if lower == "token_type" {
-			continue
-		}
-		for _, forbidden := range []string{"token", "secret", "credential", "password", "verifier"} {
-			if strings.Contains(lower, forbidden) {
-				t.Errorf("federation_bindings.%s could hold a credential", name)
-			}
-		}
+	// Anti-vacuous: an empty schema would make the loop above prove nothing.
+	if inspected < 50 {
+		t.Fatalf("inspected only %d columns; the schema is not what this test expects", inspected)
 	}
 }
 
@@ -963,12 +1016,27 @@ func TestClientsRoundTripKeepsSecretHashOnly(t *testing.T) {
 	}
 }
 
+// testAuditKey is the chain key the audit tests use. Any 32 bytes will do; the
+// tests that matter are about what changes when it is wrong, not what it is.
+func testAuditKey() []byte { return bytes.Repeat([]byte{0x5a}, 32) }
+
+// openAudit returns the durable audit sink, failing the test if it cannot be
+// built.
+func openAudit(t *testing.T, db *DB) *AuditLogger {
+	t.Helper()
+	logger, err := db.Audit(testAuditKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return logger
+}
+
 // The audit log is the one remaining in-memory piece when the server runs
 // without a database. With one, every Record must be a durable row and must
 // round-trip its structured detail.
 func TestAuditLoggerPersistsRecord(t *testing.T) {
 	db := openTestDB(t)
-	logger := db.Audit()
+	logger := openAudit(t, db)
 	ctx := context.Background()
 	stamp := time.Now().UTC().Truncate(time.Microsecond)
 
@@ -983,6 +1051,9 @@ func TestAuditLoggerPersistsRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The row is found by its action, not by subject: the subject column holds a
+	// pseudonym now, so a lookup by the raw account id would find nothing. That is
+	// asserted separately below.
 	var (
 		occurredAt                         time.Time
 		action, subject, provider, outcome string
@@ -991,7 +1062,7 @@ func TestAuditLoggerPersistsRecord(t *testing.T) {
 	if err := db.pool.QueryRow(ctx, `
 		SELECT occurred_at, action, subject, provider, outcome, detail
 		  FROM audit_events
-		 WHERE subject = $1`, "usr_1").
+		 WHERE action = $1`, "vault.use").
 		Scan(&occurredAt, &action, &subject, &provider, &outcome, &detail); err != nil {
 		t.Fatal(err)
 	}
@@ -999,8 +1070,12 @@ func TestAuditLoggerPersistsRecord(t *testing.T) {
 	if !occurredAt.Equal(stamp) {
 		t.Fatalf("occurred_at = %v, want %v", occurredAt, stamp)
 	}
-	if action != "vault.use" || subject != "usr_1" || provider != "phigros.taptap" || outcome != audit.OutcomeOK {
-		t.Fatalf("row = %q %q %q %q", action, subject, provider, outcome)
+	if action != "vault.use" || provider != "phigros.taptap" || outcome != audit.OutcomeOK {
+		t.Fatalf("row = %q %q %q", action, provider, outcome)
+	}
+	// The account id is not what was stored, and it is not recoverable from the row.
+	if subject == "usr_1" || subject == "" {
+		t.Fatalf("subject = %q: the raw account id should be pseudonymised", subject)
 	}
 	if detail["client_id"] != "cli" || detail["request_id"] != "req_1" {
 		t.Fatalf("detail = %v", detail)
@@ -1012,7 +1087,7 @@ func TestAuditLoggerPersistsRecord(t *testing.T) {
 	}
 	var raw string
 	if err := db.pool.QueryRow(ctx,
-		`SELECT detail::text FROM audit_events WHERE subject = $1`, "usr_2").Scan(&raw); err != nil {
+		`SELECT detail::text FROM audit_events WHERE action = $1`, "vault.enroll").Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	if raw != "{}" {
@@ -1180,24 +1255,49 @@ func TestRememberAndRevokeSubjectSessions(t *testing.T) {
 	}
 }
 
-// The index has no foreign key, so an entry written for a session that never got
-// committed must be collected by the sweep.
-func TestSweepExpiredClearsOrphanIndexRows(t *testing.T) {
+// The index row is written during SignIn, but scs commits the session row only
+// when the response is written — so for the length of one request a LIVE session
+// has no session row. The sweep must not treat that window as an orphan: doing so
+// deleted the only record of which account the session belonged to, and nothing
+// rewrote it, so a later subject Kill Switch missed a live session.
+func TestSweepSparesAFreshIndexRowAndCollectsAnAgedOne(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	store := db.Sessions()
-	if err := store.Remember(ctx, "never-committed", "usr_1"); err != nil {
+
+	// Young enough to be mid-flight: a session being signed in right now.
+	if err := store.Remember(ctx, "signing-in", "usr_1"); err != nil {
 		t.Fatal(err)
 	}
+	// Old enough to be a genuine orphan.
+	if err := store.Remember(ctx, "never-committed", "usr_2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.pool.Exec(ctx,
+		`UPDATE session_subjects SET created_at = now() - interval '2 hours' WHERE subject = $1`,
+		"usr_2"); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := store.SweepExpired(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var left int
-	if err := db.pool.QueryRow(ctx, `SELECT count(*) FROM session_subjects`).Scan(&left); err != nil {
+
+	var fresh, aged int
+	if err := db.pool.QueryRow(ctx,
+		`SELECT count(*) FROM session_subjects WHERE subject = $1`, "usr_1").Scan(&fresh); err != nil {
 		t.Fatal(err)
 	}
-	if left != 0 {
-		t.Fatalf("%d orphan index rows survived the sweep", left)
+	if err := db.pool.QueryRow(ctx,
+		`SELECT count(*) FROM session_subjects WHERE subject = $1`, "usr_2").Scan(&aged); err != nil {
+		t.Fatal(err)
+	}
+	if fresh != 1 {
+		t.Error("the sweep removed an index row that could still be mid-flight, " +
+			"dropping a live session from that account's revocable set")
+	}
+	if aged != 0 {
+		t.Error("the sweep did not collect a genuinely orphaned index row")
 	}
 }
 

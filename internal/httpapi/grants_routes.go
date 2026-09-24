@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/Re0Auth/r0semi/oauth"
 )
 
 // grantView is one client's live access to the signed-in account.
@@ -36,7 +38,13 @@ func (s *Server) handleListGrants(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read grants")
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": s.grantViews(grants)})
+}
 
+// grantViews is the one place a grant becomes its public shape, shared with the
+// account export. Like the binding view, it carries no credential and names only
+// which client holds access and to what.
+func (s *Server) grantViews(grants []oauth.Grant) []grantView {
 	views := make([]grantView, 0, len(grants))
 	for _, g := range grants {
 		views = append(views, grantView{
@@ -48,7 +56,7 @@ func (s *Server) handleListGrants(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt:  g.ExpiresAt.UTC().Format(time.RFC3339),
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": views})
+	return views
 }
 
 // handleRevokeGrant removes every token a client holds for the signed-in user.

@@ -47,6 +47,10 @@ type BindFlowStore interface {
 	Put(ctx context.Context, f BindFlow) error
 	// Consume returns and removes the flow for state.
 	Consume(ctx context.Context, state string) (BindFlow, error)
+	// PurgeUserFlows removes every pending flow one account has started and
+	// reports how many. It is the account-erasure path: a pending flow holds a
+	// PKCE verifier for a person, and an erasure must not leave it behind.
+	PurgeUserFlows(ctx context.Context, user account.UserID) (int, error)
 }
 
 // MemoryBindFlowStore is a non-durable BindFlowStore for development and tests.
@@ -78,6 +82,20 @@ func (s *MemoryBindFlowStore) Consume(_ context.Context, state string) (BindFlow
 	}
 	delete(s.m, state)
 	return f, nil
+}
+
+// PurgeUserFlows implements BindFlowStore.
+func (s *MemoryBindFlowStore) PurgeUserFlows(_ context.Context, user account.UserID) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for state, f := range s.m {
+		if f.User == user {
+			delete(s.m, state)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // BeginBind starts binding a source for a user and returns the upstream
@@ -135,12 +153,16 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 		return Binding{}, flow, fmt.Errorf("federation: bind exchange: %w", err)
 	}
 
+	generation, err := newBindingGeneration()
+	if err != nil {
+		return Binding{}, flow, err
+	}
 	binding := Binding{
 		User: user, Game: flow.Game, Source: flow.Source,
 		TokenType:  token.TokenType,
 		Expiry:     token.Expiry,
 		HasRefresh: token.RefreshToken != "",
-		Version:    1,
+		Version:    generation,
 	}
 	// The token goes into the vault; the binding store keeps only metadata.
 	if err := s.storeBindingSecret(ctx, binding, bindingSecret{
@@ -150,8 +172,14 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 		return Binding{}, flow, err
 	}
 	if err := s.bindings.Put(ctx, binding); err != nil {
-		// Do not leave an orphaned secret behind.
-		_ = s.vault.Revoke(ctx, BindingIdentity(binding))
+		// Do not leave an orphaned secret behind. A rollback that fails is reported
+		// alongside the original error rather than swallowed: the residue is a
+		// decryptable upstream token with no row pointing at it, which no endpoint
+		// can reach and only an account erasure would clear.
+		if rerr := s.vault.Revoke(ctx, BindingIdentity(binding)); rerr != nil {
+			return Binding{}, flow, errors.Join(err,
+				fmt.Errorf("federation: a secret is left in the vault with no binding: %w", rerr))
+		}
 		return Binding{}, flow, err
 	}
 	return binding, flow, nil

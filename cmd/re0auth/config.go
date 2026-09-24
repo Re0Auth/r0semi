@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"sort"
 	"strings"
@@ -57,6 +58,10 @@ type serverSection struct {
 	// and the deployment that wanted limiting off would silently get the default.
 	RateLimit      *float64 `toml:"rate_limit"`
 	RateLimitBurst *int     `toml:"rate_limit_burst"`
+	// TrustedProxies are the networks whose X-Forwarded-For header is believed
+	// when attributing a request to a client. Empty means none: the peer address
+	// is the client. Set it only to your own reverse proxies' addresses.
+	TrustedProxies []string `toml:"trusted_proxies"`
 }
 
 type storageSection struct {
@@ -143,6 +148,9 @@ type settings struct {
 	DatabaseURL string
 	KEK         []byte
 	KEKID       string
+	// AuditKey authenticates the durable audit record chain. It is required
+	// whenever the audit log is durable: an unsigned chain is not tamper-evidence.
+	AuditKey []byte
 	// RetiredKEKs can only unwrap. Empty unless a rotation is in progress or has
 	// been left unfinished.
 	RetiredKEKs  []retiredKEK
@@ -150,6 +158,9 @@ type settings struct {
 	// RateLimit is per client address, per second. Zero means no limiter.
 	RateLimit      float64
 	RateLimitBurst int
+	// TrustedProxies are the networks whose X-Forwarded-For is believed when
+	// resolving the client address. Empty means no proxy is trusted.
+	TrustedProxies []netip.Prefix
 
 	clientID        string
 	clientName      string
@@ -253,6 +264,19 @@ func loadConfig(path string) (settings, error) {
 		return settings{}, errors.New("server.rate_limit_burst must be at least 1 when rate_limit is set")
 	}
 
+	// Trusted proxies. The environment overrides the file, like every other
+	// setting. Absent means no proxy is trusted, which is the safe default: the
+	// peer address is then the client, and a fabricated X-Forwarded-For is
+	// ignored.
+	proxyValues := f.Server.TrustedProxies
+	if env := strings.TrimSpace(os.Getenv("RE0AUTH_TRUSTED_PROXIES")); env != "" {
+		proxyValues = strings.Split(env, ",")
+	}
+	cfg.TrustedProxies, err = parseTrustedProxies(proxyValues)
+	if err != nil {
+		return settings{}, err
+	}
+
 	// Storage. An explicit driver wins; otherwise a named DSN means postgres.
 	driver := f.Storage.Driver
 	if driver == "" {
@@ -293,6 +317,22 @@ func loadConfig(path string) (settings, error) {
 	cfg.KEK, err = decodeKEK32(kekValue)
 	if err != nil {
 		return settings{}, err
+	}
+
+	// The audit chain key. Required exactly when the audit log is durable: the
+	// in-memory log is a ring buffer that is not tamper-evident by construction,
+	// so there is nothing for a key to protect, while a durable chain signed with
+	// no key would be a control that only looks like one.
+	if cfg.DatabaseURL != "" {
+		value := os.Getenv("RE0AUTH_AUDIT_KEY")
+		if value == "" {
+			return settings{}, errors.New(
+				"RE0AUTH_AUDIT_KEY is required when the audit log is durable (32 bytes, base64 or hex)")
+		}
+		cfg.AuditKey, err = decodeKey32(value, "the audit chain key")
+		if err != nil {
+			return settings{}, fmt.Errorf("RE0AUTH_AUDIT_KEY: %w", err)
+		}
 	}
 
 	// Retired KEKs, resolved and length-checked here for the same reason: a
@@ -460,30 +500,60 @@ func knownNames(table map[string]idp.Provider) []string {
 	return out
 }
 
-// decodeKEK32 decodes a KEK and checks its length, so a short or long key fails
+// decodeKEK32 decodes a key and checks its length, so a short or long key fails
 // at configuration time rather than at the first unwrap.
 func decodeKEK32(value string) ([]byte, error) {
-	decoded, err := decodeKEK(value)
-	if err != nil {
-		return nil, err
-	}
-	if len(decoded) != 32 {
-		return nil, fmt.Errorf("a vault KEK must be 32 bytes, got %d", len(decoded))
-	}
-	return decoded, nil
+	return decodeKey32(value, "a vault KEK")
 }
 
-// decodeKEK accepts base64 (standard or raw) or hex, because operators paste it
-// from whichever tool generated it.
-func decodeKEK(value string) ([]byte, error) {
-	if decoded, err := base64.StdEncoding.DecodeString(value); err == nil {
-		return decoded, nil
+// decodeKey32 is decodeKEK32 with the name of the key in the error, so a bad
+// audit key does not report itself as a bad vault KEK.
+//
+// It accepts the first encoding that yields exactly 32 bytes, rather than the
+// first that merely decodes. Base64 is tried first everywhere it appears, and a
+// 32-byte key written as hex is 64 characters — all of them in the base64
+// alphabet, and a multiple of 4 — so a "try base64, then check the length" order
+// decoded it to 48 bytes and rejected it. The hex branch was dead code, and the
+// operator was told the KEY was the wrong size when the FORMAT was the problem:
+// the obvious remedy, generating a new key, silently makes every stored
+// credential unreadable.
+//
+// There is no ambiguity between the two: 32 bytes of base64 is 43 or 44
+// characters, and 32 bytes of hex is 64.
+func decodeKey32(value, what string) ([]byte, error) {
+	for _, decode := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		hex.DecodeString,
+	} {
+		if decoded, err := decode(value); err == nil && len(decoded) == 32 {
+			return decoded, nil
+		}
 	}
-	if decoded, err := base64.RawStdEncoding.DecodeString(value); err == nil {
-		return decoded, nil
+	return nil, fmt.Errorf("%s must be 32 bytes, base64 or hex", what)
+}
+
+// parseTrustedProxies parses CIDR prefixes, and bare addresses as single-host
+// prefixes. A malformed entry is an error rather than a skipped one: a typo that
+// quietly trusted nobody — or, if it were handled differently, everybody — is
+// exactly the kind of setting that looks applied and is not.
+func parseTrustedProxies(values []string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(v); err == nil {
+			out = append(out, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(v)
+		if err != nil {
+			return nil, fmt.Errorf("server.trusted_proxies entry %q is not an IP address or CIDR", v)
+		}
+		addr = addr.Unmap()
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
 	}
-	if decoded, err := hex.DecodeString(value); err == nil {
-		return decoded, nil
-	}
-	return nil, errors.New("the vault KEK must be base64 or hex")
+	return out, nil
 }

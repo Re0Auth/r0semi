@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -180,11 +181,65 @@ func (s *Tokens) DeleteBySubjectClient(ctx context.Context, subject, clientID st
 	return err
 }
 
+// TokenOwner implements oauth.Store: which client a presented value belongs to,
+// for the ownership check RFC 7009 §2.1 requires of revocation. A read, not a
+// consume — revocation must be able to ask without spending the token.
+func (s *Tokens) TokenOwner(ctx context.Context, value string) (string, error) {
+	hash := oauth.TokenHash(value)
+	var clientID string
+	err := s.pool.QueryRow(ctx,
+		`SELECT client_id FROM oauth_access_tokens WHERE token_hash = $1`, hash).Scan(&clientID)
+	if err == nil {
+		return clientID, nil
+	}
+	if !noRows(err) {
+		return "", err
+	}
+	err = s.pool.QueryRow(ctx,
+		`SELECT client_id FROM oauth_refresh_tokens WHERE token_hash = $1`, hash).Scan(&clientID)
+	if noRows(err) {
+		return "", oauth.ErrTokenNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return clientID, nil
+}
+
 // RevokeTokens implements oauth.TokenAdmin on the hand-rolled engine's tables.
 // In durable deployments the OpenID Provider owns the tokens; this covers the
 // in-memory engine's Postgres store, which shares the same seam.
 func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
 	return revokeMatching(ctx, s.pool, []string{"oauth_access_tokens", "oauth_refresh_tokens"}, f)
+}
+
+// PurgeLegacySubject removes a subject's non-token rows from the retired engine's
+// tables: its authorization codes and device authorizations.
+//
+// This exists for deployments that were migrated from the hand-rolled engine,
+// where those tables may still hold rows for a live account. The current binary
+// never writes them, so for a fresh deployment this deletes nothing — but an
+// erasure that skipped them would silently leave a migrated account's data
+// behind, which is the failure this whole path exists to prevent.
+//
+// The legacy token tables (oauth_access_tokens, oauth_refresh_tokens) are NOT
+// touched here; they are covered by RevokeTokens, which the same erasure calls.
+func (s *Tokens) PurgeLegacySubject(ctx context.Context, subject string) (int, error) {
+	if subject == "" {
+		return 0, errors.New("postgres: subject is required")
+	}
+	total := 0
+	for _, q := range []string{
+		`DELETE FROM oauth_codes WHERE subject = $1`,
+		`DELETE FROM oauth_device_authorizations WHERE subject = $1`,
+	} {
+		tag, err := s.pool.Exec(ctx, q, subject)
+		if err != nil {
+			return total, err
+		}
+		total += int(tag.RowsAffected())
+	}
+	return total, nil
 }
 
 // revokeMatching deletes rows selected by the filter from two token tables and

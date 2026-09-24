@@ -383,17 +383,23 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 }
 
 // GetRefreshTokenInfo implements op.Storage.
+//
+// The second return value is the identifier the library hands straight back to
+// RevokeToken, which HASHES whatever it is given before looking it up (that is
+// how a raw token from the wire is normally resolved). So the identifier has to
+// be the raw refresh token value, not the row's id_hash — returning a hash made
+// RevokeToken hash a hash, match neither column, and fall through to the RFC 7009
+// "already invalid" branch, so a refresh token could not be revoked at all.
+//
+// It is not a disclosure: this method is given the raw token as its argument.
 func (s *OIDCStore) GetRefreshTokenInfo(ctx context.Context, clientID, token string) (string, string, error) {
-	var (
-		subject string
-		idHash  string
-	)
+	var subject string
 	if err := s.pool.QueryRow(ctx, `
-		SELECT subject, id_hash FROM oidc_refresh_tokens WHERE token_hash = $1 AND client_id = $2`,
-		hashValue(token), clientID).Scan(&subject, &idHash); err != nil {
+		SELECT subject FROM oidc_refresh_tokens WHERE token_hash = $1 AND client_id = $2`,
+		hashValue(token), clientID).Scan(&subject); err != nil {
 		return "", "", op.ErrInvalidRefreshToken
 	}
-	return subject, idHash, nil
+	return subject, token, nil
 }
 
 // SigningKey implements op.Storage.
@@ -697,6 +703,53 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 // is what a suspended client, a compromised subject, or the Kill Switch call.
 func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
 	return revokeMatching(ctx, s.pool, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
+}
+
+// PurgeSubject removes a subject's non-token OP state: the pending consent
+// requests, any authorization codes minted from them, and the device
+// authorizations it approved or started.
+//
+// It is the token-free half of account erasure. Issued tokens are rows in the
+// token tables and are removed by RevokeTokens, not here — so a caller doing a
+// full erasure calls both. Splitting them keeps each statement's intent legible:
+// this one deletes work in flight, that one deletes access already granted.
+//
+// One transaction, because the codes are deleted by joining through the requests
+// that are about to disappear.
+func (s *OIDCStore) PurgeSubject(ctx context.Context, subject string) (int, error) {
+	if subject == "" {
+		return 0, errors.New("postgres: subject is required")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	total := 0
+	// Codes first: their only link to the subject is request_id.
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM oidc_codes
+		 WHERE request_id IN (SELECT id FROM oidc_auth_requests WHERE subject = $1)`, subject)
+	if err != nil {
+		return total, err
+	}
+	total += int(tag.RowsAffected())
+
+	for _, q := range []string{
+		`DELETE FROM oidc_auth_requests WHERE subject = $1`,
+		`DELETE FROM oidc_devices WHERE subject = $1`,
+	} {
+		tag, err := tx.Exec(ctx, q, subject)
+		if err != nil {
+			return total, err
+		}
+		total += int(tag.RowsAffected())
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return total, err
+	}
+	return total, nil
 }
 
 // DescribeDeviceAuthorization is the device verification page's view of a

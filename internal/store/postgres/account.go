@@ -255,6 +255,21 @@ func (s *Accounts) TouchLogin(ctx context.Context, provider idp.Provider, subjec
 	return nil
 }
 
+// DeleteUser implements account.Store.
+//
+// accounts_identities has ON DELETE CASCADE on user_id, so removing the user row
+// takes its identities with it. Deleting an absent user is not an error: erasure
+// is idempotent, and a retry after a partial failure must not be told it failed
+// at the last step.
+//
+// This does NOT reach tokens, sessions, bindings or vault credentials — those
+// tables carry the subject as a plain column with no foreign key. The caller
+// clears them first; see internal/lifecycle.
+func (s *Accounts) DeleteUser(ctx context.Context, user account.UserID) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM accounts_users WHERE id = $1`, string(user))
+	return err
+}
+
 func identityByKey(ctx context.Context, q querier, provider idp.Provider, subject string) (account.Identity, error) {
 	row := q.QueryRow(ctx,
 		`SELECT `+accountIdentityCols+` FROM accounts_identities WHERE provider = $1 AND subject = $2`,

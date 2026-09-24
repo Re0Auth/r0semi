@@ -53,7 +53,15 @@ func (s *Server) handleListBindings(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read bindings")
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": s.bindingViews(bindings)})
+}
 
+// bindingViews is the one place a binding becomes its public shape. It is shared
+// with the account export deliberately: a binding carries metadata only (the
+// upstream token lives in the vault), and building both responses from this one
+// function is what keeps the export from ever growing a credential the list view
+// does not have.
+func (s *Server) bindingViews(bindings []federation.Binding) []bindingView {
 	// Display metadata is looked up per game, once per game, rather than per
 	// binding.
 	sources := make(map[string]federation.Source)
@@ -84,7 +92,7 @@ func (s *Server) handleListBindings(w http.ResponseWriter, r *http.Request) {
 		}
 		views = append(views, view)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": views})
+	return views
 }
 
 func distinctGames(bindings []federation.Binding) []string {

@@ -497,6 +497,99 @@ paths:
         '429': { $ref: '#/components/responses/RateLimited' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /v1/account:
+    delete:
+      operationId: deleteAccount
+      tags: [account]
+      summary: Erase this account and everything it holds.
+      description: |
+        Irreversible. This erases the signed-in account across every store:
+        data-source bindings (revoking upstream where the source can be told),
+        the credentials in the vault, every issued access and refresh token, the
+        browser sessions, pending requests, and finally the account row itself.
+
+        It is **session-scoped**, so it can only erase the caller's own account,
+        and it requires `acknowledge` naming the consequence, like
+        `cascade_revocation`. Deletion cannot be undone, so it must not be
+        something a caller can do without writing down that it means that.
+
+        The response body reports what was removed, per store. This is not
+        decoration: the account and its sessions are gone by the time the caller
+        reads it, so the body is the only account of the erasure it will ever get.
+
+        `session_scoped` in the result is false on a deployment whose session store
+        cannot enumerate one account's sessions (the in-memory one). It is a
+        boolean rather than a zero because "cleared no sessions" and "cannot clear
+        sessions" must not look the same.
+      parameters:
+        - $ref: '#/components/parameters/CSRFToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountDeletion' }
+      responses:
+        '200':
+          description: The account was erased. The body reports what was removed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountErasure' }
+        '400':
+          description: |
+            A missing or wrong `acknowledge`, or a malformed body.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500':
+          description: |
+            A store failed part-way. Every step is idempotent, so the request is
+            safe to retry.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/account/export:
+    get:
+      operationId: exportAccount
+      tags: [account]
+      summary: Export this account's data as a downloadable document.
+      description: |
+        Everything Re0Auth holds about the signed-in account, in one JSON file:
+        the profile, the linked identities, the connected data sources, and the
+        clients that still hold access.
+
+        **Credentials are deliberately excluded.** A binding's upstream access and
+        refresh tokens are live secrets; putting them in a download would make the
+        export file as sensitive as the vault. Re0Auth also holds no password or
+        platform credential to hand over, so there is nothing of that kind to
+        include. The `notice` field in the response says so, so the omission reads
+        as a decision rather than a bug. To cut a source off, disconnect the
+        binding — the tokens then stop working.
+
+        Session-scoped and read-only, so no CSRF token is needed. The response
+        carries `Content-Disposition: attachment`, so a browser saves it rather
+        than rendering it.
+      responses:
+        '200':
+          description: The account's data, and a notice of what is omitted.
+          headers:
+            Content-Disposition:
+              description: Set to an attachment filename, so a browser downloads it.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountExport' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /v1/identities/{id}:
     delete:
       operationId: unlinkIdentity
@@ -1237,6 +1330,132 @@ paths:
         '429': { $ref: '#/components/responses/RateLimited' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /v1/admin/audit:
+    get:
+      operationId: adminListAudit
+      tags: [admin]
+      summary: Read the audit log.
+      description: |
+        Newest first, paginated. This is the operator's window into who did what:
+        every token issued, every credential used, every operator action.
+
+        **Ordered by insertion, not by the event's own timestamp.** The timestamp
+        is supplied by the emitting component, so a skewed clock — or an attacker
+        who can backdate one — could otherwise reorder history. `time` is still
+        reported; it is just not what the ordering means.
+
+        **`subject` takes an account id, not the pseudonym the log stores.** The
+        log never holds account ids (see `docs/architecture.md` §4.15); the filter
+        is translated for you. After that account has been erased its
+        pseudonymising key is gone, so the filter resolves to nothing and the page
+        is empty — which is the truthful answer, not a bug.
+
+        ## What the log does not contain
+
+        It holds pseudonymised subjects and no credentials. `detail` carries
+        non-secret context (client ids, request ids, counts) by convention, and
+        nothing in the codebase puts a token or a secret in it.
+
+        ## Reading it is an operator act
+
+        The log describes every account, so these endpoints require an
+        administrator. A signed-in account that is not on the allowlist gets the
+        same `404` as an unknown path: the log is not advertised to those who
+        cannot read it.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: subject
+          in: query
+          required: false
+          description: An account id (`usr_…`). Translated to that account's pseudonym.
+          schema: { type: string }
+        - name: action
+          in: query
+          required: false
+          description: An exact action, e.g. `oauth.token` or `vault.use`.
+          schema: { type: string }
+        - name: since
+          in: query
+          required: false
+          description: Inclusive lower bound on the event timestamp (RFC 3339).
+          schema: { type: string, format: date-time }
+        - name: until
+          in: query
+          required: false
+          description: Exclusive upper bound on the event timestamp (RFC 3339).
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          required: false
+          description: Page size. The server clamps it.
+          schema: { type: integer, minimum: 1 }
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            `pagination.next_cursor` from the previous page. Opaque; the server
+            rejects anything it did not issue.
+          schema: { type: string }
+      responses:
+        '200':
+          description: A page of entries, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditPage' }
+        '400':
+          description: A malformed `limit`, `cursor`, `since` or `until`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: The caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/admin/audit/verify:
+    get:
+      operationId: adminVerifyAudit
+      tags: [admin]
+      summary: Check the audit log's record chain.
+      description: |
+        Walks the log from the beginning, recomputing each row's hash, checking the
+        linkage to the row before it, and checking the signature. It reports the
+        first row that does not hold up.
+
+        A broken chain is reported as a `200` with `ok: false`, not as an error:
+        "the log has been tampered with" is a successful answer to the question
+        that was asked, and answering it with a `5xx` would bury the finding in a
+        transport failure.
+
+        `legacy` counts rows written before the chain existed. They are reported
+        rather than hidden — a verification that silently skipped them would
+        overstate its reach.
+
+        **What it does not cover:** deleting rows from the **end** of the log. That
+        is invisible without an external anchor, and this endpoint does not pretend
+        otherwise. See `docs/architecture.md` §4.14.
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: The verification result, whether or not the chain holds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditVerification' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: The caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1540,6 +1759,168 @@ components:
             Must be exactly `signs_out_all_devices`. It names the consequence, so
             the request cannot be made without stating it.
           enum: [signs_out_all_devices]
+
+    AccountDeletion:
+      type: object
+      required: [acknowledge]
+      properties:
+        acknowledge:
+          type: string
+          description: |
+            Must be exactly `deletes_my_account`. It names the consequence, so an
+            irreversible erasure cannot be requested without stating it.
+          enum: [deletes_my_account]
+
+    AccountErasure:
+      type: object
+      required: [result]
+      properties:
+        result:
+          $ref: '#/components/schemas/AccountErasureResult'
+
+    AccountErasureResult:
+      type: object
+      description: |
+        What the erasure removed, per store. Counts are reported rather than
+        asserted, because the caller cannot enumerate any of this afterwards.
+      properties:
+        bindings:
+          type: object
+          properties:
+            total: { type: integer }
+            revoked: { type: integer }
+            failed: { type: integer }
+        vault: { type: integer, description: Credentials shredded in the vault. }
+        tokens: { type: integer, description: Issued access and refresh tokens deleted. }
+        sessions: { type: integer }
+        flows: { type: integer, description: Pending data-source bind flows deleted. }
+        oidc: { type: integer, description: Pending consent requests and device authorizations deleted. }
+        session_scoped:
+          type: boolean
+          description: |
+            False when this deployment's session store cannot enumerate one
+            account's sessions, so the sessions were not cleared. Distinct from
+            `sessions: 0`, which means they were cleared and there were none.
+
+    AccountExport:
+      type: object
+      required: [exported_at, profile, identities, bindings, grants, notice]
+      properties:
+        exported_at: { type: string, format: date-time }
+        profile:
+          type: object
+          required: [user_id, primary_identity_id, created_at]
+          properties:
+            user_id: { type: string }
+            primary_identity_id:
+              type: string
+              description: Display-only; every identity is login-equivalent.
+            created_at: { type: string, format: date-time }
+        identities:
+          type: array
+          items: { $ref: '#/components/schemas/Identity' }
+        bindings:
+          type: array
+          description: |
+            The same shape as `GET /v1/bindings`, and credential-free for the
+            same reason: a binding's upstream token lives in the vault, not here.
+          items: { $ref: '#/components/schemas/Binding' }
+        grants:
+          type: array
+          items: { $ref: '#/components/schemas/Grant' }
+        notice:
+          $ref: '#/components/schemas/ExportNotice'
+
+    ExportNotice:
+      type: object
+      description: |
+        States what the export deliberately leaves out, so a reader can tell an
+        omission from a bug.
+      required: [credentials_excluded, reason]
+      properties:
+        credentials_excluded:
+          type: boolean
+          description: Always true. Upstream credentials are never exported.
+        reason:
+          type: string
+
+    AuditPage:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEntry' }
+        pagination:
+          type: object
+          required: [limit]
+          properties:
+            limit:
+              type: integer
+              description: The page size the server applied.
+            next_cursor:
+              type: string
+              description: |
+                Pass as `cursor` to fetch the next page. Absent on the last page,
+                which is how a caller knows to stop.
+
+    AuditEntry:
+      type: object
+      required: [id, time, action, provider, outcome, detail]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Insertion order, and what pagination is keyed on.
+        time:
+          type: string
+          format: date-time
+          description: |
+            When the emitting component said the event happened. Caller-supplied,
+            so it may be skewed; entries are ordered by `id`, not by this.
+        action:
+          type: string
+          description: |
+            e.g. `oauth.token`, `vault.use`, `admin.kill_switch`.
+        provider:
+          type: string
+          description: The emitting subsystem.
+        outcome:
+          type: string
+          enum: [ok, denied, error]
+        subject:
+          type: string
+          description: |
+            The pseudonym the log stores for the account this is about. Never the
+            account id, and after that account is erased, not resolvable to it. Absent
+            for events that concern no account.
+        detail:
+          type: object
+          additionalProperties: { type: string }
+          description: Non-secret context. By convention it never holds a credential.
+
+    AuditVerification:
+      type: object
+      required: [ok, chained, legacy]
+      properties:
+        ok:
+          type: boolean
+          description: True when every chained row verified.
+        chained:
+          type: integer
+          description: How many rows the chain covers.
+        legacy:
+          type: integer
+          description: |
+            Rows written before the chain existed. Reported rather than hidden, so the
+            reach of the check is not overstated.
+        first_bad_id:
+          type: integer
+          format: int64
+          description: The first row that failed. Present only when `ok` is false.
+        reason:
+          type: string
+          description: What was wrong with it. Present only when `ok` is false.
 
     UnbindResult:
       type: object

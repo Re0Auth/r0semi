@@ -18,14 +18,17 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"net/netip"
 	"strings"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/admin"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/internal/compress"
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/lifecycle"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/internal/webui"
 	"github.com/Re0Auth/r0semi/oauth"
@@ -63,10 +66,22 @@ type Config struct {
 	// Limiter, when set, caps requests per client address. It is applied to
 	// both planes.
 	Limiter *ratelimit.Limiter
+	// TrustedProxies are the networks whose X-Forwarded-For header is believed
+	// when attributing a request to a client. Empty — the default — trusts no
+	// proxy and uses the peer address, which is the correct answer for a
+	// deployment with nothing in front of it. Set it only to the addresses of
+	// your own reverse proxies; a prefix that is too broad lets clients choose
+	// their own rate-limit bucket.
+	TrustedProxies []netip.Prefix
 	// Secure declares that this issuer is reached over https. It gates the HSTS
 	// header only; it is the same deployment fact that makes the session cookie
 	// Secure, so a deployment sets both from one switch (`server.cookie_secure`).
 	Secure bool
+	// Ready, when set, is the readiness probe behind GET /readyz: it must return
+	// nil when the service's dependencies are usable. Nil means always ready,
+	// which is the honest answer for the in-memory deployment that has nothing to
+	// reach. Liveness (GET /healthz) needs no probe.
+	Ready ReadinessProbe
 	// Frontend, when set, is the built single-page app mounted under
 	// webui.BasePath. Pass webui.FS() for an embedded build.
 	Frontend fs.FS
@@ -91,6 +106,31 @@ type Config struct {
 	// with no service would be a promise that does nothing.
 	Admin  admin.Service
 	Admins []account.UserID
+
+	// Deleter, when set together with Sessions, enables DELETE /v1/account: the
+	// signed-in account erasing itself. It is optional because a deployment can
+	// legitimately not offer self-service erasure, and then the endpoint is absent
+	// from both the router and the spec rather than answering 501.
+	Deleter AccountDeleter
+
+	// Audit, when set, enables the operator-plane audit read and verify endpoints.
+	// It requires Sessions and a non-empty Admins allowlist, because reading the
+	// audit log means reading about every account.
+	Audit AuditReader
+}
+
+// AuditReader is the audit log's read side, declared here so the HTTP layer does
+// not import a storage adapter.
+type AuditReader interface {
+	Query(ctx context.Context, q audit.Query) (audit.Page, error)
+	Verify(ctx context.Context) (audit.Verification, error)
+}
+
+// AccountDeleter erases an account across every store. It is the
+// lifecycle.Deleter's capability, declared here so the HTTP layer does not import
+// the package that sequences the erasure.
+type AccountDeleter interface {
+	DeleteAccount(ctx context.Context, actor, subject account.UserID) (lifecycle.Result, error)
 }
 
 // TokenIntrospector resolves a bearer token to its grant. It is the business
@@ -126,7 +166,11 @@ type Server struct {
 	federate     federation.Service
 	limiter      *ratelimit.Limiter
 	secure       bool
+	ready        ReadinessProbe
 	frontend     fs.FS
+	// trustedProxies is the parsed form of Config.TrustedProxies, consulted by
+	// clientAddr when deriving the limiter key.
+	trustedProxies []netip.Prefix
 	// oidc is the protocol plane; introspector, grants and devices are the
 	// OP-backed business-plane seams.
 	oidc         http.Handler
@@ -137,6 +181,11 @@ type Server struct {
 	adminSvc admin.Service
 	// adminAllowed is the allowlist of account subjects that may call it.
 	adminAllowed map[account.UserID]bool
+	// deleter erases the signed-in account; nil when self-service erasure is off.
+	deleter AccountDeleter
+	// auditReader reads the audit log for the operator plane; nil when that plane
+	// is not configured.
+	auditReader AuditReader
 	// compressor negotiates and applies the response content coding.
 	compressor *compress.Compressor
 }
@@ -182,24 +231,38 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Admin != nil && cfg.Sessions == nil {
 		return nil, errors.New("httpapi: Config.Admin requires Config.Sessions")
 	}
+	if cfg.Deleter != nil && cfg.Sessions == nil {
+		// Erasure is session-scoped: it needs a signed-in account to erase.
+		return nil, errors.New("httpapi: Config.Deleter requires Config.Sessions")
+	}
+	if cfg.Audit != nil && cfg.Sessions == nil {
+		return nil, errors.New("httpapi: Config.Audit requires Config.Sessions")
+	}
+	if cfg.Audit != nil && len(cfg.Admins) == 0 {
+		// The audit log describes every account. Reading it is an operator act, so
+		// there must be an operator allowlist to read it through.
+		return nil, errors.New("httpapi: Config.Audit requires a non-empty Config.Admins")
+	}
 	adminAllowed := make(map[account.UserID]bool, len(cfg.Admins))
 	for _, a := range cfg.Admins {
 		adminAllowed[a] = true
 	}
 	srv := &Server{
-		issuer:       strings.TrimRight(cfg.Issuer, "/"),
-		resource:     strings.TrimRight(cfg.Resource, "/"),
-		errorBase:    strings.TrimRight(cfg.ErrorBase, "/"),
-		scopes:       cfg.Scopes,
-		sessions:     cfg.Sessions,
-		accounts:     cfg.Accounts,
-		auth:         cfg.Auth,
-		authInteract: cfg.Authorization,
-		consent:      cfg.ConsentPath,
-		federate:     cfg.Federation,
-		limiter:      cfg.Limiter,
-		secure:       cfg.Secure,
-		frontend:     cfg.Frontend,
+		issuer:         strings.TrimRight(cfg.Issuer, "/"),
+		resource:       strings.TrimRight(cfg.Resource, "/"),
+		errorBase:      strings.TrimRight(cfg.ErrorBase, "/"),
+		scopes:         cfg.Scopes,
+		sessions:       cfg.Sessions,
+		accounts:       cfg.Accounts,
+		auth:           cfg.Auth,
+		authInteract:   cfg.Authorization,
+		consent:        cfg.ConsentPath,
+		federate:       cfg.Federation,
+		limiter:        cfg.Limiter,
+		secure:         cfg.Secure,
+		ready:          cfg.Ready,
+		frontend:       cfg.Frontend,
+		trustedProxies: cfg.TrustedProxies,
 		// Wrapped once, here, so every protocol-plane mount is covered by the same
 		// recoverer: a panic in the provider must answer as an OAuth error, not as a
 		// closed connection.
@@ -209,6 +272,8 @@ func New(cfg Config) (*Server, error) {
 		devices:      cfg.DeviceStore,
 		adminSvc:     cfg.Admin,
 		adminAllowed: adminAllowed,
+		deleter:      cfg.Deleter,
+		auditReader:  cfg.Audit,
 	}
 	compressor, err := compress.New(compress.Config{
 		Encodings: compress.Default(),
@@ -293,6 +358,23 @@ func (s *Server) specRoutes() []route {
 			route{http.MethodDelete, "/v1/identities/{id}", s.handleUnlinkIdentity},
 		)
 	}
+	if s.sessions != nil && s.deleter != nil {
+		// Account erasure. Session-scoped: only the signed-in account can erase
+		// itself, and it is a write, so it carries the CSRF token and an
+		// acknowledgement. The operator-plane Kill Switch is a different,
+		// reversible-in-intent action and does not erase.
+		routes = append(routes,
+			route{http.MethodDelete, "/v1/account", s.handleDeleteAccount},
+		)
+	}
+	if s.sessions != nil {
+		// Account export. Read-only and session-scoped: it aggregates the same
+		// views the grants, identities and bindings lists already return, with no
+		// credentials in it.
+		routes = append(routes,
+			route{http.MethodGet, "/v1/account/export", s.handleExportAccount},
+		)
+	}
 	if s.federate != nil && s.sessions != nil {
 		// The bindings view, the same shape of thing as grants: what is connected
 		// to this account, and the way to disconnect it.
@@ -329,10 +411,26 @@ func (s *Server) specRoutes() []route {
 			route{http.MethodPost, "/v1/admin/kill_switch", s.handleAdminKillSwitch},
 		)
 	}
+	if s.auditReader != nil {
+		// The audit log's read side. Separate from the client-management routes
+		// above because it is a different capability — a deployment can run the
+		// operator plane without exposing the log, and vice versa is not true: this
+		// needs the same allowlist, which `New` enforces.
+		routes = append(routes,
+			route{http.MethodGet, "/v1/admin/audit", s.handleAdminAudit},
+			route{http.MethodGet, "/v1/admin/audit/verify", s.handleAdminAuditVerify},
+		)
+	}
 	return routes
 }
 func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
+	// Operational probes. They belong to no plane — an orchestrator reads the
+	// status code, not the body — and are registered before the mounts below so
+	// no later pattern can shadow them. They are exempt from the limiter; see
+	// isProbe.
+	root.HandleFunc("GET /healthz", s.handleHealth)
+	root.HandleFunc("GET /readyz", s.handleReady)
 	// The OP owns the protocol plane and both discovery documents. It is always
 	// present (ADR-0001 P4b).
 	root.Handle("GET /.well-known/oauth-authorization-server", s.oidc)

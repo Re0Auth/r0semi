@@ -411,6 +411,15 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 }
 
 // GetRefreshTokenInfo implements op.Storage.
+//
+// The second return value is the identifier the library hands straight back to
+// RevokeToken, which HASHES whatever it is given before looking it up (that is
+// how a raw token from the wire is normally resolved). So the identifier has to
+// be the raw refresh token value, not the row's hash — returning a hash made
+// RevokeToken hash a hash, match nothing, and report success without deleting
+// anything, so a refresh token could not be revoked at all.
+//
+// It is not a disclosure: this method is given the raw token as its argument.
 func (s *OIDCStore) GetRefreshTokenInfo(_ context.Context, clientID, token string) (string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -418,7 +427,7 @@ func (s *OIDCStore) GetRefreshTokenInfo(_ context.Context, clientID, token strin
 	if !ok || t.clientID != clientID {
 		return "", "", op.ErrInvalidRefreshToken
 	}
-	return t.subject, t.idHash, nil
+	return t.subject, token, nil
 }
 
 // SigningKey implements op.Storage.
@@ -818,6 +827,45 @@ func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, e
 	for k, t := range s.refreshTokens {
 		if f.Matches(t.clientID, t.subject) {
 			delete(s.refreshTokens, k)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// PurgeSubject removes a subject's non-token state: pending consent requests,
+// the codes minted from them, and device authorizations. It is the in-memory twin
+// of the Postgres store's method, and the same split applies — issued tokens are
+// RevokeTokens' job, not this one.
+func (s *OIDCStore) PurgeSubject(_ context.Context, subject string) (int, error) {
+	if subject == "" {
+		return 0, errors.New("memory: subject is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	purged := make(map[string]bool)
+	for id, req := range s.authRequests {
+		if req.Subject == subject {
+			delete(s.authRequests, id)
+			delete(s.authRequestExpiry, id)
+			purged[id] = true
+			removed++
+		}
+	}
+	// Codes hang off their request, so they go with it rather than waiting for the
+	// sweep to expire them. Leaving them behind would keep a usable authorization
+	// code alive after the account it belongs to was erased.
+	for k, c := range s.codes {
+		if purged[c.requestID] {
+			delete(s.codes, k)
+			removed++
+		}
+	}
+	for k, d := range s.devices {
+		if d.subject == subject {
+			delete(s.userCodes, normalizeUserCode(d.userCode))
+			delete(s.devices, k)
 			removed++
 		}
 	}

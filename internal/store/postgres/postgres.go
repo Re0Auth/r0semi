@@ -58,6 +58,11 @@ func Open(ctx context.Context, dsn string) (*DB, error) {
 // Close releases the pool.
 func (db *DB) Close() { db.pool.Close() }
 
+// Ping reports whether the database is reachable. It is the readiness probe: a
+// pool that cannot acquire a connection means this instance cannot serve, and an
+// orchestrator should stop routing to it until it can.
+func (db *DB) Ping(ctx context.Context) error { return db.pool.Ping(ctx) }
+
 // Accounts returns the account store.
 func (db *DB) Accounts() *Accounts { return &Accounts{pool: db.pool} }
 
@@ -83,8 +88,12 @@ func (db *DB) Sessions() *Sessions { return &Sessions{pool: db.pool} }
 // Clients returns the downstream-client registry.
 func (db *DB) Clients() *Clients { return &Clients{pool: db.pool} }
 
-// Audit returns the durable audit-log sink.
-func (db *DB) Audit() *AuditLogger { return &AuditLogger{pool: db.pool} }
+// Audit returns the durable audit-log sink. The key authenticates the record
+// chain; it is required, and must be 32 bytes, because a chain signed with no key
+// would look like tamper-evidence and not be.
+func (db *DB) Audit(key []byte) (*AuditLogger, error) {
+	return newAuditLogger(db.pool, key)
+}
 
 // Migrate applies every pending goose migration under an advisory lock, so two
 // instances starting at once cannot race. The lock is held on a dedicated pool

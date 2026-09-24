@@ -82,6 +82,14 @@ type Repo interface {
 	// the privacy story than it looks — the set of records is itself the "who holds
 	// credentials for what" question that Identity is already documented as leaking.
 	List(ctx context.Context) ([]Record, error)
+	// DeleteSubject removes every credential belonging to one subject and reports
+	// how many there were. It is the account-erasure path.
+	//
+	// It deletes whole rows rather than nulling WrappedDEK, and that distinction
+	// matters: Identity and Meta are stored in the clear, so blanking only the
+	// wrapped key would leave the account's PII behind while making the credential
+	// undecryptable — an erasure that reports success and is not one.
+	DeleteSubject(ctx context.Context, subject string) (int, error)
 }
 
 // MemoryRepo is a non-durable Repo for development and tests.
@@ -141,6 +149,23 @@ func (r *MemoryRepo) List(_ context.Context) ([]Record, error) {
 		out = append(out, cloneRecord(r.records[id]))
 	}
 	return out, nil
+}
+
+// DeleteSubject implements Repo.
+func (r *MemoryRepo) DeleteSubject(_ context.Context, subject string) (int, error) {
+	if subject == "" {
+		return 0, ErrInvalidIdentity
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for id := range r.records {
+		if id.Subject == subject {
+			delete(r.records, id)
+			n++
+		}
+	}
+	return n, nil
 }
 
 func cloneRecord(rec Record) Record {

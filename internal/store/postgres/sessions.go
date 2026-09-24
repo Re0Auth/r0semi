@@ -74,20 +74,35 @@ func (s *Sessions) Commit(token string, data []byte, expiry time.Time) error {
 
 // SweepExpired deletes expired rows. Find already removes the sessions it is
 // asked about, so this is for the ones nobody comes back to.
+//
+// The index rows it collects are aged by sessionIndexGrace. They have to be: an
+// index row is written during SignIn, but scs commits the session row only when
+// the response is written, so for the length of one request a live session has no
+// row. Sweeping that window deleted the only record of which account the session
+// belonged to, and nothing rewrote it — a later subject Kill Switch then missed a
+// live session while the sweep looked complete.
 func (s *Sessions) SweepExpired(ctx context.Context) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE expiry < now()`)
 	if err != nil {
 		return 0, err
 	}
-	// session_subjects has no foreign key (it is written before the session row
-	// exists), so its orphans are collected here rather than by a cascade.
 	if _, err := s.pool.Exec(ctx, `
 		DELETE FROM session_subjects si
-		 WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash = si.token_hash)`); err != nil {
+		 WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash = si.token_hash)
+		   AND si.created_at < now() - $1::interval`, sessionIndexGrace); err != nil {
 		return tag.RowsAffected(), err
 	}
 	return tag.RowsAffected(), nil
 }
+
+// sessionIndexGrace is how long an index row may be missing its session row before
+// the sweep treats it as an orphan.
+//
+// It has to exceed the longest possible gap between SignIn writing the index and
+// scs committing the session row — one request — by a wide margin, because being
+// wrong in the other direction silently drops a live session from the account's
+// revocable set.
+const sessionIndexGrace = "1 hour"
 
 // RevokeAllSessions deletes every session, signing everyone out. It is the session
 // half of the Kill Switch. Returns how many sessions were removed.

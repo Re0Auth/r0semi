@@ -102,3 +102,28 @@ func (s *Vault) Delete(ctx context.Context, id vault.Identity) error {
 		id.Subject, id.Provider)
 	return err
 }
+
+// DeleteSubject implements vault.Repo: every credential one subject holds, gone.
+//
+// One statement, because subject is the leading column of the primary key, so
+// this is an index range rather than a scan. RETURNING 1 makes the count exact
+// without a second round trip, and the count is worth having: it is the number
+// reported back to the person who asked to be erased.
+//
+// It removes whole rows, which is what actually erases the account's data. The
+// wrapped DEK goes with the row (so the ciphertext is unrecoverable), and so do
+// the plaintext Identity and Meta columns — which a "null the DEK" approach would
+// leave behind.
+func (s *Vault) DeleteSubject(ctx context.Context, subject string) (int, error) {
+	rows, err := s.pool.Query(ctx,
+		`DELETE FROM vault_credentials WHERE subject = $1 RETURNING 1`, subject)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	return n, rows.Err()
+}

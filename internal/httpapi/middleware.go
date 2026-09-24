@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -138,7 +137,14 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := clientKey(r)
+		// Probes are exempt: a saturated bucket must not be able to fail a
+		// liveness probe and get a healthy process restarted, nor a readiness
+		// probe and pull a serving instance out of rotation.
+		if isProbe(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		key := s.clientKey(r)
 		if !s.limiter.Allow(key) {
 			if after := s.limiter.RetryAfter(key); after > 0 {
 				seconds := int(after.Seconds() + 0.999)
@@ -161,15 +167,16 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// clientKey derives the limiter key. It uses the peer address only: trusting
-// X-Forwarded-For without a known proxy list would let a caller pick its own
-// bucket; a trusted-proxy mode is a deliberate later change.
-func clientKey(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+// clientKey derives the limiter key from the request's client address.
+//
+// It delegates to clientAddr, which is the peer address unless the peer is a
+// configured trusted proxy — in which case the proxy's X-Forwarded-For is
+// believed as far as the first hop we do not trust. Without a trust list a
+// caller would pick its own bucket by choosing the header value; with one that
+// is too broad, the same. The list is the deployment's statement of which
+// addresses in front of it are its own.
+func (s *Server) clientKey(r *http.Request) string {
+	return clientAddr(r, s.trustedProxies)
 }
 
 // plane is which of the service's three surfaces a path belongs to.

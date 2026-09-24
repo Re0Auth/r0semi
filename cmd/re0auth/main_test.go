@@ -6,6 +6,12 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -162,4 +168,187 @@ func TestOPJanitorLoopSweepsAndStopsOnCancel(t *testing.T) {
 	if fake.count() != stopped {
 		t.Fatal("the janitor swept after it was cancelled")
 	}
+}
+
+// A shutdown signal must drain the request that is already in flight rather than
+// cut it off. On a rolling deploy the process is replaced while it is answering,
+// and an abrupt exit is a failed request the user sees.
+func TestServeUntilSignalDrainsInFlightRequest(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte("done"))
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- serveUntilSignal(ctx, srv, ln, 5*time.Second) }()
+
+	respCh := make(chan *http.Response, 1)
+	reqErrCh := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err != nil {
+			reqErrCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	<-started      // the handler is running and the request is in flight
+	cancel()       // begin shutdown while it is still in flight
+	close(release) // let it finish
+
+	select {
+	case err := <-reqErrCh:
+		t.Fatalf("the in-flight request was dropped: %v", err)
+	case resp := <-respCh:
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK || string(body) != "done" {
+			t.Fatalf("in-flight response = %d %q, want 200 %q", resp.StatusCode, body, "done")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight request never completed")
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("serveUntilSignal = %v, want nil for a clean drain", err)
+	}
+}
+
+// A handler that will not finish must not hold a deploy open forever: once the
+// drain timeout passes, the connections are closed and the error is reported so
+// the caller can decide what to do about it.
+func TestServeUntilSignalClosesHungConnectionsAfterTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	// Release the handler when the test ends so its goroutine does not leak.
+	defer close(release)
+	srv := &http.Server{Handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- serveUntilSignal(ctx, srv, ln, 50*time.Millisecond) }()
+
+	go func() { _, _ = http.Get("http://" + ln.Addr().String() + "/") }()
+	<-started
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("a drain that timed out returned nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveUntilSignal did not return after the drain timeout")
+	}
+}
+
+// Trusted proxies accept CIDRs and bare addresses, and a malformed entry is an
+// error rather than a silent skip: a typo that quietly trusted nobody — or, if
+// it were handled differently, everybody — is exactly the kind of setting that
+// looks applied and is not.
+func TestParseTrustedProxies(t *testing.T) {
+	got, err := parseTrustedProxies([]string{"10.0.0.0/8", " 192.168.1.5 ", "", "2001:db8::/32"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("parsed %d prefixes, want 3: %v", len(got), got)
+	}
+	// A bare address becomes a single-host prefix.
+	if !got[1].Contains(netip.MustParseAddr("192.168.1.5")) || got[1].Bits() != 32 {
+		t.Fatalf("bare address = %v, want a /32", got[1])
+	}
+
+	if _, err := parseTrustedProxies([]string{"not-a-network"}); err == nil {
+		t.Fatal("a malformed entry was accepted")
+	}
+}
+
+// The audit chain key is required exactly when the audit log is durable. An
+// unsigned durable chain would be a control that only looks like one, and the
+// in-memory log has nothing for a key to protect.
+//
+// Durability is chosen by the config file's storage driver, not by DATABASE_URL
+// alone: with no driver named, the store defaults to memory and the DSN is
+// deliberately ignored. So the test writes a real config rather than setting an
+// environment variable that would be silently overridden.
+func TestAuditKeyIsRequiredOnlyWhenDurable(t *testing.T) {
+	valid := base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	writeConfig := func(t *testing.T, driver string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "re0auth.toml")
+		body := "[server]\nissuer = \"https://re0auth.test\"\n\n[storage]\ndriver = \"" + driver + "\"\n"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	base := func() {
+		t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+		t.Setenv("RE0AUTH_KEK", valid)
+		t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", valid)
+	}
+
+	t.Run("durable without a key is refused", func(t *testing.T) {
+		base()
+		t.Setenv("DATABASE_URL", "postgres://localhost/r0semi")
+		t.Setenv("RE0AUTH_AUDIT_KEY", "")
+		if _, err := loadConfig(writeConfig(t, "postgres")); err == nil {
+			t.Fatal("a durable deployment without RE0AUTH_AUDIT_KEY was accepted")
+		}
+	})
+
+	t.Run("a wrong-sized key is refused", func(t *testing.T) {
+		base()
+		t.Setenv("DATABASE_URL", "postgres://localhost/r0semi")
+		t.Setenv("RE0AUTH_AUDIT_KEY", base64.StdEncoding.EncodeToString(make([]byte, 16)))
+		if _, err := loadConfig(writeConfig(t, "postgres")); err == nil {
+			t.Fatal("a 16-byte audit key was accepted")
+		}
+	})
+
+	t.Run("durable with a key is accepted", func(t *testing.T) {
+		base()
+		t.Setenv("DATABASE_URL", "postgres://localhost/r0semi")
+		t.Setenv("RE0AUTH_AUDIT_KEY", valid)
+		cfg, err := loadConfig(writeConfig(t, "postgres"))
+		if err != nil {
+			t.Fatalf("a valid audit key was rejected: %v", err)
+		}
+		if len(cfg.AuditKey) != 32 {
+			t.Fatalf("audit key is %d bytes, want 32", len(cfg.AuditKey))
+		}
+	})
+
+	t.Run("memory mode needs no key", func(t *testing.T) {
+		base()
+		t.Setenv("DATABASE_URL", "")
+		t.Setenv("RE0AUTH_AUDIT_KEY", "")
+		cfg, err := loadConfig(writeConfig(t, "memory"))
+		if err != nil {
+			t.Fatalf("memory mode should not need an audit key: %v", err)
+		}
+		if cfg.AuditKey != nil {
+			t.Errorf("memory mode resolved an audit key: %v", cfg.AuditKey)
+		}
+	})
 }

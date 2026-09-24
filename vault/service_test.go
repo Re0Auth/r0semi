@@ -279,3 +279,66 @@ func TestEnrollRejectsEmptyIdentity(t *testing.T) {
 		t.Fatalf("err = %v, want ErrInvalidIdentity", err)
 	}
 }
+
+// TestDeleteSubjectShredsEveryProviderOfOneAccount is the account-erasure path:
+// every credential a subject holds goes, across providers, and another account is
+// untouched. It also proves the whole rows are gone, not just the crypto material:
+// the plaintext Identity and Meta must not linger either, or the erasure would
+// report success while leaving PII behind.
+func TestDeleteSubjectShredsEveryProviderOfOneAccount(t *testing.T) {
+	svc, repo, _, _ := newTestService(t)
+	ctx := context.Background()
+
+	for _, id := range []Identity{
+		{Subject: "usr_a", Provider: "taptap"},
+		{Subject: "usr_a", Provider: "phigros.fake"},
+		{Subject: "usr_b", Provider: "taptap"},
+	} {
+		if err := svc.Enroll(ctx, id, []byte("secret-"+id.Provider), map[string]string{"openid": "pii"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := repo.DeleteSubject(ctx, "usr_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("removed %d records, want 2", n)
+	}
+
+	// The other account still works.
+	if err := svc.Use(ctx, Identity{Subject: "usr_b", Provider: "taptap"}, func([]byte) error { return nil }); err != nil {
+		t.Errorf("the surviving account's credential broke: %v", err)
+	}
+	// The erased account's credentials are gone, including their metadata rows.
+	if err := svc.Use(ctx, Identity{Subject: "usr_a", Provider: "taptap"}, func([]byte) error {
+		t.Error("a shredded credential was still usable")
+		return nil
+	}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("use after shred = %v, want ErrNotFound", err)
+	}
+	recs, err := repo.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || recs[0].Identity.Subject != "usr_b" {
+		t.Errorf("remaining records = %+v, want only usr_b's", recs)
+	}
+}
+
+// TestDeleteSubjectIsIdempotent: erasure can be retried.
+func TestDeleteSubjectIsIdempotent(t *testing.T) {
+	_, repo, _, _ := newTestService(t)
+	ctx := context.Background()
+	if _, err := repo.DeleteSubject(ctx, "usr_absent"); err != nil {
+		t.Fatalf("deleting an absent subject: %v", err)
+	}
+}
+
+func TestDeleteSubjectRejectsAnEmptySubject(t *testing.T) {
+	_, repo, _, _ := newTestService(t)
+	if _, err := repo.DeleteSubject(context.Background(), ""); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("err = %v, want ErrInvalidIdentity", err)
+	}
+}

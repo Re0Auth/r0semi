@@ -16,10 +16,13 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -34,6 +37,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/config"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/httpapi"
+	"github.com/Re0Auth/r0semi/internal/lifecycle"
 	"github.com/Re0Auth/r0semi/internal/oidchttp"
 	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
@@ -67,6 +71,25 @@ const (
 	// records. It is well under the shortest record lifetime, so the maps stay
 	// close to the size the live records justify.
 	opJanitorInterval = 5 * time.Minute
+
+	// HTTP server timeouts. ReadHeaderTimeout bounds a slow-header (Slowloris)
+	// client; IdleTimeout bounds a kept-alive connection that has gone quiet. Read
+	// and Write bound a whole exchange: the data plane proxies an upstream
+	// response, so Write is generous enough to cover the outbound client's own
+	// deadline rather than cut a legitimately slow read short.
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 60 * time.Second
+	idleTimeout       = 120 * time.Second
+	// maxHeaderBytes is well under the standard library's 1 MiB default: every
+	// header this service reads is small, and a smaller cap is a cheaper refusal
+	// for a caller that would otherwise spend memory on one.
+	maxHeaderBytes = 64 << 10
+
+	// shutdownTimeout is how long a graceful shutdown waits for in-flight
+	// requests to finish after a signal, before closing their connections anyway.
+	// It bounds the drain so a stuck handler cannot hold a deploy open forever.
+	shutdownTimeout = 30 * time.Second
 )
 
 // storage bundles the persistence ports so the composition root does not thread
@@ -89,11 +112,14 @@ type storage struct {
 	// audit is the durable audit-log sink; nil would mean "nobody is auditing",
 	// which must never be a silent state.
 	audit audit.Logger
+	// legacy, when set, clears the retired hand-rolled engine's non-token tables
+	// during account erasure. Nil in memory mode, where those tables do not exist.
+	legacy lifecycle.LegacyPurger
 	// db is the Postgres handle when durable; nil in memory mode. The OpenID
 	// Provider store is built on it in the composition root.
 	db *postgres.DB
-	// sweep removes expired auxiliary rows and reports how many. Nil when there
-	// is nothing to sweep.
+	// sweep removes expired rows -- dated tokens, codes and pending requests, plus
+	// sessions -- and reports how many. Nil when there is nothing to sweep.
 	sweep   func(context.Context) (int64, error)
 	durable bool
 	close   func()
@@ -159,7 +185,21 @@ func main() {
 	if err != nil {
 		die("config", err)
 	}
-	ctx := context.Background()
+
+	// A signal context. Cancelling it on SIGTERM (what an orchestrator sends on a
+	// rolling deploy) or SIGINT begins a graceful drain instead of an abrupt exit,
+	// and it is what the background loops are tied to, so they stop with the
+	// process rather than outliving it.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// Once a shutdown has begun, restore default signal handling: a second signal
+	// must kill the process rather than be swallowed while the drain waits out a
+	// handler that is not coming back. stop is idempotent, so the deferred call is
+	// still safe.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	store, err := openStorage(ctx, cfg)
 	if err != nil {
@@ -251,8 +291,15 @@ func main() {
 		Federation: federationService,
 		Frontend:   webui.FS(),
 		Limiter:    buildLimiter(cfg),
+		// Which peers may speak for the client through X-Forwarded-For. Empty
+		// means none, so the peer address is the client.
+		TrustedProxies: cfg.TrustedProxies,
 		// One switch for "this issuer is https": Secure cookies and HSTS.
 		Secure: cfg.CookieSecure,
+		// Readiness is "can this instance reach what it needs to serve". With a
+		// database that is the pool; without one there is nothing to reach, so the
+		// probe stays nil and /readyz answers ready.
+		Ready: readinessProbe(store),
 	}
 	// Every deployment runs the OpenID Provider (ADR-0001 P4b). The only thing a
 	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
@@ -295,24 +342,136 @@ func main() {
 		apiConfig.Admins = admins
 		slog.Info("operator plane enabled", "admins", len(admins))
 	}
+
+	// The audit log's read side. Only the durable sink can answer: the in-memory
+	// log is a bounded ring buffer with no record chain, so a "verify" over it
+	// would report on a guarantee it does not have. Mounted when available rather
+	// than gated on storage mode, so the difference stays a property of the sink.
+	if reader, ok := store.audit.(httpapi.AuditReader); ok {
+		apiConfig.Audit = reader
+		slog.Info("audit read API enabled", "endpoints", "/v1/admin/audit, /v1/admin/audit/verify")
+	}
+
+	// Self-service account erasure. Always wired: PIPL/GDPR require a way to delete
+	// one's own data, and a deployment that could not do it would be offering
+	// sign-in it cannot undo.
+	//
+	// The wipers are the storage ports directly, not the vault Service or the
+	// federation Service. The vault Service audits every operation it performs,
+	// which is correct for credential use and wrong here: erasing the account's
+	// pseudonym key would then depend on the very log it is trying to detach from.
+	// Deleting rows at the repo layer bypasses that circularity while keeping the
+	// same crypto-shredding effect — the wrapped DEK lives in the row.
+	deleter, err := lifecycle.New(lifecycle.Config{
+		Accounts: store.accounts,
+		Tokens:   tokenRevoker,
+		Vault:    store.credentials,
+		Bindings: erasureBindings{fed: federationService},
+		Sessions: store.sessionRevoker,
+		OIDC:     oidcStore,
+		Flows:    store.bindFlows,
+		Legacy:   store.legacy,
+		// The durable audit sink owns the subject pseudonyms, so it is what destroys
+		// the key that makes a deleted account's history linkable. It is nil in
+		// memory mode, where the log is a ring buffer that keeps no keys.
+		Pseudonyms: pseudonymStore(store.audit),
+		Audit:      logger,
+	})
+	if err != nil {
+		die("lifecycle", err)
+	}
+	apiConfig.Deleter = deleter
+	if store.sessionRevoker == nil {
+		// The in-memory store cannot enumerate one account's sessions, so an
+		// erasure there clears the token tables but cannot promise the browser
+		// sessions are gone. Said at startup rather than discovered later.
+		slog.Warn("account erasure cannot clear per-account sessions without a durable session store; " +
+			"sessions for a deleted account are only dropped on expiry")
+	}
+
 	api, err := httpapi.New(apiConfig)
 	if err != nil {
 		die("http", err)
 	}
 
+	// Bind before announcing, so "listening" is only printed for an address that
+	// was actually obtained — and so the log names the resolved address, which is
+	// what a deployment with a port of 0 needs to read.
+	listener, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		die("listen", err)
+	}
 	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           api.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
+		Handler: api.Handler(),
 		// The standard library's server writes its own diagnostics. Routing them
 		// through the same handler keeps a connection or TLS error from being the
 		// one line in the log that looks different.
 		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
+
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
-	slog.Info("listening", "addr", cfg.Addr, "issuer", cfg.Issuer, "version", version)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		die("serve", err)
+	slog.Info("listening", "addr", listener.Addr().String(), "issuer", cfg.Issuer, "version", version)
+	if err := serveUntilSignal(ctx, server, listener, shutdownTimeout); err != nil {
+		// Not die(): the process started fine, so "cannot start" would be a lie.
+		// Reaching here means serving stopped for a reason other than a clean
+		// shutdown, or the drain ran out of time.
+		slog.Error("server stopped with an error", "err", err)
+		os.Exit(1)
 	}
+	slog.Info("stopped")
+}
+
+// serveUntilSignal serves srv on ln until ctx is cancelled — a shutdown signal —
+// then drains in-flight requests within timeout before closing their connections.
+//
+// The drain is the point: on a rolling deploy the process is replaced while it is
+// answering requests, and an abrupt exit drops them. Requests already in flight
+// are given the chance to finish; the listener stops accepting new ones first, so
+// a load balancer sees the instance go away cleanly.
+//
+// It returns nil for a shutdown it performed itself, and the underlying error
+// only when serving failed for some other reason.
+func serveUntilSignal(ctx context.Context, srv *http.Server, ln net.Listener, timeout time.Duration) error {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	select {
+	case err := <-serveErr:
+		// Serve reports ErrServerClosed after a Shutdown, which is not a failure.
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		slog.Info("shutdown signal received; draining in-flight requests", "timeout", timeout)
+		drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := srv.Shutdown(drainCtx); err != nil {
+			// The drain ran out of time (or failed for another reason): close the
+			// connections rather than wait on handlers that are not coming back.
+			slog.Error("graceful shutdown did not finish; closing connections", "err", err)
+			_ = srv.Close()
+			return err
+		}
+		return nil
+	}
+}
+
+// readinessProbe returns the /readyz check for a storage configuration: the
+// database pool when there is one, and nil — always ready — when there is not.
+//
+// Only the database is checked. It is the one dependency whose loss stops this
+// instance from serving anything; a single upstream source being down degrades a
+// game's data plane but does not make the instance unfit to route to.
+func readinessProbe(store storage) httpapi.ReadinessProbe {
+	if store.db == nil {
+		return nil
+	}
+	return store.db.Ping
 }
 
 // openStorage picks the backends. A DSN turns on Postgres and applies
@@ -340,6 +499,13 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 	if err != nil {
 		return storage{}, err
 	}
+	// Built before the rest so a bad chain key fails here, with the pool closed,
+	// rather than leaving a half-built storage behind.
+	auditLogger, err := db.Audit(cfg.AuditKey)
+	if err != nil {
+		db.Close()
+		return storage{}, err
+	}
 	slog.Info("storage ready", "driver", "postgres", "migrated", true)
 	sessions := db.Sessions()
 	return storage{
@@ -356,9 +522,17 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 		// The same object, for the auth layer to record which account a session
 		// belongs to.
 		sessionIndex: sessions,
-		audit:        db.Audit(),
+		audit:        auditLogger,
+		legacy:       db.Tokens(),
 		sweep: func(ctx context.Context) (int64, error) {
-			return sessions.SweepExpired(ctx)
+			// The dated tables (codes, tokens, pending requests) and the sessions
+			// are separate sweeps; sessions also collect their orphan index rows.
+			expired, err := db.SweepExpired(ctx)
+			if err != nil {
+				return expired, err
+			}
+			sessionRows, err := sessions.SweepExpired(ctx)
+			return expired + sessionRows, err
 		},
 		durable: true,
 		close:   db.Close,
@@ -405,8 +579,9 @@ func opJanitorLoop(ctx context.Context, sweep interface{ SweepExpired() int }, e
 	}
 }
 
-// sweepLoop periodically removes expired sessions. Find already deletes the ones
-// it is asked about; this covers the ones nobody comes back to.
+// sweepLoop periodically removes expired rows -- dated tokens, codes and pending
+// requests, and sessions. A lookup already refuses an expired row; this covers
+// the ones nobody comes back to, whose row would otherwise live on forever.
 func sweepLoop(ctx context.Context, sweep func(context.Context) (int64, error), every time.Duration) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -417,7 +592,7 @@ func sweepLoop(ctx context.Context, sweep func(context.Context) (int64, error), 
 		case <-ticker.C:
 			removed, err := sweep(ctx)
 			if err != nil {
-				slog.Warn("session sweep failed", "err", err)
+				slog.Warn("expiry sweep failed", "err", err)
 				continue
 			}
 			if removed > 0 {
@@ -486,6 +661,7 @@ type oidcBackend interface {
 	Grants(ctx context.Context, subject string) ([]oauth.Grant, error)
 	RevokeGrant(ctx context.Context, subject, clientID string) error
 	RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error)
+	PurgeSubject(ctx context.Context, subject string) (int, error)
 	DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error)
 	DecideDeviceAuthorization(ctx context.Context, userCode, subject string, approve bool, scopes, explicit []oauth.Scope) error
 }
@@ -696,6 +872,37 @@ func bindingOutcome(s federation.BindingRevocationSummary) admin.BindingOutcome 
 		Orphaned:    s.Orphaned,
 		Failed:      s.Failed,
 	}
+}
+
+// erasureBindings adapts the federation service to the lifecycle package's
+// binding port. It is a second adapter rather than a reuse of bindingRevoker
+// because that one answers in the operator plane's richer outcome, and the
+// erasure path only reports a count. Keeping them separate means neither
+// package's reporting needs shape the other's.
+type erasureBindings struct{ fed federation.Service }
+
+func (e erasureBindings) RevokeUserBindings(ctx context.Context, user account.UserID) (lifecycle.BindingOutcome, error) {
+	summary, err := e.fed.RevokeUserBindings(ctx, user)
+	return lifecycle.BindingOutcome{
+		Total:   summary.Total,
+		Revoked: summary.Revoked,
+		Failed:  summary.Failed,
+	}, err
+}
+
+// pseudonymStore narrows the audit sink to its erasure capability.
+//
+// The narrowing has to be dynamic because the two sinks differ in kind: the
+// durable one pseudonymises subjects and holds the keys, while the in-memory one
+// is a bounded ring buffer that keeps none and stores subjects as given. Asking
+// for the capability rather than branching on storage mode keeps that difference
+// where it belongs — in the sink — and returns nil, honestly, for the one that
+// cannot do it.
+func pseudonymStore(l audit.Logger) lifecycle.PseudonymDestroyer {
+	if d, ok := l.(lifecycle.PseudonymDestroyer); ok {
+		return d
+	}
+	return nil
 }
 
 // seedClient registers the first-party downstream client if it is not already

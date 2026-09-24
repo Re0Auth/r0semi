@@ -87,6 +87,15 @@ type Store interface {
 	// GetUser returns a user.
 	GetUser(ctx context.Context, user UserID) (User, error)
 
+	// DeleteUser removes a user and every identity it holds.
+	//
+	// It is the account row's own deletion and nothing more: the tokens, sessions,
+	// bindings and credentials that hang off the account live in tables this store
+	// does not own, and deleting the user here does not cascade to them. Callers
+	// must clear those first; internal/lifecycle does exactly that. Deleting an
+	// absent user is not an error, so a retried erasure stays idempotent.
+	DeleteUser(ctx context.Context, user UserID) error
+
 	// TouchLogin records that an identity has just authenticated.
 	TouchLogin(ctx context.Context, provider idp.Provider, subject string) error
 }
@@ -250,6 +259,22 @@ func (s *MemoryStore) TouchLogin(_ context.Context, provider idp.Provider, subje
 	ident := s.identities[id]
 	ident.LastLoginAt = time.Now().UTC()
 	s.identities[id] = ident
+	return nil
+}
+
+// DeleteUser implements Store. Both the identities and their (provider, subject)
+// lookup keys go, so a later sign-in with the same external identity creates a
+// fresh account rather than resurrecting the deleted one.
+func (s *MemoryStore) DeleteUser(_ context.Context, user UserID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.users, user)
+	for id, ident := range s.identities {
+		if ident.User == user {
+			delete(s.identities, id)
+			delete(s.byKey, identityKey{ident.Provider, ident.Subject})
+		}
+	}
 	return nil
 }
 

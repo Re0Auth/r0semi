@@ -102,3 +102,16 @@ Two documents will save you time before reporting:
 
 If you believe one of our stated invariants is violated, that is a high-value
 report: the invariants are the product.
+
+## Our own audits
+
+We run an adversarial pass against our own invariants rather than waiting for
+someone else to. The second round is on disk:
+
+- [`docs/security-audit-2.md`](docs/security-audit-2.md) — every finding, with the
+  test that pins it, plus what held and what we could not reach.
+
+Each finding's reproducer is now part of the ordinary suite: it failed before the
+fix and passes after, so it guards the fix the way any other test guards its
+subject. They are grouped in `adversary_test.go` next to the code they attack,
+and each names the finding it pins.

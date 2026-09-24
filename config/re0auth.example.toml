@@ -29,6 +29,19 @@ cookie_secure = true
 rate_limit       = 50
 rate_limit_burst = 100
 
+# The networks whose X-Forwarded-For header is believed when attributing a
+# request to a client. **Leave this empty unless Re0Auth sits behind your own
+# reverse proxy.** Empty means the peer address is the client, and a fabricated
+# X-Forwarded-For is ignored — which is what stops a caller from choosing its own
+# rate-limit bucket. When set, the chain is walked from the right, past the
+# addresses listed here, to the first one that is not: those are your proxies.
+# Entries are CIDRs, or bare addresses (treated as a single host). A malformed
+# entry refuses startup rather than being skipped.
+#
+#   trusted_proxies = ["10.0.0.0/8", "127.0.0.1/32"]
+# Environment override: RE0AUTH_TRUSTED_PROXIES="10.0.0.0/8,127.0.0.1/32"
+trusted_proxies = []
+
 [storage]
 # "postgres" or "memory". Omit the whole section to use memory (nothing survives
 # a restart; the server says so at startup). **Either way the authorization engine
@@ -48,6 +61,20 @@ dsn_env = "DATABASE_URL"
 #
 # Rotation overlaps: RE0AUTH_OIDC_RETIRED_TOKEN_KEYS=id:base64,...  (decrypt only)
 # and RE0AUTH_OIDC_RETIRED_SIGNING_KEYS=kid:base64PKIX,...  (publish only).
+
+# The audit chain key. Environment-only. **Required whenever the audit log is
+# durable**, i.e. when [storage] driver = "postgres":
+#
+#   export RE0AUTH_AUDIT_KEY=$(head -c 32 /dev/urandom | base64)
+#
+# Every audit row is chained to the one before it and signed with this key, so the
+# log cannot be rewritten undetectably even by someone with full access to the
+# database — they can recompute the hashes but cannot forge the signature. See
+# docs/architecture.md §4.14 for exactly what it does and does not cover
+# (deleting rows from the END is not detectable without an external anchor).
+#
+# Memory mode needs no key: the in-memory log is a bounded ring buffer that is not
+# tamper-evident by construction, so there is nothing for a key to protect.
 
 [vault]
 # The variable holding the 32-byte key encryption key, base64 or hex:

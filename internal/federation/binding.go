@@ -2,6 +2,8 @@ package federation
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -26,12 +28,45 @@ type Binding struct {
 	// HasRefresh records whether a refresh token exists, so refresh decisions
 	// can be made without opening the vault.
 	HasRefresh bool
-	// Version increments on every refresh. It is how a second, concurrent
-	// request notices that the token was already rotated.
+	// Version is an opaque generation, not a counter: it changes whenever this
+	// binding is written, and its only job is to let a writer notice that the row
+	// moved under it. A refresh compares it (compare-and-swap) and a rejected
+	// refresh reads a moved version as "somebody else rotated this", which is what
+	// separates a spent one-time token from a dead grant.
+	//
+	// It is therefore NOT 1 on every bind — see newBindingGeneration for what
+	// restarting at 1 broke.
 	Version uint64
 }
 
+// newBindingGeneration returns the version a freshly bound binding starts at.
+//
+// Random rather than always 1 because of what the version is FOR. `refreshRejected`
+// treats "the stored version moved" as the only evidence that another writer
+// rotated this binding — the signal that separates a spent one-time refresh token
+// from a genuinely dead grant. Re-binding the same (user, game, source) used to
+// restart the count at 1, so a stale refresh still holding 1 would see "still 1",
+// conclude the credential was dead, and delete the binding the user had just
+// reconnected, shredding its secret without telling the source.
+//
+// A fresh random generation makes a re-bind look to that check exactly like a
+// rotation, which is the truthful answer: either way, the credential the stale
+// caller holds is not the current one.
+func newBindingGeneration() (uint64, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("federation: generate binding version: %w", err)
+	}
+	if v := binary.BigEndian.Uint64(b[:]); v != 0 {
+		return v, nil
+	}
+	return 1, nil
+}
+
 // bindingSecret is what the vault protects. It never reaches the binding store.
+//
+// The fields are strings, so a decoded copy cannot be zeroized — Go strings are
+// immutable. See useBindingSecret for what that means for the vault's window.
 type bindingSecret struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
@@ -54,8 +89,18 @@ func (s *service) storeBindingSecret(ctx context.Context, b Binding, secret bind
 	})
 }
 
-// useBindingSecret opens the vault's plaintext window. The secret is valid only
-// inside fn.
+// useBindingSecret opens the vault's plaintext window and decodes the pair.
+//
+// What the window actually guarantees, stated precisely because the old comment
+// here was wrong: the BYTE BUFFER the vault decrypted into is zeroed when Use
+// returns, but `secret` is a pair of Go strings, and strings are immutable and
+// cannot be wiped. Those copies live until the garbage collector reclaims them —
+// they do not vanish with the window.
+//
+// So a caller must treat anything it lifts into its own variables as living as long
+// as it holds it. That is fine for this package's use (the token is on its way to
+// the source over TLS, in the same call), and it is not fine to stash it anywhere
+// durable.
 func (s *service) useBindingSecret(ctx context.Context, b Binding, fn func(*bindingSecret) error) error {
 	return s.vault.Use(ctx, BindingIdentity(b), func(plaintext []byte) error {
 		var secret bindingSecret
@@ -78,6 +123,12 @@ func (s *service) withAccessToken(ctx context.Context, b Binding, fn func(token 
 type BindingStore interface {
 	Get(ctx context.Context, user account.UserID, game, source string) (Binding, error)
 	Put(ctx context.Context, b Binding) error
+	// PutIfVersion stores b only if the persisted binding is still at
+	// expectedVersion, and reports whether it did. It is the compare-and-swap
+	// that makes two refreshes of the same binding safe when they run in
+	// different processes: both may read version N, but only one may write N+1.
+	// The loser must re-read and use the winner's token rather than overwrite it.
+	PutIfVersion(ctx context.Context, b Binding, expectedVersion uint64) (bool, error)
 	Delete(ctx context.Context, user account.UserID, game, source string) error
 	// List returns every binding a user holds, so the account page can show what
 	// is connected and offer to disconnect it.
@@ -114,6 +165,21 @@ func (s *MemoryBindingStore) Put(_ context.Context, b Binding) error {
 	s.m[bindingKey(b.User, b.Game, b.Source)] = b
 	s.mu.Unlock()
 	return nil
+}
+
+// PutIfVersion implements BindingStore. The version check and the write happen
+// under one lock, which is what makes it a compare-and-swap rather than a read
+// followed by a write.
+func (s *MemoryBindingStore) PutIfVersion(_ context.Context, b Binding, expectedVersion uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := bindingKey(b.User, b.Game, b.Source)
+	existing, ok := s.m[key]
+	if !ok || existing.Version != expectedVersion {
+		return false, nil
+	}
+	s.m[key] = b
+	return true, nil
 }
 
 // Delete implements BindingStore. Deleting an absent binding is not an error.

@@ -46,6 +46,28 @@ func (s *Bindings) Put(ctx context.Context, b federation.Binding) error {
 	return err
 }
 
+// PutIfVersion implements federation.BindingStore.
+//
+// It is a single conditional UPDATE, so the version check and the write cannot
+// be separated by another writer: two processes that both read version N cannot
+// both write N+1. It reports false when the row is absent or already at another
+// version, which the caller must read as "somebody else won".
+func (s *Bindings) PutIfVersion(ctx context.Context, b federation.Binding, expectedVersion uint64) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE federation_bindings
+		   SET token_type  = $4,
+		       expiry      = $5,
+		       has_refresh = $6,
+		       version     = $7
+		 WHERE user_id = $1 AND game = $2 AND source = $3 AND version = $8`,
+		string(b.User), b.Game, b.Source, b.TokenType, nullTime(b.Expiry),
+		b.HasRefresh, int64(b.Version), int64(expectedVersion))
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // Delete implements federation.BindingStore. Deleting an absent binding is not
 // an error, so unbinding stays idempotent.
 func (s *Bindings) Delete(ctx context.Context, user account.UserID, game, source string) error {
@@ -158,4 +180,19 @@ func (s *BindFlows) Consume(ctx context.Context, state string) (federation.BindF
 	flow.State = state
 	flow.User = account.UserID(userID)
 	return flow, nil
+}
+
+// PurgeUserFlows implements federation.BindFlowStore: every pending bind flow an
+// account has started, gone.
+//
+// A pending flow holds a PKCE verifier, and it is a row about a person the
+// account-erasure path must not leave behind. It is separated from Consume
+// because Consume is keyed by state (a callback is redeeming one flow) while this
+// is keyed by user (an erasure is clearing all of them).
+func (s *BindFlows) PurgeUserFlows(ctx context.Context, user account.UserID) (int, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM federation_bind_flows WHERE user_id = $1`, string(user))
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }

@@ -123,6 +123,11 @@ func newFullConfig(t *testing.T) Config {
 		Federation:        fed,
 		Admin:             adminSvc,
 		Admins:            []account.UserID{"usr_admin"},
+		// A stub, so the documented surface includes DELETE /v1/account. The point
+		// here is that every mountable route is described, not what the deleter does.
+		Deleter: stubDeleter{},
+		// Likewise for the audit read endpoints.
+		Audit: &stubAuditReader{},
 	}
 }
 

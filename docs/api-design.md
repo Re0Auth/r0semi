@@ -25,9 +25,20 @@
 | 规范 | RFC 6749 / 7636 / 8628 / 7009 / 7662 / 8414，**照抄，不发挥**。RFC 9449 (DPoP)：**明确不做**，见 D-3 决策条目 | 本文件风格指南 |
 | 请求编码 | `application/x-www-form-urlencoded` | JSON |
 | 错误体 | `{"error","error_description"}` | RFC 9457 `application/problem+json` |
-| 缓存 | `token` 响应必须 `Cache-Control: no-store` | 按资源语义 |
+| 缓存 | `token` 响应必须 `Cache-Control: no-store` | 全部 `no-store`（见下） |
 
 **铁律**：协议平面不得为了"风格统一"改动报文——那会让所有标准客户端库失效。
+
+**协议平面的失败一律是 OAuth JSON。** 库自己写的某些失败是 `text/plain`（未认证的 `introspect`、
+`userinfo` 就是），而一个平面两种格式等于没有契约。`oidchttp` 因此**缓冲并归一化**任何不带 `error`
+字段的 4xx/5xx，保留库自己设的 `WWW-Authenticate`（RFC 6750 的 challenge）。描述用状态文本，
+**不转述库的内部信息**（`ErrorType=… Parent=…` 属于日志，不属于线上契约）。
+`internal/httpapi/plane_test.go` 的走查把「非 JSON 失败」判为失败，并且**按方法**走
+（`POST /oauth/authorize` 在其中：库注册该端点时不带方法约束）。
+
+**业务平面全部 `no-store`。** 这张表的「按资源语义」曾经落空——业务面一个 `Cache-Control` 都没有。
+但这里每个响应都是**认证后的按人数据**：会话引导与 admin 客户端列表下发 CSRF token，账号导出是某个人
+账号的全部内容。既没有 `Vary`，中间缓存也就没有任何键能区分两个账号。
 
 **第三个面**：`/auth`、`/bind`、`/consent`、`/app` 以及未知路径**不属于任何平面**——它们是浏览器导航，
 格式是纯文本或重定向。见 §6 与 [browser-plane-decision.md](./browser-plane-decision.md)。
@@ -107,9 +118,11 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 
 当前实现**不接受这个头**；`idempotency_key_reused` 这个 code 也已从错误目录中删除——
 一个发不出来的错误码就是一句半衰期很长的谎，和它一起删的还有 `credential_not_found`、`conflict`。
-真正需要它的写端点目前只有两个（`DELETE /v1/grants/{client_id}` 与 `DELETE /v1/bindings/{game}/{source}`）。
-**两个都做了别的选择：** grants 撤销**本来就是幂等的**（删令牌，删两次结果一样，返回 204）；
-断开连接则**必须返回结果体**——数据源那一半做了什么，用户得知道，一个只有状态码的 204 反而会把话说少。
+真正需要它的写端点目前只有三个（`DELETE /v1/grants/{client_id}`、`DELETE /v1/bindings/{game}/{source}`
+与 `DELETE /v1/account`）。
+**三个都做了别的选择：** grants 撤销**本来就是幂等的**（删令牌，删两次结果一样，返回 204）；
+断开连接则**必须返回结果体**——数据源那一半做了什么，用户得知道，一个只有状态码的 204 反而会把话说少；
+账号抹除同样返回结果体，而且它的每一步都设计成幂等，重试安全，所以「重复请求」是**正确行为**而非需要拦掉的错误。
 因此这个机制应当**等一个真正无法天然幂等、且结果单一的写操作出现时再落地**。
 
 ### 2.7 限流
@@ -119,6 +132,12 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 
 `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` 尚未实现：当前限流器按**客户端地址**
 分桶，而非按已认证的客户端，这三个头的语义因此还没有确定的归属。等按客户端限流落地时再一并加上。
+
+**地址怎么算**（`server.trusted_proxies` / `RE0AUTH_TRUSTED_PROXIES`）：默认取**对端地址**，
+`X-Forwarded-For` 一律忽略——否则调用方自填一个头就能自选分桶，限流形同虚设。只有当对端落在
+配置的**可信代理**网络里时才读该头，并从**右往左**跳过可信代理，取第一个不可信的地址（最右侧那条是
+离我们最近的代理写下的，左侧是它被告知的）。头里出现无法解析的条目则整条链都不信、退回对端地址。
+列表为空是默认，也是没有反代时的正确答案；列表过宽等于把选择权又交回调用方。
 
 ### 2.8 可观测
 每个响应带 `X-Request-Id`；接受 W3C `traceparent`；problem 回带 `request_id`。
@@ -175,6 +194,8 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | `GET` | `/v1/me` | `account.id` | r0semi 账号（`usr_` id、显示名） |
 | `GET` | `/v1/identities` | 会话 | 本账号已链接的 IdP 身份 |
 | `DELETE` | `/v1/identities/{id}` | 会话 + CSRF | 解绑一个身份（I-2 守护，最后一个返回 `409 last_identity`） |
+| `DELETE` | `/v1/account` | 会话 + CSRF + 显式确认 | **抹除本账号**：解绑并撤上游 → 撕碎 vault 凭据 → 撤销全部令牌 → 清会话 → 清在途请求 → 删账号行。**不可逆**；200 带「删了什么」的 body |
+| `GET` | `/v1/account/export` | 会话 | **导出本账号数据**（profile / identities / bindings / grants），**不含任何凭据**；`Content-Disposition: attachment` |
 | `GET` | `/v1/games/phigros/me` | `phigros.profile.read` | 游戏内档案（rks 等） |
 | `GET` | `/v1/games/phigros/scores` | `phigros.score.read` | 成绩列表（游标分页） |
 | `GET` | `/v1/games/phigros/b30` | `phigros.b30.read` | B30 |
@@ -207,6 +228,51 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 
 > enrollment / 扫码托管已迁出 Re0Auth，成为**参考数据源**的一部分（见 architecture.md §4.10）。
 
+### 账号抹除（`DELETE /v1/account`）
+
+PIPL / GDPR 要求「可删除」，这就是那个端点。它的编排在 `internal/lifecycle`，顺序是有讲究的：
+
+1. **先解绑并撤上游**——binding 的凭据还在手里时才能告诉数据源「忘掉这个令牌」。先删本地记录就再也没有筹码去撤上游了。
+2. **再撕碎 vault**——按 `subject` 删掉**整行**（`vault_credentials` PK 首列就是 subject，走索引）。删整行而非只置空 `WrappedDEK` 是关键：`Identity` 与 `Meta` 是明文 PII（上游 openid/unionid/objectId），只置空密钥等于「密文不可解但 PII 还在」——一次自称成功、实则没有的抹除。
+3. **撤销全部令牌 → 清会话 → 清在途请求**（OP 的 auth request/code/device、federation 的 bind flow，以及**迁移遗留**的旧引擎表）。
+4. **最后删账号行**（identities 走外键级联）。
+
+还有**第 5 步，顺序不能动**：**销毁审计假名密钥**。审计日志是 append-only 且带链的（architecture.md §4.14），
+所以不删行——而是删掉那把让「`usr_…` → 假名」可计算的密钥（§4.15）。行还在、链仍通过，但再没人能把它们关联到你。
+它必须排在**「写完 `account.delete` 事件」之后**：那条事件本身也是关于这个账号的审计记录，
+先销毁密钥的话，sink 会为新事件**新造一把密钥**——恰好把刚断开的关联接回去。
+
+**每一步都幂等**，所以中途失败后重试是安全的、也是预期的恢复方式；错误里会注明卡在哪一步。
+
+**为什么需要 `acknowledge`：** 和 `cascade_revocation` 同一个理由——不可逆动作不能让一个裸 `DELETE` 触发，调用方必须把后果写出来（常量 `deletes_my_account`）。
+
+**响应为什么不是 204：** 请求返回时账号和会话都已经没了，调用方**无法自己核实**删没删干净。结果体逐 store 报告删了什么，这是它唯一能拿到的交代。
+
+**`session_scoped` 为什么是个布尔：** 内存部署无法按 subject 枚举会话（只有「全部登出」）。`sessions: 0` 和「根本无法清」必须区分开，否则前者是事实、后者是缺口，却长得一模一样。
+
+**为什么不在 `accounts_users` 上补 16 张外键：** 那些表**确实**没有外键（只有 `accounts_identities` 有），所以删账号行会静默留下孤儿。补外键是更大的改动、有历史数据的爆炸半径；这里改用**测试**守住：一个从 `information_schema` 动态取出所有带 `subject`/`user_id` 列的表、逐一断言清零的集成测试，外加一个**不依赖数据库**的静态检查（解析 migration，任何新增的带 subject 列的表若没在删除路径里登记就构建失败）。漏一张表就是合规 bug，所以两处都要机器化。
+
+### 账号数据导出（`GET /v1/account/export`）
+
+PIPL / GDPR 的「可携带」那一半。返回一份 JSON：`profile`、`identities`、`bindings`、`grants`，
+外加一个 `notice`。
+
+**它和 §5 说的「不导出上游凭据」不矛盾，因为是两件事**——§5 说的是**把凭据交给下游客户端**（那是转发凭据的信使，不做）；
+这里是**把用户自己的数据交给用户自己**。两者唯一的交集是：这份导出**同样不含凭据**，理由见下。
+
+**凭据为什么仍然排除：** binding 的 upstream access/refresh token 是**活密钥**，写进下载文件等于把导出物变成和 vault 一样敏感的东西，
+而用户的诉求是「我有哪些数据」，不是「给我一把能冒充我的钥匙」。Re0Auth 也**没有**平台口令可导（§5 的两层表）。
+`notice.credentials_excluded` 把这件事写进**文档本身**：一份静默省略的导出看起来是完整的，这一份明说它省略了什么。
+
+**反泄漏是结构性保证，不是靠审查：** 导出的 identities / bindings / grants 直接复用
+`/v1/identities`、`/v1/bindings`、`/v1/grants` **同一个 view 构造函数**（`identityViews` / `bindingViews` / `grantViews`）。
+那些端点本来就被测试钉住「不含凭据」，所以导出不可能长出一个列表页没有的字段——只有一个地方决定「一条记录对外长什么样」。
+测试上再加一道：先往 vault 里塞一个**已知明文**的 upstream token，再断言它**不出现**在导出字节里（且断言 binding 本身**出现**，否则就是空转）。
+
+**每个 section 恒在**，没有数据就是空数组：文档形状不随账号持有多少东西而变，下游解析不必判空。
+
+**只读、会话作用域**，所以不需要 CSRF；`Content-Disposition: attachment` 让浏览器保存而不是渲染它。
+
 ### 管理面（`/v1/admin`）
 
 | 方法 | 路径 | 说明 |
@@ -217,11 +283,13 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | `POST` | `/v1/admin/clients/{client_id}/activate` | 恢复（**不**恢复令牌） |
 | `DELETE` | `/v1/admin/clients/{client_id}` | 删除注册并吐销令牌；幂等 |
 | `POST` | `/v1/admin/kill_switch` | 按 `all`/`client`/`subject`/`bindings` 批量吐销（`all` 含会话与绑定；清会话需持久会话，内存模式下清不掉） |
+| `GET` | `/v1/admin/audit` | 读审计日志：`?subject=`（账号 id，服务端翻成假名）/`?action=`/`?since=`/`?until=`/`?limit=`/`?cursor=` |
+| `GET` | `/v1/admin/audit/verify` | 走一遍记录链，报告第一处对不上的行（`legacy` 报告链建立前的行数） |
 
-会话 + CSRF。管理员是**配置允许列表里的 `usr_…`**（`[admin].subjects` / `RE0AUTH_ADMIN_SUBJECTS`），
+会话 + CSRF（**只读的 `GET` 除外**——审计读端点不要 CSRF）。管理员是**配置允许列表里的 `usr_…`**（`[admin].subjects` / `RE0AUTH_ADMIN_SUBJECTS`），
 不是角色；列表为空则整个平面不挂载。非管理员（含已登录的）访问得到 `404`。
 完整契约与边界（四个 target 各切什么、为什么 `client` 不碰绑定、以及 `subject` 清会话依赖
-会话索引）见 [admin.md](./admin.md)。
+会话索引）见 [admin.md](./admin.md)。审计读端点另需一个能读的 sink，见 [admin.md](./admin.md) §5.1。
 
 ---
 
@@ -254,6 +322,9 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 **机制保留**：`Descriptor.ExplicitConsent` 与 `Risk` 仍在，仍能表达“这个 scope 必须单独勾选”；
 内置目录当前不含此类 scope，`oauth/scope_test.go` 有测试守住这一点（防止一个提供不了的能力又爬回目录）。
 
+> **别和 `GET /v1/account/export` 搞混**（§4）。那是**把用户自己的数据交给用户自己**，本节说的是
+> **把凭据交给下游客户端**。前者已实现，且同样不含凭据；后者不做。名字里都有 “export”，语义相反。
+
 ---
 
 ## 6. 单域名下的路由边界
@@ -264,9 +335,16 @@ re0auth.r0semi.net
 ├── /oauth/…              协议平面：form 编码 + OAuth 错误格式
 ├── /auth/…               IdP 客户端平面 + 上游绑定回调（/auth/upstream/{game}/{source}/callback）
 ├── /bind                 数据源绑定入口（需登录）→ 跳上游 authorize
+├── /healthz、/readyz     运维探针：纯文本，不属任何平面，免限流
 ├── /consent              前端 SPA 路由（后端不渲染 HTML）
 └── /v1/…                 业务平面：JSON + problem+json（含授权交互 API）
 ```
+
+**运维探针**：`GET /healthz`（存活）只要进程能应答就返回 `200 ok`；`GET /readyz`（就绪）在依赖可用时返回 `200`，
+否则 `503 not ready`——有数据库时检查连接池，内存模式无物可查即恒就绪。两者都是纯文本、**不属任何平面**
+（编排器读状态码，不读 body），且**免于限流**：桶被打满时不能反过来让存活探针失败而重启一个健康进程、
+或让就绪探针把一个正在服务的实例摘出轮转。依赖的具体错误只进日志、不进响应体——该端点在无凭据下可达，
+错误里可能带内网主机名。存活**只**看进程本身：依赖挂了就重启一个没出问题的进程，是把一次故障变成重启循环。
 
 授权交互 API 与账号模型见 [account-model.md](./account-model.md) §5–§7。
 

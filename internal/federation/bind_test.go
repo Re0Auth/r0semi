@@ -91,7 +91,7 @@ func TestBindFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.TokenType != "Bearer" || !binding.HasRefresh || binding.Version != 1 {
+	if binding.TokenType != "Bearer" || !binding.HasRefresh || binding.Version == 0 {
 		t.Fatalf("binding = %+v", binding)
 	}
 	if flow.ReturnTo != "/dashboard" || flow.Game != game || flow.Source != sourceName {

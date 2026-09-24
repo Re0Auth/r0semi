@@ -132,6 +132,10 @@ Service interface {
   按设计明文。它们不是密钥，但属个人数据；需要时把 `Meta` 纳入密文即可（它目前只写不读）。
   （`KeyWrapper`；默认进程内，KMS 适配器尚未实现，见 threat-model §6.0）；AAD 绑定 `(subject, provider)`，密文无法在身份间搬移。
 - **撤销 = crypto-shredding**：删除被包裹的 DEK，密文即使残留也不可解。
+- **账号级擦除 = 按 subject 删整行**（`vault.Repo.DeleteSubject`）。没有「每账号密钥」可以销毁——DEK 是
+  **每条记录一个**、按 `(Subject, Provider)` 寻址、包裹后就存在该行里——所以「擦除一个账号」就是删掉它名下的每一行。
+  删**整行**而非只置空 `WrappedDEK` 是有意的：`Identity` 与 `Meta` 是明文 PII，只置空密钥会留下 PII，
+  变成一次自称成功、实则没有的抹除。subject 是 `vault_credentials` PK 首列，这条删除走索引。
 - **I2**：明文只通过 `Use` 的回调暴露，回调返回后立即零化（无论回调是否出错）。
 - **I3**：`Use` 在把明文交给回调**之前**先落审计；审计不可用则拒绝使用（fail-closed）。
 - **多游戏扩展**：`Provider` 对 vault 不透明。新增游戏 / 上游 = 新增一个 provider 值
@@ -407,12 +411,31 @@ re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个
   **绑定表里没有任何凭据**。交互式流程：
   `GET /bind?game=&source=&return_to=`（需登录）→ 跳上游 authorize（PKCE）→
   `GET /auth/upstream/{game}/{source}/callback` → 令牌入 vault、元数据入绑定表。
-  flow 绑定浏览器会话、单次使用、短时效。
+  flow 绑定浏览器会话、单次使用、短时效。回调**同时校验会话与账号归属**
+  （`Bound` + `OwnerMatches`，与同意、设备决策两处一致）：只查会话的话，同一浏览器里切换账号的
+  第二个账号可以消费掉第一个账号的手柄与 flow 行，让原账号无法完成自己的绑定。
 - **拉取**：`Fetch(user, game, resource, source?)` → 选源 → 取绑定 → 在 `vault.Use` 的明文窗口内
   调 `{issuer}/resources/{name}`（带 Bearer）→ 逐字返回其 JSON。
 - **令牌刷新**：绑定接近过期时主动刷新；上游 401 时强制刷新并重试一次。按 binding 串行
-  （keyed mutex）避免轮换竞争（用单调递增的 `Version` 识别“别人已轮换”）；refresh 被拒（`invalid_grant`）
-  则**删除绑定元数据与 vault 密文**，回到“引导绑定”。
+  （keyed mutex）避免**进程内**轮换竞争。跨进程（多实例共享一个库）靠**原子 Version 比较**：
+  写回走 `BindingStore.PutIfVersion`（单条条件 UPDATE），读到的版本没变才写得进去，于是两个进程
+  不可能都从 N 写成 N+1，输的一方改为读回赢家的那份。refresh 被拒（`invalid_grant`）**不再直接删绑定**：
+  一次性 refresh token 会让“输了竞争”和“凭据真的死了”都长成 `invalid_grant`，所以先重读——版本动过
+  说明别人赢了、他的令牌才是活的；版本没动才删元数据与 vault 密文，回到“引导绑定”。**残余**：
+  两个进程若在赢家落库之前同时重读，仍可能都判为已死而各删一次；彻底消除需要租约（lease），暂缓。
+- **`Version` 是代次标识，不是计数器**（第二轮审计后）。它被分配为**随机 64 位**而非 `1`，因为
+  「版本动过 = 别人赢了」这个判断是 refresh 被拒时唯一的证据。重绑若回到 `1`，一个陈旧的 refresh
+  就会看到「还是 1」、判定凭据已死，进而**删掉用户刚重连的绑定**并撕毁其密钥。随机代次让「重绑」
+  与「轮换」在该判断下等价——两者都意味着**旧凭据不再是当前那份**，这才是事实。
+- **CAS 在前，写 vault 在后**（第二轮审计后）。反过来写会在两处出错：输的一方已经覆盖了赢家写进 vault
+  的令牌（两个存储各说各话）；更糟的是与 `Unbind` 竞争时会把刚被撕毁并删除的绑定的密文**写回来**——
+  绑定行没了，`ListAll` 看不见，Kill Switch 重试也够不到，只有整账号抹除能清掉。
+- **`Unbind` / `CascadeRevoke` / `shredBinding` 取同一把键锁**（第二轮审计后）。它们原本不取锁，
+  于是可以与一个已经读过绑定的 refresh 交错，造成上面那条「复活」。取锁后两者有序：要么 refresh 先跑完、
+  这次清掉它的结果；要么这次先跑完、refresh 的重读发现无可刷新。
+- **`Unbind` 区分「没有密钥」与「打不开密钥」**（第二轮审计后）。后者（KEK 未配置、审计写入被拒、
+  解密失败）原本塌缩成 `RevocationNothingToDo`——调用方与 Kill Switch 计数器被告知无需动作，
+  而**一个撤销请求都没发出**，上游令牌继续有效。现在报 `RevocationUnavailable` 并带上原因。
 - **多源仲裁**：源有 `active/degraded/retired` 状态。未 pin 时按「active → degraded」顺序尝试、跳过 retired；
   首个失败而后续成功 → `Re0Auth-Degraded: true`。**pin 的源绝不替换**（失败即失败；retired → `410 source_retired`）。
 - **raw 透传**：`GET /v1/games/{game}/sources/{source}/raw/{path...}` 逐字转发源的原始 API
@@ -507,6 +530,13 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 过期会话在 `Find` 时按 scs 语义当作“未找到”并顺手删除，另有 15 分钟一次的 `SweepExpired` 定期清理
 （`Find` 只清那些还会被访问的）。OP 的过期授权请求 / code / 设备授权在读取时按过期处理，不另起 sweep。
 
+**进程生命周期**：`cmd/re0auth` 在 `SIGTERM`/`SIGINT` 时**优雅关闭**——先停止接受新连接，给在途请求最多 30s
+完成，再关闭剩余连接；后台清扫循环（会话 `SweepExpired`、内存 OP janitor）绑在同一个 signal context 上，
+随进程一起取消，不越过进程存活。HTTP server 设了 `ReadHeaderTimeout` / `ReadTimeout` / `WriteTimeout` /
+`IdleTimeout` 与 64 KiB 的 `MaxHeaderBytes`；`WriteTimeout` 取 60s 而非更短，是因为数据面要代理上游响应，
+必须大于出站客户端自己的 20s 期限，否则会把一次合法的慢读截断。运维探针 `/healthz`、`/readyz` 见
+[api-design.md](./api-design.md) §6。
+
 > 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
 > `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
 
@@ -526,6 +556,78 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 - Kill Switch 覆盖令牌、会话与数据源绑定（`all` / `client` / `subject` / `bindings`）；绑定半边对每条绑定
   本地必断，并尽源所能调撤销/级联，见 admin.md §4.2。按账号清会话需要一个会话→账号索引
   （`session_subjects`，登录时写入、注销时移除、过期由 sweep 清理）；没有它只能整体清会话。
+  **Kill Switch 不是删除**：它是可逆意图的应急切断，账号行、identities、vault 密文都还在，账号还能重新登录。
+
+### 4.13 账号抹除（v1 已实现：`internal/lifecycle`）
+
+`DELETE /v1/account` 的编排。它与 §4.12 的 Kill Switch **刻意分开**：Kill Switch 是运维应急切断，
+抹除是用户对自己数据的终局处置，两者要清的 store 高度重叠但语义与审计不同。
+
+- **为什么需要单独一个包：** 一个账号的数据散在十几张表里，而**只有 `accounts_identities` 有指向账号的外键**。
+  直接删 `accounts_users` 会静默留下令牌、vault 行、绑定、在途请求的孤儿。必须有人逐个 store 点名、并规定顺序，
+  这段编排就是 `internal/lifecycle.Deleter` 的全部价值。
+- **顺序（外→内，上游优先）**：bindings（撤上游 + 撕 vault + 删行）→ vault `DeleteSubject` → tokens →
+  sessions → flows → OP/legacy 状态 → 账号行。**每一步幂等**，中途失败即停、可重试，错误注明卡在哪一步。
+- **为什么走 repo 层而不走 `vault.Service`：** `vault.Service` 的每个操作都会自记审计（I3），
+  抹除路径若通过它去取/清伪名密钥，就会形成「审计 → vault 查询 → 审计」的递归。直接删行绕开这条回路，
+  加密擦除的效果一样（包裹的 DEK 就在行里）。
+- **审计失败即失败**（与 §4.12 的 admin 相反）：抹除是用户主动、可重试的请求，一次无法留痕的抹除比一次失败的抹除更糟。
+- **完整性靠测试守住**，不补 16 张外键：`TestAccountDeletionLeavesNoOrphans`（需 Postgres，动态扫
+  `information_schema` 里所有含 `subject`/`user_id` 列的表，逐一断言清零）+
+  `TestEverySubjectColumnIsHandledByErasure`（无需数据库，解析 migration，新增的带 subject 列的表若没登记就构建失败）。
+  `audit_events` 是**显式豁免**：它 append-only，抹除走的是假名化而非删除（后续阶段）。
+
+### 4.14 审计完整性（v1 已实现：`internal/store/postgres/auditchain.go`）
+
+审计表「append-only」原本只是**约定**，不是控制：迁移里没有 trigger、没有权限限制，任何有表权限的角色都能改行。
+现在每一行都承诺前一行、并用**不在数据库里**的密钥签名（迁移 `0013`）：
+
+```
+row_hash  = SHA-256(prev_hash ‖ canonical(row))
+signature = HMAC-SHA256(key, row_hash)
+```
+
+- **串行化是必需的**：单行 `audit_chain` 表在每次追加的整个事务里被 `FOR UPDATE` 锁住。没有它，两个并发插入会各自读到同一个前驱，链就**分叉**了。审计不是热路径，串行化的代价可以接受。
+- **`canonical` 必须确定性**：`detail` 的键要**排序**（Go 的 map 迭代顺序是随机的，不排序则每次算出不同的哈希，行会通不过自己的校验），时间戳要**截断到微秒**（那是 `timestamptz` 实际存的精度，哈希纳秒值会在读回时对不上）。前导域名标签防止与其它用途的哈希撞车，长度前缀防止字段边界歧义。`auditchain_test.go` 有专门的测试钉住这三点。
+- **能挡什么，不能挡什么**（写在迁移注释里，因为**夸大的完整性控制比没有更糟**）：
+  - 改行 → `row_hash` 重算不出来
+  - 链中间删行 / 换序 → 后一行的 `prev_hash` 指向空
+  - **重写整条链** → 哈希可以重算，但**签名伪造不出来**（密钥不在库里）
+  - **从尾部删行 → 挡不住**。截断在没有外部锚点（把链头送去另一个系统）时是不可见的。这是已知边界，不假装覆盖。
+- **签名逐行做，不是定期对链头做**：每行都签比只签周期性链头更强，且少一张表。原计划里的 `audit_chain_checkpoints` 因此没有落地。
+- **迁移前的行** `row_hash IS NULL`，被验证器计为 `legacy` 而**不是**假装覆盖；链从迁移后的第一行开始。另外，**链开始之后**再出现无哈希的行会被判为违规——否则攻击者把某行的哈希清空就能把它降级成「legacy」跳过。
+- **内存模式没有链**：`audit.MemoryLogger` 是环形缓冲，本身就不是防篡改结构，给它加链是自欺。链是**持久化 sink 的属性**，因此 `RE0AUTH_AUDIT_KEY` 只在持久化部署里必填。
+
+### 4.15 审计主体假名化（v1 已实现：迁移 `0014` + `auditpseudo.go`）
+
+审计日志几乎每一行都点名一个账号，所以它自己就是一座个人数据仓库，「抹除账号」如果不动它，
+那个人的轨迹就留在原地。但它是 **append-only 且带链**的（§4.14），不能删行——删行会破坏链。
+
+解法是**假名化 + 销毁密钥**：
+
+```
+idx       = HMAC(audit_key, "…subject-index/1" ‖ subject)   -- 查找键
+key       = 32 随机字节                                      -- 每 subject 一把
+pseudonym = HMAC(key, "…pseudonym/1" ‖ subject)              -- 写进 audit_events.subject
+```
+
+- **抹除 = 删掉 `audit_subject_keys` 里那一行**。行没了，谁都算不出该 subject 的假名——包括本服务。
+  审计行一个字都不动，**链仍然校验通过**。这就是「擦除但不改写历史」。
+- **不存原始 subject**：`idx` 是**带密钥**的哈希，所以这张表里没有账号 id；没有环境里的密钥，
+  也无法为某个候选 subject 反算出 `idx` 去查。
+- **顺序是语义的一部分**：销毁密钥**必须**排在「写完 `account.delete` 审计事件」**之后**。
+  否则写那条事件时查不到 key，sink 会**新造一把**——恰好把这一步要断开的关联又接回去。
+  `lifecycle` 里有测试钉住这个顺序（`TestDeleteAccountDestroysThePseudonymKeyLast`）。
+- **销毁之后**同一 subject 若再来事件（例如某个陈旧会话），会拿到**新的** key、**不同的**假名，
+  因此与旧行失去关联——这正是想要的。
+- **跨进程缓存不破坏擦除**：每个进程缓存 subject→key 以避免每次写审计都查库，
+  但假名是确定性的，缓存命中也只是继续产出同一个假名；不可关联性来自**密钥行不存在**，与缓存无关。
+- **诚实的边界**：
+  - **迁移前的行保留原样**（原样就是当时的 `usr_…` 或空）。没有回填——回填要么使 0013 写在旧值上的哈希失效，
+    要么需要一个启动期的 Go 数据迁移。这是一次性的边界，写在这里而不是假装没有。
+  - **抹除前**，整库 dump 仍能把**在世账号**的审计行关联回去，因为 dump 里同时有密钥和账号 id。
+    但那份 dump 同时也含有该账号的 identities 与 email——**它本来就是全量的**。假名化不是「不被脱库」的替代品，
+    它交付的是**可抹除**。
 
 ## 5. 安全不变量（必须由测试守护）
 
@@ -555,6 +657,11 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 | 授权交互 | `oidchttp`: `TestConsentInteraction`, `TestIDTokenGating`, `TestUserinfoReturnsOnlySub`；`oidcstore`: `NarrowScopes` / `RequireExplicitConsent` 由两个 store 共用；`httpapi`: `TestAuthorizationInteractionEndToEnd`, `TestAuthorizationHandleIsBoundToBrowser`, `TestDecisionRequiresCSRF` |
 | 上游协议 | `upstreamkit`: `TestReferenceUpstreamPassesConformance`, `TestKitAuthorizeFlow`；`conformance`: `TestMissingAccountScopeIsAnError`, `TestBadTokenClassIsAnError`, `TestAuthorizeRedirectingUnknownClientIsAnError`, `TestTokenAcceptingBadGrantIsAnError` |
 | 数据联邦 | `federation`: `TestFetchReturnsSourcePayload`, `TestBindFlow`, `TestFetchRefreshesExpiredBinding`, `TestConcurrentRefreshHappensOnce`, `TestFetchFallsBackAndMarksDegraded`, `TestPinnedSourceIsNotSubstituted`, `TestRawPassthroughIsVerbatim`, `TestActiveBeatsDegraded`；`httpapi`: `TestGameResourceDataPlane`, `TestSourceBindingEndToEnd`, `TestGameRawAndDegraded` |
+| 账号抹除 | `lifecycle`: `TestDeleteAccountClearsEveryStoreInUpstreamFirstOrder`, `TestDeleteAccountStopsAtTheFailingStep`, `TestDeleteAccountFailsWhenTheRecordCannotBeWritten`, `TestDeleteAccountWithoutASessionRevokerSaysSo`；`vault`: `TestDeleteSubjectShredsEveryProviderOfOneAccount`；`memory`: `TestPurgeSubjectRemovesRequestsCodesAndDevices`, `TestPurgeSubjectLeavesOtherAccountsAlone`；`postgres`: `TestAccountDeletionLeavesNoOrphans`（需 DB）, `TestEverySubjectColumnIsHandledByErasure`（无需 DB）；`httpapi`: `TestDeleteAccountEndToEnd`, `TestDeleteAccountRequiresTheAcknowledgement`, `TestDeleteAccountRequiresCSRF`, `TestDeleteAccountIsAbsentWhenNotConfigured` |
+| 账号导出 | `httpapi`: `TestExportAccountOmitsCredentials`（先塞入已知明文再断言其不出现，反空转）, `TestExportAccountSaysCredentialsAreExcluded`, `TestExportAccountIncludesTheAccountShape`, `TestExportAccountRequiresASession` |
+| 审计完整性 | `postgres`: `TestAuditCanonicalIsDeterministic`（反空转：去掉键排序即失败）, `TestAuditCanonicalIsUnambiguous`, `TestAuditCanonicalCoversEveryField`, `TestAuditChainHashLinksToPredecessor`, `TestAuditSignatureDependsOnTheKey`, `TestNewAuditLoggerRejectsABadKey`（以上无需 DB）；`TestAuditChainRecordsAndVerifies`, `TestAuditChainCatchesDeletion`, `TestAuditChainCatchesAReSignWithTheWrongKey`, `TestAuditVerifyCountsLegacyRows`, `TestAuditVerifyRejectsAnUnchainedRowAfterTheChain`（需 DB）；`cmd/re0auth`: `TestAuditKeyIsRequiredOnlyWhenDurable` |
+| 审计假名化 | `postgres`: `TestPseudonymIsStableForOneKey`, `TestPseudonymDependsOnThePerSubjectKey`, `TestAuditHashesAreDomainSeparated`, `TestSubjectIndexDependsOnTheAuditKey`, `TestPseudonymCacheIsBounded`, `TestDestroyRejectsAnEmptySubject`（以上无需 DB）；`TestAuditPseudonymisesSubjectAndUnlinksOnDestroy`（假名稳定 → 销毁后链仍通过 → 再写不得复用旧假名）, `TestAuditLeavesAnEmptySubjectEmpty`（需 DB）；`lifecycle`: `TestDeleteAccountDestroysThePseudonymKeyLast`（顺序：先记录后销毁，反空转）, `TestDeleteAccountReportsAFailedPseudonymDestroy`, `TestDeleteAccountWithoutPseudonymsStillWorks` |
+| 审计读取 | `postgres`（需 DB）: `TestAuditQueryResolvesTheSubjectFilter`（假名翻译，否则过滤为空）, `TestAuditQueryOnAnUnknownSubjectIsEmptyAndSideEffectFree`（读不建密钥）, `TestAuditQueryAfterDestroyReturnsNothing`（行仍在、链仍通过、查不到）, `TestAuditQueryPagesWithoutGapsOrRepeats`, `TestAuditQueryClampsThePageSize`；`httpapi`: `TestAdminAuditIsHiddenFromNonAdmins`, `TestAdminAuditRequiresASession`, `TestAdminAuditPassesFiltersThrough`（解析后不得丢过滤条件）, `TestAdminAuditRejectsMalformedParameters`, `TestAdminAuditReturnsEntriesAndPagination`, `TestAdminAuditOmitsTheCursorOnTheLastPage`, `TestAdminAuditVerifyReportsTheChain`, `TestAdminAuditReportsAReadFailure`, `TestAdminAuditIsAbsentWhenNotConfigured`, `TestAuditRequiresAnAllowlist` |
 | 其他 | 信封 / 身份绑定 / provider 隔离；403 被动失效检测；MAC 签名（`TestMACAuthorizationSignsDocumentedString`） |
 
 端到端：`referencesource` 的 `TestTapTapLoginEndToEnd` 用 httptest 假 TapTap + 真实 vault，
