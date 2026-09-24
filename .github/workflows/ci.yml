@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# Every `uses:` below is pinned to a full commit SHA, with the human-readable
+# release in a trailing comment. A floating `@v4` is a version of somebody else's
+# code that can change without a commit here — and these actions run with this
+# repository's token, inside the job that holds the Postgres service and the
+# release secrets. The toolchain is already pinned for the same reason
+# (govulncheck, golangci-lint, gitleaks, the SBOM generator); a workflow is the
+# one place where "unpinned" means "executing arbitrary new code in CI".
+#
+# To move a pin: bump the SHA and the comment together. `git ls-remote <repo>
+# 'refs/tags/<tag>^{}'` gives the commit a tag points at.
 jobs:
   test:
     # The authoritative run. Unit tests use the in-memory stores and pass on any
@@ -29,11 +39,18 @@ jobs:
 
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/r0semi_test?sslmode=disable
+      # The floor enforced below. It is set just under what the suite reaches
+      # with the Postgres tests *skipped* (measured locally: 64.6%), so both a
+      # laptop without a database and this job clear it; the job's own figure is
+      # higher, because the Postgres tests execute here. Raise it when the real
+      # number rises. Never lower it to turn a red build green — a floor that
+      # moves to meet the code is not a floor.
+      COVERAGE_FLOOR: '60'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -42,11 +59,11 @@ jobs:
       # to locate the store, and the version is pinned to the one in
       # web/package.json's packageManager field so CI and a laptop resolve the
       # same dependency tree.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.8.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: pnpm
@@ -68,8 +85,17 @@ jobs:
             exit 1
           }
 
+      # svelte-check (types + accessibility) is the frontend's static analysis,
+      # and `make check` has always run it — but CI never did, so it was a check
+      # nobody was held to. docs/dependencies.md is explicit that "a check not in
+      # CI is not a check", and this is the one that was missing. It needs the
+      # dependencies from the step above; it does not need the build.
+      - name: frontend check (svelte-check)
+        working-directory: web
+        run: pnpm run check
+
       - name: cache playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
@@ -97,11 +123,38 @@ jobs:
       # development works), and the CI guard in openTestDB turns that into a
       # failure rather than a silent pass.
       #
+      # Coverage is measured on this run rather than a second one: -race implies
+      # -covermode=atomic, so the profile costs a little time and no extra pass
+      # over the suite. A profile that is not actually produced here — the flags
+      # silently disagreeing, say — would be caught by the floor step below
+      # reading an empty total, which is why the total is echoed before it is
+      # checked.
+      #
       # -p 1 serializes packages because three of them (store/postgres, oidchttp,
       # httpapi) share one database; run in parallel, one package's TRUNCATE can
       # wipe rows another is using mid-test.
       - name: go test
-        run: go test -race -p 1 -timeout 300s ./...
+        run: |
+          go test -race -p 1 -timeout 300s \
+            -covermode=atomic -coverprofile=coverage.out \
+            ./...
+          go tool cover -func=coverage.out | tail -1
+
+      # The floor. A coverage number that is only printed is a number nobody is
+      # held to; a package can rot to zero statements executed and every other
+      # gate here stays green. This is deliberately a *floor* and not a target:
+      # it is set below the current figure so it fires on a real regression and
+      # not on the normal ebb of a refactor.
+      - name: coverage floor
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "total statement coverage: ${total}% (floor ${COVERAGE_FLOOR}%)"
+          if awk -v t="$total" -v f="$COVERAGE_FLOOR" 'BEGIN { exit !(t + 0 >= f + 0) }'; then
+            echo "coverage ${total}% meets the floor"
+          else
+            echo "::error::coverage ${total}% is below the floor of ${COVERAGE_FLOOR}%"
+            exit 1
+          fi
 
       # Verbose, so the log proves each integration test executed rather than
       # skipped: the package summary reads "ok" in both cases.
@@ -139,9 +192,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -181,9 +234,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -206,13 +259,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # 0: the full history. A shallow clone would scan only the tip and miss
           # exactly the case this job exists for.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -235,12 +288,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: build the image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: false

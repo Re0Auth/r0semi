@@ -41,9 +41,9 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/r0semi_test?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -51,11 +51,11 @@ jobs:
       # pnpm before setup-node, because the node step's `cache: pnpm` needs pnpm
       # on PATH to find the store. Same version as web/package.json's
       # packageManager field.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.8.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: pnpm
@@ -67,10 +67,15 @@ jobs:
       - name: build the frontend
         run: make web
 
-      # A tag normally points at a commit that already passed ci.yml, where the
-      # race detector and the Postgres matrix live. This is the cheaper tag-time
-      # gate: it refuses a tag on a commit that does not even format, vet or test,
-      # without duplicating the whole pipeline.
+      # A tag normally points at a commit that already passed ci.yml. "Normally"
+      # is not "always" — a tag can be pushed at a commit that never saw a pull
+      # request — so the gate re-runs the suite here rather than trusting the
+      # tag. It runs with the race detector, like ci.yml: a data race is not
+      # something to discover in a released binary, and the Postgres service this
+      # job already starts is what the race detector needs to exercise the
+      # durable paths too. The cost is minutes at tag time; the alternative is a
+      # published artifact whose only concurrency evidence is a run that did not
+      # check for it.
       - name: gate
         run: |
           unformatted=$(gofmt -l .)
@@ -80,7 +85,7 @@ jobs:
             exit 1
           fi
           go vet ./...
-          go test -p 1 -timeout 300s ./...
+          go test -race -p 1 -timeout 300s ./...
 
       # The SBOM generator `make release` shells out to. Pinned here and in the
       # Makefile, so what a release publishes cannot change because an upstream tag
@@ -104,7 +109,7 @@ jobs:
       # archive and the SBOM, so one signature covers the whole release — and
       # because the set of files is fixed before the signature is made, nothing can
       # be added afterwards without the checksums no longer matching.
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: sign the checksums
         run: |
