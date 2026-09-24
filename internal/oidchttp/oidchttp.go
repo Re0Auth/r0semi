@@ -243,6 +243,17 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		writeOAuthJSONError(w, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
 		return
 	}
+	// RFC 6749 §3.2/§5.1, RFC 7662 §2.1, RFC 7009 §2.1 and RFC 8628 §3.1 all
+	// require POST for these endpoints. The library registers them without a
+	// method constraint and reads r.Form, so before this guard a GET was a working
+	// exchange — which put authorization codes, refresh tokens and introspection
+	// tokens into URLs and access logs. Refusing the method is the fix at the
+	// source; the response contract still applies to whatever POST fails.
+	if endpointRequiresPOST(r.URL.Path) && r.Method != http.MethodPost {
+		writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
+			"this endpoint requires POST")
+		return
+	}
 	// The authorize entrance, for either method. `/oauth/authorize/callback` is the
 	// library's own leg and is deliberately not included: it carries no client or
 	// scope parameters, and validating it as an entrance would break the flow.
@@ -562,6 +573,18 @@ func writeOAuthJSONError(w http.ResponseWriter, status int, code, description st
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_description": description})
+}
+
+// endpointRequiresPOST names the protocol endpoints that must only ever accept
+// POST. authorize (and its callback), userinfo and keys are absent on purpose:
+// they are GET endpoints by specification.
+func endpointRequiresPOST(path string) bool {
+	switch path {
+	case "/" + pathToken, "/" + pathIntrospection, "/" + pathRevocation, "/" + pathDeviceAuthz:
+		return true
+	default:
+		return false
+	}
 }
 
 // knownOAuthPath reports whether path is an endpoint this provider serves. It

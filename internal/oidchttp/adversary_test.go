@@ -114,11 +114,11 @@ func adversaryCode(t *testing.T, f fixture, scopes []string, challenge string) s
 	return code
 }
 
-// The library registers the device endpoint with no method constraint and reads
-// `r.Form`, so a pre-flight that only ran for POST was not a gate: a GET minted a
-// device authorization for a scope the client was never registered for. After the
-// fix both methods must be refused.
-func TestAdversarialDeviceAuthorizationPrecheckIsMethodIndependent(t *testing.T) {
+// The library registers protocol endpoints without a method constraint, so a
+// GET used to be a working exchange and put codes/tokens into URLs. These
+// endpoints are now POST-only per their RFCs; a GET is refused before any
+// pre-flight or handler can see it.
+func TestAdversarialDeviceAuthorizationRejectsGET(t *testing.T) {
 	f := newFixture(t)
 	form := url.Values{
 		"client_id": {f.deviceID},
@@ -138,16 +138,16 @@ func TestAdversarialDeviceAuthorizationPrecheckIsMethodIndependent(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if body := adversaryBody(t, resp); resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("GET device_authorization minted an authorization for an unregistered scope: %d %s",
-			resp.StatusCode, body)
+	if body := adversaryBody(t, resp); resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET device_authorization = %d, want 405: %s", resp.StatusCode, body)
+	} else if !strings.Contains(string(body), `"error"`) {
+		t.Fatalf("GET device_authorization refusal is not an OAuth error body: %s", body)
 	}
 }
 
-// The token response contract (no `id_token` without `openid`; `Cache-Control:
-// no-store`) was applied only on POST, while the library accepts the exchange on
-// any method. A GET response must be sanitized exactly like a POST one.
-func TestAdversarialTokenEndpointContractIsMethodIndependent(t *testing.T) {
+// A GET to the token endpoint must not exchange a code at all. Before this
+// guard the library accepted it and the code ended up in the URL/logs.
+func TestAdversarialTokenEndpointRejectsGET(t *testing.T) {
 	f := newFixture(t)
 	verifier := strings.Repeat("a", 64)
 	sum := sha256.Sum256([]byte(verifier))
@@ -181,21 +181,34 @@ func TestAdversarialTokenEndpointContractIsMethodIndependent(t *testing.T) {
 		t.Fatal(err)
 	}
 	getBody := adversaryBody(t, getResp)
-	if getResp.StatusCode != http.StatusOK {
-		// A refusal is also safe; only a successful-but-unsanitized response is a
-		// hole.
-		t.Logf("GET /oauth/token refused with %d: %s", getResp.StatusCode, getBody)
-		return
+	if getResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /oauth/token = %d, want 405: %s", getResp.StatusCode, getBody)
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(getBody, &payload); err != nil {
-		t.Fatalf("GET /oauth/token returned non-JSON: %s", getBody)
+	if strings.Contains(string(getBody), "access_token") || strings.Contains(string(getBody), "refresh_token") {
+		t.Fatalf("GET /oauth/token returned a token: %s", getBody)
 	}
-	if _, ok := payload["id_token"]; ok {
-		t.Fatalf("GET /oauth/token returned an id_token without the openid scope: %s", getBody)
-	}
-	if getResp.Header.Get("Cache-Control") != "no-store" {
-		t.Errorf("GET /oauth/token returned a token without Cache-Control: no-store: %v", getResp.Header)
+}
+
+// Introspection and revocation are POST-only too, for the same reason: the token
+// under inspection must not be carried in a URL.
+func TestAdversarialIntrospectionAndRevocationRejectGET(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{"/oauth/introspect", "/oauth/revoke"} {
+		resp, err := http.Get(f.server.URL + path + "?token=secret-token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := adversaryBody(t, resp)
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("GET %s = %d, want 405: %s", path, resp.StatusCode, body)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("GET %s refusal is not JSON: %s", path, body)
+		}
+		if _, ok := payload["error"].(string); !ok {
+			t.Fatalf("GET %s refusal is not an OAuth error: %s", path, body)
+		}
 	}
 }
 

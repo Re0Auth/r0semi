@@ -46,21 +46,17 @@ var protocolPaths = []string{
 	"/.well-known",
 }
 
-// protocolAnyMethod names the endpoints the library serves without a method
-// constraint: it reads `r.Form`, which a GET's query string satisfies just as a
-// POST body does. The walk reaches each of these by both methods, because the
-// wrapper's contract has to hold for the request the library actually accepts.
+// protocolAnyMethod names the endpoints that legitimately accept both GET and
+// POST: authorize (and userinfo) per their RFCs. The library serves them reading
+// `r.Form`, so the walk reaches each by both methods.
 //
-// A POST-only assumption is not cosmetic: it is exactly how the token endpoint's
-// response sanitising (no `id_token` without `openid`, `Cache-Control: no-store`)
-// and the device endpoint's scope pre-flight were each skipped on a reachable
-// path, so the walk that used the "expected" method could not see either.
+// token, revoke, introspect and device_authorization are deliberately absent:
+// they are POST-only now, and the walk asserts their GET refusal through the
+// protocol-plane error shape instead. A POST-only assumption on those was how the
+// token response sanitising and the device scope pre-flight were each skipped.
 var protocolAnyMethod = map[string]bool{
-	"/oauth/authorize":            true,
-	"/oauth/token":                true,
-	"/oauth/revoke":               true,
-	"/oauth/introspect":           true,
-	"/oauth/device_authorization": true,
+	"/oauth/authorize": true,
+	"/oauth/userinfo":  true,
 }
 
 // The two planes promise different error formats, and that promise is the whole
