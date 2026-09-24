@@ -176,6 +176,47 @@ func TestAuditChainRecordsAndVerifies(t *testing.T) {
 	}
 }
 
+// TestAdversarialAuditChainCatchesAWholeLogMetadataStrip: clearing the chain
+// columns off every row must not verify. Without the chain-head witness every row
+// reads as pre-chain and the walk reports the log intact while a caller with DB
+// write access has rewritten its contents freely.
+func TestAdversarialAuditChainCatchesAWholeLogMetadataStrip(t *testing.T) {
+	db := openTestDB(t)
+	logger := openAudit(t, db)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		if err := logger.Record(ctx, audit.Event{
+			Action: "oauth.token", Subject: "usr_1", Outcome: audit.OutcomeOK,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v, err := logger.Verify(ctx); err != nil || !v.OK {
+		t.Fatalf("a freshly written log should verify: %+v %v", v, err)
+	}
+
+	tag, err := db.pool.Exec(ctx,
+		`UPDATE audit_events SET row_hash = NULL, prev_hash = NULL, signature = NULL`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.RowsAffected() == 0 {
+		t.Fatal("the strip touched no rows; the probe would prove nothing")
+	}
+
+	v, err := logger.Verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.OK {
+		t.Fatalf("a log whose chain metadata was stripped verified: %+v", v)
+	}
+	if v.Reason == "" {
+		t.Errorf("the strip was caught but no reason was given: %+v", v)
+	}
+}
+
 // TestAuditChainCatchesDeletion: removing a row from the middle breaks the
 // linkage of the row that followed it.
 func TestAuditChainCatchesDeletion(t *testing.T) {

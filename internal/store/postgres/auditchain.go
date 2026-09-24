@@ -155,6 +155,15 @@ type AuditVerification = audit.Verification
 // reorder, and the signature catches an attacker who rewrote the whole chain
 // (who can recompute every hash but cannot forge the MAC).
 func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
+	// The chain head is read first as a witness that rows were chained at all.
+	// Without it, clearing the chain columns off every row (row_hash = NULL) makes
+	// each row look pre-chain and the walk reports the log intact while a caller
+	// with DB write access rewrote it freely.
+	var head []byte
+	if err := l.pool.QueryRow(ctx, `SELECT head_hash FROM audit_chain WHERE only_row`).Scan(&head); err != nil {
+		return audit.Verification{}, fmt.Errorf("postgres: audit: verify head: %w", err)
+	}
+
 	rows, err := l.pool.Query(ctx, `
 		SELECT id, occurred_at, action, subject, provider, outcome, detail,
 		       prev_hash, row_hash, signature
@@ -229,6 +238,17 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return AuditVerification{}, fmt.Errorf("postgres: audit: verify iterate: %w", err)
+	}
+	if v.Chained == 0 && len(head) != 0 {
+		// The head advanced, so rows were chained, yet none of them read as
+		// chained. That is exactly what clearing the chain columns produces, and
+		// reporting it intact is the failure this check exists to prevent. (An
+		// attacker who also resets the head to the genesis is indistinguishable from
+		// a genuinely pre-chain log without an external anchor — the documented
+		// boundary, not this one.)
+		v.OK = false
+		v.Reason = "the chain head has advanced but no chained row was found: the chain metadata was cleared"
+		return v, nil
 	}
 	v.OK = true
 	return v, nil

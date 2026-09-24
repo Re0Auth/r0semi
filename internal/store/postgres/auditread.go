@@ -53,7 +53,13 @@ func (l *AuditLogger) Query(ctx context.Context, q audit.Query) (audit.Page, err
 			return audit.Page{}, err
 		}
 		if key == nil {
-			return audit.Page{Entries: []audit.Entry{}}, nil
+			// An empty page — but carrying the limit the server applied, not a zero
+			// value. A zero here would make "no pseudonym key exists" (never seen, or
+			// erased) distinguishable from "the key exists but the filters matched
+			// nothing", a one-bit account-existence oracle about an arbitrary
+			// subject; and it would echo a page size the API never applies, so a
+			// client feeding it back would be refused.
+			return audit.Page{Entries: []audit.Entry{}, Limit: limit}, nil
 		}
 		add("subject", "=", pseudonymOf(key, q.Subject))
 	}

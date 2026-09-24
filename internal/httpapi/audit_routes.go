@@ -82,6 +82,17 @@ func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
 				f.name+" must be an RFC 3339 timestamp")
 			return
 		}
+		// A value that parses to Go's zero time (e.g. 0001-01-01T00:00:00Z) is
+		// refused rather than dropped. The reader treats the zero time as "no
+		// bound", so accepting it silently would widen the result set to the whole
+		// log while the caller believed they had narrowed it — and `until` is the
+		// direction that leaks more than was asked for. A filter that cannot be
+		// honoured is refused, not ignored.
+		if parsed.IsZero() {
+			s.writeProblem(w, r, http.StatusBadRequest, "invalid_request",
+				f.name+" is out of range")
+			return
+		}
 		*f.target = parsed
 	}
 

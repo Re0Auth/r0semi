@@ -222,6 +222,27 @@ func TestAdminAuditReportsAReadFailure(t *testing.T) {
 	}
 }
 
+// TestAdversarialAuditZeroTimeBoundIsRefused: a bound that parses to Go's zero
+// time (0001-01-01T00:00:00Z) must be refused, not dropped. The reader treats the
+// zero time as "no bound", so accepting it silently widened the result to the
+// whole log while the caller believed they had narrowed it.
+func TestAdversarialAuditZeroTimeBoundIsRefused(t *testing.T) {
+	env := newAdminEnv(t, true)
+	browser := newBrowser(t)
+	signIn(t, browser, env.base)
+
+	for _, q := range []string{"?since=0001-01-01T00:00:00Z", "?until=0001-01-01T00:00:00Z"} {
+		resp := getURL(t, browser, env.base+"/v1/admin/audit"+q)
+		body := decodeResp(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET %s = %d, want 400 (a bound that cannot be honoured must be refused)", q, resp.StatusCode)
+		}
+		if body["code"] != "invalid_request" {
+			t.Errorf("GET %s code = %v, want invalid_request", q, body["code"])
+		}
+	}
+}
+
 // TestAdminAuditIsAbsentWhenNotConfigured: a deployment whose audit log cannot be
 // read must not advertise the endpoints. They fall to the business-plane
 // catch-all, a 404 like any other unknown resource.

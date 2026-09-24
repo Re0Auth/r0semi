@@ -94,6 +94,44 @@ func TestAuditQueryOnAnUnknownSubjectIsEmptyAndSideEffectFree(t *testing.T) {
 	}
 }
 
+// TestAdversarialAuditNoKeyPageCarriesTheAppliedLimit: an empty page for a
+// subject with no pseudonym key must carry the same page size as any other empty
+// page. A zero limit there distinguished "no key exists" (never seen, or erased)
+// from "the key exists but the filter matched nothing" — a one-bit
+// account-existence oracle on the operator plane — and echoed a page size the API
+// never applies.
+func TestAdversarialAuditNoKeyPageCarriesTheAppliedLimit(t *testing.T) {
+	db := openTestDB(t)
+	logger := openAudit(t, db)
+	ctx := context.Background()
+
+	noKey, err := logger.Query(ctx, audit.Query{Subject: "usr_never_seen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(noKey.Entries) != 0 {
+		t.Fatalf("entries = %d, want 0", len(noKey.Entries))
+	}
+	if noKey.Limit != defaultAuditPage {
+		t.Fatalf("no-key page limit = %d, want %d", noKey.Limit, defaultAuditPage)
+	}
+
+	// The same shape from a subject whose key exists but whose filter matches
+	// nothing must be indistinguishable from it.
+	recordN(t, logger, "usr_seen", "vault.use", 1)
+	keyButEmpty, err := logger.Query(ctx, audit.Query{Subject: "usr_seen", Action: "no.such.action"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keyButEmpty.Entries) != 0 {
+		t.Fatalf("filtered entries = %d, want 0", len(keyButEmpty.Entries))
+	}
+	if keyButEmpty.Limit != noKey.Limit {
+		t.Fatalf("empty pages differ: with key limit=%d, without key limit=%d",
+			keyButEmpty.Limit, noKey.Limit)
+	}
+}
+
 // TestAuditQueryAfterDestroyReturnsNothing is the erasure property seen from the
 // operator's side: the rows are still in the table, and the log can no longer say
 // whose they are. The empty page is the correct answer, not a missing feature.
