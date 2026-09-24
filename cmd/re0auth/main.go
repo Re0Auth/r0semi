@@ -365,7 +365,13 @@ func main() {
 	// log is a bounded ring buffer with no record chain, so a "verify" over it
 	// would report on a guarantee it does not have. Mounted when available rather
 	// than gated on storage mode, so the difference stays a property of the sink.
-	if reader, ok := store.audit.(httpapi.AuditReader); ok {
+	//
+	// It also rides with the operator plane: reading the log means reading about
+	// every account, so the endpoints are admin-only and the plane is not mounted
+	// without an allowlist. A durable deployment with no admins is legitimate — it
+	// simply has no read API — and it must still start, which is why this is gated
+	// here rather than left for httpapi.New to reject.
+	if reader := auditReadSide(cfg.adminSubjects, store.audit); reader != nil {
 		apiConfig.Audit = reader
 		slog.Info("audit read API enabled", "endpoints", "/v1/admin/audit, /v1/admin/audit/verify")
 	}
@@ -976,6 +982,27 @@ func (e erasureBindings) RevokeUserBindings(ctx context.Context, user account.Us
 func pseudonymStore(l audit.Logger) lifecycle.PseudonymDestroyer {
 	if d, ok := l.(lifecycle.PseudonymDestroyer); ok {
 		return d
+	}
+	return nil
+}
+
+// auditReadSide returns the sink's read capability, or nil when the deployment
+// must not offer it.
+//
+// Two things gate it, and both are refusals rather than branches on storage mode:
+// the sink must be able to answer (only the durable chain can — a "verify" over
+// the in-memory ring buffer would report on a guarantee it does not have), and
+// the deployment must name an operator. The log describes every account, so its
+// read side is admin-only; the same allowlist that mounts the operator plane is
+// what mounts this. A durable deployment with no admins is legitimate and simply
+// gets no read API — httpapi.New would reject the alternative, taking the whole
+// server down over an endpoint nobody is allowed to call.
+func auditReadSide(admins []string, l audit.Logger) httpapi.AuditReader {
+	if len(admins) == 0 {
+		return nil
+	}
+	if r, ok := l.(httpapi.AuditReader); ok {
+		return r
 	}
 	return nil
 }

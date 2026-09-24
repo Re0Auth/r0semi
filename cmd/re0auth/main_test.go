@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Re0Auth/r0semi/audit"
 )
 
 func TestOIDCTokenKeyFailClosed(t *testing.T) {
@@ -350,6 +352,40 @@ func TestAuditKeyIsRequiredOnlyWhenDurable(t *testing.T) {
 			t.Errorf("memory mode resolved an audit key: %v", cfg.AuditKey)
 		}
 	})
+}
+
+// auditReadSink is the durable sink's shape in miniature: it can be logged to,
+// through the embedded in-memory logger, and it can be read.
+type auditReadSink struct {
+	*audit.MemoryLogger
+}
+
+func (auditReadSink) Query(context.Context, audit.Query) (audit.Page, error) {
+	return audit.Page{}, nil
+}
+
+func (auditReadSink) Verify(context.Context) (audit.Verification, error) {
+	return audit.Verification{}, nil
+}
+
+// The audit read API needs both a sink that can answer and an allowlist to read
+// through. Wiring only the first is what took the whole server down: the durable
+// run has a readable sink, so httpapi.New was handed an audit reader with no
+// admins and refused to start.
+func TestAuditReadSideIsGatedOnAnAllowlist(t *testing.T) {
+	readable := auditReadSink{audit.NewMemoryLogger()}
+
+	if got := auditReadSide(nil, readable); got != nil {
+		t.Fatal("the read API was offered without an admin allowlist")
+	}
+	if got := auditReadSide([]string{"usr_admin"}, readable); got == nil {
+		t.Fatal("the read API was withheld from a named admin")
+	}
+	// And the allowlist alone is not enough: the sink has to be able to answer,
+	// which the in-memory ring buffer cannot.
+	if got := auditReadSide([]string{"usr_admin"}, audit.NewMemoryLogger()); got != nil {
+		t.Fatal("the read API was offered by a sink that cannot read")
+	}
 }
 
 // The operational surface — metrics and profiling — is a separate listener on
