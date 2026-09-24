@@ -1,0 +1,36 @@
+# What the image build does not need. Keeping the context small is not just
+# speed: anything copied into a layer can leak into an intermediate one, so
+# deployment-local secrets and the tool's own state stay out.
+
+.git
+.github
+.commandcode
+
+# Build output and local binaries: the image builds its own.
+dist
+re0auth
+referencesource
+*.exe
+
+# The frontend is installed and built inside the web stage from the lockfile, so
+# a host node_modules or build cache must never be copied in and shadow it.
+web/node_modules
+web/.svelte-kit
+web/test-results
+web/playwright-report
+
+# Replaced by the web stage's output; the source-tree placeholder is not needed.
+internal/webui/dist
+
+# Deployment-local configuration and secrets. The example files stay (they are
+# documentation), but a real config and any *.local/*.secret file must not enter
+# an image layer.
+config/re0auth.toml
+config/*.local.*
+config/*.secret.*
+.env
+
+# Editor and VCS noise.
+.gitignore
+.vscode
+.idea

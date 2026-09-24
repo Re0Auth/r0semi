@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test check e2e play dist sbom checksums release clean
+.PHONY: all web build test check e2e play dist sbom checksums release docker clean
 
 all: web build
 
@@ -130,6 +130,15 @@ checksums: sbom
 	@cd dist && $(SHA256) re0auth_$(VERSION)_* > SHA256SUMS && echo "checksums: $$(wc -l < SHA256SUMS) file(s)"
 
 release: dist sbom checksums
+
+# Container image. There is no registry and no push here: this builds the image
+# from the same source the release archives come from, for a deployment to tag
+# and push itself. The Dockerfile takes the target platform from the build, so
+# multi-arch is a `docker buildx build --platform` flag away rather than a change
+# to any of this.
+IMAGE ?= re0auth
+docker:
+	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
 
 clean:
 	rm -rf web/node_modules web/.svelte-kit dist
