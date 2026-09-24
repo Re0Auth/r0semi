@@ -74,6 +74,8 @@ func TestOIDCWiringEndToEnd(t *testing.T) {
 	copy(cryptoKey[:], []byte("0123456789abcdef0123456789abcdef"))
 	opHandler, err := oidchttp.New(oidchttp.Config{
 		Storage:       store,
+		Clients:       db.Clients(),
+		Registry:      oauth.DefaultRegistry(),
 		CryptoKey:     cryptoKey,
 		CryptoKeyID:   "wiring-test",
 		AllowInsecure: true,

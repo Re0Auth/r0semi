@@ -242,6 +242,13 @@ func TestOIDCDeviceFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A duplicate user code is rejected with the sentinel. Checked while the first
+	// authorization is still live: the exchange below consumes its row (the device
+	// code is single use), and a consumed code frees its user code by design.
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "dev-code-2", "bcdf-ghjk", expires, nil); !errors.Is(err, op.ErrDuplicateUserCode) {
+		t.Fatalf("duplicate user code = %v, want ErrDuplicateUserCode", err)
+	}
+
 	st, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "dev-code-1")
 	if err != nil {
 		t.Fatal(err)
@@ -274,12 +281,6 @@ func TestOIDCDeviceFlow(t *testing.T) {
 	}
 	if accessID == "" {
 		t.Fatal("no access token issued from device state")
-	}
-
-	// A duplicate user code is rejected with the sentinel.
-	err = store.StoreDeviceAuthorization(ctx, "oidc-device", "dev-code-2", "BCDF-GHJK", expires, nil)
-	if !errors.Is(err, op.ErrDuplicateUserCode) {
-		t.Fatalf("duplicate user code = %v, want ErrDuplicateUserCode", err)
 	}
 }
 
