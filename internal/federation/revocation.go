@@ -114,6 +114,13 @@ func (s *service) CascadeRevoke(ctx context.Context, user account.UserID, game, 
 	if src.CascadeRevocationEndpoint == "" {
 		return RevocationResult{}, ErrCascadeUnsupported
 	}
+	// Same per-binding lock a refresh and an unbind take. A cascade must not
+	// interleave with a refresh either: the refresh would rotate the token out from
+	// under the request that is telling the source to kill the session, or write a
+	// fresh secret back after this call shredded it.
+	unlock := s.locks.lock(bindingKey(user, game, source))
+	defer unlock()
+
 	binding, err := s.bindings.Get(ctx, user, game, source)
 	if err != nil {
 		return RevocationResult{}, err

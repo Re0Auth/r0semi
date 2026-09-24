@@ -101,7 +101,14 @@ func (s *service) revokeBindings(ctx context.Context, bindings []Binding) Bindin
 
 // shredBinding removes a binding whose source is gone. Order mirrors Unbind: the
 // secret first, because it is the part that could still be used, then the row.
+//
+// It takes the same per-binding lock the other removal paths take, for the same
+// reason: a refresh in flight must not be able to write a fresh secret back after
+// this has shredded the old one and deleted the row.
 func (s *service) shredBinding(ctx context.Context, b Binding) error {
+	unlock := s.locks.lock(bindingKey(b.User, b.Game, b.Source))
+	defer unlock()
+
 	if err := s.vault.Revoke(ctx, BindingIdentity(b)); err != nil {
 		return err
 	}

@@ -314,6 +314,43 @@ func TestRevokeInvalidatesAccessToken(t *testing.T) {
 	}
 }
 
+// RFC 7009 §2.1: a token may only be revoked by the client it was issued to.
+// Without this check, any registered client that came by another client's token
+// value could revoke it — and the refresh chain hanging off it — which is a
+// denial of service on somebody else's session.
+func TestRevokeRefusesATokenIssuedToAnotherClient(t *testing.T) {
+	svc, clients, _, _, _ := newTestAS(t)
+	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})
+	registerClient(t, clients, "other", ClientPublic, "", []Scope{ScopeAccountID})
+	ctx := context.Background()
+	verifier := "verifier-verifier-verifier-verifier"
+
+	auth, _ := svc.Authorize(ctx, AuthorizationRequest{
+		ClientID: "app", RedirectURI: "https://app.example/cb", Subject: "u",
+		Scopes: []Scope{ScopeAccountID}, CodeChallenge: pkceChallenge(verifier), CodeChallengeMethod: "S256",
+	})
+	tok, _ := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "app", Code: auth.Code, RedirectURI: "https://app.example/cb", CodeVerifier: verifier,
+	})
+
+	if err := svc.Revoke(ctx, RevokeRequest{ClientID: "other", Token: tok.AccessToken}); err == nil {
+		t.Fatal("another client revoked a token it does not own")
+	}
+
+	info, err := svc.Introspect(ctx, tok.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Active {
+		t.Fatal("the token was revoked anyway")
+	}
+
+	// The owner still can.
+	if err := svc.Revoke(ctx, RevokeRequest{ClientID: "app", Token: tok.AccessToken}); err != nil {
+		t.Fatalf("the owner could not revoke its own token: %v", err)
+	}
+}
+
 func TestAccessTokenExpires(t *testing.T) {
 	svc, clients, _, _, clock := newTestAS(t)
 	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})

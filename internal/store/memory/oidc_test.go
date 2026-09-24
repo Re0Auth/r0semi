@@ -205,3 +205,59 @@ func TestRefreshTokenRotationStillWorksWhenPresentedOnce(t *testing.T) {
 		t.Fatalf("the replacement refresh token was rejected: %v", err)
 	}
 }
+
+// Revocation must work through the path a client actually takes.
+//
+// The library feeds GetRefreshTokenInfo's identifier straight back into
+// RevokeToken, so the two have to agree on what that identifier is. When they did
+// not, RevokeToken hashed a hash, matched nothing, fell through to RFC 7009's
+// "already invalid means success" branch, and answered 200 while the refresh
+// token kept minting — a leaked token surviving its own revocation.
+func TestRefreshTokenRevocationRoundTrip(t *testing.T) {
+	store, client := testStore(t)
+	ctx := context.Background()
+	req := &oidcstore.AuthRequest{ClientID: client.ID, Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	_, refresh, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subject, tokenID, err := store.GetRefreshTokenInfo(ctx, client.ID, refresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subject != "usr_1" {
+		t.Fatalf("subject = %q, want usr_1", subject)
+	}
+
+	if err := store.RevokeToken(ctx, tokenID, subject, client.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// The whole point: it must no longer be spendable.
+	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err == nil {
+		t.Fatal("the refresh token still works after being revoked through " +
+			"GetRefreshTokenInfo's identifier")
+	}
+}
+
+// The revocation must not cross clients: an identifier that resolves is still
+// only revocable by the client it was issued to (RFC 7009 §2.1).
+func TestRefreshTokenRevocationIsScopedToItsClient(t *testing.T) {
+	store, client := testStore(t)
+	ctx := context.Background()
+	req := &oidcstore.AuthRequest{ClientID: client.ID, Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	_, refresh, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RevokeToken(ctx, refresh, "usr_1", "some-other-client"); err == nil {
+		t.Fatal("another client revoked a refresh token it does not own")
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err != nil {
+		t.Fatalf("the token was revoked anyway: %v", err)
+	}
+}

@@ -38,10 +38,18 @@ func (c Credential) Encode() ([]byte, error) {
 }
 
 // DecodeCredential parses a payload previously produced by Credential.Encode.
+//
+// It validates what it parses. Every caller does check Valid() today, so this
+// changes nothing now — but a decoder that hands back a structurally incomplete
+// credential is a trap for the next caller, and "the caller will check" is a
+// property of today's code rather than of this function's contract.
 func DecodeCredential(b []byte) (Credential, error) {
 	var c Credential
 	if err := json.Unmarshal(b, &c); err != nil {
 		return Credential{}, fmt.Errorf("tapsign: decode credential: %w", err)
+	}
+	if err := c.Valid(); err != nil {
+		return Credential{}, err
 	}
 	return c, nil
 }

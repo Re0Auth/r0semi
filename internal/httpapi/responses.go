@@ -103,8 +103,17 @@ func writeOAuthError(w http.ResponseWriter, r *http.Request, status int, code, d
 	_ = json.NewEncoder(w).Encode(oauthErrorBody{Error: code, ErrorDescription: description})
 }
 
+// writeJSON is the business plane's one success writer.
+//
+// It sets no-store for the same reason the protocol plane does: every response on
+// this plane is authenticated and per-person — the session bootstrap and the admin
+// client list carry a CSRF token, and the account export is the whole of somebody's
+// account. A shared cache in front of the deployment has no key that distinguishes
+// accounts (there is no Vary here either), and a browser cache would keep the CSRF
+// token on disk after the session ended.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }

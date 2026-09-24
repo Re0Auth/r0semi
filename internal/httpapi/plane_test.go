@@ -105,15 +105,27 @@ func TestErrorFormatNeverCrossesPlanes(t *testing.T) {
 		})
 	}
 
-	protocolPlane := protocolPaths
-	for _, path := range protocolPlane {
-		method := http.MethodGet
-		if protocolPostOnly[path] {
-			method = http.MethodPost
+	// Each endpoint is asked the way a client would reach it. `POST
+	// /oauth/authorize` is in this walk on purpose: the library registers that
+	// endpoint without a method constraint and reads `r.Form`, so a walk that
+	// issued only GETs would not notice a pre-flight that only ran for GET — which
+	// is exactly the gap that let a confidential client obtain a code with no
+	// PKCE and let an unknown client answer in the library's plain-text shape.
+	type attempt struct{ method, path string }
+	attempts := make([]attempt, 0, len(protocolPaths)+1)
+	for _, p := range protocolPaths {
+		m := http.MethodGet
+		if protocolPostOnly[p] {
+			m = http.MethodPost
 		}
-		t.Run("oauth "+method+" "+path, func(t *testing.T) {
+		attempts = append(attempts, attempt{m, p})
+	}
+	attempts = append(attempts, attempt{http.MethodPost, "/oauth/authorize"})
+
+	for _, a := range attempts {
+		t.Run("oauth "+a.method+" "+a.path, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			handler.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+			handler.ServeHTTP(rec, httptest.NewRequest(a.method, a.path, nil))
 			if rec.Code < 400 {
 				return
 			}
@@ -276,20 +288,32 @@ func assertProblemPlane(t *testing.T, rec *httptest.ResponseRecorder) {
 	}
 }
 
-// assertOAuthPlane checks a protocol-plane failure: never problem+json, and never
-// the problem shape wearing an OAuth Content-Type.
+// assertOAuthPlane checks a protocol-plane failure: an OAuth error body, and never
+// problem+json.
+//
+// A non-JSON body is a failure, not something to tolerate. OAuth clients parse
+// `{error, error_description}`; a plain-text 400 from the library is the plane
+// contract leaking, and it is what an unknown client used to get on the POST
+// authorize path because the pre-flight did not run there.
 func assertOAuthPlane(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	ct := rec.Header().Get("Content-Type")
 	if strings.Contains(ct, "problem+json") {
 		t.Fatalf("protocol plane answered %d with %q — body: %s", rec.Code, ct, rec.Body.String())
 	}
+	if rec.Code < 400 {
+		return
+	}
 	body := decodeBody(t, rec)
 	if body == nil {
-		return
+		t.Fatalf("protocol plane answered %d with Content-Type %q and a non-JSON body: %s",
+			rec.Code, ct, rec.Body.String())
 	}
 	if _, ok := body["type"]; ok {
 		t.Fatalf("protocol plane leaked a problem+json object: %s", rec.Body.String())
+	}
+	if _, ok := body["error"]; !ok {
+		t.Fatalf("protocol-plane failure carries no `error` field: %s", rec.Body.String())
 	}
 }
 

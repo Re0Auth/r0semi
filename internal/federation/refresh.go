@@ -82,22 +82,56 @@ func (s *service) refreshBinding(ctx context.Context, src Source, current Bindin
 	})
 	if err != nil {
 		if errors.Is(err, errRefreshRejected) {
-			// The grant is dead; the user must bind the source again. Drop both
-			// the metadata and the encrypted secret.
-			_ = s.bindings.Delete(ctx, fresh.User, fresh.Game, fresh.Source)
-			_ = s.vault.Revoke(ctx, BindingIdentity(fresh))
-			return Binding{}, &NotBoundError{Game: fresh.Game, Source: fresh.Source}
+			return s.refreshRejected(ctx, fresh)
 		}
 		return Binding{}, err
 	}
 
-	if err := s.storeBindingSecret(ctx, updated, rotated); err != nil {
+	// Claim the version FIRST, and write the secret only if the claim held.
+	//
+	// The reverse order was wrong in two ways that only showed up under concurrency.
+	// A writer that lost the race had already overwritten the winner's token in the
+	// vault while the winner's row described a different one — the two stores
+	// disagreeing about which upstream token is live. And a refresh racing an
+	// Unbind resurrected the secret of a binding that had just been removed: the
+	// row was gone so the swap failed, but the vault write had already happened,
+	// leaving a decryptable token that ListAll cannot see, the Kill Switch cannot
+	// reach again, and only an account erasure clears.
+	won, err := s.bindings.PutIfVersion(ctx, updated, fresh.Version)
+	if err != nil {
 		return Binding{}, err
 	}
-	if err := s.bindings.Put(ctx, updated); err != nil {
+	if !won {
+		// Another process — or an unbind — got there first. Its row is the truth,
+		// and we must not touch the vault.
+		return s.bindings.Get(ctx, fresh.User, fresh.Game, fresh.Source)
+	}
+	if err := s.storeBindingSecret(ctx, updated, rotated); err != nil {
+		// The row now describes a rotation whose secret was not stored. That is a
+		// broken binding rather than a silent divergence: the next call presents
+		// the old token, is rejected, and the rejection path cleans up. Worth
+		// stating plainly — this is the one case the ordering trade buys.
 		return Binding{}, err
 	}
 	return updated, nil
+}
+
+// refreshRejected decides what a definitively rejected refresh grant means.
+//
+// A one-time refresh token makes invalid_grant ambiguous: if another process
+// rotated this binding while we were calling the source, our call loses the race
+// and is rejected for a token that is not dead, only spent. Deleting the binding
+// then would destroy one the other process just renewed. So re-read first — a
+// version that moved past the one we spent means somebody else won, and their
+// token is the live one. Only a version that did not move means the grant is
+// genuinely gone and the user must bind again.
+func (s *service) refreshRejected(ctx context.Context, spent Binding) (Binding, error) {
+	if latest, err := s.bindings.Get(ctx, spent.User, spent.Game, spent.Source); err == nil && latest.Version != spent.Version {
+		return latest, nil
+	}
+	_ = s.bindings.Delete(ctx, spent.User, spent.Game, spent.Source)
+	_ = s.vault.Revoke(ctx, BindingIdentity(spent))
+	return Binding{}, &NotBoundError{Game: spent.Game, Source: spent.Source}
 }
 
 // isRefreshRejected reports a token endpoint that definitively rejected the

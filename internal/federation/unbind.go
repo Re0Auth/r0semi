@@ -7,6 +7,7 @@ import (
 	"net/url"
 
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/vault"
 )
 
 // Bindings lists the sources a user has connected, so the account page can show
@@ -34,6 +35,18 @@ func (s *service) Unbind(ctx context.Context, user account.UserID, game, source 
 	if !ok {
 		return RevocationResult{}, ErrUnknownSource
 	}
+	// The same per-binding lock a refresh takes, for the whole call.
+	//
+	// Without it an unbind could interleave with a refresh that was already past
+	// its own read: the refresh would finish by writing the secret back into the
+	// vault after this call had shredded it and removed the row, resurrecting a
+	// credential whose binding no longer exists. Holding the lock makes the two
+	// operations ordered — either the refresh completes first and this call clears
+	// its result, or this call completes first and the refresh's re-read finds
+	// nothing to refresh.
+	unlock := s.locks.lock(bindingKey(user, game, source))
+	defer unlock()
+
 	binding, err := s.bindings.Get(ctx, user, game, source)
 	if errors.Is(err, ErrNotBound) {
 		return RevocationResult{Upstream: RevocationNothingToDo}, nil
@@ -78,9 +91,17 @@ func (s *service) revokeUpstream(ctx context.Context, src Source, binding Bindin
 		secret = *sec
 		return nil
 	}); err != nil {
-		// No readable secret means there is nothing to revoke upstream. Not an
-		// error: the goal of the call has already been achieved.
-		return RevocationNothingToDo, ""
+		if errors.Is(err, vault.ErrNotFound) {
+			// There is no secret to revoke. Not an error: the goal of the call has
+			// already been achieved.
+			return RevocationNothingToDo, ""
+		}
+		// The record EXISTS but could not be opened — an unconfigured KEK, a refused
+		// audit write, a failed decrypt. Reporting that as "nothing to do" told the
+		// caller, and the Kill Switch's counters, that no upstream action was needed
+		// while no revocation request had been sent at all: an incident responder
+		// read "every source was told" and every upstream token was still live.
+		return RevocationUnavailable, err.Error()
 	}
 
 	token, hint := preferredToken(secret)

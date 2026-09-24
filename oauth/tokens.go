@@ -78,6 +78,15 @@ type Store interface {
 	ListBySubject(ctx context.Context, subject string) ([]GrantRecord, error)
 	// DeleteBySubjectClient removes every token one client holds for one subject.
 	DeleteBySubjectClient(ctx context.Context, subject, clientID string) error
+
+	// TokenOwner returns the client a presented token value was issued to, or
+	// ErrTokenNotFound. The value may name an access token or a refresh token.
+	//
+	// It is a READ, not a consume, and it exists because RFC 7009 §2.1 requires
+	// revocation to check that the token belongs to the client asking: deleting by
+	// value alone let any registered client revoke another's tokens — and with
+	// them the refresh chain — if it ever came by the value.
+	TokenOwner(ctx context.Context, value string) (string, error)
 }
 
 // TokenFilter selects tokens for bulk revocation. An empty filter matches every
@@ -168,6 +177,20 @@ func (s *MemoryStore) DeleteAccess(_ context.Context, value string) error {
 	delete(s.access, TokenHash(value))
 	s.mu.Unlock()
 	return nil
+}
+
+// TokenOwner implements Store.
+func (s *MemoryStore) TokenOwner(_ context.Context, value string) (string, error) {
+	key := TokenHash(value)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.access[key]; ok {
+		return t.ClientID, nil
+	}
+	if t, ok := s.refresh[key]; ok {
+		return t.ClientID, nil
+	}
+	return "", ErrTokenNotFound
 }
 
 // SaveRefresh implements Store.

@@ -263,7 +263,19 @@ func (s *Server) handleBindCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := r.URL.Query().Get("state")
-	if state == "" || !s.sessions.Bound(r.Context(), "bind", state) {
+	// Bound AND owned by this account. Both, like every other handle in this
+	// service: the handle is recorded against the browser (so a relayed state
+	// cannot be replayed elsewhere) *and* against the account that started it.
+	//
+	// The ownership check was missing here, and this is the one caller that
+	// omitted it. A second account in the same browser could therefore pass the
+	// browser check, consume the handle and the flow row, and leave the account
+	// that started the flow unable to finish it — a cross-account denial of the
+	// victim's own binding. The answer is the same 400 as an unknown handle: a
+	// distinct refusal would confirm the handle exists.
+	if state == "" ||
+		!s.sessions.Bound(r.Context(), "bind", state) ||
+		!s.sessions.OwnerMatches(r.Context(), "bind", state, user) {
 		http.Error(w, "unknown or expired bind request", http.StatusBadRequest)
 		return
 	}

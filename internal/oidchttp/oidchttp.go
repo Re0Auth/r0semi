@@ -216,37 +216,116 @@ func stripUnsupportedDiscoveryFields(body []byte) []byte {
 	return out
 }
 
-// serveOAuth delegates to the provider, except for two contract points the
-// library leaves open: the authorize scope gate (O-7) and the token response's
-// no-store headers (RFC 6749 §5.1).
+// serveOAuth delegates to the provider, except for the contract points the
+// library leaves open: the authorize and device-authorization pre-flights (O-7),
+// and the token response's no-store headers (RFC 6749 §5.1).
+//
+// The method is deliberately not part of the authorize condition. The library
+// registers its authorize endpoint without a method constraint and reads
+// `r.Form`, which includes a POST body, so a check that only ran for GET let a
+// POST through with no client, redirect, PKCE or scope validation at all — which
+// is how a confidential client could obtain a code with no `code_challenge`.
 func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	if !knownOAuthPath(r.URL.Path) {
 		writeOAuthJSONError(w, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
 		return
 	}
-	if r.Method == http.MethodGet && r.URL.Path == "/"+pathAuthorize {
+	// The authorize entrance, for either method. `/oauth/authorize/callback` is the
+	// library's own leg and is deliberately not included: it carries no client or
+	// scope parameters, and validating it as an entrance would break the flow.
+	if r.URL.Path == "/"+pathAuthorize {
 		if h.validateAuthorize(w, r) {
+			return
+		}
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/"+pathDeviceAuthz {
+		if h.validateDeviceAuthorization(w, r) {
 			return
 		}
 	}
 
 	const tokenPath = "/" + pathToken
-	if r.Method != http.MethodPost || r.URL.Path != tokenPath {
-		h.provider.ServeHTTP(w, r)
-		return
-	}
+	isToken := r.Method == http.MethodPost && r.URL.Path == tokenPath
 
+	// Everything the provider writes is buffered, so a failure it wrote without an
+	// OAuth body can be normalised before it reaches the client. The protocol
+	// plane's contract is that every failure parses as `{error, …}`; the library
+	// answers some of them — an unauthenticated introspect or userinfo, for
+	// instance — in plain text, and a client that has to parse two shapes on one
+	// plane has no contract at all.
 	bw := newBufferedWriter()
 	h.provider.ServeHTTP(bw, r)
 	body := bw.body.Bytes()
-	if bw.status == http.StatusOK {
-		body = sanitizeTokenResponse(body)
+
+	switch {
+	case isToken:
+		if bw.status == http.StatusOK {
+			body = sanitizeTokenResponse(body)
+		}
+		// RFC 6749 §5.1 requires these on every token response, error included: a
+		// cached token (or error) is a cached secret.
+		bw.header.Set("Cache-Control", "no-store")
+		bw.header.Set("Pragma", "no-cache")
+	case bw.status >= 400 && !isOAuthErrorBody(bw.header.Get("Content-Type"), body):
+		body = normalizeOAuthFailure(bw, r.URL.Path)
 	}
-	// RFC 6749 §5.1 requires these on every token response, error included: a
-	// cached token (or error) is a cached secret.
-	bw.header.Set("Cache-Control", "no-store")
-	bw.header.Set("Pragma", "no-cache")
 	bw.flush(w, body)
+}
+
+// isOAuthErrorBody reports whether a response already satisfies the protocol
+// plane's failure contract: JSON, carrying a string `error`.
+func isOAuthErrorBody(contentType string, body []byte) bool {
+	if !strings.Contains(contentType, "json") {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	_, ok := payload["error"].(string)
+	return ok
+}
+
+// normalizeOAuthFailure rewrites a bare failure into the protocol plane's shape.
+//
+// The description is the status text, not the library's message: those carry
+// internal type names ("ErrorType=invalid_client Parent=…"), and the wire
+// contract is not the place for another package's internals. The real text is
+// already in the log, which is where an operator needs it.
+//
+// The library's own headers — `WWW-Authenticate` above all, which RFC 6750 makes
+// the challenge — are left alone.
+func normalizeOAuthFailure(bw *bufferedWriter, path string) []byte {
+	out, err := json.Marshal(map[string]string{
+		"error":             oauthErrorCode(path, bw.status),
+		"error_description": http.StatusText(bw.status),
+	})
+	if err != nil {
+		// Unreachable for a map of strings; a static body beats an empty one.
+		return []byte(`{"error":"server_error"}`)
+	}
+	bw.header.Set("Content-Type", "application/json")
+	return out
+}
+
+// oauthErrorCode names the failure a bare status stands for.
+func oauthErrorCode(path string, status int) string {
+	switch {
+	case status == http.StatusUnauthorized && path == "/"+pathUserinfo:
+		// userinfo authenticates with a bearer token, not client credentials, and
+		// RFC 6750 names its 401 `invalid_token`.
+		return "invalid_token"
+	case status == http.StatusUnauthorized:
+		return "invalid_client"
+	case status == http.StatusForbidden:
+		return "access_denied"
+	case status == http.StatusTooManyRequests:
+		return "temporarily_unavailable"
+	case status >= 500:
+		return "server_error"
+	default:
+		return "invalid_request"
+	}
 }
 
 // withCoreScopes ensures the scopes OIDC itself defines are advertised.
@@ -290,20 +369,54 @@ func splitProtocolScopes(scopes []string) (described, protocol []string) {
 	return described, protocol
 }
 
-// validateAuthorize refuses an authorize request the library would answer either
-// by silently dropping scopes (op.ValidateAuthReqScopes) or with a plain-text
-// body (AuthRequestError for a redirect-disabled error). It returns true when it
-// has already written the response.
+// requestParams returns a request's parameters from wherever this method carries
+// them: the query string, the form body, or both.
 //
-// Two contract points depend on this: O-7 (an unknown or disallowed scope must
-// be an error, not a silent narrowing) and the protocol plane's promise to speak
+// The library reads `r.Form` for GET and POST alike, so reading only
+// `r.URL.Query()` here is exactly how a POST slipped past every check. ParseForm
+// caches its result, so the library's own call costs nothing and sees what this
+// one read.
+func requestParams(r *http.Request) url.Values {
+	if err := r.ParseForm(); err != nil {
+		// A malformed body is not a parameter set. Returning empty makes the
+		// pre-flight answer "invalid_request" for the missing field rather than
+		// letting the request through unvalidated.
+		return url.Values{}
+	}
+	return r.Form
+}
+
+// scopeProblem returns the first requested scope this client may not ask for, or
+// "" when every one of them is acceptable.
+//
+// The catalogue describes data permissions; the OIDC-standard scopes are protocol
+// flags it deliberately does not describe, so they are let past. Everything else
+// must be both known to the catalogue AND registered for the client — a scope the
+// registry can describe but this client was not granted is still a scope it may
+// not ask for.
+func (h *Handler) scopeProblem(client oauth.Client, scopes []string) string {
+	for _, scope := range scopes {
+		if standardOIDCScope(scope) {
+			continue
+		}
+		s := oauth.Scope(scope)
+		if _, known := h.registry.Get(s); known && client.AllowsScope(s) {
+			continue
+		}
+		return scope
+	}
+	return ""
+}
+
+// validateAuthorize is the pre-flight the library does not do.
+//
 // OAuth errors. A missing scope, an unknown client and an unregistered redirect
 // URI are all errors the resource owner must see, so none of them may redirect.
 func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool {
 	if h.clients == nil || h.registry == nil {
 		return false
 	}
-	q := r.URL.Query()
+	q := requestParams(r)
 	clientID := q.Get("client_id")
 	if clientID == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
@@ -344,16 +457,52 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "scope is required")
 		return true
 	}
-	for _, scope := range strings.Fields(rawScope) {
-		if standardOIDCScope(scope) {
-			continue
-		}
-		s := oauth.Scope(scope)
-		if _, known := h.registry.Get(s); known && client.AllowsScope(s) {
-			continue
-		}
+	if h.scopeProblem(client, strings.Fields(rawScope)) != "" {
 		params := map[string]string{"error": "invalid_scope", "state": q.Get("state")}
 		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+		return true
+	}
+	return false
+}
+
+// validateDeviceAuthorization enforces the client's scope allowance on the device
+// authorization request.
+//
+// The library stores the requested scopes verbatim — it checks the grant type and
+// decodes the form, and nothing else — so without this a client registered for
+// one scope can obtain any scope the catalogue knows by asking the device
+// endpoint instead of the authorize endpoint. The answer is a JSON OAuth error
+// rather than a redirect: this endpoint has no redirect_uri to send it to.
+func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Request) bool {
+	if h.clients == nil || h.registry == nil {
+		return false
+	}
+	form := requestParams(r)
+
+	clientID := form.Get("client_id")
+	if clientID == "" {
+		// A confidential client authenticates with HTTP Basic instead.
+		if id, _, ok := r.BasicAuth(); ok {
+			clientID = id
+		}
+	}
+	if clientID == "" {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
+		return true
+	}
+	client, err := h.clients.Get(r.Context(), clientID)
+	if err != nil {
+		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client", "unknown client")
+		return true
+	}
+	rawScope := form.Get("scope")
+	if rawScope == "" {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "scope is required")
+		return true
+	}
+	if bad := h.scopeProblem(client, strings.Fields(rawScope)); bad != "" {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_scope",
+			"the scope "+bad+" is not registered for this client")
 		return true
 	}
 	return false
