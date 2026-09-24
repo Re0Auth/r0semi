@@ -537,6 +537,13 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 必须大于出站客户端自己的 20s 期限，否则会把一次合法的慢读截断。运维探针 `/healthz`、`/readyz` 见
 [api-design.md](./api-design.md) §6。
 
+**运维面在独立的内部监听器上**（`server.internal_addr` / `RE0AUTH_INTERNAL_ADDR`，空即不启用）：
+`/metrics`（Prometheus 黄金指标 —— 流量 / 错误 / 延迟 / 在途 —— 加 Go 运行时与进程采集器，见
+`internal/observability`）与 `/debug/pprof/`。它**必须与 `addr` 不同**（配置校验强制）：单独一个监听器
+正是「这些端点无法经公网端口到达」的保证，而 pprof 会导出进程内部状态（goroutine 转储、堆、CPU profile），
+把 `internal_addr` 指向公网地址就是把它们公开。它按与主监听器同一套超时启动，并在同一个信号上优雅关闭
+（`serveUntilSignal` 现在接收一组 endpoint，两者一起排空）。
+
 > 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
 > `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
 
@@ -714,7 +721,8 @@ critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期
 3. isolation / interception 的引入时机与形态。
 4. core 的可观测性：fiber 状态是否导出为指标，`App.Check` 结果是否作为 CI 门禁。
    **部分已决**：依赖方向的 CI 门禁已由 `internal/archtest` 落地；`core` 自身的可观测性随其生产接入
-   一并推迟（ADR-0002），接入前不再是待办。
+   一并推迟（ADR-0002），接入前不再是待办。（这里说的是 `core` **组件图自身**的指标；服务层面的黄金指标
+   与 pprof 已由 §4.11 的内部监听器提供。）
 5. 旧引擎在 Postgres 侧的遗留表与适配器：`oauth_codes` / `oauth_access_tokens` /
    `oauth_refresh_tokens` / `oauth_device_authorizations`（迁移 0001 / 0006）以及
    `internal/store/postgres` 的 `Tokens` / `Devices`，在 P4b 之后已无生产调用者。

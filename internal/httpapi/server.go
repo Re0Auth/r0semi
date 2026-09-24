@@ -29,6 +29,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/compress"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/lifecycle"
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/internal/webui"
 	"github.com/Re0Auth/r0semi/oauth"
@@ -82,6 +83,11 @@ type Config struct {
 	// which is the honest answer for the in-memory deployment that has nothing to
 	// reach. Liveness (GET /healthz) needs no probe.
 	Ready ReadinessProbe
+	// Metrics, when set, instruments every request with Prometheus golden
+	// signals, labelled by plane. Nil disables instrumentation. It is separate
+	// from the scrape endpoint: the metrics are recorded whether or not the
+	// internal listener that exports them is configured.
+	Metrics *observability.Metrics
 	// Frontend, when set, is the built single-page app mounted under
 	// webui.BasePath. Pass webui.FS() for an embedded build.
 	Frontend fs.FS
@@ -167,6 +173,7 @@ type Server struct {
 	limiter      *ratelimit.Limiter
 	secure       bool
 	ready        ReadinessProbe
+	metrics      *observability.Metrics
 	frontend     fs.FS
 	// trustedProxies is the parsed form of Config.TrustedProxies, consulted by
 	// clientAddr when deriving the limiter key.
@@ -261,6 +268,7 @@ func New(cfg Config) (*Server, error) {
 		limiter:        cfg.Limiter,
 		secure:         cfg.Secure,
 		ready:          cfg.Ready,
+		metrics:        cfg.Metrics,
 		frontend:       cfg.Frontend,
 		trustedProxies: cfg.TrustedProxies,
 		// Wrapped once, here, so every protocol-plane mount is covered by the same
@@ -518,7 +526,15 @@ func (s *Server) Handler() http.Handler {
 		h = s.compressor.Handler(h)
 	}
 	h = s.withSecurityHeaders(h)
-	return withRequestID(recoverBrowser(h))
+	out := withRequestID(recoverBrowser(h))
+	if s.metrics != nil {
+		// Installed outermost, so a request that never reaches a handler — a 404,
+		// a rate-limit rejection, a recovered panic — is still counted. The plane
+		// label is reused from planeOf rather than re-derived, so the metric and
+		// the error format can never disagree about which plane a path is on.
+		out = s.metrics.Middleware(func(r *http.Request) string { return planeOf(r.URL.Path).String() }, out)
+	}
+	return out
 }
 
 func (s *Server) businessPlane() http.Handler {

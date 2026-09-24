@@ -18,6 +18,7 @@
 | `github.com/zitadel/oidc/v3` | `internal/store/postgres` 的 `op.Storage`（ADR-0001：OpenID Provider） | OIDC 原生：设备码流（RFC 8628）内置、不透明引用令牌模型、`AuthRequest` 由实现者拥有（scope 收窄/同意可挂载）。**稳定 API 是 legacy `Storage`，新版 `Server` API 到 v4 前 experimental**。仍只用 `go-jose/v4`，不引第二套 JOSE（对照 fosite 见 [oidc-decision.md](./oidc-decision.md)） |
 | `github.com/BurntSushi/toml` | `internal/config` 与 `cmd/*` 加载 `config/*.toml` | TOML 的事实标准。配置来源只有文件和环境变量两类，不需要 koanf 那样的多来源合并层 |
 | `github.com/klauspost/compress` | `internal/compress`（HTTP `zstd` 内容编码） | zstd 不在 Go 标准库；这是纯 Go、无 cgo 的事实标准实现。**只为 zstd 引入**：gzip 用标准库（`compress/gzip`），br 暂缓（见 §3） |
+| `github.com/prometheus/client_golang` | `internal/observability`（黄金指标 + Go 运行时 / 进程采集器），经 `server.internal_addr` 的内部监听器暴露 | Prometheus 官方 Go 客户端，事实标准。选它而不是手写 exposition 格式，是因为格式与并发语义（counter / histogram 的原子性、注册表）错一次就是**指标本身在撒谎**——那比没有指标更糟。它只用**私有** `Registry`，于是"导出哪些指标"由本仓库决定，而不是被某个依赖注册进全局注册表的东西决定 |
 | `gopkg.in/yaml.v3` | **仅测试**：`internal/httpapi` 解析 `docs/openapi.yaml`，断言 spec 与实际路由双向一致 | YAML 的事实标准。**只在 `_test.go` 里被引用，不进任何二进制** |
 
 关于 `yaml.v3` 的两点交代：
@@ -104,6 +105,8 @@
 | `golang.org/x/vuln/cmd/govulncheck`（v1.8.0） | `ci.yml` 的 `supply-chain` 作业 | Go 官方工具，做**调用图**分析：只报**从本代码可达**的漏洞，而不是“依赖树里有这个版本”。这正是“能不能被利用”与“版本号看着危险”的区别。不固定的扫描器会在别人的发布节奏上把绿灯变红，而会因此变红的门禁最后都会被人删掉 |
 | `github.com/CycloneDX/cyclonedx-gomod`（v1.12.0） | `ci.yml` 与 `release.yml`（`make sbom`） | 直接读 **Go 模块图**产出 CycloneDX SBOM。选它而不是 syft 这类通用扫描器，是因为它读的是 `go.mod` 与构建信息本身，不依赖镜像或文件系统启发式；代价是它自己的依赖树不小，但**只在 CI 存在** |
 | `sigstore/cosign`（keyless） | `release.yml` | 对 `SHA256SUMS` 做**无密钥**签名：身份来自 GitHub Actions 的 OIDC，证书写明是哪个 workflow 产出的，签名进 Rekor 透明日志。没有密钥要保管、泄露或轮换——对一个无资金项目，这比维护一个 GPG key 更可辩护 |
+| `golangci-lint`（v2.14.0） | `ci.yml` 的 `lint` 作业 | Go 静态分析的聚合器。只启用**标准分析器**加少数针对本项目的检查（泄漏的响应体、与哨兵错误的 `==`、被吞掉的错误、`//nolint` 的规范性），规则与各自理由写在 `.golangci.yml`。**不启用**那些会跟着风格漂移把绿灯变红的规则——会因此变红的门禁最后都会被人删掉 |
+| `gitleaks`（v8.30.1） | `ci.yml` 的 `secrets` 作业 | 扫**全量历史**的密钥扫描器。提交进公开仓库的凭据就是必须轮换的凭据，所以它每次改动都跑，而不是只在发布时跑。扩展默认规则集；唯一的豁免（`.gitleaks.toml`）是审计报告里引用的 PoC 输出，那些令牌来自一次性的本地运行、从未在任何地方有效 |
 
 **两个“不撒谎”的细节**：SBOM 的文件名让 checksum 的通配符能匹配到它（一个*看起来完整*却漏掉某个产物的
 checksum 文件比没有更糟），签名签的是 `SHA256SUMS` 本身——于是全部产物被一次签名锁住；CI 里还对 SBOM 的

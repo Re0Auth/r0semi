@@ -62,6 +62,11 @@ type serverSection struct {
 	// when attributing a request to a client. Empty means none: the peer address
 	// is the client. Set it only to your own reverse proxies' addresses.
 	TrustedProxies []string `toml:"trusted_proxies"`
+	// InternalAddr is where the operational surface is served: Prometheus metrics
+	// and the Go runtime's profiling endpoints. Empty disables it entirely — the
+	// default, because profiling endpoints belong on a private network and never
+	// on the public one. Point it at a loopback or cluster-internal address.
+	InternalAddr string `toml:"internal_addr"`
 }
 
 type storageSection struct {
@@ -161,6 +166,9 @@ type settings struct {
 	// TrustedProxies are the networks whose X-Forwarded-For is believed when
 	// resolving the client address. Empty means no proxy is trusted.
 	TrustedProxies []netip.Prefix
+	// InternalAddr is the address of the operational listener that serves metrics
+	// and profiling. Empty means it is not served at all.
+	InternalAddr string
 
 	clientID        string
 	clientName      string
@@ -225,6 +233,7 @@ func loadConfig(path string) (settings, error) {
 		CookieSecure: config.Bool("RE0AUTH_COOKIE_SECURE", f.Server.CookieSecure),
 		KEKID:        config.FirstNonEmpty(os.Getenv("RE0AUTH_KEK_ID"), f.Vault.KEKID, "kek-1"),
 		DatabaseURL:  os.Getenv("DATABASE_URL"),
+		InternalAddr: config.FirstNonEmpty(os.Getenv("RE0AUTH_INTERNAL_ADDR"), f.Server.InternalAddr),
 	}
 	if cfg.Issuer == "" {
 		return settings{}, errors.New("server.issuer is required (or RE0AUTH_ISSUER); e.g. https://re0auth.example")
@@ -275,6 +284,14 @@ func loadConfig(path string) (settings, error) {
 	cfg.TrustedProxies, err = parseTrustedProxies(proxyValues)
 	if err != nil {
 		return settings{}, err
+	}
+
+	// The operational surface must not be the public one. They are separate
+	// addresses precisely so profiling endpoints cannot be scraped through the
+	// public listener; configuring them the same would defeat that.
+	if cfg.InternalAddr != "" && cfg.InternalAddr == cfg.Addr {
+		return settings{}, errors.New(
+			"server.internal_addr must differ from server.addr: the operational surface is not the public one")
 	}
 
 	// Storage. An explicit driver wins; otherwise a named DSN means postgres.
@@ -340,10 +357,10 @@ func loadConfig(path string) (settings, error) {
 	// at rotation time.
 	for i, retired := range f.Vault.Retired {
 		field := fmt.Sprintf("vault.retired[%d]", i)
-		switch {
-		case retired.KEKID == "":
+		switch retired.KEKID {
+		case "":
 			return settings{}, fmt.Errorf("%s.kek_id is required", field)
-		case retired.KEKID == cfg.KEKID:
+		case cfg.KEKID:
 			return settings{}, fmt.Errorf(
 				"%s.kek_id %q is the current key's id; a retired key must be a different key",
 				field, retired.KEKID)

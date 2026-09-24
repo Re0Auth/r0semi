@@ -29,6 +29,35 @@ license is available at <https://www.apache.org/licenses/LICENSE-2.0>.
     Copyright The zitadel/oidc Contributors
     (Reproduced from that module's NOTICE, as Apache-2.0 §4(d) requires.)
 
+  - github.com/prometheus/client_golang
+    Prometheus instrumentation library for Go applications
+    Copyright 2012-2015 The Prometheus Authors
+    This product includes software developed at SoundCloud Ltd. (http://soundcloud.com/).
+    The following components are included in this product: perks - a fork of
+    https://github.com/bmizerany/perks, Copyright 2013-2015 Blake Mizerany and
+    Björn Rabenstein; and Go support for Protocol Buffers, Copyright 2010 The Go
+    Authors.
+    (Reproduced from that module's NOTICE, as Apache-2.0 §4(d) requires.)
+
+  - github.com/prometheus/client_model
+    Data model artifacts for Prometheus.
+    Copyright 2012-2015 The Prometheus Authors
+    This product includes software developed at SoundCloud Ltd. (http://soundcloud.com/).
+    (Reproduced from that module's NOTICE, as Apache-2.0 §4(d) requires.)
+
+  - github.com/prometheus/common
+    Common libraries shared by Prometheus Go components.
+    Copyright 2015 The Prometheus Authors
+    This product includes software developed at SoundCloud Ltd. (http://soundcloud.com/).
+    (Reproduced from that module's NOTICE, as Apache-2.0 §4(d) requires.)
+
+  - github.com/prometheus/procfs
+    procfs provides functions to retrieve system, kernel and process metrics from
+    the pseudo-filesystem proc.
+    Copyright 2014-2015 The Prometheus Authors
+    This product includes software developed at SoundCloud Ltd. (http://soundcloud.com/).
+    (Reproduced from that module's NOTICE, as Apache-2.0 §4(d) requires.)
+
   - github.com/go-logr/logr
   - github.com/go-logr/stdr
   - go.opentelemetry.io/auto/sdk
@@ -42,6 +71,7 @@ MIT License
 
   - github.com/BurntSushi/toml
   - github.com/alexedwards/scs/v2
+  - github.com/beorn7/perks
   - github.com/bmatcuk/doublestar/v4
   - github.com/cenkalti/backoff/v4
   - github.com/cespare/xxhash/v2
@@ -63,11 +93,14 @@ BSD 3-Clause License
     Copyright (c) 2012 The Go Authors. All rights reserved.
     Copyright (c) 2016 Klaus Post. All rights reserved.
   - github.com/muhlemmer/httpforwarded
+  - github.com/munnerz/goautoneg
   - github.com/zitadel/schema
   - golang.org/x/oauth2
   - golang.org/x/sync
+  - golang.org/x/sys
   - golang.org/x/text
   - golang.org/x/time
+  - google.golang.org/protobuf
 
   Copyright 2009 The Go Authors. All rights reserved.
 

@@ -200,6 +200,20 @@ const (
 	planeBusiness
 )
 
+// String names a plane for logs and metric labels. The names are stable: they
+// appear in dashboards and alerts, so renaming one is a breaking change to
+// observability even though no API depends on it.
+func (p plane) String() string {
+	switch p {
+	case planeProtocol:
+		return "protocol"
+	case planeBusiness:
+		return "business"
+	default:
+		return "browser"
+	}
+}
+
 // planeOf classifies a path. It is the single definition of that question, shared
 // by every middleware that has to choose an error shape or decide whether a
 // response may be transformed at all. Two definitions is exactly how

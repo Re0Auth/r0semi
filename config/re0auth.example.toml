@@ -42,6 +42,19 @@ rate_limit_burst = 100
 # Environment override: RE0AUTH_TRUSTED_PROXIES="10.0.0.0/8,127.0.0.1/32"
 trusted_proxies = []
 
+# The operational surface: Prometheus metrics (/metrics) and the Go runtime's
+# profiling endpoints (/debug/pprof/). Empty — the default — serves neither.
+#
+# Point it at a loopback or cluster-internal address, **never a public one**. A
+# CPU profile dumps process internals and a metric exposition reveals traffic
+# shape; both are for an operator or a scraper on the private network. It must
+# differ from `addr`: a separate listener is the whole reason these endpoints are
+# not reachable through the public one.
+#
+#   internal_addr = "127.0.0.1:9090"
+# Environment override: RE0AUTH_INTERNAL_ADDR="127.0.0.1:9090"
+internal_addr = ""
+
 [storage]
 # "postgres" or "memory". Omit the whole section to use memory (nothing survives
 # a restart; the server says so at startup). **Either way the authorization engine

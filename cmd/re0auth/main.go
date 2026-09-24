@@ -38,6 +38,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/internal/httpapi"
 	"github.com/Re0Auth/r0semi/internal/lifecycle"
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/internal/oidchttp"
 	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
@@ -283,6 +284,12 @@ func main() {
 		die("federation", err)
 	}
 
+	// The Prometheus instrumentation. It is always built: whether it is *exported*
+	// depends on an internal address being configured, but recording is cheap and
+	// a metric that only starts once someone remembers to enable it is missing
+	// from exactly the incident it was meant to explain.
+	metrics := observability.New()
+
 	apiConfig := httpapi.Config{
 		Issuer:     cfg.Issuer,
 		Sessions:   sessions,
@@ -300,6 +307,9 @@ func main() {
 		// database that is the pool; without one there is nothing to reach, so the
 		// probe stays nil and /readyz answers ready.
 		Ready: readinessProbe(store),
+		// The golden-signal instrumentation, labelled by plane. Always on; see
+		// where it is built above.
+		Metrics: metrics,
 	}
 	// Every deployment runs the OpenID Provider (ADR-0001 P4b). The only thing a
 	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
@@ -401,8 +411,51 @@ func main() {
 	if err != nil {
 		die("listen", err)
 	}
-	server := &http.Server{
-		Handler: api.Handler(),
+	endpoints := []endpoint{{server: newServer(api.Handler()), listener: listener}}
+
+	// The operational surface — metrics and the runtime profiling endpoints — is
+	// a separate listener, off unless an address is configured. It is separate on
+	// purpose: a profile dumps process internals, and that is not something the
+	// public port should ever be able to answer.
+	if cfg.InternalAddr != "" {
+		internalListener, err := net.Listen("tcp", cfg.InternalAddr)
+		if err != nil {
+			die("internal listen", err)
+		}
+		endpoints = append(endpoints, endpoint{
+			server:   newServer(metrics.InternalHandler()),
+			listener: internalListener,
+		})
+		slog.Info("internal surface listening",
+			"addr", internalListener.Addr().String(),
+			"endpoints", "/metrics, /debug/pprof/")
+	}
+
+	slog.Info("listening", "addr", listener.Addr().String(), "issuer", cfg.Issuer, "version", version)
+	if err := serveUntilSignal(ctx, shutdownTimeout, endpoints...); err != nil {
+		// Not die(): the process started fine, so "cannot start" would be a lie.
+		// Reaching here means serving stopped for a reason other than a clean
+		// shutdown, or the drain ran out of time.
+		slog.Error("server stopped with an error", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("stopped")
+}
+
+// endpoint is one listener together with the server that serves it. Shutdown has
+// to drain every one of them, which is why they travel together rather than as
+// parallel slices a caller has to keep in step.
+type endpoint struct {
+	server   *http.Server
+	listener net.Listener
+}
+
+// newServer builds an HTTP server with the limits every listener here shares. The
+// public and internal surfaces differ only in what they serve, not in how they
+// are bounded.
+func newServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler: h,
 		// The standard library's server writes its own diagnostics. Routing them
 		// through the same handler keeps a connection or TLS error from being the
 		// one line in the log that looks different.
@@ -414,30 +467,24 @@ func main() {
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
-	slog.Info("listening", "addr", listener.Addr().String(), "issuer", cfg.Issuer, "version", version)
-	if err := serveUntilSignal(ctx, server, listener, shutdownTimeout); err != nil {
-		// Not die(): the process started fine, so "cannot start" would be a lie.
-		// Reaching here means serving stopped for a reason other than a clean
-		// shutdown, or the drain ran out of time.
-		slog.Error("server stopped with an error", "err", err)
-		os.Exit(1)
-	}
-	slog.Info("stopped")
 }
 
-// serveUntilSignal serves srv on ln until ctx is cancelled — a shutdown signal —
-// then drains in-flight requests within timeout before closing their connections.
+// serveUntilSignal serves every endpoint until ctx is cancelled — a shutdown
+// signal — then drains in-flight requests within timeout before closing their
+// connections.
 //
 // The drain is the point: on a rolling deploy the process is replaced while it is
 // answering requests, and an abrupt exit drops them. Requests already in flight
-// are given the chance to finish; the listener stops accepting new ones first, so
+// are given the chance to finish; the listeners stop accepting new ones first, so
 // a load balancer sees the instance go away cleanly.
 //
 // It returns nil for a shutdown it performed itself, and the underlying error
 // only when serving failed for some other reason.
-func serveUntilSignal(ctx context.Context, srv *http.Server, ln net.Listener, timeout time.Duration) error {
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(ln) }()
+func serveUntilSignal(ctx context.Context, timeout time.Duration, endpoints ...endpoint) error {
+	serveErr := make(chan error, len(endpoints))
+	for _, ep := range endpoints {
+		go func(ep endpoint) { serveErr <- ep.server.Serve(ep.listener) }(ep)
+	}
 
 	select {
 	case err := <-serveErr:
@@ -450,14 +497,18 @@ func serveUntilSignal(ctx context.Context, srv *http.Server, ln net.Listener, ti
 		slog.Info("shutdown signal received; draining in-flight requests", "timeout", timeout)
 		drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		if err := srv.Shutdown(drainCtx); err != nil {
-			// The drain ran out of time (or failed for another reason): close the
-			// connections rather than wait on handlers that are not coming back.
-			slog.Error("graceful shutdown did not finish; closing connections", "err", err)
-			_ = srv.Close()
-			return err
+		var err error
+		for _, ep := range endpoints {
+			if e := ep.server.Shutdown(drainCtx); e != nil {
+				// The drain ran out of time (or failed for another reason): close
+				// the connections rather than wait on handlers that are not coming
+				// back.
+				slog.Error("graceful shutdown did not finish; closing connections", "err", e)
+				_ = ep.server.Close()
+				err = e
+			}
 		}
-		return nil
+		return err
 	}
 }
 

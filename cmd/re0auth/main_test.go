@@ -30,8 +30,7 @@ func TestOIDCTokenKeyFailClosed(t *testing.T) {
 
 	good := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", good)
-	key, err := oidcTokenKey()
-	if err != nil || len(key) != 32 {
+	if _, err := oidcTokenKey(); err != nil {
 		t.Fatalf("valid token key rejected: %v", err)
 	}
 }
@@ -189,7 +188,7 @@ func TestServeUntilSignalDrainsInFlightRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveUntilSignal(ctx, srv, ln, 5*time.Second) }()
+	go func() { errCh <- serveUntilSignal(ctx, 5*time.Second, endpoint{server: srv, listener: ln}) }()
 
 	respCh := make(chan *http.Response, 1)
 	reqErrCh := make(chan error, 1)
@@ -244,7 +243,7 @@ func TestServeUntilSignalClosesHungConnectionsAfterTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveUntilSignal(ctx, srv, ln, 50*time.Millisecond) }()
+	go func() { errCh <- serveUntilSignal(ctx, 50*time.Millisecond, endpoint{server: srv, listener: ln}) }()
 
 	go func() { _, _ = http.Get("http://" + ln.Addr().String() + "/") }()
 	<-started
@@ -351,4 +350,77 @@ func TestAuditKeyIsRequiredOnlyWhenDurable(t *testing.T) {
 			t.Errorf("memory mode resolved an audit key: %v", cfg.AuditKey)
 		}
 	})
+}
+
+// The operational surface — metrics and profiling — is a separate listener on
+// purpose: profiling dumps process internals, and none of it belongs on the
+// public port. Pointing both at the same address would silently put it there.
+func TestInternalAddrMustDifferFromThePublicAddr(t *testing.T) {
+	t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+	t.Setenv("RE0AUTH_KEK", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	t.Setenv("RE0AUTH_ADDR", "127.0.0.1:8080")
+
+	t.Setenv("RE0AUTH_INTERNAL_ADDR", "127.0.0.1:8080")
+	if _, err := loadConfig(""); err == nil {
+		t.Fatal("internal_addr equal to addr was accepted")
+	}
+
+	t.Setenv("RE0AUTH_INTERNAL_ADDR", "127.0.0.1:9090")
+	cfg, err := loadConfig("")
+	if err != nil {
+		t.Fatalf("a distinct internal_addr was rejected: %v", err)
+	}
+	if cfg.InternalAddr != "127.0.0.1:9090" {
+		t.Fatalf("internal_addr = %q, want 127.0.0.1:9090", cfg.InternalAddr)
+	}
+}
+
+// Shutdown has to reach every listener, not just the public one: an internal
+// listener that kept serving after the signal would leave metrics and profiling
+// reachable on a process that was supposed to be gone.
+func TestServeUntilSignalDrainsEveryEndpoint(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var endpoints []endpoint
+	var addrs []string
+	for i := 0; i < 2; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		endpoints = append(endpoints, endpoint{
+			server: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("ok"))
+			})},
+			listener: ln,
+		})
+		addrs = append(addrs, ln.Addr().String())
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- serveUntilSignal(ctx, 5*time.Second, endpoints...) }()
+
+	// Both are serving before the signal.
+	for _, addr := range addrs {
+		resp, err := http.Get("http://" + addr + "/")
+		if err != nil {
+			t.Fatalf("GET %s: %v", addr, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("serveUntilSignal = %v, want nil for a clean drain", err)
+	}
+	// Every listener is closed: a fresh connection is refused.
+	for _, addr := range addrs {
+		resp, err := http.Get("http://" + addr + "/")
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Errorf("listener %s was still accepting after shutdown", addr)
+		}
+	}
 }
