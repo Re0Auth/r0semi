@@ -11,6 +11,14 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Build output. The quickstart builds ./re0auth at the repository root, and
+# `make release` writes dist/. Anchored so these cannot shadow an unrelated
+# directory of the same name deeper in the tree (internal/webui/dist is the
+# embedded frontend, and has its own rules).
+/re0auth
+/referencesource
+/dist/
+
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*

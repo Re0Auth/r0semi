@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test check e2e play clean
+.PHONY: all web build test check e2e play dist checksums release clean
 
 all: web build
 
@@ -57,5 +57,51 @@ check:
 play:
 	cd web && pnpm run dev
 
+# Release artifacts: one archive per platform, each carrying the example config,
+# the licence and the pre-release warning.
+#
+# `release` depends on `web` for the reason the header gives, and asserts the
+# result: the Go binaries embed internal/webui/dist, so packaging before the
+# frontend is built would ship a binary whose /app answers "Frontend not built".
+# The placeholder has no index.html, which is what makes the assertion possible.
+#
+# Split into two targets so the compile-and-archive half can be run and inspected
+# on its own; `release` adds the checksums a published artifact must carry.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+RELEASE_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+ZIP ?= zip
+# sha256sum is coreutils; macOS ships shasum instead.
+SHA256 ?= $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
+
+dist: web
+	@test -f internal/webui/dist/index.html || { echo "refusing to package: the embedded frontend is the placeholder"; exit 1; }
+	rm -rf dist && mkdir -p dist
+	@for platform in $(RELEASE_PLATFORMS); do \
+		os=$${platform%/*}; arch=$${platform#*/}; \
+		name="re0auth_$(VERSION)_$${os}_$${arch}"; \
+		echo "  $$name"; \
+		mkdir -p "dist/$$name"; \
+		ext=""; [ "$$os" = windows ] && ext=".exe"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath \
+			-ldflags "-s -w -X main.version=$(VERSION)" \
+			-o "dist/$$name/re0auth$$ext" ./cmd/re0auth || exit 1; \
+		cp config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md "dist/$$name/"; \
+		if [ "$$os" = windows ]; then \
+			(cd dist && $(ZIP) -qr "$$name.zip" "$$name") || exit 1; \
+		else \
+			tar -czf "dist/$$name.tar.gz" -C dist "$$name" || exit 1; \
+		fi; \
+		rm -rf "dist/$$name"; \
+	done
+	@echo "packaged $(VERSION):"; ls -1 dist
+
+# Requires sha256sum (coreutils) or shasum (macOS), and zip for the Windows
+# archives. CI runs on ubuntu-latest, where all three exist; a Windows checkout
+# can build the project but not cut a release.
+checksums: dist
+	@cd dist && $(SHA256) re0auth_$(VERSION)_* > SHA256SUMS && echo "checksums: $$(wc -l < SHA256SUMS) file(s)"
+
+release: dist checksums
+
 clean:
-	rm -rf web/node_modules web/.svelte-kit
+	rm -rf web/node_modules web/.svelte-kit dist

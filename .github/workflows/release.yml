@@ -1,0 +1,95 @@
+name: release
+
+# Tag-only, on purpose. A downloadable binary is a claim that a commit is worth
+# running, and that claim should be made deliberately: pushing to main runs
+# ci.yml and publishes nothing.
+on:
+  push:
+    tags: ['v*']
+
+# gh release create writes a release; nothing else here needs more than read.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    # The Go suite refuses to *skip* the Postgres tests when CI is set
+    # (openTestDB fails instead of skipping), so the gate below needs a real
+    # server — the same one ci.yml uses.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: r0semi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/r0semi_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # pnpm before setup-node, because the node step's `cache: pnpm` needs pnpm
+      # on PATH to find the store. Same version as web/package.json's
+      # packageManager field.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # First, and through the Makefile target rather than by hand, so the order
+      # cannot be got wrong: the binaries embed internal/webui/dist, and `make web`
+      # is what asserts the embed is the real app rather than the placeholder.
+      - name: build the frontend
+        run: make web
+
+      # A tag normally points at a commit that already passed ci.yml, where the
+      # race detector and the Postgres matrix live. This is the cheaper tag-time
+      # gate: it refuses a tag on a commit that does not even format, vet or test,
+      # without duplicating the whole pipeline.
+      - name: gate
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+          go vet ./...
+          go test -p 1 -timeout 300s ./...
+
+      # The version comes from the tag rather than from `git describe`, so the
+      # artifact and the release agree even in a shallow clone. The target re-runs
+      # the frontend step (idempotent, a few seconds): keeping the dependency is
+      # what makes the ordering a guarantee instead of a step order somebody can
+      # rearrange.
+      - name: package
+        run: make release VERSION="${{ github.ref_name }}"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
