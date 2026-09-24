@@ -169,6 +169,55 @@ func TestAuthorizationServerMetadata(t *testing.T) {
 	if _, ok := doc["dpop_signing_alg_values_supported"]; ok {
 		t.Fatal("the metadata advertises DPoP, which is not implemented")
 	}
+
+	// Metadata is a negotiated contract, so it must describe this deployment
+	// rather than the library's full capability set. Only the code response type,
+	// and only code/refresh/device grants, are actually implemented.
+	assertStringSet(t, doc["response_types_supported"], []string{"code"}, "response_types_supported")
+	assertStringSet(t, doc["grant_types_supported"],
+		[]string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"},
+		"grant_types_supported")
+	assertStringSet(t, doc["claims_supported"], []string{"sub"}, "claims_supported")
+	assertStringSet(t, doc["token_endpoint_auth_methods_supported"],
+		[]string{"none", "client_secret_basic", "client_secret_post"},
+		"token_endpoint_auth_methods_supported")
+	for _, removed := range []string{
+		"registration_endpoint",
+		"check_session_iframe",
+		"end_session_endpoint",
+		"token_endpoint_auth_signing_alg_values_supported",
+		"userinfo_signing_alg_values_supported",
+	} {
+		if _, ok := doc[removed]; ok {
+			t.Fatalf("metadata advertises %s, which is not implemented", removed)
+		}
+	}
+}
+
+// assertStringSet checks a discovery list against an exact expected set,
+// independent of order.
+func assertStringSet(t *testing.T, value any, want []string, field string) {
+	t.Helper()
+	raw, ok := value.([]any)
+	if !ok {
+		t.Fatalf("%s = %v, want an array", field, value)
+	}
+	got := make(map[string]bool, len(raw))
+	for _, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("%s contains a non-string: %v", field, v)
+		}
+		got[s] = true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s = %v, want exactly %v", field, raw, want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("%s = %v, missing %q", field, raw, w)
+		}
+	}
 }
 
 func TestProtectedResourceMetadata(t *testing.T) {

@@ -124,9 +124,14 @@ func New(cfg Config) (*Handler, error) {
 		CryptoKey:             cfg.CryptoKey,
 		CryptoKeyId:           cfg.CryptoKeyID,
 		CodeMethodS256:        true,
+		AuthMethodPost:        true,
 		GrantTypeRefreshToken: true,
 		SupportedScopes:       withCoreScopes(cfg.Scopes),
-		SupportedUILocales:    []language.Tag{language.English},
+		// userinfo returns only `sub` (O-3), so that is what the metadata may
+		// claim. The library's default lists email/name/phone/address, which this
+		// deployment can never supply.
+		SupportedClaims:    []string{"sub"},
+		SupportedUILocales: []language.Tag{language.English},
 		DeviceAuthorization: op.DeviceAuthorizationConfig{
 			Lifetime:     10 * time.Minute,
 			PollInterval: 5 * time.Second,
@@ -204,21 +209,65 @@ func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path st
 }
 
 // stripUnsupportedDiscoveryFields removes advertised capabilities that are
-// deliberately out of contract (ADR-0001 O-9).
+// deliberately out of contract (ADR-0001 O-9) and overrides the ones the library
+// advertises more broadly than this deployment actually implements.
+//
+// Metadata a client negotiates from has to describe this server. The library
+// emits its own full capability set — implicit and hybrid response types, the
+// implicit and JWT-bearer grants, private_key_jwt client auth, and the full
+// profile/email claim list — because it can implement them, not because every
+// embedding does. This deployment implements the code flow, refresh and device
+// grants, and returns only `sub`, so those are what the document may say.
 func stripUnsupportedDiscoveryFields(body []byte) []byte {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body
 	}
-	changed := false
-	for _, key := range []string{"end_session_endpoint", "end_session_encryption_alg_values_supported"} {
-		if _, ok := payload[key]; ok {
-			delete(payload, key)
-			changed = true
-		}
+	for _, key := range []string{
+		"end_session_endpoint",
+		"end_session_encryption_alg_values_supported",
+		"registration_endpoint",
+		"check_session_iframe",
+		"request_object_signing_alg_values_supported",
+		"request_object_encryption_alg_values_supported",
+		"request_object_encryption_enc_values_supported",
+		"id_token_encryption_alg_values_supported",
+		"id_token_encryption_enc_values_supported",
+		"userinfo_signing_alg_values_supported",
+		"userinfo_encryption_alg_values_supported",
+		"userinfo_encryption_enc_values_supported",
+		"token_endpoint_auth_signing_alg_values_supported",
+		"introspection_endpoint_auth_signing_alg_values_supported",
+		"revocation_endpoint_auth_signing_alg_values_supported",
+		"acr_values_supported",
+		"display_values_supported",
+	} {
+		delete(payload, key)
 	}
-	if !changed {
-		return body
+	overrides := map[string]any{
+		"response_types_supported": []string{"code"},
+		"grant_types_supported": []string{
+			"authorization_code",
+			"refresh_token",
+			"urn:ietf:params:oauth:grant-type:device_code",
+		},
+		"claims_supported": []string{"sub"},
+		"token_endpoint_auth_methods_supported": []string{
+			"none", "client_secret_basic", "client_secret_post",
+		},
+		"introspection_endpoint_auth_methods_supported": []string{
+			"client_secret_basic", "client_secret_post",
+		},
+		"revocation_endpoint_auth_methods_supported": []string{
+			"none", "client_secret_basic", "client_secret_post",
+		},
+	}
+	for key, value := range overrides {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			continue
+		}
+		payload[key] = raw
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {
