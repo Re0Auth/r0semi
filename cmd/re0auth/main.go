@@ -48,7 +48,13 @@ var (
 	configFlag = flag.String("config", "", "path to the TOML config file (default: RE0AUTH_CONFIG, then config/re0auth.toml)")
 	rotateKeys = flag.Bool("rotate-keys", false,
 		"re-wrap every stored credential's DEK under the current KEK, then exit")
+	showVersion = flag.Bool("version", false, "print the build version and exit")
 )
+
+// version identifies the build. The release target stamps it at link time
+// (`-ldflags -X main.version=…`); a binary compiled by hand answers "dev", which
+// is the honest answer to "which build is this?" when nobody stamped it.
+var version = "dev"
 
 const (
 	// federationMaxConcurrent bounds how many requests the data plane may have in
@@ -120,6 +126,14 @@ func die(stage string, err error) {
 
 func main() {
 	flag.Parse()
+
+	// -version has to work with no config and no logging configured, because the
+	// question it answers ("which build is this?") is asked by someone who is
+	// already looking at a deployment that will not start.
+	if *showVersion {
+		fmt.Println("re0auth", version)
+		return
+	}
 
 	// Before anything that logs. A bad level or format is a configuration error
 	// like any other: refuse to start rather than run with a setting the operator
@@ -295,7 +309,7 @@ func main() {
 		// one line in the log that looks different.
 		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
 	}
-	slog.Info("listening", "addr", cfg.Addr, "issuer", cfg.Issuer)
+	slog.Info("listening", "addr", cfg.Addr, "issuer", cfg.Issuer, "version", version)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		die("serve", err)
 	}

@@ -31,6 +31,11 @@ import (
 
 var configFlag = flag.String("config", "", "path to the TOML config file (default: REFERENCE_SOURCE_CONFIG, then config/referencesource.toml)")
 
+var showVersion = flag.Bool("version", false, "print the build version and exit")
+
+// version identifies the build; the build target stamps it with -X main.version.
+var version = "dev"
+
 // die reports why the process cannot start, and exits non-zero.
 //
 // It replaces log.Fatalf so the reason is a structured field rather than a
@@ -43,6 +48,11 @@ func die(stage string, err error) {
 
 func main() {
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("referencesource", version)
+		return
+	}
 
 	// Before anything that logs. A bad level or format is a configuration error
 	// like any other: refuse to start rather than run with a setting the operator
