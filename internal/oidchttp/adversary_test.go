@@ -11,13 +11,51 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Re0Auth/r0semi/oauth"
 )
+
+// logCapture keeps every record written to the default logger as rendered text,
+// so a test can assert over the whole line rather than over the fields it
+// remembered to check.
+type logCapture struct {
+	mu   sync.Mutex
+	text strings.Builder
+}
+
+func (h *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *logCapture) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slog.NewTextHandler(&h.text, nil).Handle(context.Background(), r)
+}
+
+func (h *logCapture) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logCapture) WithGroup(string) slog.Handler      { return h }
+
+func (h *logCapture) String() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.text.String()
+}
+
+// captureDefaultLog swaps the process default logger for a capturing one and
+// restores it afterwards. This package has no parallel tests, so the swap is safe.
+func captureDefaultLog(t *testing.T) *logCapture {
+	t.Helper()
+	cap := &logCapture{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(cap))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return cap
+}
 
 func adversaryBody(t *testing.T, resp *http.Response) []byte {
 	t.Helper()
@@ -272,6 +310,149 @@ func TestSeamProbesHeld(t *testing.T) {
 			if _, ok := js["error"].(string); !ok {
 				t.Fatalf("%s answered a failure outside the protocol plane shape: %s", path, b)
 			}
+		}
+	}
+}
+
+// Round 4, audit-3's A3-4 hypothesis — now CONFIRMED and fixed.
+//
+// The device pre-flight must validate the client the library will actually bill.
+// The wrapper read `client_id` from the FORM and only fell back to Basic, while
+// the library does the reverse (pkg/op/client.go ClientIDFromRequest) and ignores
+// the form's value outright whenever Basic is present. So a confidential client
+// registered for one narrow scope could name a BROADER client in the body,
+// authenticate as itself with Basic, sail through this wrapper's scope check, and
+// be issued a device code for a scope it was never registered for. Round 4 took
+// that all the way to a live access token.
+//
+// A single-identity probe cannot see this: both existing device guards used one
+// client, which is why the mismatch survived two rounds.
+func TestAdversarialDeviceAuthorizationRefusesTwoClientIdentities(t *testing.T) {
+	f := newFixture(t)
+
+	deviceRequest := func(t *testing.T, form url.Values, basicID, basicSecret string) (*http.Response, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+"/oauth/device_authorization",
+			strings.NewReader(form.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if basicID != "" {
+			req.SetBasicAuth(basicID, basicSecret)
+		}
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, adversaryBody(t, resp)
+	}
+
+	// The escalation: the narrow confidential client names the broad client in the
+	// body and asks for the broad client's scope. Before the fix this answered 200
+	// with a device_code, because the wrapper checked the named client and the
+	// library billed the authenticated one.
+	resp, body := deviceRequest(t,
+		url.Values{"client_id": {f.webID}, "scope": {"phigros.score.read"}},
+		f.narrowID, "nsecret")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a narrow confidential client obtained a device authorization for another client's scope: %d %s",
+			resp.StatusCode, body)
+	}
+
+	// Even a scope the authenticated client IS registered for is refused, because
+	// the request claims two identities and preferring either is how the mismatch
+	// stayed invisible. This is the assertion that pins the rule rather than the
+	// symptom.
+	resp, body = deviceRequest(t,
+		url.Values{"client_id": {f.webID}, "scope": {"account.id"}},
+		f.narrowID, "nsecret")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a device request naming two different clients was accepted: %d %s", resp.StatusCode, body)
+	}
+
+	// The honest paths still work: Basic alone, and the form alone for a public
+	// client. A fix that refused these would be a different bug.
+	resp, body = deviceRequest(t, url.Values{"scope": {"account.id"}}, f.narrowID, "nsecret")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("a confidential client authenticating with Basic alone was refused: %d %s", resp.StatusCode, body)
+	}
+	resp, body = deviceRequest(t, url.Values{"client_id": {f.deviceID}, "scope": {"account.id"}}, "", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("a public client naming itself in the body was refused: %d %s", resp.StatusCode, body)
+	}
+}
+
+// Round 4, the seam round 3 named as unaudited: the third-party library logs
+// through the process's DEFAULT slog handler, which this binary configures.
+//
+// Enumerating what it writes (zitadel/oidc v3.51.3):
+//
+//   - pkg/op/error.go logs `oidc_error`, whose LogValue (pkg/oidc/error.go)
+//     includes `description` and the whole `parent` chain. On the paths this
+//     wrapper uses, `DefaultToServerError(err, err.Error())` sets that description
+//     to the error text the storage returned — so the log carries whatever this
+//     service puts in an error, verbatim.
+//   - pkg/oidc/authorization.go LogValue logs scopes, response_type, client_id and
+//     redirect_uri, and NOT code_challenge or state.
+//
+// Neither is a defect in itself. What it means is that the invariant "no error
+// string may contain a credential" now protects the log as well as the wire, and
+// that is exactly the kind of reasoning that belongs in a test rather than in a
+// paragraph.
+func TestAdversarialProtocolErrorsDoNotLogCredentials(t *testing.T) {
+	f := newFixture(t)
+
+	// Distinctive, so a hit in the log can only be the value fed in below.
+	const codeSecret = "SECRET-AUTHZ-CODE-0001"
+	const refreshSecret = "SECRET-REFRESH-0002"
+	const bearerSecret = "SECRET-BEARER-0003"
+
+	cap := captureDefaultLog(t)
+
+	postForm := func(path string, form url.Values) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+path, strings.NewReader(form.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = adversaryBody(t, resp)
+	}
+
+	// Each credential through the endpoint that consumes it.
+	postForm("/oauth/token", url.Values{
+		"grant_type": {"authorization_code"}, "code": {codeSecret},
+		"client_id": {f.webID}, "client_secret": {"s3cret"},
+		"redirect_uri": {"https://client.example/cb"},
+	})
+	postForm("/oauth/token", url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {refreshSecret},
+		"client_id": {f.webID}, "client_secret": {"s3cret"},
+	})
+	postForm("/oauth/introspect", url.Values{
+		"token": {bearerSecret}, "client_id": {f.webID}, "client_secret": {"s3cret"},
+	})
+	postForm("/oauth/revoke", url.Values{
+		"token": {bearerSecret}, "client_id": {f.webID}, "client_secret": {"s3cret"},
+	})
+	// A device poll too: the record lookup is the one that takes the code.
+	postForm("/oauth/token", url.Values{
+		"grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}, "device_code": {codeSecret},
+		"client_id": {f.deviceID},
+	})
+
+	logged := cap.String()
+	if strings.TrimSpace(logged) == "" {
+		t.Fatal("nothing was logged, so this guard would pass vacuously")
+	}
+	for _, secret := range []string{codeSecret, refreshSecret, bearerSecret, "s3cret"} {
+		if strings.Contains(logged, secret) {
+			t.Errorf("a credential reached the log (%q):\n%s", secret, logged)
 		}
 	}
 }

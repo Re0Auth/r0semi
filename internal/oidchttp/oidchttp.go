@@ -501,12 +501,34 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Request) bool {
 	form := requestParams(r)
 
-	clientID := form.Get("client_id")
-	if clientID == "" {
-		// A confidential client authenticates with HTTP Basic instead.
-		if id, _, ok := r.BasicAuth(); ok {
-			clientID = id
-		}
+	// Resolve the client the way the library will, and refuse a request that names
+	// two different ones.
+	//
+	// The library resolves the identity as "HTTP Basic if present, else the form's
+	// client_id" (pkg/op/client.go ClientIDFromRequest), and it ignores the form's
+	// value outright when Basic is present. Reading the form first — which is what
+	// this did — meant the pre-flight checked ONE client while the library recorded
+	// ANOTHER: a confidential client registered only for account.id could put a
+	// broader client's (public) id in the form, authenticate as itself with Basic,
+	// pass the scope check below, and be issued a device code for a scope it was
+	// never registered for. Round 4 confirmed that reaching a live access token.
+	//
+	// Disagreement is not a case with a right answer to prefer. A request that
+	// claims two identities is malformed, and answering it by picking a side is
+	// exactly how the mismatch stayed invisible.
+	formClientID := strings.TrimSpace(form.Get("client_id"))
+	basicClientID, _, hasBasic := r.BasicAuth()
+	basicClientID = strings.TrimSpace(basicClientID)
+	if hasBasic && formClientID != "" && formClientID != basicClientID {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
+			"client_id does not match the authenticated client")
+		return true
+	}
+	clientID := formClientID
+	if hasBasic {
+		// A confidential client authenticates with HTTP Basic instead of naming
+		// itself in the body, and the library bills the Basic identity.
+		clientID = basicClientID
 	}
 	if clientID == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "client_id is required")

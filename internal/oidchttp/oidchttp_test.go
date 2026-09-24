@@ -39,6 +39,10 @@ type fixture struct {
 	store    *memory.OIDCStore
 	webID    string
 	deviceID string
+	// narrowID is a CONFIDENTIAL client registered for one narrow scope. Audit-3
+	// named its absence as the reason the device-flow client-identity hypothesis
+	// could not be reproduced; round 4 needed exactly this shape.
+	narrowID string
 }
 
 func newFixture(t testing.TB) fixture {
@@ -47,6 +51,7 @@ func newFixture(t testing.TB) fixture {
 
 	suffix := randSuffix()
 	webID, deviceID := "http-web-"+suffix, "http-device-"+suffix
+	narrowID := "http-narrow-" + suffix
 
 	clients := oauth.NewMemoryClientRegistry()
 	web, err := oauth.NewClient(webID, "Web", oauth.ClientConfidential, "s3cret",
@@ -61,7 +66,13 @@ func newFixture(t testing.TB) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []oauth.Client{web, device} {
+	narrow, err := oauth.NewClient(narrowID, "Narrow", oauth.ClientConfidential, "nsecret",
+		[]string{"https://narrow.example/cb"},
+		[]oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []oauth.Client{web, device, narrow} {
 		if err := clients.Create(ctx, c); err != nil {
 			t.Fatal(err)
 		}
@@ -106,7 +117,7 @@ func newFixture(t testing.TB) fixture {
 	}
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID}
+	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID, narrowID: narrowID}
 }
 
 func get(t testing.TB, client *http.Client, u string) *http.Response {
