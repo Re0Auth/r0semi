@@ -209,8 +209,21 @@ func (s *Tokens) TokenOwner(ctx context.Context, value string) (string, error) {
 // RevokeTokens implements oauth.TokenAdmin on the hand-rolled engine's tables.
 // In durable deployments the OpenID Provider owns the tokens; this covers the
 // in-memory engine's Postgres store, which shares the same seam.
+//
+// Authorization codes are removed with the tokens: a code that was never
+// redeemed is a redeemable capability, and leaving it behind after a Kill Switch
+// would let it mint fresh tokens.
 func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
-	return revokeMatching(ctx, s.pool, []string{"oauth_access_tokens", "oauth_refresh_tokens"}, f)
+	total, err := revokeMatching(ctx, s.pool, []string{"oauth_access_tokens", "oauth_refresh_tokens"}, f)
+	if err != nil {
+		return total, err
+	}
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM oauth_codes WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
+		f.ClientID, f.Subject); err != nil {
+		return total, err
+	}
+	return total, nil
 }
 
 // PurgeLegacySubject removes a subject's non-token rows from the retired engine's

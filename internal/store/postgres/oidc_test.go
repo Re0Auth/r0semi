@@ -85,6 +85,31 @@ func TestRefreshTokenRotationIsSingleUse(t *testing.T) {
 	}
 }
 
+// Mirrors memory.TestRevokeTokensAlsoDropsPendingAuthorizationCode: a Kill Switch
+// must not leave an unredeemed code able to mint fresh tokens afterwards.
+func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	ar := newAuthRequest(t, ctx, store)
+	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuthCode(ctx, ar.GetID(), "code-to-redeem"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Anti-vacuous: the code is redeemable before the revocation.
+	if _, err := store.AuthRequestByCode(ctx, "code-to-redeem"); err != nil {
+		t.Fatalf("the code was not redeemable before revocation: %v", err)
+	}
+
+	if _, err := store.RevokeTokens(ctx, oauth.TokenFilter{Subject: "usr_1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "code-to-redeem"); err == nil {
+		t.Fatal("the authorization code survived the Kill Switch and can still mint tokens")
+	}
+}
+
 func newAuthRequest(t *testing.T, ctx context.Context, store *OIDCStore) op.AuthRequest {
 	t.Helper()
 	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{

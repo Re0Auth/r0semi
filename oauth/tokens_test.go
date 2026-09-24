@@ -145,3 +145,29 @@ func TestMemoryStoreLookupsStillWork(t *testing.T) {
 		t.Fatalf("second consume = %v, want ErrTokenNotFound", err)
 	}
 }
+
+// A code is a redeemable capability, so bulk revocation has to remove it with the
+// tokens. A Kill Switch that only deleted access/refresh rows would let the code
+// mint a fresh pair afterwards.
+func TestMemoryStoreBulkRevocationDropsCodes(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	for _, c := range []AuthorizationCode{
+		{ClientID: "cli_a", Subject: "usr_1"},
+		{ClientID: "cli_b", Subject: "usr_2"},
+	} {
+		if err := store.SaveCode(ctx, "code-"+c.ClientID, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := store.RevokeTokens(ctx, TokenFilter{Subject: "usr_1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConsumeCode(ctx, "code-cli_a"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("subject-revoked code still redeemable: %v", err)
+	}
+	if _, err := store.ConsumeCode(ctx, "code-cli_b"); err != nil {
+		t.Fatalf("neighbouring account's code was revoked: %v", err)
+	}
+}

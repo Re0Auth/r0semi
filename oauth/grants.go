@@ -194,6 +194,10 @@ func (s *MemoryStore) DeleteBySubjectClient(_ context.Context, subject, clientID
 // RevokeTokens implements TokenAdmin. It returns how many records it removed,
 // because a Kill Switch report with no number is not something an operator can
 // act on.
+//
+// Authorization codes are removed with the tokens even though they are not
+// counted: an unredeemed code is a redeemable capability, so a Kill Switch that
+// left one alive could still mint fresh tokens afterwards.
 func (s *MemoryStore) RevokeTokens(_ context.Context, f TokenFilter) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -209,6 +213,11 @@ func (s *MemoryStore) RevokeTokens(_ context.Context, f TokenFilter) (int, error
 		if f.Matches(t.ClientID, t.Subject) {
 			delete(s.refresh, key)
 			removed++
+		}
+	}
+	for key, c := range s.codes {
+		if f.Matches(c.ClientID, c.Subject) {
+			delete(s.codes, key)
 		}
 	}
 	return removed, nil

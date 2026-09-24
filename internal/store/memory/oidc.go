@@ -834,6 +834,13 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 
 // RevokeTokens implements oauth.TokenAdmin. It counts both tables, so a Kill
 // Switch report has a number an operator can act on.
+//
+// Pending authorization requests and their authorization codes are revoked with
+// the tokens, though they are not counted as tokens. A code is a redeemable
+// capability: an attacker holding one issued before the Kill Switch can exchange
+// it for a fresh access/refresh pair after the switch returns success, which is
+// exactly the "isolated but still reachable" state the endpoint exists to rule
+// out. Device authorizations go for the same reason.
 func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -848,6 +855,19 @@ func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, e
 		if f.Matches(t.clientID, t.subject) {
 			delete(s.refreshTokens, k)
 			removed++
+		}
+	}
+	purged := make(map[string]bool)
+	for id, req := range s.authRequests {
+		if f.Matches(req.ClientID, req.Subject) {
+			delete(s.authRequests, id)
+			delete(s.authRequestExpiry, id)
+			purged[id] = true
+		}
+	}
+	for k, c := range s.codes {
+		if purged[c.requestID] {
+			delete(s.codes, k)
 		}
 	}
 	// Device authorizations are capabilities, not tokens, so they are not counted

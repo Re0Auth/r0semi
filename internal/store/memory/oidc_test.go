@@ -138,6 +138,67 @@ func TestRevokeTokensCountsBothTables(t *testing.T) {
 	}
 }
 
+// A Kill Switch that leaves an unredeemed authorization code alive is not a kill
+// switch: the holder can exchange that code for a new access/refresh pair after
+// the operator has been told the account is contained. The code has to go with
+// the tokens, even though it is not counted as one.
+func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+
+	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+		ClientID:            "cli",
+		RedirectURI:         "https://app.example/cb",
+		ResponseType:        oidc.ResponseTypeCode,
+		Scopes:              []string{"account.id"},
+		CodeChallenge:       "challenge-1234567890",
+		CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuthCode(ctx, ar.GetID(), "code-to-redeem"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Anti-vacuous: the code is redeemable before the revocation.
+	if _, err := store.AuthRequestByCode(ctx, "code-to-redeem"); err != nil {
+		t.Fatalf("the code was not redeemable before revocation: %v", err)
+	}
+
+	if _, err := store.RevokeTokens(ctx, oauth.TokenFilter{Subject: "usr_1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "code-to-redeem"); err == nil {
+		t.Fatal("the authorization code survived the Kill Switch and can still mint tokens")
+	}
+
+	// A client-targeted switch must cut the code too.
+	ar2, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+		ClientID:            "cli",
+		RedirectURI:         "https://app.example/cb",
+		ResponseType:        oidc.ResponseTypeCode,
+		Scopes:              []string{"account.id"},
+		CodeChallenge:       "challenge-1234567890",
+		CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuthCode(ctx, ar2.GetID(), "code-for-client"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevokeTokens(ctx, oauth.TokenFilter{ClientID: "cli"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "code-for-client"); err == nil {
+		t.Fatal("the client-targeted Kill Switch left an authorization code redeemable")
+	}
+}
+
 // Rotation must be a claim, not a check. Two requests can hold the same refresh
 // token at once — a stolen copy, or a client that retried — and the second must
 // be refused rather than issued a second generation. Otherwise rotation never

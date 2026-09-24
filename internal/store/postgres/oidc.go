@@ -746,10 +746,54 @@ func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int,
 	if err != nil {
 		return total, err
 	}
+	// A pending authorization request whose code has not been redeemed is a
+	// redeemable capability, not a token. Leaving it alive let a code issued
+	// before the Kill Switch mint a fresh access/refresh pair after the switch
+	// reported success.
+	if _, err := revokePendingAuthorizations(ctx, s.pool, f); err != nil {
+		return total, err
+	}
 	if _, err := revokeMatching(ctx, s.pool, []string{"oidc_devices"}, f); err != nil {
 		return total, err
 	}
 	return total, nil
+}
+
+// revokePendingAuthorizations deletes auth requests selected by the filter and
+// the codes minted from them. Codes are deleted first because their only link to
+// the subject is request_id.
+func revokePendingAuthorizations(ctx context.Context, pool *pgxpool.Pool, f oauth.TokenFilter) (int, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	removed := 0
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM oidc_codes
+		 WHERE request_id IN (
+		       SELECT id FROM oidc_auth_requests
+		        WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2))`,
+		f.ClientID, f.Subject)
+	if err != nil {
+		return removed, err
+	}
+	removed += int(tag.RowsAffected())
+
+	tag, err = tx.Exec(ctx, `
+		DELETE FROM oidc_auth_requests
+		 WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
+		f.ClientID, f.Subject)
+	if err != nil {
+		return removed, err
+	}
+	removed += int(tag.RowsAffected())
+
+	if err := tx.Commit(ctx); err != nil {
+		return removed, err
+	}
+	return removed, nil
 }
 
 // PurgeSubject removes a subject's non-token OP state: the pending consent

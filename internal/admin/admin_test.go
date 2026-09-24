@@ -78,6 +78,38 @@ func TestKillSwitchTouchesNoSessionsWithoutARevoker(t *testing.T) {
 	}
 }
 
+// An unredeemed authorization code is a redeemable capability. If the Kill
+// Switch leaves it in the token store, the holder exchanges it after the operator
+// has been told the account is contained — so bulk revocation has to remove codes
+// along with tokens.
+func TestKillSwitchRevokesOutstandingAuthorizationCode(t *testing.T) {
+	ctx := context.Background()
+	svc, _, tokens, _ := newTestService(t)
+	saveTokens(t, tokens, "cli", "usr_1")
+	if err := tokens.SaveCode(ctx, "code-live", oauth.AuthorizationCode{
+		ClientID: "cli", Subject: "usr_1", Scopes: []oauth.Scope{"openid"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Anti-vacuous: the code is redeemable before the switch.
+	if _, err := tokens.ConsumeCode(ctx, "code-live"); err != nil {
+		t.Fatalf("the code was not redeemable before the switch: %v", err)
+	}
+	if err := tokens.SaveCode(ctx, "code-live", oauth.AuthorizationCode{
+		ClientID: "cli", Subject: "usr_1", Scopes: []oauth.Scope{"openid"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.KillSwitch(ctx, "usr_admin", Target{Subject: "usr_1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tokens.ConsumeCode(ctx, "code-live"); !errors.Is(err, oauth.ErrTokenNotFound) {
+		t.Fatalf("ConsumeCode after Kill Switch = %v, want ErrTokenNotFound", err)
+	}
+}
+
 // The secret exists only in the registration response. What is stored accepts it
 // and nothing can read it back.
 func TestRegisterReturnsTheSecretOnlyOnce(t *testing.T) {
