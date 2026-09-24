@@ -298,7 +298,24 @@ func New(cfg Config) (*Server, error) {
 			return planeOf(r.URL.Path) != planeProtocol
 		},
 		OnNotAcceptable: func(w http.ResponseWriter, r *http.Request) {
-			srv.writeProblem(w, r, http.StatusNotAcceptable, "not_acceptable", "no acceptable content coding")
+			// The compression layer can answer before any handler runs, so it
+			// has to choose the shape itself — by the same planeOf predicate the
+			// rest of the service uses. A browser navigation that refuses every
+			// content coding must not be handed a business problem+json object.
+			switch planeOf(r.URL.Path) {
+			case planeBusiness:
+				srv.writeProblem(w, r, http.StatusNotAcceptable, "not_acceptable", "no acceptable content coding")
+			case planeProtocol:
+				// Not reachable today (the protocol plane is not eligible for
+				// compression), but the shape is stated rather than inherited
+				// so a future change to Eligible cannot leak the wrong body.
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusNotAcceptable)
+				_, _ = w.Write([]byte(`{"error":"invalid_request","error_description":"no acceptable content coding"}`))
+			default:
+				http.Error(w, "no acceptable content coding", http.StatusNotAcceptable)
+			}
 		},
 	})
 	if err != nil {

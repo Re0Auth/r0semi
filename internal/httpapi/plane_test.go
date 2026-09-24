@@ -270,6 +270,25 @@ func TestBrowserPlaneNeverAnswersWithAPlaneError(t *testing.T) {
 			})
 		}
 	})
+
+	// The compressor can answer before any handler runs, so it too has to choose
+	// the plane's shape. It used to borrow writeProblem for every path, which gave
+	// a browser navigation a problem+json 406.
+	t.Run("compression", func(t *testing.T) {
+		handler := newFullEnv(t).Handler()
+		for _, path := range browserPaths {
+			t.Run(path, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodGet, path, nil)
+				req.Header.Set("Accept-Encoding", "identity;q=0")
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusNotAcceptable {
+					t.Fatalf("status = %d, want 406", rec.Code)
+				}
+				assertBrowserPlane(t, rec)
+			})
+		}
+	})
 }
 
 // assertProblemPlane checks a business-plane failure: problem+json, with a
