@@ -12,7 +12,7 @@
 | D-2 | **不透明 access token + Introspect**（RFC 7662）；不做 JWT AT，换取即时撤销。**唯一的 JWT 是 `id_token`**（见 D-6） |
 | D-3 | **v1 不做 DPoP**（RFC 9449）：只签发普通 Bearer。曾一度在 AS 元数据里广告 DPoP，已移除——广告了却只发普通 Bearer 是**静默降级**（见 §2.10） |
 | D-4 | **单域名**（如 `re0auth.r0semi.net`），但代码路由树内部**严格划清 `/oauth/` 与 `/v1/` 上下文边界** |
-| D-5 | **不提供上游凭据导出端点**：re0auth 不持有上游凭据，无物可导。需要上游原生 API 时走 `raw` 透传，而不是交出令牌（见 §5） |
+| D-5 | **不提供上游凭据导出端点**：要导出的**原始平台**凭据（如 TapTap stoken）在数据源手里，本地无物可导；本地那份**源签发**的令牌则永不交给下游（两层区分见 §5）。需要上游原生 API 时走 `raw` 透传 |
 | D-6 | **采纳 OIDC**：Re0Auth 是 OpenID Provider。`id_token` 仅在请求含 `openid` 时签发，`sub` = `usr_`；`userinfo` 默认只回 `sub`，email 永不返回；服务 OIDC discovery（保留 RFC 8414 别名）。ADR 见 [oidc-decision.md](./oidc-decision.md) |
 
 ---
@@ -22,12 +22,15 @@
 | | **协议平面** | **业务平面** |
 |---|---|---|
 | 路径 | `/oauth/*`、`/.well-known/*` | `/v1/*` |
-| 规范 | RFC 6749 / 7636 / 8628 / 7009 / 7662 / 8414 / 9449，**照抄，不发挥** | 本文件风格指南 |
+| 规范 | RFC 6749 / 7636 / 8628 / 7009 / 7662 / 8414，**照抄，不发挥**。RFC 9449 (DPoP)：**明确不做**，见 D-3 决策条目 | 本文件风格指南 |
 | 请求编码 | `application/x-www-form-urlencoded` | JSON |
 | 错误体 | `{"error","error_description"}` | RFC 9457 `application/problem+json` |
 | 缓存 | `token` 响应必须 `Cache-Control: no-store` | 按资源语义 |
 
 **铁律**：协议平面不得为了"风格统一"改动报文——那会让所有标准客户端库失效。
+
+**第三个面**：`/auth`、`/bind`、`/consent`、`/app` 以及未知路径**不属于任何平面**——它们是浏览器导航，
+格式是纯文本或重定向。见 §6 与 [browser-plane-decision.md](./browser-plane-decision.md)。
 
 ---
 
@@ -64,7 +67,11 @@
 ```
 
 - `type` 指向可点击文档；`code` 是稳定机器码；`request_id` 用于排查。
-- `401` = 令牌缺失/无效（必须带 `WWW-Authenticate`）；`403` = 令牌有效但 scope 不足。
+- `401` = 令牌缺失/无效（必须带 `WWW-Authenticate: Bearer error="invalid_token"`）；
+  `403` = 令牌有效但 scope 不足，必须带 `WWW-Authenticate: Bearer error="insufficient_scope"`，
+  能指名单个 scope 时附 `scope="…"`。raw 透传按「该源任一资源 scope」粗粒度门禁，故省略 `scope=`。
+  这是 RFC 6750 §3.1 区分「令牌不行」与「令牌太窄」的唯一标准手段——没有它，标准客户端只能看到
+  一个裸 403，无法从协议层知道该去申请哪个 scope。
 - 初始错误码目录：
 
 | code | status | 含义 |
@@ -138,7 +145,6 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | `POST` | `/oauth/introspect` | RFC 7662 | 资源服务器使用 |
 | `POST` | `/oauth/device_authorization` | RFC 8628 §3.1 | CLI/桌面设备码（**已实现**） |
 | `GET` | `/v1/device/verification` | RFC 8628 §3.3 | 设备流验证页：需登录，且把 user code 绑到当前浏览器会话 |
-| `GET` | `/oauth/consent` | — | 同意页（浏览器） |
 | `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 | 授权服务器元数据 |
 | `GET` | `/.well-known/openid-configuration` | OIDC Discovery 1.0 | OIDC 元数据；与 RFC 8414 文档内容一致（O-1） |
 | `GET` | `/.well-known/oauth-protected-resource` | RFC 9728 | 资源元数据 |
@@ -146,7 +152,12 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | `GET` | `/oauth/keys` | OIDC Discovery §3 | JWKS（`id_token` 的 RS256 公钥） |
 
 硬约束：
-- PKCE S256 强制；禁 implicit、禁 ROPC；重定向 URI 精确匹配。
+- PKCE S256 强制，**对所有客户端（含 confidential）**——这是 OAuth 2.1 的要求；库只对 public
+  client 强制，故在 `validateAuthorize` 里独立兜底。禁 implicit、禁 ROPC；重定向 URI 精确匹配。
+- discovery 的 `scopes_supported` 必须包含 OIDC 核心 scope `openid` 与 `offline_access`
+  （OIDC Discovery 1.0 §3：`openid` MUST 支持，OpenID Core 定义的 scope SHOULD 列出）。
+  少列不会让库出错（它照样接受），但会毁掉 RP：严格按 `scopes_supported` 协商的客户端永远不会
+  请求 `openid`，也就永远拿不到 `id_token`。**被接受却没声明**，与「声明了却没实现」是同一类意外。
 - `authorize` 响应带 `iss`（RFC 9207）防混淆。
 - `id_token` **仅在请求含 `openid` scope 时**返回；否则响应中不得出现 `id_token`（O-2）。
 - `end_session` / `id_token_hint` / PAR / 动态客户端注册 / Session Management **不实现、不广告**（O-9）。
@@ -205,11 +216,12 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 | `POST` | `/v1/admin/clients/{client_id}/suspend` | 暂停并吐销其令牌 |
 | `POST` | `/v1/admin/clients/{client_id}/activate` | 恢复（**不**恢复令牌） |
 | `DELETE` | `/v1/admin/clients/{client_id}` | 删除注册并吐销令牌；幂等 |
-| `POST` | `/v1/admin/kill_switch` | 按 `all`/`client`/`subject`/`bindings` 批量吐销（`all` 含会话与绑定） |
+| `POST` | `/v1/admin/kill_switch` | 按 `all`/`client`/`subject`/`bindings` 批量吐销（`all` 含会话与绑定；清会话需持久会话，内存模式下清不掉） |
 
 会话 + CSRF。管理员是**配置允许列表里的 `usr_…`**（`[admin].subjects` / `RE0AUTH_ADMIN_SUBJECTS`），
 不是角色；列表为空则整个平面不挂载。非管理员（含已登录的）访问得到 `404`。
-完整契约与边界（尤其 Kill Switch **不**覆盖绑定/上游）见 [admin.md](./admin.md)。
+完整契约与边界（四个 target 各切什么、为什么 `client` 不碰绑定、以及 `subject` 清会话依赖
+会话索引）见 [admin.md](./admin.md)。
 
 ---
 
@@ -218,12 +230,23 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 曾规划过 `POST /v1/credentials/taptap/export`（critical scope + 逐项同意 + 强制审计），
 把底层 TapTap session token 交给下游。**v1 不实现它，因为这个端点已无物可导。**
 
-架构演进后，**re0auth 不持有任何上游凭据**：上游令牌存进**数据源自己的 vault**，re0auth 侧的绑定
-只存元数据（`token_type` / `expiry` / `has_refresh` / `version`）。本地没有可导出的凭据，
-“导出”只能是虚构的。
+「无物可导」要成立，得先把**两层**上游凭据分清——这是最容易读岔的一处：
 
-需要上游原生 API 的下游走 **raw 透传**（§4 的 `GET /v1/games/{game}/sources/{source}/raw/{path...}`）：
-它给出同样的数据、逐字透传上游语义，**不交出令牌**——令牌始终留在源侧，仍可按绑定撤销。
+| 层 | 例子 | 谁持有 | re0auth 能看到吗 |
+|---|---|---|---|
+| **原始平台凭据** | TapTap 的 `sessionToken`（stoken） | **数据源自己**的 vault | 从不持有，也从不接触 |
+| **源签发的令牌** | 源自己的 AS 签发的 access / refresh token | **re0auth 的 vault**（信封加密，键 `Provider = "<game>.<source>"`） | 持有；明文只在 `vault.Use` 的窗口内出现，且只用于调用源 |
+
+绑定表（`BindingStore`）对两层都**只存元数据**（`token_type` / `expiry` / `has_refresh` / `version`），
+凭据本体在 vault 里、永不进绑定表。于是：
+
+- **该导出的那个根本不在本地**：被要求导出的「底层 stoken」在数据源手里，导出它只能是虚构的。
+- **在本地的那一个也不能给**：源签发的令牌在有效期内是能取数、能续期的凭据，交给下游等于把这一层
+  降级成转发凭据的信使，撤销、审计与 provenance 一起失守。
+
+所以需要上游原生 API 的下游走 **raw 透传**（§4 的
+`GET /v1/games/{game}/sources/{source}/raw/{path...}`）：Re0Auth 用它自己手里那份令牌去调源，
+逐字透传上游语义，下游**只拿到数据、拿不到令牌**，且随时可按绑定撤销。
 
 若将来确有“下游必须直接调数据源”的场景，正确做法是新增一个**按源的**导出 scope
 （形如 `<game>.<source>.token.read`），并配套同意 UI、审计与弃用路径——**而不是复用这个旧名字**。
@@ -251,10 +274,27 @@ re0auth.r0semi.net
 
 实现约束（防串味）：
 
+- **分类是正向的，只有一份。** `planeOf(path)` 明确命名每个平面：协议 = `/oauth` + `/.well-known`；
+  业务 = `/v1`；**其余一律是浏览器面**。以前用 `isProtocolPath` 那种「不是协议就是业务」的负向写法，
+  曾让 `/auth`、`/bind` 与**所有未知路径**被误判为业务平面——后果不是难看，而是**运维调限流会改变
+  这些页面的 wire 契约**。
+- **浏览器面（第三个面）**：`/auth/…`、`/bind`、`/consent`、`/app/…` 以及未知路径。这些 URL 由人
+  通过浏览器导航到达，失败是**纯文本或重定向**，**禁止** problem+json，**禁止** `{error,error_description}`。
+  `/auth/` 的既有 `http.Error` 与 `/bind` 的失败路径即此格式；`/consent`、`/app/*` 由 SPA 提供 HTML。
+  未知路径也是纯文本 404——**在浏览器里输入错的 URL 应该像 404，而不像 API 错误**；`/v1` 子树的
+  catch-all 仍然回 problem+json，API 客户端的笔误落在那儿。
+- 平面判定**只有一处定义**，它同时驱动错误写出、限流/体积上限的形状、panic 恢复的形状，以及压缩层
+  是否可变换（`compress.Config.Eligible`）。两处定义正是 `/.well-known/*` 一度「对一个是协议面、
+  对另一个是业务面」的原因。
+- **panic 也必须落在自己的平面里**：协议面的 panic → OAuth 500；业务面 → problem+json 500；浏览器面
+  → 纯文本 500（由最外层兜住，因此也覆盖共享中间件里的 panic）。
 - 两组路由使用**独立的错误写出器**与**独立的认证语义**；共享的只有 trace / 限流 / TLS 中间件。
 - 协议平面中间件**禁止**输出 problem+json；业务平面中间件**禁止**输出 `{error,error_description}`。
 - 两者的路由注册互不可见，由代码结构直接保证（不同包 / 不同 Router 实例挂载）。
 - `oauth` 组件只依赖 `oauth.clients` / `oauth.tokens` / `audit`；`/v1` 资源层另起一层用 `Introspect` + vault 实现，不反向依赖协议层。
+
+> 决策背景与权衡见 [browser-plane-decision.md](./browser-plane-decision.md)（ADR-0003）；
+> 同意句柄的所有权校验见 [consent-binding-decision.md](./consent-binding-decision.md)（ADR-0004）。
 
 ---
 

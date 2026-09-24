@@ -150,6 +150,14 @@ paths:
           description: |
             The token is valid but does not carry `account.id`. The body names the
             missing scope in `required_scope`.
+          headers:
+            WWW-Authenticate:
+              description: |
+                RFC 6750 §3.1 challenge: `Bearer error="insufficient_scope"`,
+                with `scope="…"` naming the scope that is missing. It is the only
+                standard way a client tells this apart from an invalid token (401)
+                rather than reading this document's `required_scope`.
+              schema: { type: string }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -814,6 +822,12 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403':
           description: The token does not carry the resource's scope.
+          headers:
+            WWW-Authenticate:
+              description: |
+                RFC 6750 §3.1 challenge: `Bearer error="insufficient_scope"`,
+                with `scope="…"` naming the resource's scope.
+              schema: { type: string }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -909,6 +923,14 @@ paths:
           description: |
             The token grants none of this source's resource scopes. The raw proxy
             is gated coarsely by those until a dedicated scope exists.
+          headers:
+            WWW-Authenticate:
+              description: |
+                RFC 6750 §3.1 challenge: `Bearer error="insufficient_scope"`.
+                Because the requirement is a set rather than one scope, the
+                challenge deliberately omits the optional `scope` parameter
+                instead of naming an arbitrary member.
+              schema: { type: string }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

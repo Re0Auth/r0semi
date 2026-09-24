@@ -35,7 +35,7 @@ subjects = ["usr_01J...", "usr_01K..."]
 | `POST` | `/v1/admin/clients/{client_id}/suspend` | 暂停客户端并**吊销其全部令牌** |
 | `POST` | `/v1/admin/clients/{client_id}/activate` | 恢复（**不**恢复已吊销的令牌） |
 | `DELETE` | `/v1/admin/clients/{client_id}` | 删除注册并吊销其全部令牌；幂等 |
-| `POST` | `/v1/admin/kill_switch` | 按 `all` / `client` / `subject` 批量吊销令牌（`all` 另清空会话） |
+| `POST` | `/v1/admin/kill_switch` | 按 `all` / `client` / `subject` / `bindings` 批量吊销令牌与绑定（`all` 与 `subject` 另清会话，需持久会话） |
 
 实现：`internal/admin`（逻辑 + 审计）与 `internal/httpapi/admin_routes.go`（传输）。
 两个端口极窄——`Clients`（注册表）与 `Revoker`（令牌批量删除）——所以同一套逻辑既跑 Postgres，也跑内存存储。
@@ -84,8 +84,12 @@ subjects = ["usr_01J...", "usr_01K..."]
 
 **它仍做不到什么，必须说清楚：**
 
-- **不直接操作任何上游凭据**——Re0Auth 不持有上游凭据（[api-design.md](./api-design.md) §5）。它只能**请求源**去动源自己持有的凭据；源不能撤销、或不可达，会如实出现在 `bindings.unsupported` / `bindings.unavailable`，而不是被折叠成成功。
-- **`subject` 清会话依赖会话索引**（`session_subjects`）：登录时把会话令牌记到账号名下，注销时移除、过期由 sweep 清理。没有索引的部署（内存模式）只能整体清会话；有持久会话的部署，`subject` 会让该账号在所有浏览器掉登录。
+- **不直接操作任何上游凭据**——原始平台凭据（如 TapTap stoken）在**数据源**手里，Re0Auth 从不持有；
+  它自己 vault 里那份是**源签发的令牌**，Kill Switch 只用它去**请求源**动手（两层凭据的区分见
+  [api-design.md](./api-design.md) §5）。源不能撤销、或不可达，会如实出现在 `bindings.unsupported` / `bindings.unavailable`，而不是被折叠成成功。
+- **`subject` 清会话依赖会话索引**（`session_subjects`）：登录时把会话令牌记到账号名下，注销时移除、过期由 sweep 清理。
+  **没有持久会话的部署（内存模式）一条会话都清不掉**——scs 会话只是一个不透明 Cookie，`memstore` 既没有 subject 概念也没有枚举 API，`all` 都没有可以遍历的东西可删；该模式下会话本来也不持久，重启进程才是重置手段。
+  有持久会话的部署，`subject` 会让该账号在所有浏览器掉登录，`all` 清全部。
 
   理由：scs 会话只是一个不透明 Cookie，存储层只看到编码后的字节，没有任何“这个会话属于谁”的概念。索引因此由 Re0Auth 自己在登录时写；写失败则拒绝该会话（fail-closed），否则就会出现一个运维永远碰不到的会话。
 

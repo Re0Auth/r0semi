@@ -234,7 +234,7 @@ type Credential struct {          // 一个 provider 的私有凭据形态，vau
 - **撤销 / 自省**：`Revoke` 幂等（RFC 7009）；`Introspect`（RFC 7662）返回 `Active` / subject / scopes。
 - **危险 scope 的强制**：`Authorize` 要求任何标记 `ExplicitConsent` 的 scope 必须出现在请求的 `Explicit`
   列表中，否则 `access_denied`，且客户端必须被显式注册该 scope。
-  **内置目录当前不含此类 scope**（re0auth 不持有上游凭据，无可导出的东西，见 api-design.md §5）；
+  **内置目录当前不含此类 scope**（re0auth 手里没有**原始平台**凭据，无可导出的东西，见 api-design.md §5）；
   机制保留，并由测试用**合成 scope**覆盖——测试不该依赖产品 scope 的语义。
 
 MVP scope 目录：`account.id`、`taptap.account.id`、`phigros.profile.read`、`phigros.score.read`、
@@ -248,7 +248,8 @@ MVP scope 目录：`account.id`、`taptap.account.id`、`phigros.profile.read`�
 > **但它只代理、不拥有数据**：没有配置源、或用户尚未绑定该源时，数据面什么都不给
 > （`source_not_bound` / 空列表），所谓「代理成绩」是把源的 JSON 原样返回。上游凭据由数据源
 > 自己持有，re0auth 只托管源签发的令牌。
-> **不会实现的**：上游凭据导出端点——re0auth 不持有上游凭据，见 api-design.md §5。
+> **不会实现的**：上游凭据导出端点——要导出的**原始平台**凭据在数据源手里，而本地那份**源签发**的
+> 令牌永不交给下游，见 api-design.md §5。
 
 ### 4.5 HTTP 层与两平面路由（v1 已实现：`internal/httpapi`）
 
@@ -312,7 +313,7 @@ API 的每个 404 都会变成 HTML。前缀与 `web/vite.config.ts` 的 `paths.
 
 **未构建前端也不能让 `go build` 失败**：`//go:embed all:dist` 要求目录存在且非空，而 `adapter-static` 会先清空输出目录。
 两者直接冲突——前者要新克隆就能编译，后者要独占那个目录的内容。
-解法是让占位文件由 `npm run build` 在构建后自己重新写回（`web/scripts/restore-dist-placeholder.mjs`），
+解法是让占位文件由 `pnpm run build` 在构建后自己重新写回（`web/scripts/restore-dist-placeholder.mjs`），
 而不是做成一个可以被遗忘的独立步骤。占位目录里没有 `index.html`，所以“`index.html` 存在”就是“真的构建过”的证明，CI 据此断言。
 
 ### 4.7 浏览器端到端（`web/e2e`，Playwright）
