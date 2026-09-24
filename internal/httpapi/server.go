@@ -552,7 +552,26 @@ func (s *Server) businessPlane() http.Handler {
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown resource")
 	})
-	return recoverBusiness(s, mux)
+	return recoverBusiness(s, withNoStore(mux))
+}
+
+// withNoStore marks every business-plane response uncacheable.
+//
+// The rule already lived in the writers (writeJSON, writeProblem), and round 2's
+// A5-4 was the finding that it had not been applied everywhere. Round 4 found the
+// case that proves it still was not: the raw proxy writes its response itself, so
+// it was the one authenticated body leaving the service with no cache directive at
+// all — and the test that pins the rule enumerated handlers rather than the plane,
+// so it could not see it.
+//
+// Attaching the rule to the plane instead of to each writer is what stops the next
+// handler that bypasses the writers from reopening it. The writers keep setting it
+// as well: their direct callers in tests do not go through this wrapper.
+func withNoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handleNotFound answers a path that is on no plane at all.

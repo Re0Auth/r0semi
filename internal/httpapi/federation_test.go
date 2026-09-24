@@ -325,6 +325,12 @@ func TestGameRawAndDegraded(t *testing.T) {
 	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/vnd.native") {
 		t.Fatalf("raw content-type = %q", got)
 	}
+	// Round 4: the raw handler writes its own response, so it bypassed the
+	// writers that carry the business plane's no-store rule and was the one
+	// authenticated body leaving with no cache directive at all.
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("raw responses must not be cached: Cache-Control = %q", got)
+	}
 	rawBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if string(rawBody) != `{"native":true}` {
@@ -337,4 +343,86 @@ func TestGameRawAndDegraded(t *testing.T) {
 		t.Fatalf("raw unsupported = %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+
+	// Round 4: a doubly-encoded `..` must not reach the upstream. net/http
+	// unescapes a wildcard value exactly once, so `%252e%252e` arrives at the
+	// handler as `%2e%2e` — which a literal-`..` check lets through, and the
+	// source (or a proxy in front of it) decodes into `..`. This is the entry
+	// point an attacker actually uses; the federation-level tests call Raw with an
+	// already-decoded path and so could never pin it.
+	resp = authedGet(t, srv.URL+"/v1/games/phigros/sources/b-src/raw/%252e%252e/v1/native/scores", at)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a doubly-encoded traversal = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// Round 4: the raw gate must fail closed when a source declares no scoped
+// resource.
+//
+// `len(scopes) > 0 && !hasAnyScope(...)` made an empty scope set mean "no check at
+// all": a source whose resource entry carried no `scope` — a configuration typo
+// the TOML decoder does not report, since it ignores unknown keys — let ANY live
+// token read its whole native API, including an identity-only account.id one. The
+// normalized path for the same source already answered 403, so this is an
+// asymmetry closing rather than a new rule.
+func TestRawRefusesASourceWithNoScopedResource(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.native+json")
+		_, _ = w.Write([]byte(`{"native":true}`))
+	}))
+	defer up.Close()
+
+	registry, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "unscoped", Issuer: up.URL, TokenClass: "revocable", RawBase: up.URL,
+		// No Scope on the resource: the mistake this test exists to catch.
+		Resources: []federation.Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := federation.NewMemoryBindingStore()
+	v := newTestVault(t)
+	b := federation.Binding{User: "usr_test", Game: "phigros", Source: "unscoped", Version: 1}
+	if err := bindings.Put(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	seedBindingSecret(t, v, b, "up-token")
+	fed, err := federation.NewService(federation.Config{
+		Registry: registry, Bindings: bindings, Vault: v, Doer: up.Client(), BaseURL: "https://re0auth.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clients := oauth.NewMemoryClientRegistry()
+	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{fedRedirect}, []oauth.Scope{oauth.ScopePhigrosProfile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clients.Create(context.Background(), client); err != nil {
+		t.Fatal(err)
+	}
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, nil)
+	api, err := New(Config{
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Federation:        fed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	at := mintToken(t, api.Handler(), store, "cli", "usr_test", oauth.ScopePhigrosProfile)
+
+	resp := authedGet(t, srv.URL+"/v1/games/phigros/sources/unscoped/raw/v1/native/scores", at)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("raw against a source with no scoped resource = %d, want 403 (fail closed)", resp.StatusCode)
+	}
 }

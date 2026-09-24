@@ -133,6 +133,15 @@ func (s *Server) writeFederationError(w http.ResponseWriter, r *http.Request, er
 		s.writeProblem(w, r, http.StatusGone, "source_retired", "the source has been retired")
 	case errors.Is(err, federation.ErrRawUnsupported):
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "the source has no raw API")
+	case errors.Is(err, federation.ErrRawPathEscapes):
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request",
+			"the raw path must stay under the source's base URL")
+	case errors.Is(err, federation.ErrResponseTooLarge):
+		// The upstream answered, so this is not "could not reach it" — but the
+		// proxy will not hand back a truncated body as if it were whole, and the
+		// condition is only expressible as a gateway failure.
+		s.writeProblem(w, r, http.StatusBadGateway, "upstream_unavailable",
+			"the source's response is larger than this proxy will pass through")
 	case errors.Is(err, federation.ErrBindUnavailable):
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "the source is not configured for binding")
 	default:
@@ -197,7 +206,17 @@ func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oaut
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown game or source")
 		return
 	}
-	if len(scopes) > 0 && !hasAnyScope(info.Scopes, scopes) {
+	// The gate is "the token carries one of the source's resource scopes", and it
+	// must fail closed when the source declares none.
+	//
+	// `len(scopes) > 0 &&` made an empty scope set mean "no check at all". A
+	// source whose resource entry carries no `scope` — a config mistake the TOML
+	// decoder does not report, since it ignores unknown keys — therefore turned
+	// the raw proxy into "any live token reads the whole native API", including an
+	// identity-only account.id one. Round 4 confirmed it. The normalized path for
+	// the same source already refused (403), so this is the asymmetry closing
+	// rather than a new rule.
+	if len(scopes) == 0 || !hasAnyScope(info.Scopes, scopes) {
 		// No single scope is named: the raw proxy is gated coarsely, by any of the
 		// source's resource scopes.
 		s.insufficientScope(w, r, "", "this token does not grant access to "+game)

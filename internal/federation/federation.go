@@ -10,6 +10,7 @@ package federation
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 )
@@ -27,6 +28,13 @@ var (
 	ErrSourceRetired = errors.New("federation: source is retired")
 	// ErrRawUnsupported reports a source without a raw API.
 	ErrRawUnsupported = errors.New("federation: source has no raw API")
+	// ErrRawPathEscapes reports a raw request whose path tries to climb out of
+	// the source's base URL.
+	ErrRawPathEscapes = errors.New("federation: raw path escapes the source base")
+	// ErrResponseTooLarge reports an upstream body past the size this proxy will
+	// pass through. It is an error rather than a truncated success: a short body
+	// returned as a complete one is the response lying about itself.
+	ErrResponseTooLarge = errors.New("federation: upstream response exceeds the size limit")
 )
 
 // SourceStatus is a source's lifecycle state (docs/upstream-protocol.md §10).
@@ -155,10 +163,44 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 			s.Status = StatusActive
 		}
 		s.RawBase = strings.TrimRight(s.RawBase, "/")
+		if s.RawBase != "" {
+			if err := validateRawBase(s.RawBase); err != nil {
+				return nil, fmt.Errorf("federation: source %s: %w", k, err)
+			}
+		}
 		r.byKey[k] = s
 		r.byGame[s.Game] = append(r.byGame[s.Game], s)
 	}
 	return r, nil
+}
+
+// validateRawBase checks a source's native API root before anything is ever joined
+// to it.
+//
+// The join is `RawBase + "/" + path`, so a base that is not an absolute http(s)
+// URL — or that carries its own query or fragment — silently changes what every
+// raw request means. With `raw_base = "https://api.example/v1?x=1"` the caller's
+// path and query are appended to the *query string*: the path guard is never
+// consulted on the join it was written for, and the subject's upstream token is
+// sent to whatever that string resolves to. With `//evil.example` the value loads
+// fine and every call fails at request time, far from the typo.
+//
+// It is an operator's mistake rather than a remote attack, which is exactly why it
+// has to be reported at startup: nothing downstream can tell "the operator meant
+// this" from "the operator fat-fingered it".
+func validateRawBase(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("raw_base %q is not a URL: %w", raw, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("raw_base %q must be an absolute http(s) URL", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf(
+			"raw_base %q must not carry a query or fragment: the caller's path is appended to it", raw)
+	}
+	return nil
 }
 
 // AllSources returns every configured source, ordered by game then name.

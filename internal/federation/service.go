@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -344,8 +345,91 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 	return out, nil
 }
 
+// cleanRawPath normalizes the caller-supplied path before it is joined to a
+// source's base URL, and refuses one that would climb out of it.
+//
+// net/http's ServeMux already cleans `..` and `//` out of r.URL.Path before it
+// matches a route, so inside the assembled server this is a second line rather
+// than the first. It is here because "the safety of this join rests on a property
+// of a different package" is not a property: a handler mounted on a bare mux, in
+// a test, or behind a future router would not have it, and the failure mode is a
+// request to an endpoint the operator never configured. A guard that travels with
+// the code that depends on it is the only kind that cannot be left behind.
+//
+// An escaping path is refused rather than resolved. This endpoint proxies a
+// source's own API verbatim; no caller needs to traverse upwards to use it, and
+// answering `a/../../b` with `b` would be inventing a meaning the contract does
+// not give it.
+func cleanRawPath(raw string) (string, error) {
+	if err := rejectEscapingPath(raw); err != nil {
+		return "", err
+	}
+	cleaned := path.Clean("/" + raw)
+	if cleaned == "/" {
+		return "", nil
+	}
+	// Clean always yields an absolute path; the caller rejoins the relative form.
+	return strings.TrimPrefix(cleaned, "/"), nil
+}
+
+// maxRawPathDecodeRounds bounds the re-decoding below. Two encodings are what an
+// attacker actually sends; the cap is there so a crafted input cannot make the
+// loop spin, and hitting it is itself a refusal.
+const maxRawPathDecodeRounds = 4
+
+// rejectEscapingPath fails a path that could climb out of the base URL — including
+// a path that only does so after something downstream decodes it again.
+//
+// Checking the once-decoded value for a literal ".." segment is not enough, and
+// round 4 showed why: net/http unescapes a wildcard value exactly once before this
+// function ever sees it, so the caller still controls a second encoding. `%2e%2e`
+// arrives as `%2e%2e`, survives a literal-`..` check, is concatenated on, and is
+// decoded by the source — or by a proxy in front of it — into `..`. The result is
+// a different resource on the same host (the host cannot be changed; see the
+// tests), which is the operator's prefix being escaped rather than an SSRF.
+//
+// So the check is applied at every decoding depth, and the forms that have nothing
+// to do with `..` are refused alongside it:
+//
+//   - a segment that *begins* with ".." — `..;` is `..` to any server that strips
+//     path parameters before normalizing;
+//   - a backslash, which is a path separator to a Windows-hosted source;
+//   - still-changing input after the depth cap, rather than guessing what the
+//     source will make of it.
+//
+// A malformed escape is deliberately NOT refused: `%` alone cannot decode into a
+// traversal anywhere, and refusing it would break a legitimate path that contains
+// a literal percent sign. The loop simply stops, which leaves the value for the
+// source to read as the literal text it is.
+func rejectEscapingPath(raw string) error {
+	candidate := raw
+	for round := 0; round < maxRawPathDecodeRounds; round++ {
+		for _, segment := range strings.Split(candidate, "/") {
+			if strings.HasPrefix(segment, "..") || strings.ContainsRune(segment, '\\') {
+				return ErrRawPathEscapes
+			}
+		}
+		decoded, err := url.PathUnescape(candidate)
+		if err != nil {
+			return nil
+		}
+		if decoded == candidate {
+			return nil
+		}
+		candidate = decoded
+	}
+	return ErrRawPathEscapes
+}
+
 func (s *service) rawFetch(ctx context.Context, src Source, path string, query url.Values, token string) (RawResult, error) {
-	endpoint := src.RawBase + "/" + strings.TrimLeft(path, "/")
+	cleaned, err := cleanRawPath(path)
+	if err != nil {
+		return RawResult{}, err
+	}
+	endpoint := src.RawBase
+	if cleaned != "" {
+		endpoint += "/" + cleaned
+	}
 	if len(query) > 0 {
 		endpoint += "?" + query.Encode()
 	}
@@ -361,9 +445,19 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 		return RawResult{}, fmt.Errorf("federation: raw %s: %w", src.Name, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	// One byte past the cap, so "exactly at the limit" and "past the limit" are
+	// distinguishable. A truncated body returned as a complete 200 claims a
+	// completeness it does not have, on the one endpoint whose contract is
+	// "verbatim" — and for the byte-oriented payloads this endpoint exists for
+	// (NDJSON, CSV, plain text) the truncation stays syntactically valid, so
+	// nothing downstream can notice it. The normalized path cannot have this
+	// problem: its body has to parse as JSON, and a cut one does not.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return RawResult{}, fmt.Errorf("federation: read raw %s: %w", src.Name, err)
+	}
+	if len(body) > maxBody {
+		return RawResult{}, ErrResponseTooLarge
 	}
 	return RawResult{
 		Status:      resp.StatusCode,
