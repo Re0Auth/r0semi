@@ -90,6 +90,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --title "${{ github.ref_name }}" \
+          # A tag carrying a pre-release suffix (v1.2.3-rc.1, -beta.2, …) is marked
+          # as one. Without this an rc would land as the repository's latest
+          # release, which is the same kind of over-claim the README's warning
+          # exists to avoid — and the tag most likely to carry such a suffix is the
+          # one cut to validate this very pipeline.
+          #
+          # The tag comes from GITHUB_REF_NAME rather than an interpolated
+          # expression, so a tag with shell metacharacters cannot become code.
+          case "${GITHUB_REF_NAME}" in
+            *-*) pre="--prerelease" ;;
+            *)   pre="" ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            $pre \
             --generate-notes
