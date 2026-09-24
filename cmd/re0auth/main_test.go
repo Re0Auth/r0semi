@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestOIDCTokenKeyFailClosed(t *testing.T) {
@@ -104,5 +107,59 @@ func TestLoadIdPRejectsCustomProviderWithoutIssuer(t *testing.T) {
 	var cfg settings
 	if err := loadIdP(&cfg, map[string]idpSection{"mystery": {ClientID: "cid"}}); err == nil {
 		t.Fatal("accepted a custom provider with no issuer")
+	}
+}
+
+// countingSweeper stands in for the memory store: it records how often the
+// janitor asks it to sweep, and never reports anything removed.
+type countingSweeper struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c *countingSweeper) SweepExpired() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+	return 0
+}
+
+func (c *countingSweeper) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// The in-memory OP store has no janitor of its own, so this loop is what keeps
+// its maps from growing for the life of the process. It must actually sweep, and
+// it must stop when the process's context ends rather than outliving it.
+func TestOPJanitorLoopSweepsAndStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &countingSweeper{}
+	done := make(chan struct{})
+	go func() {
+		opJanitorLoop(ctx, fake, time.Millisecond)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for fake.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if fake.count() == 0 {
+		t.Fatal("the janitor never swept")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the janitor ignored cancellation")
+	}
+
+	stopped := fake.count()
+	time.Sleep(10 * time.Millisecond)
+	if fake.count() != stopped {
+		t.Fatal("the janitor swept after it was cancelled")
 	}
 }

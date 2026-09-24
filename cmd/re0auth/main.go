@@ -26,6 +26,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"github.com/Re0Auth/r0semi/audit"
+	"github.com/Re0Auth/r0semi/httpclient"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/admin"
@@ -47,6 +48,19 @@ var (
 	configFlag = flag.String("config", "", "path to the TOML config file (default: RE0AUTH_CONFIG, then config/re0auth.toml)")
 	rotateKeys = flag.Bool("rotate-keys", false,
 		"re-wrap every stored credential's DEK under the current KEK, then exit")
+)
+
+const (
+	// federationMaxConcurrent bounds how many requests the data plane may have in
+	// flight to upstream sources at once. It is the bulkhead: past it, callers
+	// wait for a slot rather than piling up goroutines, each holding a buffered
+	// body, when a source turns slow.
+	federationMaxConcurrent = 256
+
+	// opJanitorInterval is how often the in-memory OP store is swept of expired
+	// records. It is well under the shortest record lifetime, so the maps stay
+	// close to the size the live records justify.
+	opJanitorInterval = 5 * time.Minute
 )
 
 // storage bundles the persistence ports so the composition root does not thread
@@ -193,13 +207,23 @@ func main() {
 	if err != nil {
 		die("sources", err)
 	}
+	// One pooled, bounded client for every outbound call the data plane makes.
+	// The standard library's default transport keeps only two idle connections per
+	// host, which for a proxy fronting a handful of sources means redialing on
+	// nearly every request. Doer and HTTPClient point at the same client, so the
+	// resource fetches and the OAuth token exchange share one connection pool.
+	federationClient := httpclient.NewOutboundClient(httpclient.OutboundConfig{
+		Timeout:       20 * time.Second,
+		MaxConcurrent: federationMaxConcurrent,
+	})
 	federationService, err := federation.NewService(federation.Config{
-		Registry: registry,
-		Bindings: store.bindings,
-		Flows:    store.bindFlows,
-		Vault:    vaultService,
-		Doer:     &http.Client{Timeout: 20 * time.Second},
-		BaseURL:  cfg.Issuer,
+		Registry:   registry,
+		Bindings:   store.bindings,
+		Flows:      store.bindFlows,
+		Vault:      vaultService,
+		Doer:       federationClient,
+		HTTPClient: federationClient,
+		BaseURL:    cfg.Issuer,
 	})
 	if err != nil {
 		die("federation", err)
@@ -218,7 +242,7 @@ func main() {
 	}
 	// Every deployment runs the OpenID Provider (ADR-0001 P4b). The only thing a
 	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
-	oidcHandler, oidcStore, err := openOIDC(cfg, store, sessions, logger)
+	oidcHandler, oidcStore, err := openOIDC(ctx, cfg, store, sessions, logger)
 	if err != nil {
 		die("oidc", err)
 	}
@@ -345,6 +369,28 @@ func reportDurability(store storage) {
 	slog.Info("storage ready", "driver", "postgres", "persistent_ports", persistentPorts)
 }
 
+// opJanitorLoop sweeps expired records from the in-memory OP store on a ticker.
+// It returns when ctx is done, so it stops with the process rather than
+// outliving it. It is the memory-store counterpart of sweepLoop: the store
+// exposes a pure SweepExpired, and the loop that calls it lives here, where the
+// logging policy does.
+func opJanitorLoop(ctx context.Context, sweep interface{ SweepExpired() int }, every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if removed := sweep.SweepExpired(); removed > 0 {
+				slog.Info("swept expired OP records", "removed", removed)
+				continue
+			}
+			slog.Debug("OP sweep found nothing to remove")
+		}
+	}
+}
+
 // sweepLoop periodically removes expired sessions. Find already deletes the ones
 // it is asked about; this covers the ones nobody comes back to.
 func sweepLoop(ctx context.Context, sweep func(context.Context) (int64, error), every time.Duration) {
@@ -433,7 +479,7 @@ type oidcBackend interface {
 // openOIDC builds the OpenID Provider store and HTTP handler. The store is
 // Postgres when a database is configured and in-memory otherwise (ADR-0001 P4b);
 // the handler and every policy around it are identical either way.
-func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.Logger) (*oidchttp.Handler, oidcBackend, error) {
+func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.Manager, logger audit.Logger) (*oidchttp.Handler, oidcBackend, error) {
 	tokenKey, err := oidcTokenKey()
 	if err != nil {
 		return nil, nil, err
@@ -474,7 +520,7 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 			RequestTTL: authorizationRequestTTL,
 		})
 	} else {
-		oidcStore, err = memory.NewOIDCStore(memory.OIDCOptions{
+		mem, err := memory.NewOIDCStore(memory.OIDCOptions{
 			Clients:    store.clients,
 			Registry:   registry,
 			Signer:     signer,
@@ -482,6 +528,16 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 			Login:      login,
 			RequestTTL: authorizationRequestTTL,
 		})
+		if err != nil {
+			return nil, nil, err
+		}
+		// The memory store never expires a record on its own — a lookup refuses an
+		// expired one, but nothing removes it. Without this loop the token and
+		// pending-request maps grow for the life of the process, and every call
+		// that scans them under the store's single lock (grants, revocation) then
+		// gets slower as they do.
+		go opJanitorLoop(ctx, mem, opJanitorInterval)
+		oidcStore = mem
 	}
 	if err != nil {
 		return nil, nil, err
