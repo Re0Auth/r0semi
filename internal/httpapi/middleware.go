@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -119,6 +120,96 @@ func requestID(r *http.Request) string {
 	}
 	return ""
 }
+
+// withAccessLog writes one line per request: what was asked for, what came back,
+// how long it took, and under which request id.
+//
+// It sits inside withRequestID, so the id it logs is the one the caller was told
+// to quote, and outside the recoverer, so a panic that becomes a 500 is logged as
+// a 500 rather than as a request that never finished.
+//
+// The path is logged; the query string is not. Every authorization, bind callback
+// and device verification carries a `code`, `state` or `user_code` in its query,
+// and a log line is a file that gets copied into tickets — the same reasoning
+// behind Referrer-Policy: no-referrer. The request id is enough to correlate with
+// anything else that logs, and the path is enough to know what was asked for.
+//
+// Probes are logged at debug. An orchestrator polls /healthz and /readyz every
+// few seconds for the life of the process, and at info that is the log's steady
+// state rather than a signal in it. Nothing is lost — the line is still written,
+// just below the level a default deployment shows.
+//
+// The line is written with a detached context, because the request that produced
+// it may already be gone: a client that hung up mid-response is one of the cases
+// most worth recording, and a cancelled context is the wrong reason to lose it.
+func (s *Server) withAccessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &accessRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+
+		level := slog.LevelInfo
+		if isProbe(r.URL.Path) {
+			level = slog.LevelDebug
+		}
+		slog.LogAttrs(context.Background(), level, "request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", rec.status),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.Int64("bytes", rec.bytes),
+			slog.String("plane", planeOf(r.URL.Path).String()),
+			slog.String("request_id", requestID(r)),
+			slog.String("client", s.clientKey(r)),
+		)
+	})
+}
+
+// accessRecorder captures the status code and the body size for the access log
+// while forwarding everything else.
+//
+// Flush is re-declared for the same reason observability.statusRecorder declares
+// it: the compression middleware type-asserts for http.Flusher directly, and a
+// wrapper that does not implement it makes a streaming response lose its flushes
+// without an error anywhere. Unwrap lets http.ResponseController reach any other
+// optional interface (Hijack, SetReadDeadline) without this type naming each one.
+type accessRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+	wrote  bool
+}
+
+func (r *accessRecorder) WriteHeader(code int) {
+	if !r.wrote {
+		r.status = code
+		r.wrote = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *accessRecorder) Write(p []byte) (int, error) {
+	if !r.wrote {
+		r.status = http.StatusOK
+		r.wrote = true
+	}
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += int64(n)
+	return n, err
+}
+
+func (r *accessRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *accessRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+var (
+	_ http.ResponseWriter = (*accessRecorder)(nil)
+	_ http.Flusher        = (*accessRecorder)(nil)
+)
 
 func newRequestID() string {
 	b := make([]byte, 12)

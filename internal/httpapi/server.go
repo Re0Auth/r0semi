@@ -499,13 +499,18 @@ func (s *Server) Handler() http.Handler {
 	//	1. request id       -- so even a rejected request can be quoted to an
 	//	                       operator. A 429 is the response most likely to be
 	//	                       reported, and it never reaches a handler.
-	//	2. security headers -- including on those rejections, so a failure is
+	//	2. access log       -- inside the request id, so it logs the id the caller
+	//	                       was given; outside the recoverer, so a panic is
+	//	                       logged as the 500 it becomes rather than as a
+	//	                       request that never finished.
+	//	3. panic recovery   -- so a crash answers in its plane's format.
+	//	4. security headers -- including on those rejections, so a failure is
 	//	                       still not frameable and still leaks no URL.
-	//	3. compression      -- so every eligible response can be negotiated.
-	//	4. the limiter      -- shed load before sessions or handlers do any work.
-	//	5. the body limit   -- cap what a handler can be made to read, which is a
+	//	5. compression      -- so every eligible response can be negotiated.
+	//	6. the limiter      -- shed load before sessions or handlers do any work.
+	//	7. the body limit   -- cap what a handler can be made to read, which is a
 	//	                       different question from how often it may ask.
-	//	6. session loading  -- wraps the whole tree; /auth and /v1 both need it.
+	//	8. session loading  -- wraps the whole tree; /auth and /v1 both need it.
 	//
 	// The headers sit *outside* compression deliberately. The compressor can
 	// answer on its own — a client that refuses every coding gets a 406 without
@@ -526,7 +531,7 @@ func (s *Server) Handler() http.Handler {
 		h = s.compressor.Handler(h)
 	}
 	h = s.withSecurityHeaders(h)
-	out := withRequestID(recoverBrowser(h))
+	out := withRequestID(s.withAccessLog(recoverBrowser(h)))
 	if s.metrics != nil {
 		// Installed outermost, so a request that never reaches a handler — a 404,
 		// a rate-limit rejection, a recovered panic — is still counted. The plane
