@@ -15,7 +15,7 @@ test('an application appears when authorized, and revoking it ends its access', 
 
 	// Nothing authorized yet.
 	await page.goto('/app/grants');
-	await expect(page.getByText('还没有任何应用获得授权。')).toBeVisible();
+	await expect(page.getByText('还没有应用获得授权。')).toBeVisible();
 
 	const tokens = await authorizeAndExchange(page, request, 'account.id');
 
@@ -34,7 +34,7 @@ test('an application appears when authorized, and revoking it ends its access', 
 	await page.getByRole('button', { name: '撤销', exact: true }).click();
 	await page.getByRole('button', { name: '确认撤销', exact: true }).click();
 
-	await expect(page.getByText('还没有任何应用获得授权。')).toBeVisible();
+	await expect(page.getByText('还没有应用获得授权。')).toBeVisible();
 
 	// The part that makes "revoked" mean something: the client's token is dead.
 	const after = await callWithToken(request, '/v1/me', tokens.access_token);

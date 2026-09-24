@@ -12,7 +12,7 @@ test('a source can be connected, used, and disconnected', async ({ page, request
 	await signIn(page);
 
 	await page.goto('/app/sources');
-	await expect(page.getByText('还没有连接任何数据源。')).toBeVisible();
+	await expect(page.getByText('还没有连接数据源哦~')).toBeVisible();
 	// And the page offers something to connect to. Without that it would be a dead
 	// end for exactly the people who need it.
 	await expect(page.locator('[data-source="phigros/e2e"]')).toBeVisible();
@@ -31,7 +31,7 @@ test('a source can be connected, used, and disconnected', async ({ page, request
 	const card = page.locator('[data-binding="phigros/e2e"]');
 	await card.getByRole('button', { name: '断开连接', exact: true }).click();
 	await card.getByRole('button', { name: '确认断开', exact: true }).click();
-	await expect(page.getByText('还没有连接任何数据源。')).toBeVisible();
+	await expect(page.getByText('还没有连接数据源哦~')).toBeVisible();
 
 	// The same token now reports the source is unbound. That is what makes the
 	// disconnection real rather than cosmetic.
@@ -68,10 +68,10 @@ test('signing out everywhere ends the session and removes the binding', async ({
 	await card.getByRole('button', { name: '登出全部设备', exact: true }).click();
 	// The warning has to be on screen before the button that acts on it, and it has
 	// to say the thing that makes this different from disconnecting.
-	await expect(card.getByText(/所有设备都会被登出/)).toBeVisible();
+	await expect(card.getByText(/之后需要重新登录/)).toBeVisible();
 	await card.getByRole('button', { name: '我明白，登出全部设备', exact: true }).click();
 
-	await expect(page.getByText('还没有连接任何数据源。')).toBeVisible();
+	await expect(page.getByText('还没有连接数据源哦~')).toBeVisible();
 
 	// The source was asked to end the session, and asked on the cascade endpoint —
 	// not the token one, which would have left the login standing.

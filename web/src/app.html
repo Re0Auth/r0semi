@@ -2,7 +2,13 @@
 <html lang="zh-CN">
 	<head>
 		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<!--
+			viewport-fit=cover is what makes env(safe-area-inset-*) resolve to real
+			numbers on a notched device. Without it the insets are always zero and the
+			shell's safe-area padding is dead code. It never suppresses zoom: no
+			maximum-scale, no user-scalable=no, so pinch-to-zoom still works.
+		-->
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<meta name="color-scheme" content="light dark" />
 		<meta name="referrer" content="no-referrer" />
 		<!--
@@ -11,6 +17,8 @@
 			sign-in page: it is plainly branded, and its own CSP forbids framing.
 			See web/vite.config.ts (kit.csp) and internal/webui (frame-ancestors).
 		-->
+		<link rel="icon" href="%sveltekit.assets%/favicon.svg" type="image/svg+xml" />
+		<!-- Replaced per route by <svelte:head>; this is what shows before hydration. -->
 		<title>Re0Auth</title>
 		%sveltekit.head%
 	</head>

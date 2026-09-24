@@ -12,6 +12,7 @@
 	import Alert from '$lib/components/ui/Alert.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Card from '$lib/components/ui/Card.svelte';
+	import CopyValue from '$lib/components/ui/CopyValue.svelte';
 
 	// `gone` covers both "expired" and "not this browser's", which the server
 	// deliberately reports as the same thing: a stolen handle should not be
@@ -129,10 +130,25 @@
 	}
 </script>
 
-<h1 class="text-lg font-semibold">授权请求</h1>
+<!--
+	The title names the client that is asking, once the request has loaded. On this
+	one screen the tab is part of the trust story: a person who lands on a consent
+	page should be able to read which application wants access without hunting for it.
+-->
+<svelte:head>
+	<title>{request ? `${request.client.name} 请求授权 · Re0Auth` : '授权请求 · Re0Auth'}</title>
+</svelte:head>
+
+<h1 class="text-page font-semibold text-balance">授权请求</h1>
 
 {#if phase === 'loading'}
-	<p class="mt-4 text-sm text-ink-muted">正在读取授权请求…</p>
+	<p class="mt-4 flex items-center gap-2 text-sm text-ink-muted">
+		<span
+			class="spinner size-3.5 shrink-0 rounded-full border-2 border-current border-t-transparent"
+			aria-hidden="true"
+		></span>
+		正在读取授权请求…
+	</p>
 {:else if phase === 'anonymous'}
 	<div class="mt-4 flex flex-col gap-4">
 		<Alert tone="warn" title="需要先登录">登录后才能看到这个授权请求。</Alert>
@@ -147,9 +163,10 @@
 		<Alert tone="danger" title="读取失败">{detail}</Alert>
 	</div>
 {:else if request}
-	<p class="mt-1 text-sm text-ink-muted">
+	<p class="mt-1 max-w-text text-base text-pretty text-ink-muted">
 		<strong class="font-medium text-ink">{request.client.name}</strong> 请求访问你的 Re0Auth 账号。
 	</p>
+	<p class="mt-1 text-xs text-ink-faint">应用名称由 Re0Auth 登记，应用无法自行更改。</p>
 
 	{#if unmetBindings.length > 0}
 		<!--
@@ -158,20 +175,20 @@
 			consent. The server decides this list and builds each bind URL; the page only
 			navigates to it.
 		-->
-		<Alert tone="warn" title="需要先连接数据源">
-			这些权限对应游戏数据，需要你先在数据源那边登录一次。连接完成后会回到这里，继续授权。
-		</Alert>
+		<Alert tone="warn">还没有这个数据源的权限哦~请先连接数据源。</Alert>
 		<Card class="mt-3">
 			<ul class="divide-y divide-line">
 				{#each unmetBindings as m (m.game + '/' + m.source)}
 					<li class="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
 						<div class="min-w-0">
-							<p class="text-sm font-medium">{m.display_name}</p>
-							<p class="mt-0.5 font-mono text-xs text-ink-faint">{m.game}/{m.source}</p>
+							<p class="text-base font-medium">{m.display_name}</p>
+							<p class="mt-0.5 font-mono text-xs break-all text-ink-faint">{m.game}/{m.source}</p>
 							<p class="mt-1 text-xs text-ink-muted">{m.scopes.join(' · ')}</p>
 						</div>
-						<Button variant="primary" onclick={() => window.location.assign(m.bind_url)}
-							>连接</Button
+						<Button
+							variant="primary"
+							class="w-full sm:w-auto"
+							onclick={() => window.location.assign(m.bind_url)}>连接</Button
 						>
 					</li>
 				{/each}
@@ -181,10 +198,7 @@
 
 	<Card class="mt-4">
 		<div class="border-b border-line px-4 py-3">
-			<p class="text-sm font-medium">该应用将获得以下权限</p>
-			<p class="mt-0.5 text-xs text-ink-faint">
-				取消勾选即可缩小范围。至少保留一项，否则请直接拒绝。
-			</p>
+			<p class="text-base font-medium">该应用将获得以下权限</p>
 		</div>
 		<ScopeList
 			scopes={request.scopes}
@@ -197,17 +211,35 @@
 			{#if actionError}
 				<Alert tone="danger" title="没有完成">{actionError}</Alert>
 			{:else if unacknowledged.length > 0}
-				<p class="text-xs text-danger">有权限需要单独确认后才能继续。</p>
+				<p class="text-xs text-danger">请先勾选上面的确认项。</p>
 			{:else if unmetBindings.length > 0}
-				<p class="text-xs text-danger">请先连接上面列出的数据源，再继续授权。</p>
+				<p class="text-xs text-danger">请先连接数据源。</p>
 			{:else if granted.length === 0}
-				<p class="text-xs text-ink-muted">你没有勾选任何权限。请至少保留一项，或拒绝这次请求。</p>
+				<p class="text-xs text-ink-muted">没有勾选任何权限，请至少保留一项。</p>
 			{/if}
-			<div class="flex flex-wrap items-center justify-end gap-2">
-				<Button variant="secondary" loading={busy === 'deny'} disabled={busy !== null} onclick={() => decide('deny')}>
+			<!--
+				On a phone the two decisions stack and go full width, so the one that grants
+				access is a whole-width target under the thumb rather than a 90px box at the
+				right edge. The DOM order does not change, so the reading order is the same
+				either way.
+			-->
+			<div class="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
+				<Button
+					variant="secondary"
+					class="w-full sm:w-auto"
+					loading={busy === 'deny'}
+					disabled={busy !== null}
+					onclick={() => decide('deny')}
+				>
 					拒绝
 				</Button>
-				<Button variant="primary" loading={busy === 'approve'} disabled={!canApprove} onclick={() => decide('approve')}>
+				<Button
+					variant="primary"
+					class="w-full sm:w-auto"
+					loading={busy === 'approve'}
+					disabled={!canApprove}
+					onclick={() => decide('approve')}
+				>
 					同意并继续
 				</Button>
 			</div>
@@ -215,18 +247,19 @@
 	</Card>
 
 	<dl class="mt-4 space-y-1 text-xs text-ink-faint">
-		<div class="flex gap-2">
+		<div class="flex items-center gap-2">
 			<dt class="shrink-0">应用标识</dt>
-			<dd class="font-mono">{request.client.id}</dd>
+			<dd class="flex min-w-0 items-center gap-1">
+				<span class="font-mono break-all">{request.client.id}</span>
+				<CopyValue value={request.client.id} label="应用标识" />
+			</dd>
 		</div>
-		<div class="flex gap-2">
+		<div class="flex items-center gap-2">
 			<dt class="shrink-0">授权请求</dt>
-			<dd class="font-mono">{request.id}</dd>
+			<dd class="flex min-w-0 items-center gap-1">
+				<span class="font-mono break-all">{request.id}</span>
+				<CopyValue value={request.id} label="授权请求" />
+			</dd>
 		</div>
 	</dl>
-
-	<p class="mt-4 text-xs text-ink-faint">
-		应用名称由 Re0Auth 登记，应用自己无法更改它。Re0Auth 不会把你的上游凭据交给这个应用——
-		它拿到的是有范围限制、可撤销的短期令牌。连接数据源让你在数据源那边登录，凭据留在数据源自己手里。
-	</p>
 {/if}

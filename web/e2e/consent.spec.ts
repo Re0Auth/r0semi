@@ -86,13 +86,13 @@ test('a scope that needs a data source is connected before it can be approved', 
 
 	// The request names phigros.b30.read, which the e2e deployment serves from a
 	// source this account has not connected.
-	await expect(page.getByText('需要先连接数据源')).toBeVisible();
+	await expect(page.getByText('还没有这个数据源的权限')).toBeVisible();
 	await expect(page.getByRole('button', { name: '同意并继续' })).toBeDisabled();
 
 	await connectFromConsent(page);
 
 	// Same handle, now satisfied: the pending request survived the round trip.
-	await expect(page.getByText('需要先连接数据源')).toHaveCount(0);
+	await expect(page.getByText('还没有这个数据源的权限')).toHaveCount(0);
 	await expect(page.getByRole('button', { name: '同意并继续' })).toBeEnabled();
 
 	await page.getByRole('button', { name: '同意并继续' }).click();

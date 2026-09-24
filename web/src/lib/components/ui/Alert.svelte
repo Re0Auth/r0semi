@@ -7,14 +7,15 @@
 		/** Rendered under the body; use for the actions that resolve the alert. */
 		actions?: Snippet;
 		children?: Snippet;
+		class?: string;
 	}
 
-	let { tone = 'info', title, actions, children }: Props = $props();
+	let { tone = 'info', title, actions, children, class: klass = '' }: Props = $props();
 
 	const tones = {
-		info: 'border-line-strong bg-canvas',
-		warn: 'border-warn/40 bg-warn-soft',
-		danger: 'border-danger/40 bg-danger-soft'
+		info: 'border-line-strong bg-surface-sunken',
+		warn: 'border-warn/40 bg-warn-soft contrast-more:border-warn',
+		danger: 'border-danger/40 bg-danger-soft contrast-more:border-danger'
 	} as const;
 
 	// role="alert" so a screen reader announces a failure without the user having
@@ -24,7 +25,7 @@
 	const role = $derived(tone === 'info' ? 'status' : 'alert');
 </script>
 
-<div class="rounded-card border p-4 text-sm {tones[tone]}" {role}>
+<div class="reveal rounded-card border p-4 text-sm {tones[tone]} {klass}" {role}>
 	{#if title}
 		<p class="font-semibold">{title}</p>
 	{/if}

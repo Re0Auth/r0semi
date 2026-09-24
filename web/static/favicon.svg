@@ -1,0 +1,36 @@
+<!--
+	The header mark at icon size: the ink square with the canvas monogram.
+
+	The two hex values are the `ink` and `canvas` tokens converted to sRGB, because
+	an SVG asset cannot read a CSS custom property. The media query keeps the mark
+	legible on a browser chrome that follows the system theme, in the same way the
+	interface itself does: dark square on light, light square on dark.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Re0Auth">
+	<style>
+		.bg {
+			fill: #131819;
+		}
+		.fg {
+			fill: #f7f9f9;
+		}
+		@media (prefers-color-scheme: dark) {
+			.bg {
+				fill: #f1f4f4;
+			}
+			.fg {
+				fill: #0b0e0e;
+			}
+		}
+	</style>
+	<rect class="bg" width="64" height="64" rx="16" />
+	<text
+		class="fg"
+		x="32"
+		y="32"
+		text-anchor="middle"
+		dominant-baseline="central"
+		font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+		font-size="30"
+		font-weight="700">r0</text>
+</svg>

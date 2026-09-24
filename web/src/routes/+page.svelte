@@ -1,12 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { fade, fly } from 'svelte/transition';
+	import { quartOut } from 'svelte/easing';
 	import { base } from '$app/paths';
 	import { api, ApiError, type IDPProvider, type Session } from '$lib/api';
 	import { messageOf } from '$lib/errors';
+	import { focusFirstControl, restoreFocus } from '$lib/a11y';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Card from '$lib/components/ui/Card.svelte';
+	import CopyValue from '$lib/components/ui/CopyValue.svelte';
 
 	type Phase = 'loading' | 'anonymous' | 'signed_in' | 'failed';
 
@@ -105,6 +109,13 @@
 		}
 	}
 
+	// Cancelling hands focus back to the 解绑 button for this identity. It is found by
+	// selector because the confirmation re-creates it, so a cached node would be stale.
+	function cancelUnlink(id: string) {
+		confirmingUnlink = null;
+		void restoreFocus(`[data-unlink="${id}"]`);
+	}
+
 	// Linking is the opposite of signing in: it adds an identity to the account
 	// already signed in, instead of creating or entering one.
 	function link(provider: IDPProvider) {
@@ -115,10 +126,31 @@
 		window.location.assign(url.toString());
 	}</script>
 
-<h1 class="text-lg font-semibold">你的 Re0Auth 账号</h1>
+<svelte:head>
+	<title>账号 · Re0Auth</title>
+</svelte:head>
+
+<h1 class="text-page font-semibold text-balance">你的 Re0Auth 账号</h1>
+
+<!--
+	Escape closes an open confirmation from anywhere on the page, the way a keyboard
+	user expects a temporary surface to behave, rather than only while focus happens
+	to be inside it. Guarded on the state so it cannot steal focus when nothing is open.
+-->
+<svelte:window
+	onkeydown={(e) => {
+		if (e.key === 'Escape' && confirmingUnlink !== null) cancelUnlink(confirmingUnlink);
+	}}
+/>
 
 {#if phase === 'loading'}
-	<p class="mt-4 text-sm text-ink-muted">正在读取…</p>
+	<p class="mt-4 flex items-center gap-2 text-sm text-ink-muted">
+		<span
+			class="spinner size-3.5 shrink-0 rounded-full border-2 border-current border-t-transparent"
+			aria-hidden="true"
+		></span>
+		正在读取你的账号…
+	</p>
 {:else if phase === 'failed'}
 	<p class="mt-4 text-sm text-danger">{detail}</p>
 {:else if phase === 'anonymous'}
@@ -127,24 +159,30 @@
 			<Alert tone="danger" title="登录没有完成">{authError}</Alert>
 		</div>
 	{/if}
-	<p class="mt-4 text-sm text-ink-muted">
-		Re0Auth 不设密码。选择一个身份提供方登录，账号会由它建立——首次登录即注册。
-	</p>
+	<p class="mt-4 text-sm text-ink-muted">用外部账号登录，首次登录即注册。</p>
 	<div class="mt-4">
 		<SignIn />
 	</div>
 {:else if session}
-	<div class="mt-4 flex flex-col gap-4">
-		{#if authError}
+	{#if authError}
+		<div class="mt-4">
 			<Alert tone="danger" title="身份操作没有完成">{authError}</Alert>
-		{/if}
+		</div>
+	{/if}
+	<!--
+		One column again now that the two nav cards are gone. Composition follows
+		content: a two-column grid existed to hold the identity card beside the two
+		"manage" shortcuts, and with the shortcuts in the header nav there is nothing
+		left to put in the second column.
+	-->
+	<div class="mt-4 flex flex-col gap-4">
 		<Card>
 			<div class="border-b border-line px-4 py-3">
 				<p class="text-xs font-medium text-ink-faint">账号 ID</p>
-				<p class="mt-0.5 font-mono text-sm">{session.user_id}</p>
-				<p class="mt-2 text-xs text-ink-faint">
-					这是 Re0Auth 自己的标识，不是任何上游 ID。下游应用只能看到它。
-				</p>
+				<div class="mt-0.5 flex items-center gap-1">
+					<p class="font-mono text-sm break-all">{session.user_id}</p>
+					<CopyValue value={session.user_id} label="账号 ID" />
+				</div>
 			</div>
 			<ul class="divide-y divide-line">
 				{#each session.identities as identity (identity.id)}
@@ -159,16 +197,26 @@
 							/>
 						{/if}
 						<div class="min-w-0 flex-1">
-							<p class="truncate text-sm font-medium">{identity.display_name}</p>
+							<p class="truncate text-base font-medium">{identity.display_name}</p>
 							<p class="truncate text-xs text-ink-muted">
 								{identity.provider}
 								{#if identity.email}· {identity.email}{/if}
 							</p>
 						</div>
 						{#if confirmingUnlink === identity.id}
-							<div class="flex flex-wrap items-center gap-2">
-								<span class="text-xs text-danger">解绑后这个身份不能再登录本账号。</span>
-								<Button variant="quiet" onclick={() => (confirmingUnlink = null)}>取消</Button>
+							<!--
+								focusFirstControl lands on 取消 rather than 确认解绑, so a stray Enter
+								cannot unlink anything. The entrance is short and the exit shorter, on
+								the same curve the rest of the interface uses.
+							-->
+							<div
+								class="flex flex-wrap items-center gap-2"
+								use:focusFirstControl
+								in:fly={{ y: -4, duration: 200, easing: quartOut }}
+								out:fade={{ duration: 140 }}
+							>
+								<span class="text-sm text-danger">解绑后这个身份不能再登录本账号。</span>
+								<Button variant="quiet" onclick={() => cancelUnlink(identity.id)}>取消</Button>
 								<Button
 									variant="danger"
 									loading={unlinking === identity.id}
@@ -177,8 +225,10 @@
 								>
 							</div>
 						{:else if session.identities.length > 1}
-							<Button variant="quiet" onclick={() => (confirmingUnlink = identity.id)}
-								>解绑</Button
+							<Button
+								variant="quiet"
+								data-unlink={identity.id}
+								onclick={() => (confirmingUnlink = identity.id)}>解绑</Button
 							>
 						{/if}
 					</li>
@@ -186,13 +236,11 @@
 			</ul>
 			{#if providers.length > 0}
 				<div class="flex flex-col gap-2 border-t border-line px-4 py-3">
-					<p class="text-xs text-ink-faint">
-						绑定新身份是把新的 IdP 身份加到当前账号上，不是新建账号。全部门同一等，任意一个都可以登录。
-					</p>
-					<div class="flex flex-wrap gap-2">
+					<div class="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
 						{#each providers as p (p.id)}
 							<Button
 								variant="secondary"
+								class="w-full sm:w-auto"
 								loading={linking === p.id}
 								onclick={() => link(p)}>绑定 {p.display_name}</Button
 							>
@@ -200,29 +248,14 @@
 					</div>
 				</div>
 			{/if}
-			<div class="flex justify-end border-t border-line px-4 py-3">
-				<Button variant="secondary" loading={signingOut} onclick={signOut}>退出登录</Button>
+			<div class="flex flex-col border-t border-line px-4 py-3 sm:flex-row sm:justify-end">
+				<Button
+					variant="secondary"
+					class="w-full sm:w-auto"
+					loading={signingOut}
+					onclick={signOut}>退出登录</Button
+				>
 			</div>
-		</Card>
-
-		<Card>
-			<div class="flex items-center justify-between border-b border-line px-4 py-3">
-				<p class="text-sm font-medium">已授权的应用</p>
-				<a href="{base}/grants" class="text-xs text-accent underline-offset-4 hover:underline">管理</a>
-			</div>
-			<p class="px-4 py-3 text-xs text-ink-faint">
-				查看哪些应用能以你的身份行动，并随时撤销它们。
-			</p>
-		</Card>
-
-		<Card>
-			<div class="flex items-center justify-between border-b border-line px-4 py-3">
-				<p class="text-sm font-medium">数据源连接</p>
-				<a href="{base}/sources" class="text-xs text-accent underline-offset-4 hover:underline">管理</a>
-			</div>
-			<p class="px-4 py-3 text-xs text-ink-faint">
-				连接游戏数据源，Re0Auth 才能替你读取那些游戏的数据。
-			</p>
 		</Card>
 	</div>
 {/if}

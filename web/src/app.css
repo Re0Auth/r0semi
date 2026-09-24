@@ -8,8 +8,7 @@
  * OAuth consent screen, and "what colour is this button" should not require
  * reading a dependency's source.
  *
- * The palette is a monochrome one with a single accent. Two constraints shaped
- * it:
+ * Two constraints shaped the palette:
  *
  *   - The consent screen must look like *this* service and not like a generic
  *     sign-in page. Familiar-looking consent screens are the raw material of
@@ -17,62 +16,201 @@
  *   - Nothing may depend on colour alone. Risk levels, source status and scope
  *     emphasis all carry a word or a glyph as well, so the page still reads
  *     correctly in greyscale, in high contrast, or with colour blindness.
+ *
+ * Built in OKLCH so equal lightness steps look equal. Neutrals carry a trace of
+ * the accent hue (C <= 0.01, under the threshold where it reads as colour), so
+ * the greys feel related to the accent instead of cold beside it.
+ *
+ * Hues are load-bearing, not decorative. Each owns a region of the wheel with
+ * room on both sides, which is what keeps the system legible under
+ * deuteranopia, protanopia and tritanopia:
+ *
+ *   action   achromatic   the primary affordance carries no hue at all
+ *   accent   200          links, active nav, selection, focus
+ *   danger   27           destructive and failed
+ *   warn     72           degraded or needs attention, still valid
+ *   ok       152          healthy, supported, done
+ *
+ * The primary action is deliberately achromatic. It is the one choice that can
+ * never be mistaken for the danger action on a consent screen, it survives
+ * every colour-vision simulation, and it keeps the accent rare enough to mean
+ * something. Inverted near-black on light and near-white on dark is also the
+ * highest-contrast pair each theme can offer, which is what an approval button
+ * wants.
  */
 @theme {
-	--color-canvas: oklch(0.99 0 0);
-	--color-surface: oklch(1 0 0);
-	--color-line: oklch(0.91 0 0);
-	--color-line-strong: oklch(0.82 0 0);
-	--color-ink: oklch(0.19 0 0);
-	--color-ink-muted: oklch(0.48 0 0);
-	--color-ink-faint: oklch(0.62 0 0);
+	--color-canvas: oklch(0.981 0.003 200);
+	--color-surface: oklch(0.997 0.002 200);
+	--color-surface-sunken: oklch(0.962 0.004 200);
+	--color-line: oklch(0.86 0.006 200);
+	--color-line-strong: oklch(0.775 0.009 200);
+	--color-ink: oklch(0.205 0.008 200);
+	--color-ink-muted: oklch(0.44 0.01 200);
+	--color-ink-faint: oklch(0.545 0.01 200);
 
-	--color-accent: oklch(0.52 0.14 258);
-	--color-accent-ink: oklch(0.98 0 0);
-	--color-accent-soft: oklch(0.96 0.02 258);
+	--color-accent: oklch(0.47 0.105 200);
+	--color-accent-soft: oklch(0.945 0.03 200);
+	--color-focus: oklch(0.47 0.105 200);
 
-	--color-danger: oklch(0.52 0.19 27);
+	--color-action: oklch(0.205 0.008 200);
+	--color-action-ink: oklch(0.985 0.002 200);
+	--color-action-hover: oklch(0.29 0.01 200);
+
+	--color-danger: oklch(0.5 0.185 27);
 	--color-danger-soft: oklch(0.96 0.02 27);
-	--color-warn: oklch(0.62 0.13 75);
-	--color-warn-soft: oklch(0.97 0.03 75);
-	--color-ok: oklch(0.56 0.13 150);
+	--color-warn: oklch(0.505 0.115 70);
+	--color-warn-soft: oklch(0.965 0.03 72);
+	--color-ok: oklch(0.495 0.115 152);
 
 	--radius-card: 0.75rem;
+
+	/*
+	 * Type.
+	 *
+	 * The stack lives here rather than duplicated onto `html`, so `font-sans` and
+	 * the page default cannot drift apart. A strong system stack is the right
+	 * choice for product UI: it costs no request, has no loading shift, and
+	 * renders CJK with the platform's own face instead of a latinised fallback
+	 * that mangles it. The emoji faces are appended because display names and
+	 * source names are user-supplied and will eventually contain one.
+	 */
+	--font-sans:
+		ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+		'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', 'Apple Color Emoji', 'Segoe UI Emoji',
+		sans-serif;
+
+	/*
+	 * The scale, named by the job the text is doing rather than by a t-shirt size.
+	 * A call site should ask "what is this text for", not "which number looked
+	 * right".
+	 *
+	 *   page     1.75rem   the one h1 on a screen
+	 *   section  1.31rem   an h2 that groups content
+	 *   lg       1.13rem   the device-code field, which is input rather than prose
+	 *   base     1rem      prose: the sentences a person actually reads
+	 *   sm       0.88rem   controls and row labels
+	 *   xs       0.75rem   micro meta and identifiers
+	 *   2xs      0.69rem   the monogram, and nothing else
+	 *
+	 * The hierarchy steps are the ones that matter, and each is at least 1.31:
+	 * 12 -> 16 -> 21 -> 28. `sm` sits alongside `base` as a different role
+	 * (controls), not as a hierarchy step, which is why 14 to 16 is allowed to be
+	 * close. Every size under 28 reads at weight 400 or heavier, so nothing thins
+	 * out at small sizes.
+	 *
+	 * Leading follows the text, not the scale: prose gets 1.7 because CJK glyphs
+	 * are full-height and crowd at the 1.5 that suits latin; headings get 1.25 to
+	 * 1.35 because they are short and must not float apart.
+	 */
+	--text-2xs: 0.6875rem;
+	--text-2xs--line-height: 1.2;
+	--text-xs: 0.75rem;
+	--text-xs--line-height: 1.45;
+	--text-sm: 0.875rem;
+	--text-sm--line-height: 1.45;
+	--text-base: 1rem;
+	--text-base--line-height: 1.7;
+	--text-lg: 1.125rem;
+	--text-lg--line-height: 1.5;
+	--text-section: 1.3125rem;
+	--text-section--line-height: 1.35;
+	--text-page: 1.75rem;
+	--text-page--line-height: 1.25;
+
+	/*
+	 * One measure for every block of prose, in rem rather than `ch`.
+	 *
+	 * `ch` resolves against the element's own font size, so a 14px footnote and a
+	 * 16px paragraph would wrap at different widths and the page would show two
+	 * ragged right edges. 36rem is 576px: roughly 36 CJK characters or 70 latin
+	 * ones per line, inside the readable band at both sizes.
+	 */
+	--container-text: 36rem;
+
+	/*
+	 * Motion baseline.
+	 *
+	 * 150ms is the responsiveness floor for interactive state: faster reads as
+	 * twitchy, slower reads as lag. The curve decelerates hard (ease-out quart) so
+	 * movement settles into place instead of easing out limply; it is the same
+	 * curve the cross-fades below use, so hover, press and reveal share one voice.
+	 * Setting these on the theme means every `transition-*` utility inherits them
+	 * instead of each call site picking a duration.
+	 */
+	--default-transition-duration: 150ms;
+	--default-transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
 
 :root {
-	color-scheme: light dark;
+	color-scheme: light;
+
+	/*
+	 * The named stops. Deliberately few, and each one has a job:
+	 *
+	 *   reveal   something appearing in place: a confirmation, an alert
+	 *   enter    a surface arriving with the page
+	 *   spin     a continuous waiting indicator, steady rather than panicked
+	 *
+	 * There is no separate stop for press feedback: a press is colour and scale
+	 * only, and it goes at the shared 150ms baseline every transition uses.
+	 */
+	--duration-reveal: 200ms;
+	--duration-enter: 300ms;
+	--duration-spin: 800ms;
+	--ease-out: cubic-bezier(0.2, 0, 0, 1);
 }
 
+/*
+ * Dark is a second theme, not an inversion.
+ *
+ * These override plain custom properties rather than re-declaring `@theme`.
+ * `@theme` is a build-time construct and has to stay at the top level: nested in
+ * a media query Tailwind hoists its variables into `:root` and drops the
+ * condition, which silently collapses both themes into one. Overriding the
+ * variables is what makes the media query apply, and being unlayered it wins
+ * over the `@layer theme` block without a specificity fight.
+ *
+ * The values are tuned independently: depth comes from surface lightness rather
+ * than shadow, the accent loses chroma so it does not glow on the dark canvas,
+ * and both keys of the inverted primary action are re-derived rather than
+ * flipped.
+ */
 @media (prefers-color-scheme: dark) {
-	@theme {
-		--color-canvas: oklch(0.16 0 0);
-		--color-surface: oklch(0.21 0 0);
-		--color-line: oklch(0.29 0 0);
-		--color-line-strong: oklch(0.38 0 0);
-		--color-ink: oklch(0.96 0 0);
-		--color-ink-muted: oklch(0.72 0 0);
-		--color-ink-faint: oklch(0.56 0 0);
+	:root {
+		color-scheme: dark;
 
-		--color-accent: oklch(0.72 0.12 258);
-		--color-accent-ink: oklch(0.16 0 0);
-		--color-accent-soft: oklch(0.26 0.04 258);
+		--color-canvas: oklch(0.16 0.004 200);
+		--color-surface: oklch(0.205 0.005 200);
+		--color-surface-sunken: oklch(0.148 0.004 200);
+		--color-line: oklch(0.34 0.008 200);
+		--color-line-strong: oklch(0.42 0.01 200);
+		--color-ink: oklch(0.965 0.003 200);
+		--color-ink-muted: oklch(0.86 0.008 200);
+		--color-ink-faint: oklch(0.78 0.01 200);
 
-		--color-danger: oklch(0.7 0.16 27);
-		--color-danger-soft: oklch(0.26 0.04 27);
-		--color-warn: oklch(0.78 0.12 75);
-		--color-warn-soft: oklch(0.26 0.04 75);
-		--color-ok: oklch(0.72 0.12 150);
+		--color-accent: oklch(0.78 0.1 200);
+		--color-accent-soft: oklch(0.28 0.04 200);
+		--color-focus: oklch(0.78 0.1 200);
+
+		--color-action: oklch(0.965 0.003 200);
+		--color-action-ink: oklch(0.17 0.005 200);
+		--color-action-hover: oklch(0.88 0.005 200);
+
+		--color-danger: oklch(0.84 0.14 27);
+		--color-danger-soft: oklch(0.27 0.045 27);
+		--color-warn: oklch(0.82 0.115 78);
+		--color-warn-soft: oklch(0.275 0.045 75);
+		--color-ok: oklch(0.79 0.11 152);
 	}
 }
 
 html {
 	background: var(--color-canvas);
 	color: var(--color-ink);
-	font-family:
-		ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
-		'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
 	-webkit-text-size-adjust: 100%;
+	/* One place, not per component: smoothing is a root decision. */
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
 }
 
 body {
@@ -80,18 +218,132 @@ body {
 	min-height: 100dvh;
 }
 
+/*
+ * The one horizontal inset the whole shell uses.
+ *
+ * `max()` against the safe-area inset means the gutter is never smaller than the
+ * design value, and grows only where a notch, rounded corner or home indicator
+ * would otherwise sit on top of the content. Logical properties rather than
+ * left/right so a future RTL locale needs no second rule. `viewport-fit=cover`
+ * in app.html is what makes these insets non-zero on a notched device.
+ */
+.shell-x {
+	padding-inline-start: max(1.25rem, env(safe-area-inset-left));
+	padding-inline-end: max(1.25rem, env(safe-area-inset-right));
+}
+
+.shell-y {
+	padding-block-end: max(1rem, env(safe-area-inset-bottom));
+}
+
+/*
+ * High contrast gets structure from boundaries, not from tint. The components
+ * already replace their alpha borders with solid ones under
+ * `prefers-contrast: more` (see the ui/ components); these two tokens are what
+ * every divider, card and control outline is drawn from, so strengthening them
+ * here reaches the whole surface at once.
+ */
+@media (prefers-contrast: more) {
+	:root {
+		--color-line: oklch(0.72 0.006 200);
+		--color-line-strong: oklch(0.62 0.009 200);
+	}
+}
+
+@media (prefers-color-scheme: dark) and (prefers-contrast: more) {
+	:root {
+		--color-line: oklch(0.46 0.008 200);
+		--color-line-strong: oklch(0.56 0.01 200);
+	}
+}
+
+::selection {
+	background: var(--color-accent-soft);
+	color: var(--color-ink);
+}
+
 /* Visible focus everywhere, because the primary audience is a keyboard and a
    screen reader as much as a mouse. */
 :focus-visible {
-	outline: 2px solid var(--color-accent);
+	outline: 2px solid var(--color-focus);
 	outline-offset: 2px;
 }
 
+/*
+ * Motion.
+ *
+ * Everything here moves `transform` and `opacity` only: both are composited, so
+ * nothing triggers layout and nothing janks on a phone. Nothing animates `height`
+ * or `margin`, which is why a surface that changes size does it by appearing,
+ * not by growing.
+ *
+ * Two shapes, and no more:
+ *
+ *   reveal   something appearing where it belongs. A 4px rise plus a fade is
+ *            enough to say "this arrived just now" and short enough that a person
+ *            who triggers it ten times does not pay attention ten times. Routine
+ *            confirmations are not staged or staggered: that cost repeats on
+ *            every trigger, so it belongs to once-per-visit surfaces only.
+ *   spin     a waiting indicator. Steady, not panicked.
+ *
+ * The page arrival reuses `reveal` at a longer duration, so the surface settles
+ * in rather than performing.
+ */
+@keyframes reveal-up {
+	from {
+		opacity: 0;
+		transform: translateY(4px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+.reveal {
+	animation: reveal-up var(--duration-reveal) var(--ease-out) both;
+}
+
+.enter {
+	animation: reveal-up var(--duration-enter) var(--ease-out) both;
+}
+
+@keyframes spin-steady {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+.spinner {
+	animation: spin-steady var(--duration-spin) linear infinite;
+}
+
+/*
+ * Reduced motion is part of the design, not a patch.
+ *
+ * `0.01ms` rather than `none`, so transitionend and animationend still fire and
+ * anything waiting on them does not hang. Dropping the durations collapses every
+ * reveal and every press into an instant state change, which is the correct
+ * substitute: the information survives, the movement does not.
+ *
+ * One exception, and it is deliberate. The bar asks for less motion, not none,
+ * and a spinner is not a vestibular trigger, so it keeps turning instead of
+ * freezing into a dead ring that looks like a hung request. It is the "leave it
+ * alone" column of the preference table, and a class selector outranks the
+ * universal one, so this wins over the reset above without needing a second copy
+ * of the whole block.
+ */
 @media (prefers-reduced-motion: reduce) {
 	*,
 	*::before,
 	*::after {
 		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
 		transition-duration: 0.01ms !important;
+	}
+
+	.spinner {
+		animation-duration: var(--duration-spin) !important;
+		animation-iteration-count: infinite !important;
 	}
 }

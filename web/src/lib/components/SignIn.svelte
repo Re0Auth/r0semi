@@ -52,7 +52,7 @@
 		Saying so is more useful than an empty box: it is a configuration problem,
 		and it is the operator's, not the visitor's.
 	-->
-	<p class="text-sm text-ink-muted">此部署未配置任何身份提供方，因此暂时无法登录。</p>
+	<p class="text-sm text-ink-muted">这个部署没有配置登录方式。</p>
 {:else}
 	<div class="flex flex-col gap-2">
 		{#each providers as p (p.id)}

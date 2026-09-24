@@ -1,3 +1,9 @@
-# allow crawling everything by default
+# Re0Auth serves a consent surface, not a document.
+#
+# Every screen under /app is a per-user session view. A consent handle is bound to
+# the browser that created it and a device code is single use, so an indexed one is
+# useless to whoever finds it, and all an index does is advertise this deployment.
+# The root stays crawlable, so a public page added later is indexable without
+# touching this file.
 User-agent: *
-Disallow:
+Disallow: /app/

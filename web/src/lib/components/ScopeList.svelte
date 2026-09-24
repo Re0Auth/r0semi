@@ -43,25 +43,25 @@
 						id="scope-{s.scope}"
 						checked={!!selected[s.scope]}
 						onchange={(e) => onToggle?.(s.scope, e.currentTarget.checked)}
-						class="mt-1 size-5 shrink-0 accent-[var(--color-accent)]"
+						class="mt-1 size-5 shrink-0 accent-[var(--color-accent)] pointer-coarse:size-6"
 					/>
 				{/if}
 				<div class="min-w-0 flex-1">
 					<div class="flex flex-wrap items-center gap-2">
 						{#if readonly}
-							<span class="font-medium">{s.title || s.scope}</span>
+							<span class="text-base font-medium">{s.title || s.scope}</span>
 						{:else}
-							<label for="scope-{s.scope}" class="cursor-pointer font-medium">
+							<label for="scope-{s.scope}" class="cursor-pointer text-base font-medium">
 								{s.title || s.scope}
 							</label>
 						{/if}
 						<Badge tone={riskTone[s.risk]}>{riskText[s.risk]}</Badge>
 						{#if s.explicit_consent}
-							<Badge tone="danger">需单独确认</Badge>
+							<Badge tone="danger" attention>需单独确认</Badge>
 						{/if}
 					</div>
-					<p class="mt-1 text-sm text-ink-muted">{s.description}</p>
-					<p class="mt-1 font-mono text-xs text-ink-faint">{s.scope}</p>
+					<p class="mt-1 text-base text-pretty text-ink-muted">{s.description}</p>
+					<p class="mt-1 font-mono text-xs break-all text-ink-faint">{s.scope}</p>
 
 					{#if s.explicit_consent && !readonly}
 						<!--
@@ -71,13 +71,13 @@
 							what makes it clear.
 						-->
 						<label
-							class="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border border-danger/40 bg-danger-soft p-3 text-sm"
+							class="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border border-danger/40 bg-danger-soft p-3 text-base contrast-more:border-danger"
 						>
 							<input
 								type="checkbox"
 								checked={!!acknowledged[s.scope]}
 								onchange={(e) => onAcknowledge?.(s.scope, e.currentTarget.checked)}
-								class="mt-0.5 size-4 shrink-0"
+								class="mt-0.5 size-4 shrink-0 pointer-coarse:size-5"
 							/>
 							<span>
 								我理解 <code class="font-mono">{s.scope}</code> 的含义，并单独同意授予它。

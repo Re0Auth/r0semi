@@ -8,14 +8,18 @@
 	import Button from '$lib/components/ui/Button.svelte';
 	import Card from '$lib/components/ui/Card.svelte';
 
-	type Phase = 'code' | 'anonymous' | 'invalid' | 'pending' | 'done' | 'failed';
+	type Phase = 'code' | 'anonymous' | 'pending' | 'done';
+
+	/** What is wrong with the code in the field, shown against the field itself. */
+	type CodeError = { title: string; body: string };
 
 	let phase = $state<Phase>('code');
 	let code = $state('');
 	let pending = $state<DevicePending | null>(null);
 	let selected = $state<Record<string, boolean>>({});
 	let acknowledged = $state<Record<string, boolean>>({});
-	let detail = $state('');
+	let codeError = $state<CodeError | null>(null);
+	let codeInput = $state<HTMLInputElement | undefined>(undefined);
 	let actionError = $state('');
 	let checking = $state(false);
 	let busy = $state<'approve' | 'deny' | null>(null);
@@ -35,13 +39,25 @@
 
 	async function submit() {
 		const value = code.trim();
-		if (!value) return;
+		if (!value) {
+			// The submit stays enabled on purpose. A greyed-out button hides the one
+			// thing the user has to fix, so the click is what reveals what is missing
+			// and where; focus lands on the field so the fix is one keystroke away.
+			codeError = { title: '请输入设备代码', body: '代码显示在设备的屏幕上。' };
+			codeInput?.focus();
+			return;
+		}
 		checking = true;
+		codeError = null;
 		actionError = '';
 		try {
 			const res = await api.getDeviceVerification(value);
 			if (res.state === 'awaiting_code') {
-				phase = 'code';
+				codeError = {
+					title: '没能确认这个代码',
+					body: '检查有没有输错。'
+				};
+				codeInput?.focus();
 				return;
 			}
 			pending = res;
@@ -53,13 +69,16 @@
 				phase = 'anonymous';
 				return;
 			}
-			if (err instanceof ApiError && err.code === 'not_found') {
-				detail = '这个代码无效或已过期。请回到你的设备上重新获取一个。';
-				phase = 'invalid';
-				return;
-			}
-			detail = messageOf(err);
-			phase = 'failed';
+			// The form stays on screen with the value still in the field, so a typo is
+			// an edit rather than a page to navigate back to. Nothing typed is lost.
+			codeError =
+				err instanceof ApiError && err.code === 'not_found'
+					? {
+							title: '代码不可用',
+							body: '代码无效或已过期，回到设备上重新获取一个。'
+						}
+					: { title: '没能读取这个代码', body: messageOf(err) };
+			codeInput?.focus();
 		} finally {
 			checking = false;
 		}
@@ -123,8 +142,13 @@
 				return;
 			}
 			if (err instanceof ApiError && err.code === 'not_found') {
-				detail = '这个代码已过期。请回到你的设备上重新获取一个。';
-				phase = 'invalid';
+				// Back to the field, not to a dead-end page: the code is still in it.
+				codeError = {
+					title: '代码不可用',
+					body: '这个代码已过期。回到你的设备上重新获取一个，再填到这里。'
+				};
+				phase = 'code';
+				codeInput?.focus();
 				return;
 			}
 			actionError = messageOf(err);
@@ -132,22 +156,16 @@
 	}
 </script>
 
-<h1 class="text-lg font-semibold">设备登录</h1>
-<p class="mt-1 text-sm text-ink-muted">输入你的设备上显示的代码，确认这次登录。</p>
+<svelte:head>
+	<title>设备登录 · Re0Auth</title>
+</svelte:head>
+
+<h1 class="text-page font-semibold text-balance">设备登录</h1>
 
 {#if phase === 'anonymous'}
 	<div class="mt-4 flex flex-col gap-4">
 		<Alert tone="warn" title="需要先登录">登录后才能确认设备代码。</Alert>
 		<SignIn />
-	</div>
-{:else if phase === 'invalid'}
-	<div class="mt-4 flex flex-col gap-4">
-		<Alert tone="warn" title="代码不可用">{detail}</Alert>
-		<Button variant="secondary" onclick={() => (phase = 'code')}>换一个代码</Button>
-	</div>
-{:else if phase === 'failed'}
-	<div class="mt-4">
-		<Alert tone="danger" title="读取失败">{detail}</Alert>
 	</div>
 {:else if phase === 'done'}
 	<div class="mt-4">
@@ -158,7 +176,9 @@
 		</Alert>
 	</div>
 {:else if phase === 'code'}
-	<Card class="mt-4">
+	<!-- A form for eight characters does not get better by being 850px wide, so it keeps
+	     a comfortable measure even when the frame has room for more. -->
+	<Card class="mt-4 lg:max-w-md">
 		<form
 			class="flex flex-col gap-3 p-4"
 			onsubmit={(e) => {
@@ -169,21 +189,35 @@
 			<label class="text-sm font-medium" for="user-code">设备代码</label>
 			<input
 				id="user-code"
+				bind:this={codeInput}
 				bind:value={code}
 				autocomplete="one-time-code"
 				autocapitalize="characters"
 				spellcheck="false"
 				placeholder="WDJB-MJHT"
-				class="rounded-lg border border-line-strong bg-canvas px-3 py-2 font-mono text-lg tracking-widest uppercase"
+				aria-invalid={codeError !== null}
+				aria-describedby={codeError ? 'user-code-error' : undefined}
+				class="rounded-lg border border-line-strong bg-surface-sunken px-3 py-2 font-mono text-lg tracking-widest uppercase"
 			/>
-			<div class="flex justify-end">
-				<Button variant="primary" type="submit" loading={checking} disabled={!code.trim()}>继续</Button>
+			{#if codeError}
+				<!--
+					The problem appears against the field it belongs to, with the typed value
+					still in place, so correcting a typo is an edit rather than a navigation.
+					The Alert carries role="alert", which is what announces it.
+				-->
+				<div id="user-code-error">
+					<Alert tone="danger" title={codeError.title}>{codeError.body}</Alert>
+				</div>
+			{/if}
+			<div class="flex flex-col sm:flex-row sm:justify-end">
+				<Button variant="primary" class="w-full sm:w-auto" type="submit" loading={checking}
+					>继续</Button
+				>
 			</div>
 		</form>
 	</Card>
-	<p class="mt-3 text-xs text-ink-faint">代码由你的设备生成，几分钟内有效。</p>
 {:else if pending}
-	<p class="mt-1 text-sm text-ink-muted">
+	<p class="mt-1 max-w-text text-base text-pretty text-ink-muted">
 		<strong class="font-medium text-ink">{pending.client.name}</strong> 正在请求访问你的账号。
 	</p>
 
@@ -194,7 +228,7 @@
 				<p class="mt-0.5 font-mono text-sm tracking-widest">{pending.user_code}</p>
 			</div>
 			{#if countdown}
-				<p class="text-xs text-ink-muted">剩余 {countdown}</p>
+				<p class="text-xs tabular-nums text-ink-muted">剩余 {countdown}</p>
 			{/if}
 		</div>
 		<ScopeList
@@ -223,7 +257,5 @@
 		</div>
 	</Card>
 
-	<p class="mt-4 text-xs text-ink-faint">
-		如果你没有在自己的设备上发起这次登录，请选择「拒绝」。
-	</p>
+	<p class="mt-4 text-xs text-ink-faint">不是你在自己的设备上发起的？请选择「拒绝」。</p>
 {/if}

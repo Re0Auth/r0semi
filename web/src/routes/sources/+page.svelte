@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { fade, fly } from 'svelte/transition';
+	import { quartOut } from 'svelte/easing';
 	import { base } from '$app/paths';
 	import {
 		api,
@@ -9,6 +11,7 @@
 		type UpstreamRevocation
 	} from '$lib/api';
 	import { messageOf } from '$lib/errors';
+	import { focusFirstControl, restoreFocus } from '$lib/a11y';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Alert from '$lib/components/ui/Alert.svelte';
 	import Badge from '$lib/components/ui/Badge.svelte';
@@ -156,20 +159,51 @@
 		}
 	}
 
+	// Backing out of either confirmation hands focus back to the button that opened it,
+	// found by selector because the confirmation re-creates that button.
+	function cancelDisconnect(id: string) {
+		confirming = null;
+		void restoreFocus(`[data-disconnect="${id}"]`);
+	}
+
+	function cancelCascade(id: string) {
+		cascadeConfirming = null;
+		void restoreFocus(`[data-cascade="${id}"]`);
+	}
+
 	function formatDate(iso: string): string {
 		const date = new Date(iso);
 		return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
 	}
 </script>
 
-<h1 class="text-lg font-semibold">数据源连接</h1>
-<p class="mt-1 text-sm text-ink-muted">
-	Re0Auth 只有先连接到数据源，才能替你读取那个游戏的数据。连接时你是在数据源那边完成登录，
-	Re0Auth 拿到的只是它签发的令牌——令牌始终存在 Re0Auth 的保险库里，不会交给任何下游应用。
-</p>
+<svelte:head>
+	<title>数据源连接 · Re0Auth</title>
+</svelte:head>
+
+<h1 class="text-page font-semibold text-balance">数据源连接</h1>
+
+<!--
+	Escape closes whichever confirmation is open, guarded on the state so it cannot
+	steal focus when neither is. Both are checkable here because they are independent
+	states: the cascade panel and the disconnect prompt can be open at once.
+-->
+<svelte:window
+	onkeydown={(e) => {
+		if (e.key !== 'Escape') return;
+		if (confirming !== null) cancelDisconnect(confirming);
+		if (cascadeConfirming !== null) cancelCascade(cascadeConfirming);
+	}}
+/>
 
 {#if phase === 'loading'}
-	<p class="mt-4 text-sm text-ink-muted">正在读取…</p>
+	<p class="mt-4 flex items-center gap-2 text-sm text-ink-muted">
+		<span
+			class="spinner size-3.5 shrink-0 rounded-full border-2 border-current border-t-transparent"
+			aria-hidden="true"
+		></span>
+		正在读取数据源连接…
+	</p>
 {:else if phase === 'anonymous'}
 	<div class="mt-4 flex flex-col gap-4">
 		<Alert tone="warn" title="需要先登录">登录后才能管理数据源连接。</Alert>
@@ -178,12 +212,19 @@
 {:else if phase === 'failed'}
 	<p class="mt-4 text-sm text-danger">{detail}</p>
 {:else}
-	<div class="mt-4 flex flex-col gap-4">
+	<!--
+		Two columns at lg. Connected carries the consequences and connectable offers more,
+		so side by side they read as the pair they are instead of one tall list with an
+		empty right half. Auto-placement does the work: the sections are pinned to a
+		column, and the page-level alerts and the footnote span both, so the pairing holds
+		whether or not an alert is present. Below lg it is the same single stacked column.
+	-->
+	<div class="mt-4 flex flex-col gap-4 lg:grid lg:grid-cols-2 lg:items-start lg:gap-6">
 		{#if actionError}
-			<Alert tone="danger" title="没有完成">{actionError}</Alert>
+			<Alert tone="danger" title="没有完成" class="lg:col-span-2">{actionError}</Alert>
 		{/if}
 		{#if outcome}
-			<Alert tone={upstreamCopy[outcome.upstream].tone} title="{outcome.source}：{upstreamCopy[outcome.upstream].title}">
+			<Alert tone={upstreamCopy[outcome.upstream].tone} title="{outcome.source}：{upstreamCopy[outcome.upstream].title}" class="lg:col-span-2">
 				{upstreamCopy[outcome.upstream].body}
 				{#if outcome.error}
 					<span class="font-mono text-xs">（{outcome.error}）</span>
@@ -192,11 +233,11 @@
 		{/if}
 
 		<!-- Connected first: this is the part with consequences. -->
-		<section>
-			<h2 class="text-sm font-semibold">已连接</h2>
+		<section class="lg:col-start-1">
+			<h2 class="text-section font-semibold text-balance">已连接</h2>
 			{#if bindings.length === 0}
 				<Card class="mt-2">
-					<p class="px-4 py-6 text-center text-sm text-ink-muted">还没有连接任何数据源。</p>
+					<p class="px-4 py-6 text-center text-base text-ink-muted">还没有连接数据源哦~</p>
 				</Card>
 			{:else}
 				<div class="mt-2 flex flex-col gap-3">
@@ -210,17 +251,20 @@
 						<Card data-binding={key(binding)}>
 							<div class="flex flex-wrap items-start justify-between gap-3 border-b border-line px-4 py-3">
 								<div class="min-w-0">
-									<p class="font-medium">{binding.display_name}</p>
-									<p class="mt-0.5 font-mono text-xs text-ink-faint">{key(binding)}</p>
+									<p class="text-base font-medium">{binding.display_name}</p>
+									<p class="mt-0.5 font-mono text-xs break-all text-ink-faint">{key(binding)}</p>
 								</div>
 								<div class="flex flex-wrap gap-2">
 									{#if binding.status === 'degraded'}
-										<Badge tone="warn">降级</Badge>
+										<Badge tone="warn" attention>降级</Badge>
 									{:else if binding.status === 'retired'}
-										<Badge tone="danger">已下线</Badge>
+										<Badge tone="danger" attention>已下线</Badge>
 									{/if}
-									<Badge tone={binding.token_class === 'long_lived' ? 'warn' : 'neutral'}>
-										{binding.token_class === 'long_lived' ? '长期有效凭据' : '可撤销凭据'}
+									<Badge
+										tone={binding.token_class === 'long_lived' ? 'warn' : 'neutral'}
+										attention={binding.token_class === 'long_lived'}
+									>
+										{binding.token_class === 'long_lived' ? '不可远程撤销' : '可远程撤销'}
 									</Badge>
 									{#if binding.has_refresh}
 										<Badge tone="neutral">可自动续期</Badge>
@@ -229,8 +273,8 @@
 							</div>
 
 							{#if !binding.configured}
-								<p class="border-b border-line px-4 py-2 text-xs text-warn">
-									这个数据源已不在本部署的配置中。连接仍然存在，也可以断开，只是已经没有东西可以描述它了。
+								<p class="border-b border-line px-4 py-2 text-sm text-pretty text-warn">
+									本部署已移除这个数据源，连接仍可断开。
 								</p>
 							{/if}
 
@@ -240,20 +284,25 @@
 									the button, so it cannot be mistaken for disconnecting — a different act
 									with a different consequence, and one you cannot undo by connecting again.
 								-->
-								<div class="border-t border-danger/40 bg-danger-soft px-4 py-3">
-									<p class="text-sm font-medium text-danger">在数据源端登出全部设备</p>
-									<p class="mt-1 text-sm">
-										数据源会作废它签发的登录凭据，因此<strong>你在这个数据源上的所有设备都会被登出</strong>，
-										包括你现在正在用的这台。你需要重新登录。
+								<div
+									class="w-full border-t border-danger/40 bg-danger-soft px-4 py-3 contrast-more:border-danger"
+									use:focusFirstControl
+									in:fly={{ y: -4, duration: 200, easing: quartOut }}
+									out:fade={{ duration: 140 }}
+								>
+									<p class="text-base font-medium text-danger">在数据源端登出全部设备</p>
+									<p class="mt-1 text-base text-pretty">
+										包括你现在正在用的这台，之后需要重新登录。
 									</p>
-									<p class="mt-1 text-xs text-ink-muted">
-										Re0Auth 自己做不到这件事，只能请求数据源执行。数据源没有响应的话，什么都不会变——
-										连接会保留，可以重试。
-									</p>
-									<div class="mt-3 flex flex-wrap items-center gap-2">
-										<Button variant="quiet" onclick={() => (cascadeConfirming = null)}>取消</Button>
+									<div class="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+										<Button
+											variant="quiet"
+											class="w-full sm:w-auto"
+											onclick={() => cancelCascade(key(binding))}>取消</Button
+										>
 										<Button
 											variant="danger"
+											class="w-full sm:w-auto"
 											loading={working === key(binding)}
 											onclick={() => cascade(binding)}
 										>
@@ -264,27 +313,55 @@
 							{/if}
 
 							<div class="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3">
-								<p class="text-xs text-ink-faint">
+								<p class="text-xs tabular-nums text-ink-faint">
 									{binding.expiry ? `当前凭据最迟 ${formatDate(binding.expiry)} 失效` : '凭据没有公开的失效时间'}
 								</p>
 								{#if confirming === key(binding)}
-									<div class="flex flex-wrap items-center gap-2">
-										<span class="text-xs text-ink-muted">Re0Auth 会立即断开，并尝试通知数据源撤销。</span>
-										<Button variant="quiet" onclick={() => (confirming = null)}>取消</Button>
-										<Button variant="danger" loading={working === key(binding)} onclick={() => disconnect(binding)}>
+									<!--
+										focusFirstControl lands on 取消, so a stray Enter cannot disconnect.
+										The entrance is short and the exit shorter, on the shared curve.
+									-->
+									<div
+										class="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center"
+										use:focusFirstControl
+										in:fly={{ y: -4, duration: 200, easing: quartOut }}
+										out:fade={{ duration: 140 }}
+									>
+										<span class="text-sm text-ink-muted">Re0Auth 会立即断开，并尝试通知数据源撤销。</span>
+										<Button
+											variant="quiet"
+											class="w-full sm:w-auto"
+											onclick={() => cancelDisconnect(key(binding))}>取消</Button
+										>
+										<Button
+											variant="danger"
+											class="w-full sm:w-auto"
+											loading={working === key(binding)}
+											onclick={() => disconnect(binding)}
+										>
 											确认断开
 										</Button>
 									</div>
 								{:else}
-									<div class="flex flex-wrap items-center gap-2">
+									<div class="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
 										<!-- Offered only where the source advertised it, so there is no
 										     button here that would fail. -->
 										{#if binding.cascade_revocation}
-											<Button variant="quiet" onclick={() => (cascadeConfirming = key(binding))}>
+											<Button
+												variant="quiet"
+												class="w-full sm:w-auto"
+												data-cascade={key(binding)}
+												onclick={() => (cascadeConfirming = key(binding))}
+											>
 												登出全部设备
 											</Button>
 										{/if}
-										<Button variant="secondary" onclick={() => (confirming = key(binding))}>断开连接</Button>
+										<Button
+											variant="secondary"
+											class="w-full sm:w-auto"
+											data-disconnect={key(binding)}
+											onclick={() => (confirming = key(binding))}>断开连接</Button
+										>
 									</div>
 								{/if}
 							</div>
@@ -294,27 +371,30 @@
 			{/if}
 		</section>
 
-		<section>
-			<h2 class="text-sm font-semibold">可连接</h2>
+		<section class="lg:col-start-2">
+			<h2 class="text-section font-semibold text-balance">可连接</h2>
 			{#if connectable.length === 0}
-				<p class="mt-2 text-sm text-ink-muted">本部署没有提供其他可连接的数据源。</p>
+				<p class="mt-2 text-base text-ink-muted">没有可连接的数据源。</p>
 			{:else}
 				<div class="mt-2 flex flex-col gap-3">
 					{#each connectable as src (key(src))}
 						<Card data-source={key(src)}>
 							<div class="flex flex-wrap items-start justify-between gap-3 px-4 py-3">
 								<div class="min-w-0">
-									<p class="font-medium">{src.display_name}</p>
-									<p class="mt-0.5 font-mono text-xs text-ink-faint">{key(src)}</p>
+									<p class="text-base font-medium">{src.display_name}</p>
+									<p class="mt-0.5 font-mono text-xs break-all text-ink-faint">{key(src)}</p>
 								</div>
 								<div class="flex flex-wrap items-center gap-2">
 									{#if src.status === 'degraded'}
-										<Badge tone="warn">降级</Badge>
+										<Badge tone="warn" attention>降级</Badge>
 									{/if}
-									<Badge tone={src.token_class === 'long_lived' ? 'warn' : 'neutral'}>
-										{src.token_class === 'long_lived' ? '长期有效凭据' : '可撤销凭据'}
+									<Badge
+										tone={src.token_class === 'long_lived' ? 'warn' : 'neutral'}
+										attention={src.token_class === 'long_lived'}
+									>
+										{src.token_class === 'long_lived' ? '不可远程撤销' : '可远程撤销'}
 									</Badge>
-									<Button variant="primary" onclick={() => connect(src)}>连接</Button>
+									<Button variant="primary" class="w-full sm:w-auto" onclick={() => connect(src)}>连接</Button>
 								</div>
 							</div>
 						</Card>
@@ -322,10 +402,5 @@
 				</div>
 			{/if}
 		</section>
-
-		<p class="text-xs text-ink-faint">
-			断开连接只影响 Re0Auth。它不会作废你在数据源那边的登录——那需要数据源自己执行，
-			而且通常会把你所有设备都登出，所以它是一个单独的、写着后果的按钮。
-		</p>
 	</div>
 {/if}
