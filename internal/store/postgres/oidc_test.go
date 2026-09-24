@@ -55,6 +55,36 @@ func oidcFixture(t *testing.T) (*OIDCStore, *audit.MemoryLogger, context.Context
 	return store, logger, ctx
 }
 
+// Rotation must be a claim, not a check: two requests holding the same refresh
+// token must not both be issued a new generation. Here the claim is the row the
+// DELETE removes, and the row count is what makes it exclusive — so the second
+// caller finds nothing and is refused. Mirrors
+// memory.TestRefreshTokenRotationIsSingleUse.
+func TestRefreshTokenRotationIsSingleUse(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	req := &oidcstore.AuthRequest{ClientID: "oidc-web", Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	_, first, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	held1, err := store.TokenRequestByRefreshToken(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held2, err := store.TokenRequestByRefreshToken(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, err := store.CreateAccessAndRefreshTokens(ctx, held1, first); err != nil {
+		t.Fatalf("the first rotation was refused: %v", err)
+	}
+	if _, _, _, err := store.CreateAccessAndRefreshTokens(ctx, held2, first); !errors.Is(err, ErrRefreshTokenSpent) {
+		t.Fatalf("second rotation error = %v, want ErrRefreshTokenSpent — the token was spent twice", err)
+	}
+}
+
 func newAuthRequest(t *testing.T, ctx context.Context, store *OIDCStore) op.AuthRequest {
 	t.Helper()
 	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{

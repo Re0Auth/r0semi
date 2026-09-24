@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"testing"
 	"time"
 
@@ -134,5 +135,73 @@ func TestRevokeTokensCountsBothTables(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("revoked = %d, want access + refresh = 2", n)
+	}
+}
+
+// Rotation must be a claim, not a check. Two requests can hold the same refresh
+// token at once — a stolen copy, or a client that retried — and the second must
+// be refused rather than issued a second generation. Otherwise rotation never
+// notices the reuse, so a stolen token is replayable for as long as the victim
+// keeps refreshing, and nothing ever signals it.
+//
+// The interleaving is written out rather than raced, because the defect is a
+// window between two lock acquisitions and not a data race: concurrent goroutines
+// would make this test flaky while proving nothing extra.
+func TestRefreshTokenRotationIsSingleUse(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	req := &oidcstore.AuthRequest{ClientID: "cli", Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	_, first, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both requests see the token before either rotates it.
+	held1, err := store.TokenRequestByRefreshToken(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held2, err := store.TokenRequestByRefreshToken(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, err := store.CreateAccessAndRefreshTokens(ctx, held1, first); err != nil {
+		t.Fatalf("the first rotation was refused: %v", err)
+	}
+	if _, _, _, err := store.CreateAccessAndRefreshTokens(ctx, held2, first); !errors.Is(err, ErrRefreshTokenSpent) {
+		t.Fatalf("second rotation error = %v, want ErrRefreshTokenSpent — the token was spent twice", err)
+	}
+}
+
+// The refusal must not be a blanket one: a rotation that presents a token the
+// store still holds has to succeed, or refresh stops working entirely.
+func TestRefreshTokenRotationStillWorksWhenPresentedOnce(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	req := &oidcstore.AuthRequest{ClientID: "cli", Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	_, first, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := store.TokenRequestByRefreshToken(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, _, err := store.CreateAccessAndRefreshTokens(ctx, held, first)
+	if err != nil {
+		t.Fatalf("rotation was refused: %v", err)
+	}
+	if second == "" || second == first {
+		t.Fatalf("refresh token was not rotated: first=%q second=%q", first, second)
+	}
+	// The spent one is gone, and the replacement is live.
+	if _, err := store.TokenRequestByRefreshToken(ctx, first); err == nil {
+		t.Fatal("the spent refresh token is still accepted")
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, second); err != nil {
+		t.Fatalf("the replacement refresh token was rejected: %v", err)
 	}
 }

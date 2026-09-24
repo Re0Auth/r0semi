@@ -37,18 +37,26 @@ type OIDCStore struct {
 	signer   *oidcstore.Signer
 	audit    audit.Logger
 
-	authRequests  map[string]*oidcstore.AuthRequest
-	codes         map[string]codeRecord // by TokenHash(code)
-	accessTokens  map[string]accessToken
-	refreshTokens map[string]refreshToken
-	devices       map[string]deviceRecord // by TokenHash(device code)
-	userCodes     map[string]string       // normalized user code -> TokenHash(device code)
+	authRequests      map[string]*oidcstore.AuthRequest
+	authRequestExpiry map[string]time.Time
+	codes             map[string]codeRecord // by TokenHash(code)
+	accessTokens      map[string]accessToken
+	refreshTokens     map[string]refreshToken
+	devices           map[string]deviceRecord // by TokenHash(device code)
+	userCodes         map[string]string       // normalized user code -> TokenHash(device code)
 
 	accessTTL  time.Duration
 	refreshTTL time.Duration
 	requestTTL time.Duration
 	now        func() time.Time
 }
+
+// ErrRefreshTokenSpent reports a refresh token presented after it had already
+// been rotated. It is a refusal, not a lookup miss: the caller asked to spend a
+// token this store has already consumed, which is what a replayed (or stolen)
+// refresh token looks like. Returning an error rather than minting a second
+// generation is the whole point — it is the only thing that makes reuse visible.
+var ErrRefreshTokenSpent = errors.New("memory: refresh token was already rotated")
 
 type codeRecord struct {
 	requestID string
@@ -124,21 +132,22 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		ttl = 30 * time.Minute
 	}
 	return &OIDCStore{
-		clients:       opts.Clients,
-		registry:      opts.Registry,
-		login:         opts.Login,
-		signer:        opts.Signer,
-		audit:         opts.Audit,
-		authRequests:  make(map[string]*oidcstore.AuthRequest),
-		codes:         make(map[string]codeRecord),
-		accessTokens:  make(map[string]accessToken),
-		refreshTokens: make(map[string]refreshToken),
-		devices:       make(map[string]deviceRecord),
-		userCodes:     make(map[string]string),
-		accessTTL:     time.Hour,
-		refreshTTL:    30 * 24 * time.Hour,
-		requestTTL:    ttl,
-		now:           now,
+		clients:           opts.Clients,
+		registry:          opts.Registry,
+		login:             opts.Login,
+		signer:            opts.Signer,
+		audit:             opts.Audit,
+		authRequests:      make(map[string]*oidcstore.AuthRequest),
+		authRequestExpiry: make(map[string]time.Time),
+		codes:             make(map[string]codeRecord),
+		accessTokens:      make(map[string]accessToken),
+		refreshTokens:     make(map[string]refreshToken),
+		devices:           make(map[string]deviceRecord),
+		userCodes:         make(map[string]string),
+		accessTTL:         time.Hour,
+		refreshTTL:        30 * 24 * time.Hour,
+		requestTTL:        ttl,
+		now:               now,
 	}, nil
 }
 
@@ -183,6 +192,7 @@ func (s *OIDCStore) CreateAuthRequest(_ context.Context, req *oidc.AuthRequest, 
 		Subject:       userID,
 	}
 	s.authRequests[id] = a
+	s.authRequestExpiry[id] = s.now().Add(s.requestTTL)
 	return a, nil
 }
 
@@ -231,6 +241,7 @@ func (s *OIDCStore) DeleteAuthRequest(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.authRequests, id)
+	delete(s.authRequestExpiry, id)
 	for k, c := range s.codes {
 		if c.requestID == id {
 			delete(s.codes, k)
@@ -259,9 +270,27 @@ func (s *OIDCStore) CreateAccessToken(_ context.Context, request op.TokenRequest
 	return id, expires, nil
 }
 
-// CreateAccessAndRefreshTokens implements op.Storage.
+// CreateAccessAndRefreshTokens implements op.Storage. Refresh tokens rotate:
+// presenting one consumes it and issues a new one.
+//
+// The claim on the presented token and both writes happen under ONE lock. That
+// is not tidiness: rotating as "read it now, delete it later" leaves a window in
+// which two requests holding the same refresh token are both honoured, and the
+// window is invisible to the race detector — the two critical sections never
+// overlap, so there is no data race to find. The consequence is worse than one
+// extra token: rotation never notices the reuse, so a stolen refresh token can be
+// replayed indefinitely alongside the victim's own client, and nothing ever
+// signals that it happened.
+//
+// The presented token is checked, not assumed. A request that arrives with a
+// token this store no longer holds is refused rather than quietly minting a
+// replacement, so a replay fails instead of succeeding twice.
 func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op.TokenRequest, currentRefreshToken string) (string, string, time.Time, error) {
-	accessID, expires, err := s.CreateAccessToken(ctx, request)
+	accessID, err := oidcstore.RandomValue()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	value, err := oidcstore.RandomValue()
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
@@ -280,13 +309,16 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 		audience = r.GetAudience()
 	}
 
-	value, err := oidcstore.RandomValue()
-	if err != nil {
-		return "", "", time.Time{}, err
-	}
+	// Everything that can fail has failed by now, so the critical section below
+	// cannot leave a claimed-but-unreplaced refresh token behind.
 	now := s.now()
-	s.mu.Lock()
-	s.refreshTokens[oauth.TokenHash(value)] = refreshToken{
+	expires := now.Add(s.accessTTL)
+	access := accessToken{
+		id: accessID, clientID: oidcstore.ClientIDOf(request), subject: request.GetSubject(),
+		scopes:   oidcstore.NonNil(oidcstore.WithoutOfflineAccess(request.GetScopes())),
+		issuedAt: now, expiresAt: expires,
+	}
+	refresh := refreshToken{
 		valueHash: oauth.TokenHash(value),
 		idHash:    oauth.TokenHash(accessID),
 		clientID:  oidcstore.ClientIDOf(request),
@@ -298,10 +330,21 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 		issuedAt:  now,
 		expiresAt: now.Add(s.refreshTTL),
 	}
+
+	s.mu.Lock()
 	if currentRefreshToken != "" {
-		delete(s.refreshTokens, oauth.TokenHash(currentRefreshToken))
+		spent := oauth.TokenHash(currentRefreshToken)
+		if _, held := s.refreshTokens[spent]; !held {
+			s.mu.Unlock()
+			return "", "", time.Time{}, ErrRefreshTokenSpent
+		}
+		delete(s.refreshTokens, spent)
 	}
+	s.accessTokens[oauth.TokenHash(accessID)] = access
+	s.refreshTokens[oauth.TokenHash(value)] = refresh
 	s.mu.Unlock()
+
+	s.record(ctx, "oidc.token", request.GetSubject(), access.clientID, audit.OutcomeOK)
 	return accessID, value, expires, nil
 }
 
@@ -483,7 +526,7 @@ func normalizeUserCode(code string) string {
 func (s *OIDCStore) StoreDeviceAuthorization(_ context.Context, clientID, deviceCode, userCode string, expires time.Time, scopes []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.purgeExpiredDevices()
+	s.purgeExpiredDevicesLocked(s.now())
 	if _, exists := s.userCodes[normalizeUserCode(userCode)]; exists {
 		return op.ErrDuplicateUserCode
 	}
@@ -519,13 +562,94 @@ func (d deviceRecord) state() *op.DeviceAuthorizationState {
 	}
 }
 
-func (s *OIDCStore) purgeExpiredDevices() {
-	now := s.now()
+// purgeExpiredDevicesLocked drops expired device authorizations. The caller
+// holds the lock.
+func (s *OIDCStore) purgeExpiredDevicesLocked(now time.Time) int {
+	removed := 0
 	for h, d := range s.devices {
 		if now.After(d.expiresAt) {
 			delete(s.devices, h)
 			delete(s.userCodes, normalizeUserCode(d.userCode))
+			removed++
 		}
+	}
+	return removed
+}
+
+// SweepExpired removes every record whose deadline has passed and returns how
+// many it removed.
+//
+// A lookup already refuses an expired record, but nothing removed it. That is
+// the leak this closes: without a sweep the maps keep every token, code and
+// pending request the deployment ever issued, for the life of the process. It
+// matters twice over, because the calls that scan them under the store's single
+// lock — Grants, RevokeGrant, RevokeTokens, DeleteAuthRequest — then get slower
+// as the maps grow.
+//
+// No goroutine starts here, so a test can call it directly; the composition root
+// runs it on a ticker. A record is removed only once a lookup would already
+// refuse it, so a sweep can never revoke something still in use.
+func (s *OIDCStore) SweepExpired() int {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for id, expires := range s.authRequestExpiry {
+		if now.After(expires) {
+			delete(s.authRequestExpiry, id)
+			delete(s.authRequests, id)
+			removed++
+		}
+	}
+	for k, c := range s.codes {
+		if now.After(c.expiresAt) {
+			delete(s.codes, k)
+			removed++
+		}
+	}
+	for k, t := range s.accessTokens {
+		if !now.Before(t.expiresAt) {
+			delete(s.accessTokens, k)
+			removed++
+		}
+	}
+	for k, t := range s.refreshTokens {
+		if !now.Before(t.expiresAt) {
+			delete(s.refreshTokens, k)
+			removed++
+		}
+	}
+	removed += s.purgeExpiredDevicesLocked(now)
+	return removed
+}
+
+// Counts is how many records each map currently holds.
+type Counts struct {
+	AuthRequests  int
+	Codes         int
+	AccessTokens  int
+	RefreshTokens int
+	Devices       int
+}
+
+// Records is the total number of records the store holds.
+func (c Counts) Records() int {
+	return c.AuthRequests + c.Codes + c.AccessTokens + c.RefreshTokens + c.Devices
+}
+
+// Counts reports the current size of each map. It exists so the sweep's effect
+// is observable: a test asserts the maps stay bounded, and a benchmark reports
+// the population it ran at rather than assuming it.
+func (s *OIDCStore) Counts() Counts {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return Counts{
+		AuthRequests:  len(s.authRequests),
+		Codes:         len(s.codes),
+		AccessTokens:  len(s.accessTokens),
+		RefreshTokens: len(s.refreshTokens),
+		Devices:       len(s.devices),
 	}
 }
 

@@ -234,10 +234,30 @@ func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenReque
 	return id, expires, nil
 }
 
+// ErrRefreshTokenSpent reports a refresh token presented after it had already
+// been rotated. It is a refusal, not a lookup miss: the caller asked to spend a
+// token this store has already consumed, which is what a replayed (or stolen)
+// refresh token looks like. Returning an error rather than minting a second
+// generation is the only thing that makes reuse visible.
+var ErrRefreshTokenSpent = errors.New("postgres: refresh token was already rotated")
+
 // CreateAccessAndRefreshTokens implements op.Storage. Refresh tokens rotate:
 // presenting one consumes it and issues a new one.
+//
+// Rotation is one transaction, and the presented token is claimed by a DELETE
+// whose row count is checked. Rotating as "read it now, delete it later" leaves a
+// window in which two requests holding the same refresh token are both honoured —
+// and the window is invisible to the race detector, because the two statements
+// never contend on a lock. The consequence is worse than one extra token:
+// rotation never notices the reuse, so a stolen refresh token can be replayed
+// indefinitely alongside the victim's own client, and nothing signals that it
+// happened.
 func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op.TokenRequest, currentRefreshToken string) (string, string, time.Time, error) {
-	accessID, expires, err := s.CreateAccessToken(ctx, request)
+	accessID, err := oidcstore.RandomValue()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	value, err := oidcstore.RandomValue()
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
@@ -259,26 +279,47 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	amr = oidcstore.NonNil(amr)
 	audience = oidcstore.NonNil(audience)
 
-	value, err := oidcstore.RandomValue()
+	now := time.Now().UTC()
+	expires := now.Add(s.accessTTL)
+
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	if _, err := s.pool.Exec(ctx, `
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Claim the presented token first. Under READ COMMITTED a concurrent DELETE of
+	// the same row blocks, then finds nothing once the winner commits — so exactly
+	// one of two racing requests sees a row to consume.
+	if currentRefreshToken != "" {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM oidc_refresh_tokens WHERE token_hash = $1`, hashValue(currentRefreshToken))
+		if err != nil {
+			return "", "", time.Time{}, fmt.Errorf("postgres: rotate refresh token: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return "", "", time.Time{}, ErrRefreshTokenSpent
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)
+		VALUES ($1,$2,$3,$4,$5)`,
+		hashValue(accessID), clientIDOf(request), request.GetSubject(), scopes, expires); err != nil {
+		return "", "", time.Time{}, fmt.Errorf("postgres: create access token: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO oidc_refresh_tokens
 			(token_hash, id_hash, client_id, subject, scopes, amr, audience, auth_time, expires_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		hashValue(value), hashValue(accessID), clientIDOf(request), request.GetSubject(),
-		scopes, amr, audience, authTime, time.Now().UTC().Add(s.refreshTTL),
+		scopes, amr, audience, authTime, now.Add(s.refreshTTL),
 	); err != nil {
 		return "", "", time.Time{}, fmt.Errorf("postgres: create refresh token: %w", err)
 	}
-
-	if currentRefreshToken != "" {
-		if _, err := s.pool.Exec(ctx,
-			`DELETE FROM oidc_refresh_tokens WHERE token_hash = $1`, hashValue(currentRefreshToken)); err != nil {
-			return "", "", time.Time{}, fmt.Errorf("postgres: rotate refresh token: %w", err)
-		}
+	if err := tx.Commit(ctx); err != nil {
+		return "", "", time.Time{}, err
 	}
+	s.record(ctx, "oidc.token", request.GetSubject(), clientIDOf(request), audit.OutcomeOK)
 	return accessID, value, expires, nil
 }
 
