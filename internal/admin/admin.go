@@ -239,19 +239,24 @@ func (s *service) DeleteClient(ctx context.Context, actor, clientID string) erro
 
 // KillSwitch implements Service.
 //
-// Scope, stated precisely because "kill switch" invites over-claiming:
+// Scope, stated precisely because "kill switch" invites over-claiming. Exactly
+// one target may be set, and each one cuts:
 //
-//   - all:    every issued token, and (with a session revoker) every browser
-//     session. It cannot reach an upstream credential; re0auth does not
-//     hold one.
-//   - client: every token that client holds, and the client is suspended so it
-//     cannot immediately mint more.
-//   - subject: every token that account holds. Its browser sessions are NOT
-//     dropped, because sessions are opaque cookies with no subject index;
-//     the account is still able to sign in again.
+//   - all:      every issued token, every browser session (where the deployment
+//     has a session revoker), and every data-source binding.
+//   - client:   every token that client holds, and the client is suspended so it
+//     cannot immediately mint more. A binding belongs to a person, not to a
+//     client, so this target leaves bindings alone.
+//   - subject:  every token that account holds, every browser session it holds
+//     (where a session subject index exists; see SessionRevoker), and every
+//     binding it holds.
+//   - bindings: every binding, and nothing else. The narrow form: cut data
+//     access while everyone stays signed in.
 //
-// The data-source bindings are a separate plane and are NOT touched here. That
-// half of the design (threat-model D5) is not implemented yet.
+// What it still cannot do: reach an upstream credential by itself. Re0Auth holds
+// no platform credential, and the token a source issued is only ever used to ask
+// that source to act on its own. A source that cannot revoke, or cannot be
+// reached, is reported in Report.Bindings rather than folded into a success.
 func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (Report, error) {
 	var rep Report
 	if target.setCount() != 1 {

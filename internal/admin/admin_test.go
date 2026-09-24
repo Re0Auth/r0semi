@@ -55,6 +55,29 @@ func countTokens(t *testing.T, s *oauth.MemoryStore, subject string) int {
 	return len(recs)
 }
 
+// A deployment with no session revoker — memory mode — cannot reach its own
+// sessions at all: scs keeps them as opaque cookies and its in-memory store has no
+// listing API, so there is nothing to iterate even for `all`. docs/admin.md §4.2
+// used to say the no-index fallback was "clear every session"; the code never did
+// that, and the honest report is the reason this matters — the number says zero.
+func TestKillSwitchTouchesNoSessionsWithoutARevoker(t *testing.T) {
+	svc, _, tokens, _ := newTestService(t)
+	saveTokens(t, tokens, "cli", "usr_1")
+
+	rep, err := svc.KillSwitch(context.Background(), "usr_admin", Target{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Anti-vacuous: the dimensions that *can* run must have run, so a zero below
+	// is the session one and not an untouched report.
+	if rep.TokensRevoked == 0 {
+		t.Fatal("no tokens were revoked; this test would pass without exercising anything")
+	}
+	if rep.SessionsRevoked != 0 {
+		t.Fatalf("sessions_revoked = %d, want 0: with no revoker there is nothing to reach", rep.SessionsRevoked)
+	}
+}
+
 // The secret exists only in the registration response. What is stored accepts it
 // and nothing can read it back.
 func TestRegisterReturnsTheSecretOnlyOnce(t *testing.T) {
