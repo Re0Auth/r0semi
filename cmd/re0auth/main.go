@@ -793,12 +793,19 @@ func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.M
 		return nil, nil, err
 	}
 	handler, err := oidchttp.New(oidchttp.Config{
-		Issuer:           cfg.Issuer,
-		Storage:          oidcStore,
-		CryptoKey:        tokenKey,
-		CryptoKeyID:      "re0auth",
-		Scopes:           scopes,
-		AllowInsecure:    !cfg.CookieSecure,
+		Issuer:      cfg.Issuer,
+		Storage:     oidcStore,
+		CryptoKey:   tokenKey,
+		CryptoKeyID: "re0auth",
+		Scopes:      scopes,
+		// Taken from the issuer's scheme, which is what the OP's question is
+		// actually about: "may this issuer be plain http". It used to be derived
+		// from cookie_secure — a different setting, about a different thing — and
+		// the two could disagree with nothing looking at both: an https issuer
+		// with cookie_secure = false made the OP accept an http issuer, which is
+		// the one outcome that check exists to prevent. The OP now answers only to
+		// the issuer URL it was given.
+		AllowInsecure:    strings.HasPrefix(cfg.Issuer, "http://"),
 		Clients:          store.clients,
 		Registry:         registry,
 		Consent:          oidcStore,
