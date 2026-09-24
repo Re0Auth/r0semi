@@ -7,9 +7,13 @@ on:
   push:
     tags: ['v*']
 
-# gh release create writes a release; nothing else here needs more than read.
+# gh release create writes a release. id-token is what keyless signing exchanges
+# for a short-lived certificate from Fulcio: there is no signing key to store,
+# leak or rotate, and the certificate records which workflow produced the
+# artifact — something a bare checksum cannot say.
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -78,13 +82,36 @@ jobs:
           go vet ./...
           go test -p 1 -timeout 300s ./...
 
+      # The SBOM generator `make release` shells out to. Pinned here and in the
+      # Makefile, so what a release publishes cannot change because an upstream tag
+      # moved.
+      - name: install the SBOM generator
+        run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+
       # The version comes from the tag rather than from `git describe`, so the
       # artifact and the release agree even in a shallow clone. The target re-runs
       # the frontend step (idempotent, a few seconds): keeping the dependency is
       # what makes the ordering a guarantee instead of a step order somebody can
-      # rearrange.
+      # rearrange. It also produces the SBOM and checksums that cover both.
       - name: package
         run: make release VERSION="${{ github.ref_name }}"
+
+      # Keyless signing: the signature's identity is this workflow, attested by
+      # GitHub's OIDC provider and recorded in the transparency log. Nothing to
+      # store, nothing to rotate.
+      #
+      # It signs SHA256SUMS rather than each file. The checksums already bind every
+      # archive and the SBOM, so one signature covers the whole release — and
+      # because the set of files is fixed before the signature is made, nothing can
+      # be added afterwards without the checksums no longer matching.
+      - uses: sigstore/cosign-installer@v3
+
+      - name: sign the checksums
+        run: |
+          cosign sign-blob --yes \
+            --output-signature dist/SHA256SUMS.sig \
+            --output-certificate dist/SHA256SUMS.pem \
+            dist/SHA256SUMS
 
       - name: publish
         env:

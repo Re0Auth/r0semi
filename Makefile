@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test check e2e play dist checksums release clean
+.PHONY: all web build test check e2e play dist sbom checksums release clean
 
 all: web build
 
@@ -65,13 +65,21 @@ play:
 # frontend is built would ship a binary whose /app answers "Frontend not built".
 # The placeholder has no index.html, which is what makes the assertion possible.
 #
-# Split into two targets so the compile-and-archive half can be run and inspected
-# on its own; `release` adds the checksums a published artifact must carry.
+# Split into targets so each half can be run and inspected on its own. The chain
+# is a dependency chain rather than a list of steps on purpose: `dist` wipes the
+# output directory, so an SBOM produced before it would be deleted, and a release
+# assembled by hand in the wrong order is exactly the kind of mistake an ordering
+# someone has to remember invites. `release` is the whole thing: archives, the
+# SBOM, and checksums that cover both.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 RELEASE_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 ZIP ?= zip
 # sha256sum is coreutils; macOS ships shasum instead.
 SHA256 ?= $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
+# The SBOM generator. Pinned here and in the release workflow; a newer one may be
+# installed by hand, but a release does not float on an upstream tag.
+#   go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+SBOM ?= cyclonedx-gomod
 
 dist: web
 	@test -f internal/webui/dist/index.html || { echo "refusing to package: the embedded frontend is the placeholder"; exit 1; }
@@ -95,13 +103,33 @@ dist: web
 	done
 	@echo "packaged $(VERSION):"; ls -1 dist
 
+# The software bill of materials: a CycloneDX inventory of every module linked
+# into the binaries.
+#
+# It is generated from the module graph rather than from one built binary, because
+# the dependency set is identical on all six platforms — the Go toolchain links
+# statically, so there is no per-platform difference to record.
+#
+# The file is named so the checksum glob below matches it. A checksum file that
+# silently skips a published artifact is worse than none, because it looks
+# complete; and the `-s` test refuses an empty one for the same reason — an SBOM
+# with no components would pass every other check in this file.
+sbom: dist
+	@command -v $(SBOM) >/dev/null 2>&1 || { \
+		echo "the SBOM generator is not on PATH; install it with:"; \
+		echo "  go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0"; \
+		exit 1; }
+	$(SBOM) mod -json -output "dist/re0auth_$(VERSION)_sbom.cdx.json"
+	@test -s "dist/re0auth_$(VERSION)_sbom.cdx.json" || { echo "refusing to ship an empty SBOM"; exit 1; }
+	@echo "sbom: dist/re0auth_$(VERSION)_sbom.cdx.json"
+
 # Requires sha256sum (coreutils) or shasum (macOS), and zip for the Windows
 # archives. CI runs on ubuntu-latest, where all three exist; a Windows checkout
 # can build the project but not cut a release.
-checksums: dist
+checksums: sbom
 	@cd dist && $(SHA256) re0auth_$(VERSION)_* > SHA256SUMS && echo "checksums: $$(wc -l < SHA256SUMS) file(s)"
 
-release: dist checksums
+release: dist sbom checksums
 
 clean:
 	rm -rf web/node_modules web/.svelte-kit dist
