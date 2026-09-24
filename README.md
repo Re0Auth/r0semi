@@ -96,6 +96,20 @@ TEST_DATABASE_URL='postgres://postgres:x@localhost:5432/postgres?sslmode=disable
   go test ./internal/store/postgres/
 ```
 
+## 发布产物
+
+打 `v*` tag 时 CI 会构建并发布预编译二进制（`linux` / `darwin` / `windows` × `amd64` / `arm64`），
+每个平台一个归档，内含可执行文件、`config/re0auth.example.toml`、`LICENSE`、`NOTICE`，以及
+`README.md` 与 `SECURITY.md`——**「未达生产可用」那条警告要跟着产物走**，而不是留在仓库里。
+另有 `SHA256SUMS`，最后一步是 `gh release create`。
+
+产物**不是开箱即用**：三把密钥与 issuer 必填（`RE0AUTH_KEK`、`RE0AUTH_OIDC_TOKEN_KEY`、
+`RE0AUTH_OIDC_SIGNING_KEY`），缺一即拒绝启动——没有默认值是有意的，见上面的「快速开始」。
+`re0auth -version` 打印构建版本（由 tag 注入），启动日志里也带同一个值。
+
+`cmd/referencesource` **不在产物里**：它是验证 Upstream Kit 的演示数据源，vault 与会话都在内存、
+登录是桩实现，发布它等于暗示可以拿它去部署。
+
 ## 许可与合规
 
 本项目采用 **MPL-2.0**，全文见 [LICENSE](LICENSE)，第三方依赖见 [NOTICE](NOTICE)。
