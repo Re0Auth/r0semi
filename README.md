@@ -138,6 +138,24 @@ sha256sum -c SHA256SUMS    # macOS: shasum -a 256 -c SHA256SUMS
 `cmd/referencesource` **不在产物里**：它是验证 Upstream Kit 的演示数据源，vault 与会话都在内存、
 登录是桩实现，发布它等于暗示可以拿它去部署。
 
+## 容器镜像
+
+`make docker` 用仓库根的多阶段 `Dockerfile` 构建镜像：前端（`pnpm` 构建，锁文件固定版本）→ 静态 Go
+二进制（前端 `go:embed` 进同一个文件）→ distroless 非 root 运行时。CI 每次改动都会构建一次（**不推送**），
+因为一个从没被构建过的 Dockerfile 就是一个不能用的 Dockerfile。
+
+镜像里**没有配置、也没有密钥**：issuer 与各把密钥都在运行时经环境变量注入（见上面的「快速开始」）。
+`RE0AUTH_ADDR` 在镜像里预设为 `0.0.0.0:8080`，否则进程默认的 `127.0.0.1` 从容器外不可达。
+
+## 运维面
+
+`/healthz`（存活）与 `/readyz`（就绪）在公网监听器上，纯文本、免限流，供编排器读状态码。
+
+Prometheus 指标（黄金指标 + Go 运行时/进程采集器）与 `pprof` **不在公网端口**：设
+`server.internal_addr`（例如 `127.0.0.1:9090`）会另起一个内部监听器提供 `/metrics` 与 `/debug/pprof/`，
+不设置即两者都不提供。它**必须与 `addr` 不同**——pprof 会导出进程内部状态，单独一个监听器是「只限内部」
+的**结构性**保证，而不是一句约定。
+
 ## 许可与合规
 
 本项目采用 **MPL-2.0**，全文见 [LICENSE](LICENSE)，第三方依赖见 [NOTICE](NOTICE)。
