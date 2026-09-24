@@ -38,11 +38,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # pnpm before setup-node: the node step's `cache: pnpm` needs pnpm on PATH
+      # to locate the store, and the version is pinned to the one in
+      # web/package.json's packageManager field so CI and a laptop resolve the
+      # same dependency tree.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
 
       # Before the Go steps, because internal/webui embeds the result. Without
       # this, every Go test still passes — against the placeholder, which is
@@ -50,8 +58,8 @@ jobs:
       - name: build frontend
         working-directory: web
         run: |
-          npm ci
-          npm run build
+          pnpm install --frozen-lockfile
+          pnpm run build
           # The placeholder keeps the embed compiling on a machine with no Node;
           # it does not contain index.html. Its presence is therefore proof that
           # a real build happened and got embedded.
@@ -64,7 +72,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
 
       - name: gofmt
         run: |
@@ -116,9 +124,9 @@ jobs:
       - name: browser tests (built-in engine)
         working-directory: web
         run: |
-          npx playwright install --with-deps chromium
-          npx playwright test
+          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright test
 
       - name: browser tests (OpenID Provider engine)
         working-directory: web
-        run: E2E_DATABASE_URL="$TEST_DATABASE_URL" npx playwright test
+        run: E2E_DATABASE_URL="$TEST_DATABASE_URL" pnpm exec playwright test

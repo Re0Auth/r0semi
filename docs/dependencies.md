@@ -75,7 +75,7 @@
 | `svelte` 5 + `@sveltejs/kit` 2 | 整个 `web/` | runes 的响应式模型比“虚拟 DOM + hooks”简单；编译期框架、运行时最小。选 SvelteKit 而不是 Next/Nuxt 是因为输出可以是纯静态文件，恰好是 `go:embed` 需要的形状 |
 | `@sveltejs/adapter-static` | 输出到 `internal/webui/dist` | 见 §4 最后一条 |
 | `tailwindcss` 4 + `@tailwindcss/vite` | 样式 | v4 的 `@theme` 让设计 token 就是普通 CSS 变量，不用多一层配置对象。对内部实现细节（`--color-ink` 等）的审计，比对一个组件库的源码容易 |
-| `svelte-check` | `npm run check` | TS + a11y 静态检查。不放进 CI 的检查等于没有 |
+| `svelte-check` | `pnpm run check` | TS + a11y 静态检查。不放进 CI 的检查等于没有 |
 | `@playwright/test` | `web/e2e` | 真浏览器跑同意页与设备流。只有在浏览器里才能发现“每一层各自正确、拼起来却不能用”的那类 bug——比如一个掐死自己 bootstrap 的 CSP。它只在开发/CI 存在，不进产物 |
 
 **刻意不用 `shadcn-svelte` 的 CLI。** 评估过：v1.7 的 `init` 要求交互式选一套 preset（`--preset` 的取值没有非交互的帮助说明），

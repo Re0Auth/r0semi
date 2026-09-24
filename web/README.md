@@ -16,7 +16,7 @@ Two facts shape everything here:
 ## Run it, embedded (what ships)
 
 ```sh
-cd web && npm ci && npm run build     # writes ../internal/webui/dist
+cd web && pnpm install --frozen-lockfile && pnpm run build     # writes ../internal/webui/dist
 cd .. && go run ./cmd/re0auth          # http://127.0.0.1:8080/app/
 ```
 
@@ -32,7 +32,7 @@ Vite on `:5173`, proxying the Go plane to a re0auth already running on `:8080`.
 RE0AUTH_ISSUER=http://localhost:5173 go run ./cmd/re0auth
 
 # 2. the frontend, in another terminal
-cd web && npm run dev        # or, from the repo root: make play
+cd web && pnpm run dev        # or, from the repo root: make play
 # open http://localhost:5173/app/
 ```
 
@@ -60,8 +60,8 @@ returns to `return_to=/` lands on the app rather than a 404.
 ## Checks and tests
 
 ```sh
-npm run check        # svelte-check (types)
-npm run test:e2e     # Playwright; builds and starts its own re0auth + fake IdP
+pnpm run check        # svelte-check (types)
+pnpm run test:e2e     # Playwright; builds and starts its own re0auth + fake IdP
 ```
 
 The e2e suite (`web/e2e/`) is where the login, consent, device and binding flows

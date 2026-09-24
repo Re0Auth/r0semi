@@ -145,7 +145,7 @@ func writeNotBuilt(w http.ResponseWriter) {
 <h1>Frontend not built</h1>
 <p>This binary was built without the frontend, so there is no page here. The API
 is unaffected and still available under <code>/oauth/</code> and <code>/v1/</code>.</p>
-<pre><code>cd web &amp;&amp; npm ci &amp;&amp; npm run build</code></pre>
+<pre><code>cd web &amp;&amp; pnpm install --frozen-lockfile &amp;&amp; pnpm run build</code></pre>
 <p>then rebuild the Go binary. <code>make web</code> at the repository root does both.</p>
 </body></html>
 `))

@@ -14,7 +14,7 @@ all: web build
 
 # Build the frontend straight into the directory the Go binary embeds.
 web:
-	cd web && npm ci && npm run build
+	cd web && pnpm install --frozen-lockfile && pnpm run build
 	@# The placeholder that keeps the embed compiling has no index.html, so its
 	@# presence is proof that a real build reached the embed directory.
 	@test -f internal/webui/dist/index.html || { echo "frontend build did not land in internal/webui/dist"; exit 1; }
@@ -29,7 +29,7 @@ test:
 # provider, so nothing else needs to be running — and there is no test-only way
 # to obtain a session, which is why the suite is worth having.
 e2e: web
-	cd web && npx playwright install chromium && npx playwright test
+	cd web && pnpm exec playwright install chromium && pnpm exec playwright test
 
 check:
 	@unformatted=$$(gofmt -l .); \
@@ -38,7 +38,7 @@ check:
 	# The dependency firewall. `go test ./...` also runs it; here it is explicit
 	# so `make check` fails on a layering violation without running the full suite.
 	go test ./internal/archtest/
-	cd web && npm run check
+	cd web && pnpm run check
 
 # Frontend dev server with hot reload (Vite on :5173).
 #
@@ -55,7 +55,7 @@ check:
 # server at http://127.0.0.1:5173/app/ after signing in; cookies are per host, not
 # per port, so :8080 and :5173 share them.)
 play:
-	cd web && npm run dev
+	cd web && pnpm run dev
 
 clean:
 	rm -rf web/node_modules web/.svelte-kit

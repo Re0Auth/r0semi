@@ -68,7 +68,7 @@ go build ./cmd/referencesource
 前端为 SvelteKit 构建出的静态 SPA，`go:embed` 进同一个二进制，挂在 `/app/*`。
 
 ```sh
-make web     # npm ci + vite build，产物直接写进 internal/webui/dist
+make web     # pnpm install + vite build，产物直接写进 internal/webui/dist
 make build
 ```
 
@@ -83,7 +83,7 @@ go test ./...
 前端：
 
 ```sh
-cd web && npm ci && npm run check
+cd web && pnpm install --frozen-lockfile && pnpm run check
 ```
 
 ```sh

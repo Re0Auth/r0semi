@@ -153,7 +153,7 @@ func TestUnbuiltFrontendExplainsItself(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "npm run build") {
+	if !strings.Contains(body, "pnpm run build") {
 		t.Fatalf("body = %q, want the build instructions", body)
 	}
 }
