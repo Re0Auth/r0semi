@@ -407,6 +407,10 @@ const app = spawn(bin, ['-config', configFile()], {
 		...process.env,
 		// Any 32 bytes. base64 so the server's key parser accepts it directly.
 		RE0AUTH_KEK: Buffer.alloc(32, 7).toString('base64'),
+		// Required exactly when the audit log is durable, which the Postgres run is
+		// and the memory run is not. Set unconditionally so both launches are the
+		// same env and only the storage driver differs.
+		RE0AUTH_AUDIT_KEY: Buffer.alloc(32, 11).toString('base64'),
 		E2E_IDP_SECRET: 'e2e-secret',
 		E2E_SOURCE_SECRET: 'e2e-source-secret',
 		// Fixed keys keep the run deterministic. Every deployment runs the OpenID
