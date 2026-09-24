@@ -552,11 +552,22 @@ func (s *OIDCStore) StoreDeviceAuthorization(_ context.Context, clientID, device
 func (s *OIDCStore) GetDeviceAuthorizatonState(_ context.Context, clientID, deviceCode string) (*op.DeviceAuthorizationState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	d, ok := s.devices[oauth.TokenHash(deviceCode)]
+	h := oauth.TokenHash(deviceCode)
+	d, ok := s.devices[h]
 	if !ok || d.clientID != clientID {
 		return nil, errors.New("memory: device authorization not found")
 	}
-	return d.state(), nil
+	st := d.state()
+	if d.done && !d.denied {
+		// Single use. The library reads this once, right before it mints the
+		// tokens, and has no consume step of its own — so without this a device_code
+		// kept minting fresh access/refresh pairs for the rest of its TTL, and a
+		// revocation performed in between was undone by the next poll. A denied or
+		// still-pending record is left in place for the library to answer.
+		delete(s.devices, h)
+		delete(s.userCodes, normalizeUserCode(d.userCode))
+	}
+	return st, nil
 }
 
 func (d deviceRecord) state() *op.DeviceAuthorizationState {
@@ -807,6 +818,15 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 			delete(s.refreshTokens, k)
 		}
 	}
+	// A device authorization for this client and subject is a capability that
+	// outlives the tokens: leaving it would let the holder of the device_code mint
+	// a fresh pair after the user just revoked the grant.
+	for h, d := range s.devices {
+		if d.clientID == clientID && d.subject == subject {
+			delete(s.userCodes, normalizeUserCode(d.userCode))
+			delete(s.devices, h)
+		}
+	}
 	s.mu.Unlock()
 	s.record(ctx, "oidc.grant.revoke", subject, clientID, audit.OutcomeOK)
 	return nil
@@ -828,6 +848,16 @@ func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, e
 		if f.Matches(t.clientID, t.subject) {
 			delete(s.refreshTokens, k)
 			removed++
+		}
+	}
+	// Device authorizations are capabilities, not tokens, so they are not counted
+	// here — but they are revoked with the rest: a held device_code would
+	// otherwise re-mint what was just revoked, defeating the Kill Switch for the
+	// life of the code.
+	for h, d := range s.devices {
+		if f.Matches(d.clientID, d.subject) {
+			delete(s.userCodes, normalizeUserCode(d.userCode))
+			delete(s.devices, h)
 		}
 	}
 	return removed, nil

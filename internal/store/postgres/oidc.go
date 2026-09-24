@@ -10,6 +10,7 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
@@ -525,7 +526,34 @@ func (s *OIDCStore) StoreDeviceAuthorization(ctx context.Context, clientID, devi
 }
 
 // GetDeviceAuthorizatonState implements op.Storage.
+//
+// It consumes an approved authorization on the first read: the library reads the
+// state once, immediately before minting the tokens, and never marks the record
+// spent. Deleting it here (rather than only reading) makes the device_code single
+// use — a second exchange finds nothing — and means a revocation that fired
+// between two polls cannot be replayed away. A pending or denied record is not
+// touched and falls through to a plain read for the library to answer.
 func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, deviceCode string) (*op.DeviceAuthorizationState, error) {
+	var (
+		st       op.DeviceAuthorizationState
+		authTime *time.Time
+	)
+	err := s.pool.QueryRow(ctx, `
+		DELETE FROM oidc_devices
+		 WHERE device_code_hash = $1 AND client_id = $2 AND done = true AND denied = false
+		RETURNING client_id, scopes, expires_at, done, denied, subject, auth_time`,
+		hashValue(deviceCode), clientID).Scan(
+		&st.ClientID, &st.Scopes, &st.Expires, &st.Done, &st.Denied, &st.Subject, &authTime,
+	)
+	if err == nil {
+		if authTime != nil {
+			st.AuthTime = *authTime
+		}
+		return &st, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("postgres: consume device authorization: %w", err)
+	}
 	return s.deviceState(ctx, `device_code_hash = $1 AND client_id = $2`, hashValue(deviceCode), clientID)
 }
 
@@ -692,6 +720,12 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_refresh_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
 		return err
 	}
+	// A device authorization for this client and subject outlives its tokens:
+	// leaving it would let the holder of the device_code mint a fresh pair after
+	// the user revoked the grant.
+	if _, err := tx.Exec(ctx, `DELETE FROM oidc_devices WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
@@ -701,8 +735,21 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 
 // RevokeTokens implements oauth.TokenAdmin for the OP-managed token tables. It
 // is what a suspended client, a compromised subject, or the Kill Switch call.
+//
+// Device authorizations are revoked alongside the tokens, on the same
+// client/subject predicate (the table carries both columns). They are not counted
+// in the result — that number is tokens — but they must go: a held device_code
+// would otherwise re-mint what was just revoked, defeating the Kill Switch for
+// the life of the code.
 func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
-	return revokeMatching(ctx, s.pool, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
+	total, err := revokeMatching(ctx, s.pool, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
+	if err != nil {
+		return total, err
+	}
+	if _, err := revokeMatching(ctx, s.pool, []string{"oidc_devices"}, f); err != nil {
+		return total, err
+	}
+	return total, nil
 }
 
 // PurgeSubject removes a subject's non-token OP state: the pending consent
