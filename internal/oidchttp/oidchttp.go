@@ -752,7 +752,13 @@ func (h *Handler) ApproveAuthorization(ctx context.Context, id, subject string, 
 	}
 	requested := ar.GetScopes()
 	granted := requested
-	if len(scopes) > 0 {
+	if scopes != nil {
+		if len(scopes) == 0 {
+			// An explicit empty approval is "grant nothing", which must not be
+			// silently reinterpreted as the full request. Omitted (nil) is how a
+			// caller asks for everything.
+			return "", &oauth.Error{Code: "invalid_request", Description: "an approval must grant at least one scope; omit scopes to grant the requested set"}
+		}
 		granted = make([]string, 0, len(scopes))
 		for _, sc := range scopes {
 			if !containsString(requested, sc.String()) {

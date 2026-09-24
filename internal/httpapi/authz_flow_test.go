@@ -307,6 +307,50 @@ func TestAuthorizationInteractionEndToEnd(t *testing.T) {
 	}
 }
 
+// An explicit empty scope set means "grant nothing". It must be refused, not
+// silently reinterpreted as the full request — and the refusal must not consume
+// the handle, so the user can still approve deliberately afterwards.
+func TestAuthorizationDecisionExplicitEmptyScopesIsRefused(t *testing.T) {
+	base, _ := newFlowEnv(t)
+	browser := newBrowser(t)
+	signIn(t, browser, base)
+
+	const verifier = "verifier-verifier-verifier-verifier-verifier"
+	handle := authorize(t, browser, base, verifier, "account.id phigros.score.read", "st-empty")
+
+	resp := getURL(t, browser, base+"/v1/authorization_requests/"+handle)
+	view := decodeResp(t, resp)
+	csrf, _ := view["csrf_token"].(string)
+
+	empty, _ := json.Marshal(map[string]any{"decision": "approve", "scopes": []string{}})
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/authorization_requests/"+handle+"/decision", bytes.NewReader(empty))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp = doReq(t, browser, req)
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("empty approval status = %d body = %s, want 400", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// The refusal must not be a blanket one, and it must not have consumed the
+	// handle: omitting scopes still approves the full requested set.
+	omitted, _ := json.Marshal(map[string]any{"decision": "approve"})
+	req, _ = http.NewRequest(http.MethodPost, base+"/v1/authorization_requests/"+handle+"/decision", bytes.NewReader(omitted))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp = doReq(t, browser, req)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("omitted-scopes approval status = %d body = %s, want 200", resp.StatusCode, body)
+	}
+	decision := decodeResp(t, resp)
+	redirectTo, _ := decision["redirect_to"].(string)
+	if redirectTo == "" {
+		t.Fatal("omitted-scopes approval returned no redirect")
+	}
+}
+
 // A handle is bound to the browser that created it.
 func TestAuthorizationHandleIsBoundToBrowser(t *testing.T) {
 	base, _ := newFlowEnv(t)

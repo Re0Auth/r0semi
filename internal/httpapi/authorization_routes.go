@@ -200,7 +200,14 @@ func (s *Server) scopeViews(scopes []oauth.Scope) []map[string]any {
 	return out
 }
 
+// toScopes converts wire scope strings. A nil input stays nil, because the
+// difference between "the field was omitted" and "the field was an empty array"
+// is part of the consent contract: omitted means grant the full request, empty
+// means the caller explicitly approved nothing and is refused.
 func toScopes(in []string) []oauth.Scope {
+	if in == nil {
+		return nil
+	}
 	out := make([]oauth.Scope, 0, len(in))
 	for _, s := range in {
 		if s != "" {

@@ -224,12 +224,17 @@ func (r *RefreshRequest) GetAuthTime() time.Time {
 // --- consent policy ---
 
 // NarrowScopes validates that an approval only narrows the requested scope set.
-// An empty approval means "everything requested". Returning an error here (as a
-// protocol error) is what keeps "approval can only narrow" true no matter which
-// engine is running.
+// A nil approval means "everything requested" — the field was omitted. An
+// explicit empty approval is refused rather than silently upgraded to the full
+// request: "grant nothing" must not become "grant everything". Returning an error
+// here (as a protocol error) is what keeps "approval can only narrow" true no
+// matter which engine is running.
 func NarrowScopes(requested []string, approved []oauth.Scope) ([]string, error) {
-	if len(approved) == 0 {
+	if approved == nil {
 		return requested, nil
+	}
+	if len(approved) == 0 {
+		return nil, &oauth.Error{Code: "invalid_request", Description: "an approval must grant at least one scope; omit the field to grant the requested scopes"}
 	}
 	granted := make([]string, 0, len(approved))
 	for _, s := range approved {

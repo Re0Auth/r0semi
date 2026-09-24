@@ -44,6 +44,21 @@ func TestNarrowScopesEmptyMeansEverythingRequested(t *testing.T) {
 	}
 }
 
+// An explicit empty approval is "grant nothing" and must be refused, not
+// silently upgraded to the full request. Only an omitted field (nil) means
+// "everything requested".
+func TestNarrowScopesExplicitEmptyIsRefused(t *testing.T) {
+	requested := []string{"account.id", "phigros.score.read"}
+	if _, err := NarrowScopes(requested, []oauth.Scope{}); err == nil {
+		t.Fatal("an explicit empty approval was accepted as the full request")
+	} else {
+		var oe *oauth.Error
+		if !errors.As(err, &oe) || oe.Code != "invalid_request" {
+			t.Fatalf("error = %v, want invalid_request", err)
+		}
+	}
+}
+
 func TestRequireExplicitConsent(t *testing.T) {
 	critical := oauth.Descriptor{
 		Scope: "phigros.score.write", Title: "Write", ExplicitConsent: true,

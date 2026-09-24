@@ -2095,6 +2095,8 @@ components:
           items: { type: string }
           description: |
             The subset being granted. Omit to grant exactly what was requested.
+            An explicit `[]` means "grant nothing" and is `400 invalid_request`:
+            it is never silently upgraded to the full request.
             It may only narrow the request; a scope that was not requested is
             rejected.
         explicit:
@@ -2165,6 +2167,10 @@ components:
         scopes:
           type: array
           items: { type: string }
+          description: |
+            The subset being granted. Omit to grant exactly what was requested.
+            An explicit `[]` is `400 invalid_request`, matching the interactive
+            consent contract.
         explicit:
           type: array
           items: { type: string }

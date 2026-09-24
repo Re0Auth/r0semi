@@ -314,7 +314,12 @@ func (s *service) DecideDeviceAuthorization(ctx context.Context, userCode, subje
 	}
 
 	granted := rec.Scopes
-	if len(scopes) > 0 {
+	if scopes != nil {
+		if len(scopes) == 0 {
+			// An explicit empty approval is "grant nothing" and must not be
+			// silently upgraded to the full request; omit the field for that.
+			return protocolError("invalid_request", "an approval must grant at least one scope; omit scopes to grant the requested set")
+		}
 		for _, sc := range scopes {
 			if !containsScope(rec.Scopes, sc) {
 				return protocolError("invalid_scope", "the decision cannot widen the requested scope")

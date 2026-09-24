@@ -109,6 +109,61 @@ func TestDeviceAuthorizationEndToEnd(t *testing.T) {
 	}
 }
 
+// The device flow shares the consent contract: an explicit empty scope set means
+// "grant nothing" and must be refused, while omitting the field still approves
+// the requested set.
+func TestDeviceDecisionExplicitEmptyScopesIsRefused(t *testing.T) {
+	base, _ := newFlowEnv(t)
+	browser := newBrowser(t)
+
+	start := decodeResp(t, postForm(t, browser, base+"/oauth/device_authorization", url.Values{
+		"client_id": {"cli"}, "scope": {"account.id phigros.score.read"},
+	}))
+	deviceCode, _ := start["device_code"].(string)
+	userCode, _ := start["user_code"].(string)
+	if deviceCode == "" || userCode == "" {
+		t.Fatalf("device_authorization = %v", start)
+	}
+
+	signIn(t, browser, base)
+	view := decodeResp(t, getURL(t, browser, base+"/v1/device/verification?user_code="+url.QueryEscape(userCode)))
+	csrf, _ := view["csrf_token"].(string)
+
+	empty, _ := json.Marshal(map[string]any{
+		"user_code": userCode, "decision": "approve", "scopes": []string{},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/device/decision", bytes.NewReader(empty))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp := doReq(t, browser, req)
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("empty device approval = %d body = %s, want 400", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// The refusal is not a blanket lockout: the code is still approvable.
+	omitted, _ := json.Marshal(map[string]any{"user_code": userCode, "decision": "approve"})
+	req, _ = http.NewRequest(http.MethodPost, base+"/v1/device/decision", bytes.NewReader(omitted))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp = doReq(t, browser, req)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("omitted device approval = %d body = %s, want 200", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	tokens := decodeResp(t, postForm(t, browser, base+"/oauth/token", url.Values{
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+		"device_code": {deviceCode},
+		"client_id":   {"cli"},
+	}))
+	if tokens["access_token"] == "" {
+		t.Fatalf("tokens after omitted approval = %v", tokens)
+	}
+}
+
 // The verification GET binds the code to the session and carries no CSRF token.
 // That is recorded here as a decision rather than left as an accident, because the
 // obvious fixes are worse than the gap:
