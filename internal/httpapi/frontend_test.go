@@ -68,6 +68,10 @@ func TestRootStaysNotFoundWithoutFrontend(t *testing.T) {
 // The client router needs the shell for paths that are not files. The risk of
 // granting that is that the mount starts swallowing API 404s, so the API's own
 // error shapes are asserted here to prove it does not.
+//
+// The root path is neither plane and answers plain text (see
+// docs/browser-plane-decision.md). What matters for this test is unchanged: it is
+// not the shell.
 func TestFrontendMountDoesNotSwallowAPIRoutes(t *testing.T) {
 	srv := withFrontend(t, testFrontend())
 	handler := srv.Handler()
@@ -82,7 +86,7 @@ func TestFrontendMountDoesNotSwallowAPIRoutes(t *testing.T) {
 		{"/app/anything/at/all", "text/html", "app shell", "an unknown client route still renders the shell"},
 		{"/v1/nope", "problem+json", "", "an unknown business-plane path is still problem+json"},
 		{"/oauth/nope", "application/json", "", "an unknown protocol-plane path is still an OAuth error"},
-		{"/nope", "problem+json", "", "an unknown root path is still problem+json"},
+		{"/nope", "text/plain", "", "an unknown root path is on no plane, and is not the shell"},
 	}
 	for _, tc := range cases {
 		rec := status(t, handler, tc.target)

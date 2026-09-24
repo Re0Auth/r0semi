@@ -203,6 +203,9 @@ func TestGameResourceDataPlane(t *testing.T) {
 	if problem["code"] != "scope_not_granted" || problem["required_scope"] != "phigros.profile.read" {
 		t.Fatalf("problem = %v", problem)
 	}
+	if got, want := resp.Header.Get("WWW-Authenticate"), `Bearer error="insufficient_scope", scope="phigros.profile.read"`; got != want {
+		t.Fatalf("WWW-Authenticate = %q, want %q", got, want)
+	}
 
 	// An unbound source yields actionable guidance, not a bare failure.
 	if err := bindings.Delete(context.Background(), "usr_test", "phigros", "fake"); err != nil {

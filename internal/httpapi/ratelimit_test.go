@@ -117,3 +117,39 @@ func TestRateLimitProtocolPlaneUsesOAuthError(t *testing.T) {
 		t.Fatalf("protocol plane leaked a problem field: %v", body)
 	}
 }
+
+// A rejected request at the root of the protocol namespace must answer like
+// everything under it. The trailing slash is not something a client has to know:
+// `/oauth` is a URL somebody types, and the shared middleware used to classify it
+// as the business plane while the router treated it as the protocol subtree.
+func TestRateLimitAtTheProtocolNamespaceRoot(t *testing.T) {
+	for _, path := range []string{"/oauth", "/.well-known"} {
+		t.Run(path, func(t *testing.T) {
+			env := newTestEnv(t)
+			limited, err := New(Config{
+				Issuer:            testIssuer,
+				OIDC:              env.handler,
+				TokenIntrospector: env.handler,
+				GrantStore:        env.store,
+				DeviceStore:       env.store,
+				Limiter:           ratelimit.New(0.001, 1),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			do := func() *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodGet, path, nil)
+				req.RemoteAddr = "203.0.113.7:1234"
+				rec := httptest.NewRecorder()
+				limited.Handler().ServeHTTP(rec, req)
+				return rec
+			}
+			do() // spend the single token
+			rec := do()
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("second request = %d, want 429", rec.Code)
+			}
+			assertOAuthPlane(t, rec)
+		})
+	}
+}

@@ -120,3 +120,22 @@ func TestSecurityHeadersOnRateLimitedResponse(t *testing.T) {
 		t.Error("a throttled response must still carry a request id")
 	}
 }
+
+// The compressor can answer on its own — it refuses without ever calling next —
+// so anything wrapped inside it is skipped for exactly that response. That
+// response is also the one whose input the caller fully controls, which makes it
+// the last one in the service that should go out without nosniff and friends.
+func TestSecurityHeadersOnCompressorRefusal(t *testing.T) {
+	env := newTestEnv(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	req.Header.Set("Accept-Encoding", "identity;q=0")
+	rec := httptest.NewRecorder()
+	env.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotAcceptable {
+		t.Fatalf("status = %d, want 406", rec.Code)
+	}
+	assertSecurityHeaders(t, rec.Header())
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Error("a refused response must still carry a request id")
+	}
+}

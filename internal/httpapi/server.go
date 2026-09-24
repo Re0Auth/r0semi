@@ -200,7 +200,10 @@ func New(cfg Config) (*Server, error) {
 		limiter:      cfg.Limiter,
 		secure:       cfg.Secure,
 		frontend:     cfg.Frontend,
-		oidc:         cfg.OIDC,
+		// Wrapped once, here, so every protocol-plane mount is covered by the same
+		// recoverer: a panic in the provider must answer as an OAuth error, not as a
+		// closed connection.
+		oidc:         recoverProtocol(cfg.OIDC),
 		introspector: cfg.TokenIntrospector,
 		grants:       cfg.GrantStore,
 		devices:      cfg.DeviceStore,
@@ -212,8 +215,14 @@ func New(cfg Config) (*Server, error) {
 		// The protocol plane stays uncompressed: its responses are tiny, must not
 		// be cached, and a token response must never be transformed (BREACH). The
 		// business plane and the frontend assets are where compression pays.
+		//
+		// The predicate is the middleware's own planeOf rather than a second prefix
+		// test. Two tests for one question is how /.well-known/* was eligible for
+		// compression here while the plane split called it protocol plane — so a
+		// client refusing every coding got a 406 rendered by the business writer on
+		// an OIDC discovery URL.
 		Eligible: func(r *http.Request) bool {
-			return !strings.HasPrefix(r.URL.Path, "/oauth/")
+			return planeOf(r.URL.Path) != planeProtocol
 		},
 		OnNotAcceptable: func(w http.ResponseWriter, r *http.Request) {
 			srv.writeProblem(w, r, http.StatusNotAcceptable, "not_acceptable", "no acceptable content coding")
@@ -330,6 +339,15 @@ func (s *Server) Handler() http.Handler {
 	root.Handle("GET /.well-known/openid-configuration", s.oidc)
 	root.Handle("/oauth/", s.oidc)
 	root.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleResourceMetadata)
+	// The rest of the namespace, so an unknown path or a wrong method under
+	// /.well-known answers in the protocol plane rather than falling through to the
+	// business catch-all. More specific patterns still win, so the three documents
+	// above keep their own handlers; this only covers what they do not.
+	//
+	// It matters because the plane split used to be decided by two different prefix
+	// tests, one of which called /.well-known/* business plane — which is how an
+	// OIDC discovery URL could answer 404 with a problem+json body.
+	root.Handle("/.well-known/", s.oidc)
 	root.Handle("/v1/", s.businessPlane())
 	if s.auth != nil || s.bindEnabled() {
 		authMux := http.NewServeMux()
@@ -372,30 +390,37 @@ func (s *Server) Handler() http.Handler {
 
 	// Order, outermost first:
 	//
-	//	1. request id      -- so even a rejected request can be quoted to an
-	//	                      operator. A 429 is the response most likely to be
-	//	                      reported, and it never reaches a handler.
+	//	1. request id       -- so even a rejected request can be quoted to an
+	//	                       operator. A 429 is the response most likely to be
+	//	                       reported, and it never reaches a handler.
 	//	2. security headers -- including on those rejections, so a failure is
-	//	                      still not frameable and still leaks no URL.
-	//	3. the limiter      -- shed load before sessions or handlers do any work.
-	//	4. the body limit   -- cap what a handler can be made to read, which is a
-	//	                      different question from how often it may ask.
-	//	5. session loading  -- wraps the whole tree; /auth and /v1 both need it.
+	//	                       still not frameable and still leaks no URL.
+	//	3. compression      -- so every eligible response can be negotiated.
+	//	4. the limiter      -- shed load before sessions or handlers do any work.
+	//	5. the body limit   -- cap what a handler can be made to read, which is a
+	//	                       different question from how often it may ask.
+	//	6. session loading  -- wraps the whole tree; /auth and /v1 both need it.
 	//
-	// Compression sits just inside the request id so every eligible response can
-	// be negotiated, and outside the header/limit middleware so their output is
-	// compressed too. It declines the protocol plane itself (see New).
+	// The headers sit *outside* compression deliberately. The compressor can
+	// answer on its own — a client that refuses every coding gets a 406 without
+	// `next` ever running — so anything inside it is skipped for exactly that
+	// response. That response is also the one whose input the caller fully
+	// controls, which makes it the last one in the service that should go out
+	// without nosniff, a referrer policy and a framing policy.
+	//
+	// The cost of the swap is that the limiter's 429 is no longer compressed. It
+	// never really was: the body is well under compress.DefaultMinSize.
 	var h http.Handler = root
 	if s.sessions != nil {
 		h = s.sessions.LoadAndSave(h)
 	}
 	h = s.withBodyLimit(h)
 	h = s.withRateLimit(h)
-	h = s.withSecurityHeaders(h)
 	if s.compressor != nil {
 		h = s.compressor.Handler(h)
 	}
-	return withRequestID(h)
+	h = s.withSecurityHeaders(h)
+	return withRequestID(recoverBrowser(h))
 }
 
 func (s *Server) businessPlane() http.Handler {
@@ -411,8 +436,14 @@ func (s *Server) businessPlane() http.Handler {
 	return recoverBusiness(s, mux)
 }
 
+// handleNotFound answers a path that is on no plane at all.
+//
+// Plain text rather than problem+json: the business plane is /v1 and nothing
+// outside it is an API, so a mistyped URL in a browser should read like a 404 page
+// rather than like an API error. The /v1 subtree has its own catch-all that
+// answers problem+json, which is where an API client's typo actually lands.
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown endpoint")
+	http.Error(w, "not found", http.StatusNotFound)
 }
 
 // bindEnabled reports whether the source-binding flow can be served.

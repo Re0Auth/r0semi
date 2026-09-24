@@ -90,8 +90,7 @@ func (s *Server) handleGameResource(w http.ResponseWriter, r *http.Request, info
 		return
 	}
 	if !hasScopeString(info.Scopes, scope) {
-		s.writeProblem(w, r, http.StatusForbidden, "scope_not_granted",
-			"this token does not include '"+scope+"'", withRequiredScope(scope))
+		s.insufficientScope(w, r, scope, "this token does not include '"+scope+"'")
 		return
 	}
 
@@ -199,7 +198,9 @@ func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oaut
 		return
 	}
 	if len(scopes) > 0 && !hasAnyScope(info.Scopes, scopes) {
-		s.writeProblem(w, r, http.StatusForbidden, "scope_not_granted", "this token does not grant access to "+game)
+		// No single scope is named: the raw proxy is gated coarsely, by any of the
+		// source's resource scopes.
+		s.insufficientScope(w, r, "", "this token does not grant access to "+game)
 		return
 	}
 
@@ -227,17 +228,26 @@ func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oaut
 
 // handleBindStart begins the interactive binding flow: it redirects the browser
 // to the source's authorization endpoint, with the flow bound to this session.
+//
+// It is a browser navigation, not an API, so its failures are plain text — the
+// same decision /auth already follows, and the one recorded in
+// docs/browser-plane-decision.md. A problem+json body here would be a format no
+// consumer of this URL parses.
 func (s *Server) handleBindStart(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.sessions.User(r.Context())
 	if !ok {
-		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "sign in to bind a source")
+		http.Error(w, "sign in to bind a source", http.StatusUnauthorized)
 		return
 	}
 	challenge, err := s.federate.BeginBind(r.Context(), user,
 		r.URL.Query().Get("game"), r.URL.Query().Get("source"),
 		safeurl.RelativePath(r.URL.Query().Get("return_to")))
 	if err != nil {
-		s.writeFederationError(w, r, err)
+		// One generic answer on purpose. The distinctions a caller would act on
+		// (unknown source, source retired, client not configured) are all "this link
+		// does not work" to the person who followed it, and the detail belongs in a
+		// log rather than in a navigation response.
+		http.Error(w, "cannot start binding this source", http.StatusBadRequest)
 		return
 	}
 	s.sessions.Bind(r.Context(), "bind", challenge.ID)
@@ -249,12 +259,12 @@ func (s *Server) handleBindStart(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBindCallback(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.sessions.User(r.Context())
 	if !ok {
-		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "sign in to continue")
+		http.Error(w, "sign in to continue", http.StatusUnauthorized)
 		return
 	}
 	state := r.URL.Query().Get("state")
 	if state == "" || !s.sessions.Bound(r.Context(), "bind", state) {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "unknown or expired bind request")
+		http.Error(w, "unknown or expired bind request", http.StatusBadRequest)
 		return
 	}
 	s.sessions.Unbind(r.Context(), "bind", state)

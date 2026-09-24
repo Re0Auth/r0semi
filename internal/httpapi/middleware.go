@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -81,11 +83,14 @@ func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
 func (s *Server) withBodyLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := oauth.LimitFormBody(w, r); err != nil {
-			if isProtocolPath(r.URL.Path) {
+			switch planeOf(r.URL.Path) {
+			case planeProtocol:
 				writeOAuthError(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
-				return
+			case planeBusiness:
+				s.writeProblem(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
+			default:
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			}
-			s.writeProblem(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -142,11 +147,14 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 				}
 				w.Header().Set("Retry-After", strconv.Itoa(seconds))
 			}
-			if isProtocolPath(r.URL.Path) {
+			switch planeOf(r.URL.Path) {
+			case planeProtocol:
 				writeOAuthError(w, r, http.StatusTooManyRequests, "temporarily_unavailable", "rate limit exceeded")
-				return
+			case planeBusiness:
+				s.writeProblem(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded")
+			default:
+				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			}
-			s.writeProblem(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -164,8 +172,50 @@ func clientKey(r *http.Request) string {
 	return host
 }
 
-func isProtocolPath(path string) bool {
-	return strings.HasPrefix(path, "/oauth/") || strings.HasPrefix(path, "/.well-known/")
+// plane is which of the service's three surfaces a path belongs to.
+//
+// The classification is positive — each plane is a namespace that is named —
+// rather than "protocol, otherwise business". The negative form is what handed
+// /auth/*, /bind and every unknown path the business plane's error shape by
+// accident, so that an operator tuning the rate limit also changed the wire
+// contract of a browser navigation.
+type plane int
+
+const (
+	// planeBrowser is a path that belongs to no plane: a surface a person reaches
+	// by navigating with a browser. Its failures are plain text or a redirect —
+	// never problem+json, never an OAuth error object.
+	planeBrowser plane = iota
+	// planeProtocol is /oauth and /.well-known: RFC 6749 requests and the metadata
+	// documents. Failures are `{error,error_description}`.
+	planeProtocol
+	// planeBusiness is /v1: JSON in, and every failure an RFC 9457 problem+json.
+	planeBusiness
+)
+
+// planeOf classifies a path. It is the single definition of that question, shared
+// by every middleware that has to choose an error shape or decide whether a
+// response may be transformed at all. Two definitions is exactly how
+// /.well-known/* came to be protocol plane to one caller and business plane to
+// another.
+//
+// Each namespace matches its root as well as its contents: `/oauth`,
+// `/.well-known` and `/v1` are URLs a client constructs by hand, and a rejection at
+// the root has to answer like everything under it.
+func planeOf(path string) plane {
+	switch {
+	case inNamespace(path, "/oauth"), inNamespace(path, "/.well-known"):
+		return planeProtocol
+	case inNamespace(path, "/v1"):
+		return planeBusiness
+	default:
+		return planeBrowser
+	}
+}
+
+// inNamespace reports whether path is prefix itself, or lies under it.
+func inNamespace(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 // recoverBusiness turns a panic into a problem+json 500.
@@ -173,7 +223,47 @@ func recoverBusiness(s *Server, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				slog.Error("panic while serving", "plane", "business", "method", r.Method, "path", r.URL.Path, "panic", rec)
 				s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "internal error")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoverProtocol turns a panic on the protocol plane into an OAuth error.
+//
+// It exists because net/http's own handling of a panic is to log it and close the
+// connection: the caller gets nothing, which is not a shape any plane promises.
+// A crash has to answer in the format of the plane it happened on, and the two
+// planes never borrow each other's — the same rule that governs every other error
+// here.
+func recoverProtocol(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("panic while serving", "plane", "protocol", "method", r.Method, "path", r.URL.Path, "panic", rec)
+				writeOAuthError(w, r, http.StatusInternalServerError, "server_error", "internal error")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoverBrowser is the outermost recoverer, catching what the plane-specific ones
+// cannot: a panic in shared middleware, in the login plane, in the frontend, or in
+// the catch-all.
+//
+// It answers with a bare text/plain 500 rather than either plane's format. Those
+// paths belong to neither plane, and docs/api-design.md §6 does not decide a
+// format for them yet — answering problem+json would make that decision by
+// accident, while text/plain is what the login plane already answers with.
+func recoverBrowser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("panic while serving", "plane", "neither", "method", r.Method, "path", r.URL.Path, "panic", rec)
+				http.Error(w, "internal error", http.StatusInternalServerError)
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -215,9 +305,32 @@ func (s *Server) requireScope(w http.ResponseWriter, r *http.Request, info oauth
 			return true
 		}
 	}
-	s.writeProblem(w, r, http.StatusForbidden, "scope_not_granted",
-		"this token does not include '"+scope.String()+"'", withRequiredScope(scope.String()))
+	s.insufficientScope(w, r, scope.String(), "this token does not include '"+scope.String()+"'")
 	return false
+}
+
+// insufficientScope writes the 403 for a token that is valid but lacks the scope
+// a call needs, together with the RFC 6750 §3.1 challenge.
+//
+// The challenge is not decoration: `WWW-Authenticate` is the only standard way a
+// client tells "your token is no good" (401, error="invalid_token") apart from
+// "your token is fine but too narrow" (403, error="insufficient_scope"). Without
+// it a standard OAuth client reports a bare 403 and cannot learn from the
+// protocol which scope to ask for; the body's `required_scope` only helps a
+// reader of this API's own spec.
+//
+// required may be empty when the requirement is a set rather than one scope — the
+// raw proxy accepts any of a source's resource scopes — and the scope parameter is
+// then omitted, which RFC 6750 §3.1 permits.
+func (s *Server) insufficientScope(w http.ResponseWriter, r *http.Request, required, detail string) {
+	challenge := `Bearer error="insufficient_scope"`
+	var opts []func(*problem)
+	if required != "" {
+		challenge += fmt.Sprintf(", scope=%q", required)
+		opts = append(opts, withRequiredScope(required))
+	}
+	w.Header().Set("WWW-Authenticate", challenge)
+	s.writeProblem(w, r, http.StatusForbidden, "scope_not_granted", detail, opts...)
 }
 
 func bearerToken(r *http.Request) string {

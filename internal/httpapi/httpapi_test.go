@@ -292,6 +292,38 @@ func TestInsufficientScopeIsForbidden(t *testing.T) {
 	if body["code"] != "scope_not_granted" || body["required_scope"] != "account.id" {
 		t.Fatalf("problem = %v", body)
 	}
+	// RFC 6750 §3.1: the challenge is how a standard client tells "your token is
+	// too narrow" from "your token is no good", and which scope it needs.
+	if got, want := rec.Header().Get("WWW-Authenticate"), `Bearer error="insufficient_scope", scope="account.id"`; got != want {
+		t.Fatalf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
+// The challenge has two shapes: one that names the missing scope, and one for a
+// requirement that is a set (the raw proxy accepts any of a source's resource
+// scopes). The scope parameter is optional in RFC 6750 §3.1, so the second omits
+// it rather than inventing a value.
+func TestInsufficientScopeChallengeShapes(t *testing.T) {
+	env := newTestEnv(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/games/phigros/b30", nil)
+
+	named := httptest.NewRecorder()
+	env.srv.insufficientScope(named, req, "phigros.b30.read", "detail")
+	if got, want := named.Header().Get("WWW-Authenticate"), `Bearer error="insufficient_scope", scope="phigros.b30.read"`; got != want {
+		t.Fatalf("named WWW-Authenticate = %q, want %q", got, want)
+	}
+	if body := decodeJSON(t, named); body["required_scope"] != "phigros.b30.read" {
+		t.Fatalf("named problem = %v", body)
+	}
+
+	anonymous := httptest.NewRecorder()
+	env.srv.insufficientScope(anonymous, req, "", "detail")
+	if got, want := anonymous.Header().Get("WWW-Authenticate"), `Bearer error="insufficient_scope"`; got != want {
+		t.Fatalf("set-valued WWW-Authenticate = %q, want %q", got, want)
+	}
+	if body := decodeJSON(t, anonymous); body["required_scope"] != nil {
+		t.Fatalf("required_scope was invented for a set-valued requirement: %v", body)
+	}
 }
 
 func TestUnknownEndpointsArePlaneSpecific(t *testing.T) {
