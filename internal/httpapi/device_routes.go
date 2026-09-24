@@ -73,7 +73,12 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
 		return
 	}
-	if !s.sessions.Bound(r.Context(), deviceBindKind, body.UserCode) {
+	// Both conditions, one answer: the code must have been loaded by this session,
+	// and — since loading it requires a signed-in user — by this same account. A
+	// code loaded before an account switch is not approvable afterwards, for the
+	// same reason a consent handle is not (see consentHandle).
+	if !s.sessions.Bound(r.Context(), deviceBindKind, body.UserCode) ||
+		!s.sessions.OwnerMatches(r.Context(), deviceBindKind, body.UserCode, user) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown user code")
 		return
 	}

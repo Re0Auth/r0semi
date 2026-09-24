@@ -190,12 +190,31 @@ func (m *Manager) ValidCSRF(r *http.Request) bool {
 // gets its own key so gob never has to encode a slice.
 func handleKey(kind, id string) string { return "handle_" + kind + "_" + id }
 
+// ownerKey namespaces the account a handle was created for. It is a different
+// prefix from handleKey so the two can never collide, and the kind is spelled the
+// same on both sides by construction — Bind writes both.
+func ownerKey(kind, id string) string { return "owner_" + kind + "_" + id }
+
 // Bind scopes a server-side handle (an authorization request, an enrollment,
 // ...) to this browser session. Only the session that created it may read or
 // decide it, which prevents one user's handle from being acted on in another
 // browser.
+//
+// When an account is already signed in, the handle is tagged with it as well.
+// That is what stops a handle created by account A from being approved by account
+// B after B signs in on the same browser. Rotating the session id on sign-in
+// preserves the session's values, deliberately — the consent flow depends on a
+// handle surviving the sign-in it triggers — so without this tag the handle would
+// follow the browser rather than the account.
+//
+// A handle created before anyone signed in carries no owner, and any signed-in
+// account may use it. That is the flow as designed rather than a gap: there was
+// nobody to bind it to. See OwnerMatches.
 func (m *Manager) Bind(ctx context.Context, kind, id string) {
 	m.sessions.Put(ctx, handleKey(kind, id), "1")
+	if user, ok := m.User(ctx); ok {
+		m.sessions.Put(ctx, ownerKey(kind, id), string(user))
+	}
 }
 
 // Bound reports whether this browser created the handle.
@@ -203,9 +222,23 @@ func (m *Manager) Bound(ctx context.Context, kind, id string) bool {
 	return m.sessions.GetString(ctx, handleKey(kind, id)) == "1"
 }
 
+// OwnerMatches reports whether the signed-in account may act on a handle.
+//
+// True when no owner was recorded — the handle was created before anyone signed
+// in, so there was nobody to bind it to — and true when the recorded owner is the
+// caller. False when a different account holds the session now.
+//
+// Callers must report false as "not found" rather than "forbidden": a handle that
+// answers "forbidden" has confirmed that it exists and belongs to somebody else.
+func (m *Manager) OwnerMatches(ctx context.Context, kind, id string, user account.UserID) bool {
+	owner := m.sessions.GetString(ctx, ownerKey(kind, id))
+	return owner == "" || owner == string(user)
+}
+
 // Unbind forgets a handle once it has been consumed.
 func (m *Manager) Unbind(ctx context.Context, kind, id string) {
 	m.sessions.Remove(ctx, handleKey(kind, id))
+	m.sessions.Remove(ctx, ownerKey(kind, id))
 }
 
 // requireSafeMethod reports whether a method is exempt from CSRF checks.

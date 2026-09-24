@@ -50,6 +50,36 @@ func (s *Server) missingBindingViews(ctx context.Context, user account.UserID, s
 	return views, nil
 }
 
+// authzBindKind namespaces the browser session binding for consent handles. It
+// must be the same value the login hook binds with (cmd/re0auth).
+const authzBindKind = "authz"
+
+// consentHandle reports whether this browser may act on the handle in the path.
+//
+// Two conditions, and the caller answers both with the same 404, so a handle that
+// belongs to another account is indistinguishable from one that does not exist:
+//
+//   - the session created it (Bound);
+//   - and, when it was created while an account was signed in, that same account
+//     still holds the session (OwnerMatches). A handle created before anyone signed
+//     in has no owner and is usable by whoever signs in — that is the flow's normal
+//     shape, not a gap.
+//
+// The second condition is what stops account A's request from being approved by
+// account B after B signs in on the same browser. Rotating the session id on
+// sign-in keeps the session's values on purpose, so without it the handle follows
+// the browser rather than the account.
+func (s *Server) consentHandle(r *http.Request, user account.UserID) (string, bool) {
+	id := r.PathValue("id")
+	if !s.authInteract.ValidID(id) || !s.sessions.Bound(r.Context(), authzBindKind, id) {
+		return "", false
+	}
+	if !s.sessions.OwnerMatches(r.Context(), authzBindKind, id, user) {
+		return "", false
+	}
+	return id, true
+}
+
 // handleGetAuthorizationRequest feeds the consent screen. It requires a signed
 // in user and that the handle belongs to this browser's session, so a stolen
 // handle is useless in another browser.
@@ -59,8 +89,8 @@ func (s *Server) handleGetAuthorizationRequest(w http.ResponseWriter, r *http.Re
 		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "sign in to continue")
 		return
 	}
-	id := r.PathValue("id")
-	if !s.authInteract.ValidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
+	id, ok := s.consentHandle(r, user)
+	if !ok {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown authorization request")
 		return
 	}
@@ -104,8 +134,8 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 		s.writeProblem(w, r, http.StatusForbidden, "invalid_request", "missing or invalid CSRF token")
 		return
 	}
-	id := r.PathValue("id")
-	if !s.authInteract.ValidID(id) || !s.sessions.Bound(r.Context(), "authz", id) {
+	id, ok := s.consentHandle(r, user)
+	if !ok {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown authorization request")
 		return
 	}
@@ -123,7 +153,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 			s.writeProblem(w, r, http.StatusNotFound, "not_found", "authorization request expired")
 			return
 		}
-		s.sessions.Unbind(r.Context(), "authz", id)
+		s.sessions.Unbind(r.Context(), authzBindKind, id)
 		writeJSON(w, http.StatusOK, map[string]string{"redirect_to": redirect})
 
 	case "approve":
@@ -132,7 +162,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 			s.writeDecisionError(w, r, err)
 			return
 		}
-		s.sessions.Unbind(r.Context(), "authz", id)
+		s.sessions.Unbind(r.Context(), authzBindKind, id)
 		writeJSON(w, http.StatusOK, map[string]string{"redirect_to": redirect})
 
 	default:

@@ -48,11 +48,31 @@ func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/github/token":
+			// The access token carries the authorization code. That is the only channel
+			// a test has for choosing which account this fake reports — the IdP client
+			// sends nothing else it could vary. See /github/user.
+			_ = r.ParseForm()
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "token_type": "Bearer", "expires_in": 3600})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "at:" + r.PostFormValue("code"), "token_type": "Bearer", "expires_in": 3600})
 		case "/github/user":
+			// The code decides the account, so a test can put two accounts into one
+			// browser. "c" is what every pre-existing caller sends (via signIn), and it
+			// keeps the subject it always had, so nothing else changes.
+			id, login := float64(42), "octocat"
+			auth := r.Header.Get("Authorization")
+			const prefix = "Bearer at:"
+			if len(auth) > len(prefix) && auth[:len(prefix)] == prefix {
+				if code := auth[len(prefix):]; code != "" && code != "c" {
+					var sum int64
+					for _, b := range []byte(code) {
+						sum += int64(b)
+					}
+					id, login = float64(sum), "u-"+code
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(42), "login": "octocat", "name": "Octo"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "login": login, "name": "Octo"})
 		default:
 			http.NotFound(w, r)
 		}
@@ -138,6 +158,14 @@ func decodeResp(t *testing.T, resp *http.Response) map[string]any {
 
 func signIn(t *testing.T, c *http.Client, base string) {
 	t.Helper()
+	signInAs(t, c, base, "c")
+}
+
+// signInAs is signIn with the authorization code spelled out. The fake IdP derives
+// its subject from the code, so two codes are two accounts in one browser — which
+// is what the consent-ownership test needs.
+func signInAs(t *testing.T, c *http.Client, base, code string) {
+	t.Helper()
 	resp := getURL(t, c, base+"/auth/github/start")
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("start status = %d", resp.StatusCode)
@@ -146,7 +174,7 @@ func signIn(t *testing.T, c *http.Client, base string) {
 	state := loc.Query().Get("state")
 	resp.Body.Close()
 
-	resp = getURL(t, c, base+"/auth/github/callback?code=c&state="+state)
+	resp = getURL(t, c, base+"/auth/github/callback?code="+code+"&state="+state)
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("callback status = %d", resp.StatusCode)
 	}

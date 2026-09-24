@@ -109,6 +109,64 @@ func TestDeviceAuthorizationEndToEnd(t *testing.T) {
 	}
 }
 
+// The verification GET binds the code to the session and carries no CSRF token.
+// That is recorded here as a decision rather than left as an accident, because the
+// obvious fixes are worse than the gap:
+//
+//   - it cannot elevate privilege. Approving needs a CSRF token and a signed-in
+//     session of its own, so an attacker who induces this GET still cannot decide
+//     anything;
+//   - requiring CSRF here would be circular: this response is where the frontend
+//     obtains the CSRF token it uses for the decision;
+//   - what it does allow is planting handle_device_<code> keys in a signed-in
+//     session, one per cross-site top-level navigation, and the page the victim
+//     lands on shows the client and the scopes about to be approved.
+//
+// Moving the binding to the decision POST would drop the guarantee that the code
+// the user approved is one this browser displayed. That is a design call, not a
+// hardening step, so the behaviour is pinned rather than changed.
+func TestDeviceVerificationBindsWithoutCSRF(t *testing.T) {
+	base, _ := newFlowEnv(t)
+	browser := newBrowser(t)
+
+	start := decodeResp(t, postForm(t, browser, base+"/oauth/device_authorization", url.Values{
+		"client_id": {"cli"}, "scope": {"account.id"},
+	}))
+	code, _ := start["user_code"].(string)
+	if code == "" {
+		t.Fatal("no user_code was issued")
+	}
+
+	signIn(t, browser, base)
+
+	// A GET a cross-site navigation could make: no CSRF header at all.
+	resp := getURL(t, browser, base+"/v1/device/verification?user_code="+url.QueryEscape(code))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("verification = %d, want 200", resp.StatusCode)
+	}
+	csrf, _ := decodeResp(t, resp)["csrf_token"].(string)
+
+	// It bound, so the decision succeeds — the pinned behaviour. The decision
+	// still had to present the CSRF token from this same session.
+	body, _ := json.Marshal(map[string]any{
+		"user_code": code,
+		"decision":  "approve",
+		"scopes":    []string{"account.id"},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/device/decision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	decided, err := browser.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decided.Body.Close()
+	if decided.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(decided.Body)
+		t.Fatalf("decision = %d: %s", decided.StatusCode, raw)
+	}
+}
+
 // The verification page is a browser surface: it must require a session, and a
 // code loaded in one browser must not be approvable from another.
 func TestDeviceDecisionIsBoundToBrowser(t *testing.T) {
