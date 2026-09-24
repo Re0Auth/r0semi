@@ -1,0 +1,20 @@
+# Gitleaks configuration.
+#
+# The default ruleset is extended, not replaced: this file adds only what the
+# default gets wrong for this repository. An allowlist that is broad enough to be
+# convenient is an allowlist that stops catching things, so the exemption below
+# is scoped as tightly as the false positive it exists to silence.
+
+title = "r0semi / Re0Auth"
+
+[extend]
+useDefault = true
+
+# The adversarial audit reports quote the output of failing tests as evidence —
+# full JSON token responses, so a reader can see what the hole actually produced.
+# Those tokens came from a throwaway local run and were never valid anywhere, but
+# the default generic-api-key rule reads their entropy as a secret. Only the audit
+# reports are exempt; every other path stays under the full ruleset.
+[[allowlists]]
+description = "Proof-of-concept output quoted in the adversarial audit reports"
+paths = ['''docs/security-audit-\d+\.md''']

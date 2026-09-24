@@ -170,6 +170,80 @@ jobs:
         run: |
           go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
           cyclonedx-gomod mod -json -output sbom.cdx.json
-          components=$(grep -c '"type": *"library"' sbom.cdx.json)
+          components=$(grep -c '"type": "library"' sbom.cdx.json)
           echo "sbom components: $components"
           test "$components" -gt 10
+
+  lint:
+    # Static analysis as its own gate. It needs no Postgres, no Node and no
+    # frontend build, so it is the fastest job to fail and it says exactly one
+    # thing when it does.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Installed from source and pinned, like govulncheck. The version is fixed
+      # rather than floating on @latest: an unpinned linter turns a green build
+      # red on someone else's release schedule, and a gate that fails for reasons
+      # unrelated to the change is a gate people delete. Configuration, and the
+      # reasoning for the rules it enables, is in .golangci.yml.
+      - name: golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          "$(go env GOPATH)/bin/golangci-lint" run --timeout=5m ./...
+
+  secrets:
+    # A credential committed to a public repository is a credential to rotate, so
+    # this runs on every change rather than only at release. It scans the whole
+    # history, not just the diff, because a secret added yesterday and removed
+    # today is still in the repository.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 0: the full history. A shallow clone would scan only the tip and miss
+          # exactly the case this job exists for.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Installed from source and pinned. The module path is github.com/zricethezav/…
+      # rather than the canonical github.com/gitleaks/…: every released tag up to
+      # 8.30.1 still declares the old path in its go.mod, so the new path cannot
+      # be installed. The pinned tag is what matters; the path is an artifact of
+      # the project's rename. Configuration is in .gitleaks.toml.
+      - name: gitleaks
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          "$(go env GOPATH)/bin/gitleaks" detect --source . --redact --verbose --config .gitleaks.toml
+
+  image:
+    # The container image is a shipped artifact like the release archives, so it
+    # is built on every change rather than only at a tag: a Dockerfile that has
+    # never been built is a Dockerfile that does not work. The build is the
+    # assertion — a placeholder frontend or a missing embed would fail it.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: re0auth:ci
+          build-args: |
+            VERSION=ci
