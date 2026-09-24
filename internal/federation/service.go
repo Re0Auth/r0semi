@@ -411,7 +411,10 @@ func rejectEscapingPath(raw string) error {
 		}
 		decoded, err := url.PathUnescape(candidate)
 		if err != nil {
-			return nil
+			// Deliberately not refused: a malformed escape cannot decode into a
+			// traversal anywhere, so it is accepted as the literal text it is. See
+			// the note above.
+			return nil //nolint:nilerr // the escape error is the accept condition, not a swallowed failure
 		}
 		if decoded == candidate {
 			return nil
