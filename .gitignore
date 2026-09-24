@@ -44,3 +44,6 @@ config/re0auth.toml
 # usually not ours, and they bloat the repository. Link instead.
 docs/*.pdf
 *.pdf
+
+# IDE CLI
+.commandcode
