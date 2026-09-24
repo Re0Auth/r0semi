@@ -41,7 +41,7 @@ type fixture struct {
 	deviceID string
 }
 
-func newFixture(t *testing.T) fixture {
+func newFixture(t testing.TB) fixture {
 	t.Helper()
 	ctx := context.Background()
 
@@ -109,7 +109,7 @@ func newFixture(t *testing.T) fixture {
 	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID}
 }
 
-func get(t *testing.T, client *http.Client, u string) *http.Response {
+func get(t testing.TB, client *http.Client, u string) *http.Response {
 	t.Helper()
 	resp, err := client.Get(u)
 	if err != nil {
@@ -118,7 +118,7 @@ func get(t *testing.T, client *http.Client, u string) *http.Response {
 	return resp
 }
 
-func postToken(t *testing.T, srv, clientID, secret string, form url.Values) (map[string]any, int) {
+func postToken(t testing.TB, srv, clientID, secret string, form url.Values) (map[string]any, int) {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, srv+"/oauth/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -137,7 +137,7 @@ func postToken(t *testing.T, srv, clientID, secret string, form url.Values) (map
 }
 
 // codeFlow runs authorize -> login+consent -> callback -> token.
-func codeFlow(t *testing.T, f fixture, scopes []string) map[string]any {
+func codeFlow(t testing.TB, f fixture, scopes []string) map[string]any {
 	t.Helper()
 	ctx := context.Background()
 
@@ -393,4 +393,188 @@ func TestConsentInteraction(t *testing.T) {
 	if _, err := f.store.AuthRequestByID(ctx, denied.GetID()); err == nil {
 		t.Fatal("denied request was not discarded")
 	}
+}
+
+// O-7 says an unknown or unauthorised scope must be an error, not a silent
+// narrowing. The OIDC-standard scopes are the documented exception: the engine
+// accepts them for every relying party. But accepting one the *catalogue* cannot
+// describe must not turn into a failure later, in the middle of consent.
+func TestApproveToleratesStandardOIDCScopes(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	// Exactly what a stock OIDC relying party asks for.
+	scopes := []string{"openid", "email", "account.id"}
+	ar, err := f.store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+		ClientID:     f.webID,
+		RedirectURI:  "https://client.example/cb",
+		ResponseType: oidc.ResponseTypeCode,
+		Scopes:       oidc.SpaceDelimitedArray(scopes),
+		State:        "state-1234567890",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The consent screen submits back what it was able to render.
+	if _, err := f.handler.ApproveAuthorization(ctx, ar.GetID(), "usr_1",
+		[]oauth.Scope{"openid", "email", "account.id"}, nil); err != nil {
+		t.Fatalf("approving a standard OIDC scope set failed: %v", err)
+	}
+}
+
+// The consent screen renders the catalogue, and `openid` is not in it — it is a
+// protocol flag, not a data permission. So the screen never echoes it back, and
+// if the decision then replaces the request's scopes with the echoed list, the
+// authorization silently stops being an OpenID one: no `openid`, therefore no
+// id_token, for a client that asked for exactly that. The round trip must not be
+// able to drop it.
+func TestApproveKeepsOpenIDWhenTheConsentScreenOmitsIt(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	ar, err := f.store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+		ClientID:     f.webID,
+		RedirectURI:  "https://client.example/cb",
+		ResponseType: oidc.ResponseTypeCode,
+		Scopes:       oidc.SpaceDelimitedArray{"openid", "account.id"},
+		State:        "state-1234567890",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// What the screen can render is only the catalogue scope.
+	if _, err := f.handler.ApproveAuthorization(ctx, ar.GetID(), "usr_1",
+		[]oauth.Scope{oauth.ScopeAccountID}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	done, err := f.store.AuthRequestByID(ctx, ar.GetID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(done.GetScopes(), oidc.ScopeOpenID) {
+		t.Fatalf("granted scopes = %v, want openid preserved (otherwise no id_token)", done.GetScopes())
+	}
+	if !containsString(done.GetScopes(), "account.id") {
+		t.Fatalf("granted scopes = %v, want the approved catalogue scope", done.GetScopes())
+	}
+}
+
+// The refresh grant had no test in this package at all, so rotation was never
+// exercised end to end — which is how a two-step read-then-rotate could go
+// unnoticed. This asserts the ordinary path (a presented token is rotated and the
+// replacement works) so that tightening rotation into a claim cannot silently
+// break refreshing; the concurrent case is pinned deterministically in the store
+// tests, where the interleaving can be written out instead of raced.
+func TestRefreshGrantRotatesAndSpendsTheOldToken(t *testing.T) {
+	f := newFixture(t)
+	// offline_access is what makes the engine issue a refresh token at all.
+	tokens := codeFlow(t, f, []string{"openid", "account.id", "offline_access"})
+	first, _ := tokens["refresh_token"].(string)
+	if first == "" {
+		t.Fatalf("the code flow issued no refresh token: %v", tokens)
+	}
+
+	refresh := func(token string) (map[string]any, int) {
+		return postToken(t, f.server.URL, f.webID, "s3cret", url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {token},
+		})
+	}
+
+	rotated, status := refresh(first)
+	if status != http.StatusOK {
+		t.Fatalf("refresh status = %d: %v", status, rotated)
+	}
+	second, _ := rotated["refresh_token"].(string)
+	if second == "" || second == first {
+		t.Fatalf("rotation did not happen: first=%q second=%q", first, second)
+	}
+
+	// Spent, not merely superseded.
+	if _, status := refresh(first); status == http.StatusOK {
+		t.Fatal("the spent refresh token was accepted a second time")
+	}
+	// And the replacement is the live one, so the fix did not simply refuse
+	// everything.
+	if _, status := refresh(second); status != http.StatusOK {
+		t.Fatalf("the replacement refresh token was rejected: %d", status)
+	}
+}
+
+// OIDC Discovery 1.0 §3 requires `openid` to be supported and says the scopes
+// defined in OpenID Core SHOULD be listed when they are supported. A relying
+// party that negotiates from `scopes_supported` must be able to discover
+// `openid`, or it will never request it — and so never receive an id_token.
+func TestDiscoveryAdvertisesCoreOIDCScopes(t *testing.T) {
+	f := newFixture(t)
+
+	resp := get(t, noRedirect, f.server.URL+OIDCDiscoveryPath)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("discovery status = %d", resp.StatusCode)
+	}
+	var disc map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&disc); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := disc["scopes_supported"].([]any)
+	advertised := make(map[string]bool, len(raw))
+	for _, s := range raw {
+		if name, ok := s.(string); ok {
+			advertised[name] = true
+		}
+	}
+	// The catalogue's own scope must survive alongside the two added core scopes.
+	for _, want := range []string{"openid", "offline_access", "account.id"} {
+		if !advertised[want] {
+			t.Errorf("scopes_supported is missing %q (got %v)", want, raw)
+		}
+	}
+}
+
+// OAuth 2.1 requires PKCE on every authorization code request, confidential
+// clients included. The fixture's web client is confidential, so this is exactly
+// the case the engine would otherwise let through.
+func TestAuthorizeRequiresPKCE(t *testing.T) {
+	f := newFixture(t)
+
+	authz := func() url.Values {
+		return url.Values{
+			"response_type": {"code"},
+			"client_id":     {f.webID},
+			"redirect_uri":  {"https://client.example/cb"},
+			"scope":         {"account.id"},
+			"state":         {"state-1234567890"},
+		}
+	}
+	assertRejected := func(t *testing.T, v url.Values, what string) {
+		t.Helper()
+		resp := get(t, noRedirect, f.server.URL+"/oauth/authorize?"+v.Encode())
+		defer resp.Body.Close()
+		// A redirect, not a 400 body: once redirect_uri is validated, RFC 6749
+		// §4.1.2.1 says the client is told through the redirect.
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("%s: status = %d, want a redirect back to the client", what, resp.StatusCode)
+		}
+		loc, err := url.Parse(resp.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loc.Query().Get("error") != "invalid_request" {
+			t.Fatalf("%s: Location = %q, want error=invalid_request", what, resp.Header.Get("Location"))
+		}
+		if loc.Query().Get("state") != "state-1234567890" {
+			t.Fatalf("%s: state was not echoed: %q", what, loc)
+		}
+	}
+
+	assertRejected(t, authz(), "no challenge at all")
+
+	plain := authz()
+	plain.Set("code_challenge", "a-challenge-that-is-not-hashed")
+	plain.Set("code_challenge_method", "plain")
+	assertRejected(t, plain, "plain challenge method")
 }

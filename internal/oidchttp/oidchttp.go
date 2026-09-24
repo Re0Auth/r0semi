@@ -114,7 +114,7 @@ func New(cfg Config) (*Handler, error) {
 		CryptoKeyId:           cfg.CryptoKeyID,
 		CodeMethodS256:        true,
 		GrantTypeRefreshToken: true,
-		SupportedScopes:       cfg.Scopes,
+		SupportedScopes:       withCoreScopes(cfg.Scopes),
 		SupportedUILocales:    []language.Tag{language.English},
 		DeviceAuthorization: op.DeviceAuthorizationConfig{
 			Lifetime:     10 * time.Minute,
@@ -249,6 +249,47 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	bw.flush(w, body)
 }
 
+// withCoreScopes ensures the scopes OIDC itself defines are advertised.
+//
+// OIDC Discovery 1.0 §3 requires a server to support `openid` and says the scopes
+// defined in OpenID Core SHOULD be listed when they are supported. Leaving them
+// out does not break the library, which accepts them regardless of this list —
+// but it breaks relying parties: a client that negotiates from `scopes_supported`
+// would never request `openid`, and so would never receive an `id_token`, while
+// `offline_access` is accepted and can never be discovered. A capability that is
+// accepted but not advertised is the same class of surprise as one that is
+// advertised but not implemented, just with the parties swapped.
+func withCoreScopes(scopes []string) []string {
+	out := append([]string(nil), scopes...)
+	for _, s := range []string{oidc.ScopeOpenID, oidc.ScopeOfflineAccess} {
+		if !containsString(out, s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// splitProtocolScopes partitions a scope set into the ones the catalogue
+// describes and the OIDC-standard ones it deliberately does not.
+//
+// The catalogue is about data permissions. `openid` and `offline_access` are
+// protocol flags, and `profile` / `email` / the other claim scopes are accepted
+// as no-ops because the `userinfo` endpoint returns only `sub` (O-3). Both kinds
+// have to be understood in two places, and they must agree: at the authorize
+// entrance, where they are let past the catalogue check, and at the consent
+// decision, where they must not be handed to the catalogue or dropped from the
+// grant.
+func splitProtocolScopes(scopes []string) (described, protocol []string) {
+	for _, s := range scopes {
+		if standardOIDCScope(s) {
+			protocol = append(protocol, s)
+			continue
+		}
+		described = append(described, s)
+	}
+	return described, protocol
+}
+
 // validateAuthorize refuses an authorize request the library would answer either
 // by silently dropping scopes (op.ValidateAuthReqScopes) or with a plain-text
 // body (AuthRequestError for a redirect-disabled error). It returns true when it
@@ -276,6 +317,26 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 	redirectURI := q.Get("redirect_uri")
 	if redirectURI == "" || !client.AllowsRedirect(redirectURI) {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "the redirect_uri is not registered for this client")
+		return true
+	}
+	// OAuth 2.1 requires PKCE on every authorization code request, confidential
+	// clients included. The engine only demands it of a public client, so the
+	// requirement is enforced here rather than left to the library. The failure is
+	// a redirect, not a 400 body: once redirect_uri is validated, RFC 6749
+	// §4.1.2.1 says the client is informed through the redirect.
+	challenge := q.Get("code_challenge")
+	method := q.Get("code_challenge_method")
+	if challenge == "" || method != "S256" {
+		description := "code_challenge is required"
+		if challenge != "" {
+			description = "code_challenge_method must be S256"
+		}
+		params := map[string]string{
+			"error":             "invalid_request",
+			"error_description": description,
+			"state":             q.Get("state"),
+		}
+		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
 	}
 	rawScope := q.Get("scope")
@@ -499,8 +560,25 @@ func (h *Handler) ApproveAuthorization(ctx context.Context, id, subject string, 
 			}
 			granted = append(granted, sc.String())
 		}
+		// The consent screen renders the catalogue, so it cannot echo a protocol
+		// scope back — `openid` decides whether an id_token is issued at all and is
+		// not a data permission, so it never appears there. Re-attach the protocol
+		// scopes the client asked for; otherwise a decision silently downgrades an
+		// OpenID authorization to a plain OAuth one, and a client that requested
+		// `openid` gets a response with no id_token in it.
+		_, protocol := splitProtocolScopes(requested)
+		for _, s := range protocol {
+			if !containsString(granted, s) {
+				granted = append(granted, s)
+			}
+		}
 	}
-	descriptors, err := h.registry.Resolve(toScopeList(granted), ar.GetClientID())
+	// Only the scopes the catalogue describes are resolved. It is what carries
+	// descriptors and explicit-consent requirements, and the protocol scopes are
+	// deliberately absent from it — resolving them would reject every standard
+	// relying party, whose default scope set is exactly `openid profile email`.
+	described, _ := splitProtocolScopes(granted)
+	descriptors, err := h.registry.Resolve(toScopeList(described), ar.GetClientID())
 	if err != nil {
 		return "", err
 	}
