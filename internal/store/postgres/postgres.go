@@ -123,7 +123,7 @@ func (db *DB) Migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("postgres: migrate: open database/sql handle: %w", err)
 	}
-	defer sqlDB.Close()
+	defer func() { _ = sqlDB.Close() }()
 
 	dir, err := fs.Sub(migrationsFS, "migrations")
 	if err != nil {
@@ -165,7 +165,7 @@ func adoptLegacyMigrations(ctx context.Context, sqlDB *sql.DB, provider *goose.P
 	if err != nil {
 		return fmt.Errorf("postgres: migrate: read legacy rows: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type legacyRow struct {
 		filename  string

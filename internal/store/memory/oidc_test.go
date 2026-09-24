@@ -88,7 +88,7 @@ func TestDeviceDecisionNarrowsAndCannotWiden(t *testing.T) {
 
 func TestUnknownDeviceCodeIsNotFound(t *testing.T) {
 	store, _ := testStore(t)
-	if _, err := store.DescribeDeviceAuthorization(context.Background(), "NOPE-NOPE"); err != oauth.ErrDeviceNotFound {
+	if _, err := store.DescribeDeviceAuthorization(context.Background(), "NOPE-NOPE"); !errors.Is(err, oauth.ErrDeviceNotFound) {
 		t.Fatalf("err = %v, want ErrDeviceNotFound", err)
 	}
 }

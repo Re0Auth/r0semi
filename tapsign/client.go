@@ -47,10 +47,10 @@ func (c *client) Verify(ctx context.Context, cred Credential) error {
 	}
 	defer drain(resp)
 
-	switch {
-	case resp.StatusCode == http.StatusOK:
+	switch resp.StatusCode {
+	case http.StatusOK:
 		return nil
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+	case http.StatusUnauthorized, http.StatusForbidden:
 		return ErrInvalidCredential
 	default:
 		return fmt.Errorf("tapsign: verify: unexpected status %d", resp.StatusCode)
@@ -87,8 +87,8 @@ func (c *client) rotate(ctx context.Context, cred Credential) (Credential, error
 	}
 	defer drain(resp)
 
-	switch {
-	case resp.StatusCode == http.StatusOK:
+	switch resp.StatusCode {
+	case http.StatusOK:
 		var out struct {
 			SessionToken string `json:"sessionToken"`
 		}
@@ -99,7 +99,7 @@ func (c *client) rotate(ctx context.Context, cred Credential) (Credential, error
 			return Credential{}, errors.New("tapsign: rotate: upstream returned an empty sessionToken")
 		}
 		return Credential{SessionToken: out.SessionToken, ObjectID: cred.ObjectID}, nil
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+	case http.StatusUnauthorized, http.StatusForbidden:
 		return Credential{}, ErrInvalidCredential
 	default:
 		return Credential{}, fmt.Errorf("tapsign: rotate: unexpected status %d", resp.StatusCode)
@@ -161,7 +161,9 @@ func (c *client) Redeem(ctx context.Context, tok TapTapToken) (Credential, error
 			},
 		},
 	}
-	resp, err := c.doJSON(ctx, http.MethodPost, "/users", body)
+	// redeemResult owns the body: it drains and closes it on the success path,
+	// and on the error path resp is nil because doJSON returned no response.
+	resp, err := c.doJSON(ctx, http.MethodPost, "/users", body) //nolint:bodyclose // closed inside redeemResult
 	cred, rerr := redeemResult(resp, err)
 	if rerr != nil {
 		return Credential{}, c.finish(ctx, "tapsign.redeem", identity, rerr)

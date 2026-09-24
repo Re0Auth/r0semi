@@ -123,9 +123,10 @@ func New(cfg Config) (*Compressor, error) {
 		seen[name] = true
 		c.names = append(c.names, name)
 		// Touch the constructor once: a coding that cannot be built must fail at
-		// startup, not mid-response.
+		// startup, not mid-response. The close is just the probe's teardown, so
+		// its error carries nothing the caller could act on.
 		w := e.New()
-		w.Close()
+		_ = w.Close()
 		enc := e
 		c.pools[name] = &sync.Pool{New: func() any { return enc.New() }}
 	}

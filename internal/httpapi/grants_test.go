@@ -70,16 +70,6 @@ func grantFlow(t *testing.T, browser *http.Client, base, verifier, scope string)
 	return tokens.AccessToken, tokens.Scope, csrf
 }
 
-func currentUserID(t *testing.T, browser *http.Client, base string) string {
-	t.Helper()
-	view := decodeResp(t, getURL(t, browser, base+"/v1/sessions/current"))
-	id, _ := view["user_id"].(string)
-	if id == "" {
-		t.Fatalf("no user id in the session view: %v", view)
-	}
-	return id
-}
-
 func grantsOf(t *testing.T, browser *http.Client, base string) []map[string]any {
 	t.Helper()
 	resp := getURL(t, browser, base+"/v1/grants")

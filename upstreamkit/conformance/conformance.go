@@ -22,6 +22,12 @@ import (
 	"github.com/Re0Auth/r0semi/upstreamkit"
 )
 
+// closeBody closes a response body and discards the error. This client owns each
+// response for the duration of one check; a Close error on a body it has already
+// finished reading is not actionable, while leaving the body open would leak a
+// connection across the many requests a conformance run makes.
+func closeBody(resp *http.Response) { _ = resp.Body.Close() }
+
 // Level classifies a finding.
 type Level string
 
@@ -127,7 +133,7 @@ func (r *runner) checkDiscovery() (upstreamkit.Discovery, bool) {
 		r.err("discovery.present", "request failed: %v", err)
 		return upstreamkit.Discovery{}, false
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 	if resp.StatusCode != http.StatusOK {
 		r.err("discovery.present", "status %d, want 200", resp.StatusCode)
 		return upstreamkit.Discovery{}, false
@@ -179,7 +185,7 @@ func (r *runner) checkOAuthMetadata() {
 		r.warn("oauth.metadata", "authorization server metadata not reachable; inline endpoints are assumed")
 		return
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	var doc struct {
 		CodeChallengeMethods []string `json:"code_challenge_methods_supported"`
@@ -214,7 +220,7 @@ func (r *runner) checkAuthorizeRejectsUnknownClient() {
 		r.err("authorize.reachable", "request failed: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 	switch {
 	case resp.StatusCode/100 == 3:
 		r.err("authorize.rejects_unknown_client", "redirected (status %d) instead of returning an error", resp.StatusCode)
@@ -237,7 +243,7 @@ func (r *runner) checkTokenRejectsBadGrant() {
 		r.err("token.reachable", "request failed: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 	if resp.StatusCode/100 == 2 {
 		r.err("token.rejects_bad_grant", "a bogus grant was accepted with status %d", resp.StatusCode)
 	}
@@ -251,7 +257,7 @@ func (r *runner) checkRevocationEndpoint() {
 		r.err("revoke.reachable", "request failed: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 	if resp.StatusCode == http.StatusNotFound {
 		r.err("revoke.present", "revocation endpoint is missing")
 	}
@@ -284,7 +290,7 @@ func (r *runner) checkCascadeEndpoint(disc upstreamkit.Discovery) {
 		r.err("cascade.reachable", "request failed: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 	if resp.StatusCode == http.StatusNotFound {
 		r.err("cascade.present", "advertised but missing: %s", endpoint)
 	}
@@ -303,7 +309,7 @@ func (r *runner) checkDataPlane(disc upstreamkit.Discovery) {
 		r.err("account.reachable", "request failed: %v", err)
 	} else {
 		status := resp.StatusCode
-		resp.Body.Close()
+		closeBody(resp)
 		if status != http.StatusUnauthorized {
 			r.err("account.requires_auth", "status %d without a token, want 401", status)
 		}
@@ -319,7 +325,7 @@ func (r *runner) checkDataPlane(disc upstreamkit.Discovery) {
 			Subject string `json:"subject"`
 		}
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&account)
-		resp.Body.Close()
+		closeBody(resp)
 		switch {
 		case status != http.StatusOK:
 			r.err("account.read", "status %d, want 200", status)
@@ -338,11 +344,11 @@ func (r *runner) checkDataPlane(disc upstreamkit.Discovery) {
 			continue
 		}
 		status := resp.StatusCode
-		resp.Body.Close()
-		switch {
-		case status == http.StatusOK:
+		closeBody(resp)
+		switch status {
+		case http.StatusOK:
 			// ok
-		case status == http.StatusForbidden:
+		case http.StatusForbidden:
 			r.skip("resource."+res.Name, "token lacks %s; skipped", res.Scope)
 		default:
 			r.err("resource."+res.Name, "status %d, want 200 (or 403 if the token lacks the scope)", status)
@@ -356,7 +362,7 @@ func (r *runner) checkDataPlane(disc upstreamkit.Discovery) {
 		return
 	}
 	status, contentType := resp.StatusCode, resp.Header.Get("Content-Type")
-	resp.Body.Close()
+	closeBody(resp)
 	if status != http.StatusNotFound {
 		r.err("resource.unknown", "unknown resource returned %d, want 404", status)
 	} else if !strings.HasPrefix(contentType, "application/problem+json") {

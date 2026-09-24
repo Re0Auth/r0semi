@@ -360,7 +360,7 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	if err != nil {
 		return RawResult{}, fmt.Errorf("federation: raw %s: %w", src.Name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return RawResult{}, fmt.Errorf("federation: read raw %s: %w", src.Name, err)
@@ -385,7 +385,7 @@ func (s *service) fetchResource(ctx context.Context, src Source, resource, token
 	if err != nil {
 		return nil, fmt.Errorf("federation: source %s: %w", src.Name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return nil, fmt.Errorf("federation: read %s: %w", src.Name, err)

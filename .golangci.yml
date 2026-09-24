@@ -1,0 +1,53 @@
+# golangci-lint configuration.
+#
+# The gate is deliberately narrow and stable: the standard analyzer set plus a
+# few checks that catch mistakes this codebase is specifically exposed to
+# (leaked HTTP response bodies and error comparisons against sentinels). A
+# linter that turns a green build red on style drift is a linter people learn to
+# route around; every rule here is one a reviewer would raise anyway.
+#
+# `gofmt` is not configured here: it runs as its own step in CI and in
+# `make check`, so the two never disagree about formatting.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused. It is the set
+  # `golangci-lint run` enables with no configuration, so a developer running it
+  # by hand sees what CI sees.
+  default: standard
+  enable:
+    # bodyclose catches an http.Response whose Body is never closed, which leaks
+    # a connection from the shared pool. This service is a proxy with outbound
+    # clients, so it is a real hazard rather than a hypothetical one.
+    - bodyclose
+    # errorlint prefers errors.Is/As over == and type assertions. The domain is
+    # built on sentinel errors (oauth.ErrClientNotFound, tap signs.ErrInvalidCredential,
+    # federation's revocation outcomes), so a bare == silently stops matching the
+    # day one of them is wrapped.
+    - errorlint
+    # misspell catches typos in comments and literals.
+    - misspell
+    # nilerr catches `if err != nil { return nil }` — an error swallowed on the
+    # way out, which in a fail-closed service is the exact failure that must not
+    # be silent.
+    - nilerr
+    # nolintlint keeps the escape hatch honest: a //nolint must name the linter
+    # it silences and say why, so it cannot become a blanket amnesty.
+    - nolintlint
+    # unconvert catches conversions of a value to its own type, which are usually
+    # a sign of a half-finished refactor.
+    - unconvert
+
+  exclusions:
+    generated: lax
+    rules:
+      # Tests ignore Close errors on httptest response bodies as a matter of
+      # course; flagging every `defer resp.Body.Close()` in a fixture buries the
+      # findings that matter. Production code is still held to errcheck.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose

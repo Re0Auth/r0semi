@@ -9,8 +9,11 @@ import (
 func TestAllowEnforcesBurstThenRefills(t *testing.T) {
 	l := New(100, 2) // 100 events/second, burst 2
 
-	if !l.Allow("a") || !l.Allow("a") {
-		t.Fatal("the burst was not honoured")
+	if !l.Allow("a") {
+		t.Fatal("the first burst token was refused")
+	}
+	if !l.Allow("a") {
+		t.Fatal("the second burst token was refused")
 	}
 	if l.Allow("a") {
 		t.Fatal("allowed beyond the burst")

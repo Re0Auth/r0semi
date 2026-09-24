@@ -199,7 +199,7 @@ func (c *client) fetchAccount(ctx context.Context, kid, macKey string) (account,
 	if err != nil {
 		return account{}, fmt.Errorf("taptapoauth: user info request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return account{}, fmt.Errorf("taptapoauth: read user info: %w", err)
@@ -236,7 +236,7 @@ func (c *client) postForm(ctx context.Context, endpoint string, form url.Values)
 	if err != nil {
 		return nil, 0, fmt.Errorf("taptapoauth: request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return nil, 0, fmt.Errorf("taptapoauth: read response: %w", err)

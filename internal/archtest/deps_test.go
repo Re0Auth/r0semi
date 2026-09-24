@@ -1,6 +1,7 @@
 package archtest
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,7 +81,8 @@ func loadPackages() (map[string]pkgInfo, error) {
 	cmd.Dir = filepath.Dir(root)
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
 			return nil, &listError{err: err, stderr: string(ee.Stderr)}
 		}
 		return nil, err

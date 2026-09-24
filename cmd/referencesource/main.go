@@ -186,10 +186,3 @@ func newVault() (vault.Service, error) {
 	// for a reference source, not for production.
 	return vault.NewService(vault.NewMemoryRepo(), wrapper, audit.NewMemoryLogger())
 }
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}

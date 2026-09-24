@@ -82,7 +82,7 @@ func (s *service) postRevocation(ctx context.Context, src Source, endpoint strin
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("the source answered %d", resp.StatusCode)
 	}

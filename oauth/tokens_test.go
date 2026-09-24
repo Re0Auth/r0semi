@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -89,7 +90,7 @@ func TestMemoryStoreLookupsStillWork(t *testing.T) {
 	if got.Subject != "s" {
 		t.Fatalf("record = %+v", got)
 	}
-	if _, err := store.GetAccess(ctx, "other"); err != ErrTokenNotFound {
+	if _, err := store.GetAccess(ctx, "other"); !errors.Is(err, ErrTokenNotFound) {
 		t.Fatalf("lookup of a wrong token = %v, want ErrTokenNotFound", err)
 	}
 
@@ -99,7 +100,7 @@ func TestMemoryStoreLookupsStillWork(t *testing.T) {
 	if _, err := store.ConsumeCode(ctx, "code"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ConsumeCode(ctx, "code"); err != ErrTokenNotFound {
+	if _, err := store.ConsumeCode(ctx, "code"); !errors.Is(err, ErrTokenNotFound) {
 		t.Fatalf("second consume = %v, want ErrTokenNotFound", err)
 	}
 }
