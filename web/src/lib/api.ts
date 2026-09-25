@@ -395,12 +395,35 @@ async function call<T>(
 export const api = {
 	listIDPProviders: () => call<{ data: IDPProvider[] }>('GET', '/v1/idp/providers'),
 
-	currentSession: () => call<Session>('GET', '/v1/sessions/current'),
+	// The success shape is validated at the boundary, not merely asserted by the
+	// type parameter. TypeScript cannot check JSON, and a missing csrf_token here
+	// would turn every later write into an unexplainable 403.
+	currentSession: async () => {
+		const session = await call<Session>('GET', '/v1/sessions/current');
+		if (typeof session?.user_id !== 'string' || typeof session?.csrf_token !== 'string') {
+			throw new ApiError(
+				0,
+				local('malformed_response', 'session response is missing user_id or csrf_token')
+			);
+		}
+		return session;
+	},
 
 	signOut: (csrf: string) => call<void>('POST', '/v1/sessions/sign_out', { csrf }),
 
-	getAuthorizationRequest: (id: string) =>
-		call<AuthorizationRequest>('GET', `/v1/authorization_requests/${encodeURIComponent(id)}`),
+	getAuthorizationRequest: async (id: string) => {
+		const request = await call<AuthorizationRequest>(
+			'GET',
+			`/v1/authorization_requests/${encodeURIComponent(id)}`
+		);
+		if (typeof request?.id !== 'string' || !Array.isArray(request?.scopes)) {
+			throw new ApiError(
+				0,
+				local('malformed_response', 'authorization request is missing id or scopes')
+			);
+		}
+		return request;
+	},
 
 	decideAuthorizationRequest: (id: string, csrf: string, decision: AuthorizationDecision) =>
 		call<RedirectResult>('POST', `/v1/authorization_requests/${encodeURIComponent(id)}/decision`, {
