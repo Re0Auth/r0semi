@@ -23,9 +23,12 @@ addr   = "0.0.0.0:8080"
 cookie_secure = true
 
 # A per-client-address limit, for load shedding rather than quota enforcement.
-# "Address" is the peer address only, so everyone behind one NAT shares a bucket;
-# 0 disables the limiter, which is the right answer for a deployment that already
-# has one in front of it. rate_limit_burst is how many may arrive at once.
+# "Address" is the peer address only, so everyone behind one NAT shares a bucket —
+# and each plane keeps its own, so a flood of one kind of traffic cannot spend the
+# budget another kind needs: a business-plane flood must not be able to lock the same
+# address out of signing in. 0 disables the limiter, which is the right answer for a
+# deployment that already has one in front of it. rate_limit_burst is how many may
+# arrive at once.
 rate_limit       = 50
 rate_limit_burst = 100
 

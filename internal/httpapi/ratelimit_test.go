@@ -81,6 +81,51 @@ func TestRateLimitUsesEachPlanesErrorShape(t *testing.T) {
 	}
 }
 
+// One bucket per (plane, address). The harm a single bucket did is concrete: every
+// client in this test comes from one address (the test server sees 127.0.0.1), which
+// is what a NAT looks like, so a flood of business-plane reads used to spend the
+// budget the same address needed to reach the token endpoint.
+//
+// The order matters for the same reason the fix does: the second business request
+// asserts the bucket is actually empty — without it, a limiter that silently stopped
+// working would make the protocol assertion below pass for the wrong reason.
+func TestRateLimitIsolatesPlanesPerAddress(t *testing.T) {
+	srv := newLimitedServer(t)
+
+	first, err := http.Get(srv.URL + "/v1/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("first business request = %d, want 401", first.StatusCode)
+	}
+
+	spent, err := http.Get(srv.URL + "/v1/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spent.Body.Close()
+	if spent.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("the business bucket was not exhausted: %d, want 429", spent.StatusCode)
+	}
+
+	// The same address, a different plane: sign-in is not collateral damage.
+	resp, err := http.PostForm(srv.URL+"/oauth/token", url.Values{
+		"grant_type": {"bogus"}, "client_id": {"cli"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		t.Fatal("a flood on the business plane locked the same address out of the protocol plane")
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("protocol request = %d, want the handler's 400", resp.StatusCode)
+	}
+}
+
 func TestRateLimitProtocolPlaneUsesOAuthError(t *testing.T) {
 	srv := newLimitedServer(t)
 

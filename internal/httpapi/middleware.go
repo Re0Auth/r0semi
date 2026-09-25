@@ -296,7 +296,17 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		key := s.clientKey(r)
+		// One bucket per (plane, address), not one per address.
+		//
+		// The planes carry different traffic with different costs, and one address is
+		// routinely many people: everyone behind a NAT or an office egress shares it.
+		// With a single bucket, a client hammering business-plane reads spent the
+		// budget those same people needed to sign in — the flood took down the one
+		// thing this service exists to do. The cost of splitting is that an address
+		// can now hold one bucket per plane, so what it may spend in total is the
+		// configured rate times the number of planes; that is a bounded multiple of
+		// a number an operator already chose, rather than an unbounded one.
+		key := planeOf(r.URL.Path).String() + "|" + s.clientKey(r)
 		limit, remaining, reset := s.limiter.Status(key)
 		setRateLimitHeaders(w, limit, remaining, reset)
 		if !s.limiter.Allow(key) {
