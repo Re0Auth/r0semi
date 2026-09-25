@@ -401,6 +401,14 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		bw.header.Get("WWW-Authenticate") == "" {
 		bw.header.Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 	}
+	// RFC 6749 §5.2: when the client authenticated with the Authorization header
+	// and that authentication failed, the 401 must carry a challenge for the
+	// scheme it attempted. The library writes the 401 without one, so a standard
+	// client cannot tell a bad secret from a transport failure.
+	if bw.status == http.StatusUnauthorized && bw.header.Get("WWW-Authenticate") == "" &&
+		(r.URL.Path == "/"+pathToken || r.URL.Path == "/"+pathIntrospection || r.URL.Path == "/"+pathRevocation) {
+		bw.header.Set("WWW-Authenticate", `Basic realm="oauth"`)
+	}
 	bw.flush(w, body)
 }
 

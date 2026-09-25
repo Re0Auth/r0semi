@@ -306,6 +306,39 @@ func TestAdversarialMalformedPKCEValuesAreRejected(t *testing.T) {
 	}
 }
 
+// RFC 6749 §5.2: a 401 from a client-authenticated endpoint must carry a
+// challenge for the scheme the client attempted, or a standard client cannot
+// tell a bad secret from a transport failure.
+func TestAdversarialClientAuthFailureCarriesAChallenge(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{"/oauth/token", "/oauth/introspect", "/oauth/revoke"} {
+		form := url.Values{"token": {"x"}}
+		if path == "/oauth/token" {
+			// A refresh grant reaches client authentication before it looks at the
+			// token; an authorization_code grant would complain about the missing
+			// code first and never test the challenge.
+			form = url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"x"}}
+		}
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+path, strings.NewReader(form.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.SetBasicAuth(f.webID, "wrong-secret")
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := adversaryBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s with a bad secret = %d, want 401: %s", path, resp.StatusCode, body)
+		}
+		if challenge := resp.Header.Get("WWW-Authenticate"); !strings.HasPrefix(challenge, "Basic") {
+			t.Fatalf("%s 401 challenge = %q, want a Basic challenge", path, challenge)
+		}
+	}
+}
+
 // A protected resource's 401 must carry an RFC 6750 Bearer challenge, so a
 // standard RP can tell "this token is bad, refresh it" from a transport error.
 // userinfo is such a resource; neither the library nor this package's client-auth
