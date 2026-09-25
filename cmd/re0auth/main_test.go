@@ -359,6 +359,9 @@ func TestAuditKeyIsRequiredOnlyWhenDurable(t *testing.T) {
 	}
 	base := func() {
 		t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+		// An https issuer requires a Secure session cookie; the config loader
+		// refuses the pair otherwise (TestIssuerSchemeAndCookieSecureMustAgree).
+		t.Setenv("RE0AUTH_COOKIE_SECURE", "true")
 		t.Setenv("RE0AUTH_KEK", valid)
 		t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", valid)
 	}
@@ -449,6 +452,7 @@ func TestAuditReadSideIsGatedOnAnAllowlist(t *testing.T) {
 // public port. Pointing both at the same address would silently put it there.
 func TestInternalAddrMustDifferFromThePublicAddr(t *testing.T) {
 	t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+	t.Setenv("RE0AUTH_COOKIE_SECURE", "true")
 	t.Setenv("RE0AUTH_KEK", base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	t.Setenv("RE0AUTH_ADDR", "127.0.0.1:8080")
 
@@ -464,6 +468,39 @@ func TestInternalAddrMustDifferFromThePublicAddr(t *testing.T) {
 	}
 	if cfg.InternalAddr != "127.0.0.1:9090" {
 		t.Fatalf("internal_addr = %q, want 127.0.0.1:9090", cfg.InternalAddr)
+	}
+}
+
+// The session cookie's Secure flag and the issuer's scheme are one decision seen
+// from two settings, and nothing else in the process looks at both. The previous
+// treatment was documentation — the troubleshooting guide described the symptom
+// ("signed in, no session") — which is a foot-gun an operator walks into at the
+// least convenient moment.
+func TestIssuerSchemeAndCookieSecureMustAgree(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	t.Setenv("RE0AUTH_KEK", key)
+	t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", key)
+
+	t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+	t.Setenv("RE0AUTH_COOKIE_SECURE", "false")
+	if _, err := loadConfig(""); err == nil {
+		t.Fatal("an https issuer with an insecure session cookie was accepted")
+	}
+
+	// The deployment that says what it means is the one that works.
+	t.Setenv("RE0AUTH_COOKIE_SECURE", "true")
+	if _, err := loadConfig(""); err != nil {
+		t.Fatalf("an https issuer with a Secure cookie was refused: %v", err)
+	}
+
+	// And the plain-http direction is deliberately left alone: browsers send Secure
+	// cookies over http to localhost, so that is a working local setup asking for the
+	// production cookie shape — refusing it would be a gate that is wrong on a real
+	// workflow, which is how gates get routed around.
+	t.Setenv("RE0AUTH_ISSUER", "http://127.0.0.1:8080")
+	t.Setenv("RE0AUTH_COOKIE_SECURE", "true")
+	if _, err := loadConfig(""); err != nil {
+		t.Fatalf("a plain-http issuer with a Secure cookie was refused: %v", err)
 	}
 }
 

@@ -302,6 +302,23 @@ func loadConfig(path string) (settings, error) {
 	if !strings.HasPrefix(cfg.Issuer, "http://") && !strings.HasPrefix(cfg.Issuer, "https://") {
 		return settings{}, fmt.Errorf("server.issuer %q must be an absolute http(s) URL", cfg.Issuer)
 	}
+	// The session cookie's Secure flag has to agree with the issuer's scheme.
+	//
+	// This pair used to be documented rather than checked — the troubleshooting
+	// guide described the symptom ("signed in, no session") — and a documented
+	// foot-gun is one an operator walks into at the least convenient moment. The
+	// https-without-Secure direction is the one worth refusing: it is the
+	// production-shaped mistake, the cookie travels unprotected, and nothing else
+	// in the process looks at both settings.
+	//
+	// The other direction (http issuer, Secure cookie) is NOT refused: browsers
+	// send Secure cookies over plain http to localhost, so that is a working local
+	// setup asking for the production cookie shape, not a misconfiguration.
+	if strings.HasPrefix(cfg.Issuer, "https://") && !cfg.CookieSecure {
+		return settings{}, errors.New(
+			"server.cookie_secure must be true when server.issuer is https; " +
+				"the session cookie would be sent without the Secure attribute")
+	}
 	// Rate limiting. Resolved before anything else that could fail, so a typo in
 	// these numbers is reported rather than quietly replaced by a default.
 	rateLimit := defaultRateLimit
