@@ -327,11 +327,17 @@ jobs:
           fi
 
   fuzz:
-    # A short, time-boxed fuzz pass on the parsers that read attacker-influenced
-    # bytes: the raw-path join and the protocol response parsing. The seed corpus
-    # also runs under the ordinary `go test` job; this job is the one that
-    # explores beyond it, which is what finds the input nobody imagined. A crash
-    # it finds is reproduced from the corpus and then pinned as a normal test.
+    # A short, time-boxed fuzz pass on EVERY target in the repo: the parsers that
+    # read attacker-influenced bytes — the raw-path join, protocol response parsing,
+    # discovery-document handling, the PKCE value, the redirect builder, the JSONP
+    # unwrapper. The seed corpus also runs under the ordinary `go test` job; this job
+    # is the one that explores beyond it, which is what finds the input nobody
+    # imagined. A crash it finds is reproduced from the corpus and then pinned as a
+    # normal test.
+    #
+    # It lists every target rather than a sample. Two targets used to be here while
+    # eight others existed, and a target that only ever sees its seed corpus never
+    # explores anything — the gate said "the parsers" and covered the two.
     #
     # Time-boxed so the gate stays cheap. It lands on the release gate too
     # (release.yml calls this workflow): a published binary should not be the
@@ -346,11 +352,29 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: fuzz the raw-path join
-        run: go test -fuzz=FuzzCleanRawPath -fuzztime=30s ./internal/federation/
-
-      - name: fuzz protocol response parsing
-        run: go test -fuzz=FuzzTokenErrorCode -fuzztime=30s ./internal/oidchttp/
+      # One `go test -fuzz` per target: the tool fuzzes exactly one at a time. The
+      # loop is `set -e`, so a target that was renamed or deleted fails the job
+      # instead of quietly dropping out of the gate — which is how the eight above
+      # came to be missing in the first place.
+      - name: fuzz every target
+        run: |
+          set -euo pipefail
+          while IFS=: read -r pkg target; do
+            echo "::group::fuzz ${target} (${pkg})"
+            go test -fuzz="${target}" -fuzztime=20s "${pkg}"
+            echo "::endgroup::"
+          done <<'TARGETS'
+          ./idp:FuzzStripJSONP
+          ./oauth:FuzzBuildRedirect
+          ./internal/federation:FuzzCleanRawPath
+          ./internal/federation:FuzzRejectEscapingPath
+          ./internal/federation:FuzzValidateRawBase
+          ./internal/oidchttp:FuzzTokenErrorCode
+          ./internal/oidchttp:FuzzIsOAuthErrorBody
+          ./internal/oidchttp:FuzzStripUnsupportedDiscoveryFields
+          ./internal/oidchttp:FuzzValidPKCEValue
+          ./internal/oidchttp:FuzzDuplicatedParam
+          TARGETS
 
   lint:
     # Static analysis as its own gate. It needs no Postgres, no Node and no
