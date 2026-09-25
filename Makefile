@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test bench check e2e play dist sbom checksums release docker clean
+.PHONY: all web build test bench check lint e2e play dist sbom checksums release docker clean
 
 all: web build
 
@@ -40,7 +40,7 @@ bench:
 e2e: web
 	cd web && pnpm exec playwright install chromium && pnpm exec playwright test
 
-check:
+check: lint
 	@unformatted=$$(gofmt -l .); \
 	if [ -n "$$unformatted" ]; then echo "not gofmt'd:"; echo "$$unformatted"; exit 1; fi
 	go vet ./...
@@ -48,6 +48,22 @@ check:
 	# so `make check` fails on a layering violation without running the full suite.
 	go test ./internal/archtest/
 	cd web && pnpm run check
+
+# Static analysis, the same linter the CI job of the same name runs. The version
+# is pinned to what that job installs (v2.14.0): a newer one may be installed by
+# hand, but the gate people run locally has to be the gate CI will apply.
+#
+# It is a hard requirement of `check`, not "run it if you have it". The point of
+# `check` is that green here means green in CI, and a gate that quietly skips the
+# linter is the same failure mode as a test that skips when a dependency is
+# missing — which is exactly what this target was added to stop.
+LINT ?= golangci-lint
+lint:
+	@command -v $(LINT) >/dev/null 2>&1 || { \
+		echo "golangci-lint is not on PATH; install the version CI pins with:"; \
+		echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0"; \
+		exit 1; }
+	$(LINT) run --timeout=5m ./...
 
 # Frontend dev server with hot reload (Vite on :5173).
 #

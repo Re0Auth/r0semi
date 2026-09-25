@@ -16,7 +16,19 @@
 gofmt -l .        # 必须为空
 go vet ./...
 go test ./...
+golangci-lint run --timeout=5m ./...
 ```
+
+静态检查器要装成 CI 固定的那个版本——版本不对齐的 linter 会在他人的发布节奏上把绿变红，
+而 `.golangci.yml` 里每条规则的理由都以那个版本为准：
+
+```sh
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+```
+
+`make check` 把上面这些串成一个入口（外加 `internal/archtest` 的依赖防火墙与前端
+`svelte-check`）。**linter 是硬要求**：没装就拒绝运行并打印上面那条安装命令，与 `sbom`
+对 SBOM 生成器的做法一致——本地绿必须等于 CI 绿，跳过 linter 的绿是假的。
 
 单元测试使用内存实现，**任何平台都能跑，不需要数据库**。
 
