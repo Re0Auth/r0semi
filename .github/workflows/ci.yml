@@ -326,6 +326,29 @@ jobs:
             exit 1
           fi
 
+  load:
+    # The capacity profile: concurrent load against a real HTTP server on the
+    # in-memory stores, reporting throughput and the latency tail. It runs on every
+    # change for the same reason `bench` does — a harness that quietly stopped
+    # running should fail here, not be discovered when somebody asks for a number.
+    #
+    # The figures are reported rather than thresholded, like `bench`. The harness
+    # itself fails when it completed no work, so a green job means numbers exist,
+    # and it appends its table to the job summary so the numbers are readable in
+    # the CI UI without opening the log.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: capacity profile
+        run: make load
+
   fuzz:
     # A short, time-boxed fuzz pass on EVERY target in the repo: the parsers that
     # read attacker-influenced bytes — the raw-path join, protocol response parsing,

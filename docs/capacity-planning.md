@@ -9,6 +9,7 @@
 | 量 | 出处 | 默认 |
 |---|---|---|
 | 单请求成本 | `internal/httpapi/bench_test.go`（`make bench`） | 需在目标机器上现测 |
+| 并发下的吞吐与尾巴 | `internal/httpapi/load_test.go`（`make load`） | 需在目标机器上现测 |
 | 连接池上限 | `postgres.PoolOptions.MaxConns` | `16` / 进程 |
 | 连接池下限 | `PoolOptions.MinConns` | `2` |
 | 语句超时 | `PoolOptions.StatementTimeout` | `30s` |
@@ -30,6 +31,41 @@ make bench     # go test -run '^$' -bench . -benchmem ./...
 **注意基准跑在内存存储上**（`Makefile` 顶部已注明）：真实 Postgres 部署会在每次请求里多加
 若干次数据库往返。所以把基准当作**单副本吞吐的上界**，真实值用面板里的 rate 与 CPU 利用率反推：
 `每副本 QPS ≈ 观察到的 QPS / 副本数`，再与 limit 的 CPU 对照决定何时加副本。
+
+### 并发下的吞吐与尾巴（`make load`）
+
+`bench` 一次打一个请求，回答"单请求多贵"；容量画像把同一个服务放进并发里，回答运维真正问的两件事：
+每秒能答多少、慢尾巴有多长。8 个 worker 各自先走一遍完整的授权码流程拿到自己的令牌，然后在
+`GET /v1/me`（不透明 bearer → 内省）与 `POST /oauth/introspect` 之间交替；真实 HTTP 连接、
+内存存储、默认 10s。
+
+```sh
+make load                                                    # CI 的默认值：8 workers × 10s
+RE0AUTH_LOAD_WORKERS=32 RE0AUTH_LOAD_SECONDS=30 make load    # 压得更狠一点
+```
+
+一次在开发机上的实测（Windows / GOMAXPROCS 20 / 8 workers × 10s，**内存存储**）：
+
+```
+capacity profile: 8 workers, 10s, 237824 requests, 23782.4 req/s
+  GET  /v1/me            n=118912  p50=<1.013ms  p95=<1.013ms  p99=1.11ms  max=11.57ms
+  POST /oauth/introspect n=118912  p50=<1.013ms  p95=1.03ms    p99=1.17ms  max=10.53ms
+  goroutines 3 -> 9, heap 6.0 MiB, clock 1.013ms, GOMAXPROCS 20
+```
+
+读法有三条，缺一条都会把数字读错：
+
+1. **仍然是内存存储的上界**，理由与 §1 相同：真实 Postgres 部署每次请求多几次往返，把它当"天花板在哪"。
+2. **这台机器的单调时钟只有约 1ms 分辨率**（画像自己会把 `clock:` 打出来），所以标着 `<1ms` 的地方是
+   **量不出来**，不是"很快"；真实尾巴数字要用 Linux CI（那份表会写进 job summary）。这也正是画像把
+   时钟粒度写进结果的原因——一张全是 0 的表看起来像结果，其实只是时钟。
+3. **画像自身需要连接池**：用 `http.DefaultClient`（每个 host 只保留 2 条空闲连接）会让并发下的连接
+   反复建立与关闭，几万条 TIME_WAIT 之后**下一次运行**直接失败（Windows 上表现为 "only one usage of
+   each socket address"）——那是夹具在量自己的抖动，不是服务故障。`load_test.go` 用的是按 worker 数
+   配好池的客户端，注释里记了这段。
+
+CI 每次都跑并把这张表写进 job summary（`GITHUB_STEP_SUMMARY`）：数字会随机器与代码变化，**能比较的
+前提是它一直存在**——与 `bench` 同一条理由，画像不因一次慢跑而失败，但"什么都没测到"会失败。
 
 ## 2. Postgres 连接预算
 

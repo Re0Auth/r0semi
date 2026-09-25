@@ -34,6 +34,18 @@ test:
 bench:
 	go test -run '^$$' -bench . -benchmem ./...
 
+# The capacity profile: concurrent load against a real HTTP server on the in-memory
+# stores, reporting throughput and the latency tail rather than ns/op. Like `bench`
+# it reports instead of thresholding — a capacity gate that fails on a slow runner
+# is a gate people delete — but the run itself fails if it completed no work, so a
+# green result cannot mean "nothing was measured".
+#
+# RE0AUTH_LOAD_SECONDS / RE0AUTH_LOAD_WORKERS tune it; the defaults (10s, 8) are
+# what CI runs. Numbers from a run go into docs/capacity-planning.md's framing:
+# in-memory stores make this a ceiling, not a promise.
+load:
+	RE0AUTH_LOAD_PROFILE=1 go test -count=1 -v -run TestLoadProfile ./internal/httpapi/
+
 # Browser tests. They build and start their own re0auth plus a fake identity
 # provider, so nothing else needs to be running — and there is no test-only way
 # to obtain a session, which is why the suite is worth having.
