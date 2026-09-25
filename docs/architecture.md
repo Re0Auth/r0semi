@@ -508,7 +508,7 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 
 | 关注点 | 做法 |
 |---|---|
-| 迁移 | `embed.FS` 内嵌 SQL + `schema_migrations` + `pg_advisory_lock`（多实例同时启动不打架） |
+| 迁移 | `embed.FS` 内嵌 SQL + goose + `pg_advisory_lock`（多实例同时启动不打架）；兼容性与回滚见 [migration-decision.md](./migration-decision.md)（ADR-0008） |
 | 令牌落盘 | 全部按键 `sha256(value)`，**明文永不入库**；测试直接查表断言。
   会话 cookie 同理（`sessions.token_hash`）——否则一张表泄露就是一整套可用会话 |
 | 凭据落盘 | 只存不透明密文材料；测试驱动真实信封加密写表，再把整行 dump 出来搜明文（并防空断言） |
@@ -605,7 +605,7 @@ signature = HMAC-SHA256(key, row_hash)
   - 改行 → `row_hash` 重算不出来
   - 链中间删行 / 换序 → 后一行的 `prev_hash` 指向空
   - **重写整条链** → 哈希可以重算，但**签名伪造不出来**（密钥不在库里）
-  - **从尾部删行 → 挡不住**。截断在没有外部锚点（把链头送去另一个系统）时是不可见的。这是已知边界，不假装覆盖。
+  - **从尾部删行 → 就地验证挡不住**。截断在没有外部锚点（把链头送去另一个系统）时不可见——尾部只是变短，剩余每一环都仍成立。`GET /v1/admin/audit/head` 把当前链头以十六进制暴露给外部系统，由部署方发布到库外的另一处存储；不发布则维持原有的较弱保证。导出侧由 `GET /v1/admin/audit` 读 API 承担（供 SIEM 拉取）。
 - **签名逐行做，不是定期对链头做**：每行都签比只签周期性链头更强，且少一张表。原计划里的 `audit_chain_checkpoints` 因此没有落地。
 - **迁移前的行** `row_hash IS NULL`，被验证器计为 `legacy` 而**不是**假装覆盖；链从迁移后的第一行开始。另外，**链开始之后**再出现无哈希的行会被判为违规——否则攻击者把某行的哈希清空就能把它降级成「legacy」跳过。
 - **内存模式没有链**：`audit.MemoryLogger` 是环形缓冲，本身就不是防篡改结构，给它加链是自欺。链是**持久化 sink 的属性**，因此 `RE0AUTH_AUDIT_KEY` 只在持久化部署里必填。

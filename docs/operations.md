@@ -1,7 +1,8 @@
 # 运维手册
 
 > 决策与理由见 [operations-decision.md](./operations-decision.md)（ADR-0006）。
-> 这里只有可执行的步骤。
+> 事故整体流程见 [incident-response.md](./incident-response.md)，逐条告警处置见 [runbooks.md](./runbooks.md)，
+> 容量与连接预算见 [capacity-planning.md](./capacity-planning.md)。这里只有可执行的步骤。
 
 ## 部署
 
@@ -31,14 +32,36 @@ curl -fsS https://auth.example.com/readyz
 
 ## 备份与恢复
 
+数据库与密钥是**两份**备份，缺一不可：没有 KEK，转储里的每条 vault 记录都打不开。
+
 ```sh
+# 1) 数据库
 DATABASE_URL=... ./scripts/backup.sh /backups
+# 2) 四把密钥（KEK / OIDC 签名 / OIDC 令牌 / 审计链）
+RE0AUTH_KEK=... RE0AUTH_OIDC_TOKEN_KEY=... \
+RE0AUTH_OIDC_SIGNING_KEY=... RE0AUTH_AUDIT_KEY=... \
+BACKUP_AGE_RECIPIENT=age1... ./scripts/backup-keys.sh /backups
+# 3) 恢复（数据库部分进空库）
 DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backups/re0auth-....dump.age
 ```
 
 - 建议每 15 分钟一次逻辑备份或持续 WAL 归档；目标 RPO ≤ 15 分钟，RTO ≤ 1 小时。
-- **恢复演练每季度一次**，并记录：恢复耗时、`/readyz` 结果、一次真实登录结果。
+- **恢复演练每季度一次**，并记录：恢复耗时、`/readyz` 结果、一次真实登录结果
+  （模板见 [incident-response.md](./incident-response.md) §6）。
 - 恢复只能进空库；`restore.sh` 会在目标已有表时拒绝执行。
+
+### DR 密钥恢复（整站丢失）
+
+四把密钥只在环境 / k8s Secret 里，**不在任何数据库备份里**——整站丢失时，光有数据库转储是不可恢复的。
+`scripts/backup-keys.sh` 把 `RE0AUTH_KEK`、`RE0AUTH_OIDC_TOKEN_KEY`、`RE0AUTH_OIDC_SIGNING_KEY`、
+`RE0AUTH_AUDIT_KEY`（以及轮换进行中的 retired 集合）写成 `0600` 的 `.env`，`BACKUP_AGE_RECIPIENT`
+存在时用 age 加密，并附 sha256 校验。
+
+- **密钥备份必须放在数据库备份够不到的地方**（另一个凭据域 / 账号），否则一次凭据泄露会同时拿走密文与钥匙。
+- `vault.retired`（配置里的旧 KEK）不在环境变量里；轮换进行中要连同配置的 retired 段一起归档，
+  否则仍被旧 key 包裹的记录会变得不可读。
+- 丢失后果：KEK 丢失 → 上游凭据永久不可恢复；审计 key 丢失 → 链无法再校验；
+  OP 两把 key 丢失 → 在途 `id_token` 全部失效、access token 不可读（等于全站登出）。
 
 ## 密钥轮换
 
@@ -81,3 +104,10 @@ DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backu
 2. 在 staging 跑一次恢复演练到新版本；
 3. 滚动更新（PDB 保证至少一个可用副本），观察 `/readyz`、错误率与 429/503；
 4. 数据库迁移在启动时执行，多实例由 advisory lock 串行化；迁移前先做一次备份。
+   迁移的兼容性规则与回滚策略见 [migration-decision.md](./migration-decision.md)（ADR-0008）：
+   同一版本只做加法，破坏性变更延后一版；**回滚 = 从备份恢复**，`re0auth -migrate-down`
+   只用于撤销最近一步。
+
+## 容量
+
+一个副本能扛多少、要开几个副本、Postgres 连接够不够，见 [capacity-planning.md](./capacity-planning.md)。
