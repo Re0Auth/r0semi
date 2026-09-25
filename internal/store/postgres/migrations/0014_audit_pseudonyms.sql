@@ -31,7 +31,7 @@
 -- Rows written before this migration keep whatever they already had. They are not
 -- rewritten, because rewriting them would either invalidate the hashes written
 -- over the old value (breaking 0013's chain) or require an in-Go data migration at
--- startup. See docs/architecture.md §4.15.
+-- startup. See docs/architecture.md §4.17.
 
 CREATE TABLE audit_subject_keys (
     idx text  PRIMARY KEY,

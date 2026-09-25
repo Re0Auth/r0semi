@@ -119,7 +119,7 @@ dsn_env = "DATABASE_URL"
 # Every audit row is chained to the one before it and signed with this key, so the
 # log cannot be rewritten undetectably even by someone with full access to the
 # database — they can recompute the hashes but cannot forge the signature. See
-# docs/architecture.md §4.14 for exactly what it does and does not cover
+# docs/architecture.md §4.16 for exactly what it does and does not cover
 # (deleting rows from the END is not detectable without an external anchor).
 #
 # Memory mode needs no key: the in-memory log is a bounded ring buffer that is not

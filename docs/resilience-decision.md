@@ -140,7 +140,7 @@
 
 - [dependencies.md](./dependencies.md) §1（`failsafe-go` 一行）、§3（`go-retryablehttp` 的结论修订）、
   §4（"重试不能重放非幂等请求"、"假时钟不能和真实时钟混用"）
-- [architecture.md](./architecture.md)：「出站韧性」一段（该段所在章节的编号目前在文档里被重复，故不引编号）
+- [architecture.md](./architecture.md) §4.5（「出站韧性」一段）
 - [oidc-decision.md](./oidc-decision.md) §5.5（押注 pre-1.0 稳定子集的先例）
 - [observability-decision.md](./observability-decision.md)（一个信号"算完成"的标准）
 - [CONTRIBUTING.md](../CONTRIBUTING.md)（依赖方向由 `internal/archtest` 机器强制）

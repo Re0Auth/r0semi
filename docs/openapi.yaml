@@ -1395,7 +1395,7 @@ paths:
         reported; it is just not what the ordering means.
 
         **`subject` takes an account id, not the pseudonym the log stores.** The
-        log never holds account ids (see `docs/architecture.md` §4.15); the filter
+        log never holds account ids (see `docs/architecture.md` §4.17); the filter
         is translated for you. After that account has been erased its
         pseudonymising key is gone, so the filter resolves to nothing and the page
         is empty — which is the truthful answer, not a bug.
@@ -1491,7 +1491,7 @@ paths:
         holds. `GET /v1/admin/audit/head` exposes the head hash for an external
         system to anchor, which is what makes that case detectable; a deployment
         that does not publish it keeps the earlier, weaker guarantee. See
-        `docs/architecture.md` §4.14.
+        `docs/architecture.md` §4.16.
       security:
         - sessionCookie: []
       responses:

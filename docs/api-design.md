@@ -222,7 +222,7 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 
 | `GET` | `/v1/sources` | — （公开） | 本部署提供的全部数据源（供「可连接」列表用） |
 | `GET` | `/v1/games/{game}/sources` | — （公开） | 该游戏的数据源、能力与 `token_class` |
-| `GET` | `/v1/games/{game}/{resource}` | 资源对应 scope | 归一化数据；`?source=` 可 pin（已实现，见 architecture.md §4.9） |
+| `GET` | `/v1/games/{game}/{resource}` | 资源对应 scope | 归一化数据；`?source=` 可 pin（已实现，见 architecture.md §4.11） |
 | `GET` | `/v1/games/{game}/sources/{source}/raw/{path...}` | 该源任一资源 scope（粗粒度） | 逐字透传源的原始 API；状态码/Content-Type/body 不改 |
 
 > 具体游戏的资源名与 scope 由 `/v1/games/{game}/sources` 公布，无需在下游硬编码。
@@ -240,7 +240,7 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 等于让**一个客户端看到用户的其他客户端**——这对它没有任何用处，用户也从未同意交出这个信息。
 唯一的消费者是账号页，它本来就有会话。
 
-> enrollment / 扫码托管已迁出 Re0Auth，成为**参考数据源**的一部分（见 architecture.md §4.10）。
+> enrollment / 扫码托管已迁出 Re0Auth，成为**参考数据源**的一部分（见 architecture.md §4.12）。
 
 ### 账号抹除（`DELETE /v1/account`）
 
@@ -251,8 +251,8 @@ PIPL / GDPR 要求「可删除」，这就是那个端点。它的编排在 `int
 3. **撤销全部令牌 → 清会话 → 清在途请求**（OP 的 auth request/code/device、federation 的 bind flow，以及**迁移遗留**的旧引擎表）。
 4. **最后删账号行**（identities 走外键级联）。
 
-还有**第 5 步，顺序不能动**：**销毁审计假名密钥**。审计日志是 append-only 且带链的（architecture.md §4.14），
-所以不删行——而是删掉那把让「`usr_…` → 假名」可计算的密钥（§4.15）。行还在、链仍通过，但再没人能把它们关联到你。
+还有**第 5 步，顺序不能动**：**销毁审计假名密钥**。审计日志是 append-only 且带链的（architecture.md §4.16），
+所以不删行——而是删掉那把让「`usr_…` → 假名」可计算的密钥（§4.17）。行还在、链仍通过，但再没人能把它们关联到你。
 它必须排在**「写完 `account.delete` 事件」之后**：那条事件本身也是关于这个账号的审计记录，
 先销毁密钥的话，sink 会为新事件**新造一把密钥**——恰好把刚断开的关联接回去。
 
@@ -357,7 +357,7 @@ re0auth.r0semi.net
 **这个 host 上没有运维指标面。** `/metrics` 与 `/debug/pprof/` **不在**上表，因为它们不挂在公网监听器上，
 而是挂在 `server.internal_addr` 指定的**独立内部监听器**（不配置即不提供）。pprof 会导出进程内部状态，
 把它放在公网端口上等于公开它；单独一个监听器是「只限内部 / 管理端」这条要求的**结构性**保证，而不是
-一句约定。两者都在 `/v1` 与三个平面的错误格式之外，见 [architecture.md](./architecture.md) §4.11。
+一句约定。两者都在 `/v1` 与三个平面的错误格式之外，见 [architecture.md](./architecture.md) §4.13。
 
 **运维探针**：`GET /healthz`（存活）只要进程能应答就返回 `200 ok`；`GET /readyz`（就绪）在依赖可用时返回 `200`，
 否则 `503 not ready`——有数据库时检查连接池，内存模式无物可查即恒就绪。两者都是纯文本、**不属任何平面**

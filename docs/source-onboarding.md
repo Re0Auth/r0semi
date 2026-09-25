@@ -262,4 +262,4 @@ curl -sS "https://<source>/.well-known/re0auth-upstream" | jq .
 ```
 
 > 相关文档 / See also: [`docs/upstream-protocol.md`](./upstream-protocol.md)、
-> [`docs/threat-model.md`](./threat-model.md)、[`docs/architecture.md`](./architecture.md) §4.9。
+> [`docs/threat-model.md`](./threat-model.md)、[`docs/architecture.md`](./architecture.md) §4.11。

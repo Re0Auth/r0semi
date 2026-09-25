@@ -62,9 +62,9 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
 
 以下都是**文档化的决定**，不是缺陷，报告它们会毁掉整份报告的可信度：不做 DPoP / PAR / 动态客户端注册 /
 `end_session` / 账号合并 / `Idempotency-Key` / 凭据导出端点 / KMS-HSM 适配器；内存存储无法枚举会话；
-vault 的 `Identity` 与 `Meta` 明文落盘（threat-model §6.1）；审计链**尾部截断**不可检测（architecture §4.14）；
-迁移 `0014` 之前的审计行保留原始 subject（architecture §4.15）；
-跨实例 refresh 的**残余竞态**（architecture §4.9）。
+vault 的 `Identity` 与 `Meta` 明文落盘（threat-model §6.1）；审计链**尾部截断**不可检测（architecture §4.16）；
+迁移 `0014` 之前的审计行保留原始 subject（architecture §4.17）；
+跨实例 refresh 的**残余竞态**（architecture §4.11）。
 
 ---
 

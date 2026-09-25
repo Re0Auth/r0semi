@@ -143,7 +143,7 @@ GET /oauth/authorize?...
   │
   ├─ 若 missing_bindings 非空（且对应 scope 仍被勾选）
   │     → 同意页显示“需要先连接数据源”，批准按钮禁用
-  │     → 走 federation 的绑定流程（/bind → 数据源 authorize → 回调，见 §4.9）
+  │     → 走 federation 的绑定流程（/bind → 数据源 authorize → 回调，见 §4.11）
   │     → 完成后回到同一 handle 的同意页，重新加载后 missing_bindings 消失
   │     → 取消勾选某个 scope 也可以解除它对应的绑定要求
   │
@@ -162,9 +162,9 @@ GET /oauth/authorize?...
   `bind_url`），同意页据此提示并禁用批准；绑定后回到同一 handle。绑定的是**数据源**
   （`federation` 的 `/bind` 流程），凭据由数据源自己持有。
 
-> 已实现：`internal/oidchttp`（OP 授权请求 + 同意决策，state 存 OP store）+ `httpapi` 路由，见 architecture.md §4.7。
-> 扫码托管已迁出 Re0Auth，成为数据源自己的登录面（见 architecture.md §4.10）。
-> 数据源的绑定流程（`/bind` → 上游 authorize → `/auth/upstream/.../callback`）同样已实现（§4.9）。
+> 已实现：`internal/oidchttp`（OP 授权请求 + 同意决策，state 存 OP store）+ `httpapi` 路由，见 architecture.md §4.9。
+> 扫码托管已迁出 Re0Auth，成为数据源自己的登录面（见 architecture.md §4.12）。
+> 数据源的绑定流程（`/bind` → 上游 authorize → `/auth/upstream/.../callback`）同样已实现（§4.11）。
 
 ## 8. 凭据命名空间
 
@@ -178,7 +178,7 @@ GET /oauth/authorize?...
 - **账号合并（merge）**：延后。需要双方强控制证明与凭据归属规则。
 - **基于 email 的自动关联**：永久不做。
 - 多身份策略（如强制要求 ≥2 身份以便找回）作为可选的安全增强，后续再评估。
-- 5 大 IdP 客户端与 `/auth` 平面**已实现**（`idp`、`internal/auth`，见 architecture.md §4.6）；
+- 5 大 IdP 客户端与 `/auth` 平面**已实现**（`idp`、`internal/auth`，见 architecture.md §4.8）；
   账号存储 `internal/account` 已强制 §2 三条不变量。真实 IdP 的 Client ID / Secret 需在部署时配置。
 - 除内置 5 家外，`[idp.<name>]` + `issuer` 可接**任意 OIDC provider**（自建 Passkey / Keycloak /
   Authentik）：端点走 discovery，`id_token` 走 JWKS 验签，不验密码。

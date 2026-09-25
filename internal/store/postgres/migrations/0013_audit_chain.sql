@@ -21,7 +21,7 @@
 --   * rewriting the whole chain -> the signatures cannot be forged without the key
 --   * deleting rows from the END -> NOT caught. Truncation is invisible without
 --     an external anchor (shipping the head to a separate system). Noted in
---     docs/architecture.md §4.14.
+--     docs/architecture.md §4.16.
 --
 -- Rows written before this migration have NULL hashes and are outside the chain;
 -- they are counted as "legacy" by verification rather than pretended to be

@@ -25,7 +25,7 @@ import (
 var accountTablesIgnored = map[string]string{
 	// Append-only and chained. The erasure destroys the subject's pseudonym key
 	// (audit_subject_keys) instead, which is what makes these rows unlinkable
-	// while leaving the chain intact. See docs/architecture.md §4.15.
+	// while leaving the chain intact. See docs/architecture.md §4.17.
 	"audit_events": "append-only: the erasure destroys the pseudonym key, not the rows",
 }
 

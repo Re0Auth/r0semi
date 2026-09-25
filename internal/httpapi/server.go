@@ -147,7 +147,7 @@ type AuditReader interface {
 	Verify(ctx context.Context) (audit.Verification, error)
 	// Head returns the chain's current head hash. Handed to a system outside this
 	// database, it is what makes a truncated tail detectable, which Verify alone
-	// cannot do. See migration 0013 and docs/architecture.md §4.14.
+	// cannot do. See migration 0013 and docs/architecture.md §4.16.
 	Head(ctx context.Context) ([]byte, error)
 }
 

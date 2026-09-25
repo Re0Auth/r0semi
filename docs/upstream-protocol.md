@@ -280,7 +280,7 @@ GET /v1/games/{game}/sources/{source}/raw/{path...}     原始透传
 
 > 已实现：`GET /v1/games/{game}/sources`、`GET /v1/games/{game}/{resource}`、
 > `GET /v1/games/{game}/sources/{source}/raw/{path...}`（raw 透传）、
-> `409 source_not_bound` + `bind_url`（及绑定流程）、多源仲裁与 `Re0Auth-Degraded`（见 architecture.md §4.9）。
+> `409 source_not_bound` + `bind_url`（及绑定流程）、多源仲裁与 `Re0Auth-Degraded`（见 architecture.md §4.11）。
 
 ## 13. 版本与一致性测试
 

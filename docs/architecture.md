@@ -86,7 +86,7 @@ Fiber（组件实例）
 | `clients` | 下游应用注册表 | `oauth.clients` | `store.sql` |
 | `oauth` | 授权服务器：authorize/token/refresh/revoke/introspect | `oauth.as` | `oauth.clients`, `oauth.tokens`, `audit.log` |
 | `consent` | 授权同意页 | — | `oauth.clients`, `oauth.as` |
-| `admin` | 应用注册 / 审核 / 吊销 / Kill Switch（**已实现**，见 §4.12） | `admin` | `oauth.clients`, `oauth.tokens`, `audit.log` |
+| `admin` | 应用注册 / 审核 / 吊销 / Kill Switch（**已实现**，见 §4.14） | `admin` | `oauth.clients`, `oauth.tokens`, `audit.log` |
 
 依赖图（边 `a ──> b` 表示 a 向 b 提供能力；单向、无环）：
 
@@ -293,6 +293,19 @@ re0auth.r0semi.net
 RFC 8628 的 `verification_uri` 指向**人类页面** `/app/device`（`oauth.Config.VerificationPath`），
 而不是给它供数据的 JSON 端点 `/v1/device/verification`——这两个东西指向同一个对象但没有理由共用路径。
 
+**限流**（`internal/ratelimit`，基于 `golang.org/x/time/rate`）：可选的 `Config.Limiter` 在会话中间件之外
+先拦住超预算的调用方；按客户端地址分桶、空闲驱逐。**三个平面各自的错误形态**：`/oauth/*` 与 `/.well-known/*`
+返回 OAuth 错误，`/v1/*` 返回 `problem+json` 的 `rate_limited`，浏览器路径是纯文本。
+
+**出站韧性**（`httpclient`，基于 `failsafe-go`）：重试（指数退避 + 抖动，认 `Retry-After`）、按上游 host 的
+熔断器、出站 bulkhead 三件套。**策略在本仓库、机制在库里**：**默认只重试幂等方法**（POST 不隐式重放），
+429/502/503/504 可重试而 500 不可，这些规则仍在 `httpclient`；循环、退避调度与熔断状态机来自库。
+bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆盖到响应头。选型、被否的方案与三处语义变化见
+[resilience-decision.md](./resilience-decision.md)（ADR-0009），依赖表见 [dependencies.md](./dependencies.md)。
+
+关键不变量（由 `internal/httpapi` 测试守护）：**协议平面绝不输出 problem+json，业务平面绝不输出
+`{error,error_description}`，浏览器平面两者都不输出**；三个平面各有独立子 mux、错误写出器与 panic 恢复，仅共享 request-id 中间件。
+
 ### 4.6 前端（`web/` + `internal/webui`）
 
 SvelteKit 2 + Svelte 5 + Tailwind v4，`adapter-static` 输出到 `internal/webui/dist`，由 `//go:embed` 嵌进二进制，
@@ -342,20 +355,7 @@ HTTP 头和 `<meta>` 同时存在时，**两个 CSP 都强制执行**。`interna
 修法就是回到设计本意：头只带 `frame-ancestors 'none'`（因为浏览器在 meta 里忽略它），其余归构建方。
 `internal/httpapi/frontend_test.go` 现在断言头**不得**重述 `script-src` 等指令。
 
-**限流**（`internal/ratelimit`，基于 `golang.org/x/time/rate`）：可选的 `Config.Limiter` 在会话中间件之外
-先拦住超预算的调用方；按客户端地址分桶、空闲驱逐。**三个平面各自的错误形态**：`/oauth/*` 与 `/.well-known/*`
-返回 OAuth 错误，`/v1/*` 返回 `problem+json` 的 `rate_limited`，浏览器路径是纯文本。
-
-**出站韧性**（`httpclient`，基于 `failsafe-go`）：重试（指数退避 + 抖动，认 `Retry-After`）、按上游 host 的
-熔断器、出站 bulkhead 三件套。**策略在本仓库、机制在库里**：**默认只重试幂等方法**（POST 不隐式重放），
-429/502/503/504 可重试而 500 不可，这些规则仍在 `httpclient`；循环、退避调度与熔断状态机来自库。
-bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆盖到响应头。选型、被否的方案与三处语义变化见
-[resilience-decision.md](./resilience-decision.md)（ADR-0009），依赖表见 [dependencies.md](./dependencies.md)。
-
-关键不变量（由 `internal/httpapi` 测试守护）：**协议平面绝不输出 problem+json，业务平面绝不输出
-`{error,error_description}`，浏览器平面两者都不输出**；三个平面各有独立子 mux、错误写出器与 panic 恢复，仅共享 request-id 中间件。
-
-### 4.6 /auth 平面与会话（v1 已实现：`idp`、`internal/account`、`internal/auth`）
+### 4.8 /auth 平面与会话（v1 已实现：`idp`、`internal/account`、`internal/auth`）
 
 - `idp`：r0semi 作为 GitHub / Google / Discord / QQ / 微软 的 OAuth 客户端
   （`golang.org/x/oauth2`，强制 PKCE S256），把回调规范化为 `Identity{Provider, Subject, ...}`。
@@ -372,7 +372,7 @@ bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆�
 - `httpapi` 在配置 `Sessions` / `Accounts` / `Auth` 时挂载 `/auth/`、包上会话中间件，
   并提供 `GET /v1/sessions/current`、`POST /v1/sessions/sign_out`。
 
-### 4.7 授权交互 API（v1 已实现：`internal/oidchttp` + `internal/authorization` + `httpapi`）
+### 4.9 授权交互 API（v1 已实现：`internal/oidchttp` + `internal/authorization` + `httpapi`）
 
 把 `/oauth/authorize` 变成真实浏览器流程，同时把安全判断全部留在服务端。`/oauth/authorize` 本身由
 OP（`internal/oidchttp`，zitadel 引擎）处理，`httpapi` 只负责同意页三个端点：
@@ -393,7 +393,7 @@ OP（`internal/oidchttp`，zitadel 引擎）处理，`httpapi` 只负责同意�
 - handle 单次使用、短时效、绑定浏览器；收窄规则由 `internal/oidcstore` 的 `NarrowScopes` /
   `RequireExplicitConsent` 统一实现，两种 OP store 共用一份。
 
-### 4.8 Upstream Kit 与一致性测试（v1 已实现：`upstreamkit`）
+### 4.10 Upstream Kit 与一致性测试（v1 已实现：`upstreamkit`）
 
 数据源（游戏后端）接入生态的工具链：
 
@@ -404,9 +404,9 @@ OP（`internal/oidchttp`，zitadel 引擎）处理，`httpapi` 只负责同意�
   （error / warning / skipped）；带 `AccessToken` 时额外检查数据面。
 - 参考上游在测试中由 Kit 构建并通过套件。**真实 TapTap 适配器已迁到数据源侧**：
   `referencesource` 用 `taptapoauth` + `tapsign` 完成 TapTap 登录与凭据兑换，Re0Auth 侧不再持有
-  原始平台凭据（见 §4.10 与 threat-model.md）。
+  原始平台凭据（见 §4.12 与 threat-model.md）。
 
-### 4.9 数据联邦层（v1 已实现：`internal/federation`）
+### 4.11 数据联邦层（v1 已实现：`internal/federation`）
 
 re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个已绑定的上游数据源，并返回该源的规范化载荷。
 
@@ -450,7 +450,7 @@ re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个
 
 > 已知粗粒度处：raw 的 scope 门禁用的是“该源任一资源 scope”，专用 `<game>.raw.read` 为后续工作。
 
-### 4.10 参考数据源（切片 1–4 已实现：`referencesource` + `cmd/referencesource`）
+### 4.12 参考数据源（切片 1–4 已实现：`referencesource` + `cmd/referencesource`）
 
 第一个**独立数据源**，也是 Upstream Kit 的实战验证。它把待验证的命题写成了代码：
 **后端原生登录无需是 OAuth 2.0，仍能成为合规数据源**——因为 OAuth 2.0 AS 面由 Kit 生成。
@@ -476,7 +476,7 @@ re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个
 > 切片 3–4（已完成）：Re0Auth 已删 `/v1/enrollments`、`internal/enrollment`、`internal/vault` 与旧 TapTap 适配器；
 > `vault`/`tapsign`/`taptapoauth`/`idp` 提升为公开库，随参考源一同发布；`referencesource` 也已提到顶层。
 
-### 4.11 组合根与持久化（v1 进行中：`cmd/re0auth` + `internal/store/postgres`）
+### 4.13 组合根与持久化（v1 进行中：`cmd/re0auth` + `internal/store/postgres`）
 
 **`cmd/re0auth` 是组合根**：从 TOML 文件 + 环境变量读配置（见 `config/re0auth.example.toml`），
 装配全部组件，起两个 HTTP 平面。它的存在是为了让存储适配器有一个**真实调用者**，而不是只被测试调用。
@@ -555,7 +555,7 @@ sweep 也会删除 OP 表中已过期的行**（`internal/store/postgres/sweep.g
 > 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
 > `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。
 
-### 4.12 管理面（v1 已实现：`internal/admin` + `httpapi`）
+### 4.14 管理面（v1 已实现：`internal/admin` + `httpapi`）
 
 应用注册 / 审核 / 吊销 / Kill Switch。完整契约见 [admin.md](./admin.md)。要点：
 
@@ -573,9 +573,9 @@ sweep 也会删除 OP 表中已过期的行**（`internal/store/postgres/sweep.g
   （`session_subjects`，登录时写入、注销时移除、过期由 sweep 清理）；没有它只能整体清会话。
   **Kill Switch 不是删除**：它是可逆意图的应急切断，账号行、identities、vault 密文都还在，账号还能重新登录。
 
-### 4.13 账号抹除（v1 已实现：`internal/lifecycle`）
+### 4.15 账号抹除（v1 已实现：`internal/lifecycle`）
 
-`DELETE /v1/account` 的编排。它与 §4.12 的 Kill Switch **刻意分开**：Kill Switch 是运维应急切断，
+`DELETE /v1/account` 的编排。它与 §4.14 的 Kill Switch **刻意分开**：Kill Switch 是运维应急切断，
 抹除是用户对自己数据的终局处置，两者要清的 store 高度重叠但语义与审计不同。
 
 - **为什么需要单独一个包：** 一个账号的数据散在十几张表里，而**只有 `accounts_identities` 有指向账号的外键**。
@@ -586,13 +586,13 @@ sweep 也会删除 OP 表中已过期的行**（`internal/store/postgres/sweep.g
 - **为什么走 repo 层而不走 `vault.Service`：** `vault.Service` 的每个操作都会自记审计（I3），
   抹除路径若通过它去取/清伪名密钥，就会形成「审计 → vault 查询 → 审计」的递归。直接删行绕开这条回路，
   加密擦除的效果一样（包裹的 DEK 就在行里）。
-- **审计失败即失败**（与 §4.12 的 admin 相反）：抹除是用户主动、可重试的请求，一次无法留痕的抹除比一次失败的抹除更糟。
+- **审计失败即失败**（与 §4.14 的 admin 相反）：抹除是用户主动、可重试的请求，一次无法留痕的抹除比一次失败的抹除更糟。
 - **完整性靠测试守住**，不补 16 张外键：`TestAccountDeletionLeavesNoOrphans`（需 Postgres，动态扫
   `information_schema` 里所有含 `subject`/`user_id` 列的表，逐一断言清零）+
   `TestEverySubjectColumnIsHandledByErasure`（无需数据库，解析 migration，新增的带 subject 列的表若没登记就构建失败）。
-  `audit_events` 是**显式豁免**：它 append-only，抹除走的是假名化而非删除（已实现，见 §4.15）。
+  `audit_events` 是**显式豁免**：它 append-only，抹除走的是假名化而非删除（已实现，见 §4.17）。
 
-### 4.14 审计完整性（v1 已实现：`internal/store/postgres/auditchain.go`）
+### 4.16 审计完整性（v1 已实现：`internal/store/postgres/auditchain.go`）
 
 审计表「append-only」原本只是**约定**，不是控制：迁移里没有 trigger、没有权限限制，任何有表权限的角色都能改行。
 现在每一行都承诺前一行、并用**不在数据库里**的密钥签名（迁移 `0013`）：
@@ -613,10 +613,10 @@ signature = HMAC-SHA256(key, row_hash)
 - **迁移前的行** `row_hash IS NULL`，被验证器计为 `legacy` 而**不是**假装覆盖；链从迁移后的第一行开始。另外，**链开始之后**再出现无哈希的行会被判为违规——否则攻击者把某行的哈希清空就能把它降级成「legacy」跳过。
 - **内存模式没有链**：`audit.MemoryLogger` 是环形缓冲，本身就不是防篡改结构，给它加链是自欺。链是**持久化 sink 的属性**，因此 `RE0AUTH_AUDIT_KEY` 只在持久化部署里必填。
 
-### 4.15 审计主体假名化（v1 已实现：迁移 `0014` + `auditpseudo.go`）
+### 4.17 审计主体假名化（v1 已实现：迁移 `0014` + `auditpseudo.go`）
 
 审计日志几乎每一行都点名一个账号，所以它自己就是一座个人数据仓库，「抹除账号」如果不动它，
-那个人的轨迹就留在原地。但它是 **append-only 且带链**的（§4.14），不能删行——删行会破坏链。
+那个人的轨迹就留在原地。但它是 **append-only 且带链**的（§4.16），不能删行——删行会破坏链。
 
 解法是**假名化 + 销毁密钥**：
 
@@ -730,7 +730,7 @@ critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期
 4. core 的可观测性：fiber 状态是否导出为指标，`App.Check` 结果是否作为 CI 门禁。
    **部分已决**：依赖方向的 CI 门禁已由 `internal/archtest` 落地；`core` 自身的可观测性随其生产接入
    一并推迟（ADR-0002），接入前不再是待办。（这里说的是 `core` **组件图自身**的指标；服务层面的黄金指标
-   与 pprof 已由 §4.11 的内部监听器提供。）
+   与 pprof 已由 §4.13 的内部监听器提供。）
 5. 旧引擎在 Postgres 侧的遗留表与适配器：`oauth_codes` / `oauth_access_tokens` /
    `oauth_refresh_tokens` / `oauth_device_authorizations`（迁移 0001 / 0006）以及
    `internal/store/postgres` 的 `Tokens` / `Devices`，在 P4b 之后已无生产调用者。
