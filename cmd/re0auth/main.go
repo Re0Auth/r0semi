@@ -12,6 +12,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -75,6 +76,17 @@ const (
 	// close to the size the live records justify.
 	opJanitorInterval = 5 * time.Minute
 
+	// auditAnchorInterval is how often the durable audit chain's head hash is
+	// written to the log.
+	//
+	// The chain catches an edited or deleted row by itself. What it cannot catch is
+	// a TRUNCATED TAIL: drop the last N rows and the remainder still verifies,
+	// because nothing in the database remembers what the head used to be. The only
+	// way to notice is to have recorded the head somewhere else — so this writes it
+	// to the log pipeline, which is a different system with its own retention and,
+	// unlike a cron job calling the admin endpoint, needs no credential.
+	auditAnchorInterval = time.Hour
+
 	// HTTP server timeouts. ReadHeaderTimeout bounds a slow-header (Slowloris)
 	// client; IdleTimeout bounds a kept-alive connection that has gone quiet. Read
 	// and Write bound a whole exchange: the data plane proxies an upstream
@@ -94,6 +106,12 @@ const (
 	// It bounds the drain so a stuck handler cannot hold a deploy open forever.
 	shutdownTimeout = 30 * time.Second
 )
+
+// headReader is the chained audit sink's current head. Only the durable chain has
+// one: the in-memory logger is a ring buffer and deliberately not a chain.
+type headReader interface {
+	Head(ctx context.Context) ([]byte, error)
+}
 
 // storage bundles the persistence ports so the composition root does not thread
 // five return values through every call.
@@ -115,6 +133,9 @@ type storage struct {
 	// audit is the durable audit-log sink; nil would mean "nobody is auditing",
 	// which must never be a silent state.
 	audit audit.Logger
+	// auditHead is the chained sink's readable head, so the anchor loop can record
+	// it outside the database. Nil in memory mode: there is no chain.
+	auditHead headReader
 	// legacy, when set, clears the retired hand-rolled engine's non-token tables
 	// during account erasure. Nil in memory mode, where those tables do not exist.
 	legacy lifecycle.LegacyPurger
@@ -226,6 +247,11 @@ func main() {
 	}
 	if store.sweep != nil {
 		go sweepLoop(ctx, store.sweep, 15*time.Minute)
+	}
+	// Only the durable chain has a head to anchor; the in-memory logger is a ring
+	// buffer and deliberately not a chained structure.
+	if store.auditHead != nil {
+		go anchorLoop(ctx, store.auditHead, auditAnchorInterval)
 	}
 
 	// The Prometheus instrumentation. It is always built: whether it is *exported*
@@ -642,6 +668,7 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 		// belongs to.
 		sessionIndex: sessions,
 		audit:        auditLogger,
+		auditHead:    auditLogger,
 		legacy:       db.Tokens(),
 		sweep: func(ctx context.Context) (int64, error) {
 			// The dated tables (codes, tokens, pending requests) and the sessions
@@ -695,6 +722,50 @@ func opJanitorLoop(ctx context.Context, sweep interface{ SweepExpired() int }, e
 			}
 			slog.Debug("OP sweep found nothing to remove")
 		}
+	}
+}
+
+// anchorLoop records the durable audit chain's head, once at startup and then on a
+// ticker, so a truncated tail stays detectable.
+//
+// Verification recomputes every hash and checks every link, which catches an edited
+// row, a deletion in the middle, and a forged signature. A TRUNCATED TAIL it cannot
+// catch: what is left is a shorter but perfectly valid chain, and nothing in the
+// database remembers what the head used to be. The head has to be recorded outside
+// the database for that to be visible, and the log pipeline is that place — a
+// different system with its own retention, needing no credential. (The admin
+// endpoint that exposes the same value is session-authenticated by design, so a cron
+// job could not call it.) Comparing a fresh `GET /v1/admin/audit/head` against the
+// newest anchored value is the operation that turns "the chain verifies" into "the
+// chain was not truncated"; it is written up in docs/operations.md.
+func anchorLoop(ctx context.Context, head headReader, every time.Duration) {
+	anchorOnce(ctx, head)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			anchorOnce(ctx, head)
+		}
+	}
+}
+
+// anchorOnce is the loop's body, split out so a test can pin the log line without
+// racing a ticker.
+func anchorOnce(ctx context.Context, head headReader) {
+	sum, err := head.Head(ctx)
+	switch {
+	case err != nil:
+		// Not fatal: the anchor is a control, and losing one interval of it is worth
+		// a line rather than a crash. A run of these is what the runbook watches for.
+		slog.Warn("could not anchor the audit chain head", "err", err)
+	case len(sum) == 0:
+		// The chain has not been written to yet, so its head is the genesis value.
+		slog.Info("audit chain head anchored", "head", "genesis")
+	default:
+		slog.Info("audit chain head anchored", "head", hex.EncodeToString(sum))
 	}
 }
 

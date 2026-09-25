@@ -1,23 +1,77 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
 )
+
+type stubHead struct {
+	sum []byte
+	err error
+}
+
+func (s stubHead) Head(context.Context) ([]byte, error) { return s.sum, s.err }
+
+// captureLog swaps the process default logger for one writing into a buffer. This
+// package has no parallel tests, so the swap is safe; anchorOnce is called
+// synchronously, so the buffer needs no lock.
+func captureLog(t *testing.T) func() string {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return buf.String
+}
+
+// The anchor is what makes a truncated audit tail detectable: verification by itself
+// accepts a shorter chain, so the only comparison available is against a head that
+// was recorded somewhere else. This pins what gets recorded and, just as important,
+// that a failed read records no head at all — an anchored value that came from an
+// error would be worse than none, because it would look like evidence.
+func TestAnchorRecordsTheChainHead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		head []byte
+		err  error
+		want string
+	}{
+		{"a chained head", []byte{0xde, 0xad, 0xbe, 0xef}, nil, "head=deadbeef"},
+		{"a chain nobody has written to yet", nil, nil, "head=genesis"},
+		{"a sink that cannot be read", nil, errors.New("pool is closed"), "could not anchor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLog(t)
+			anchorOnce(context.Background(), stubHead{sum: tc.head, err: tc.err})
+
+			out := logged()
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("log does not mention %q:\n%s", tc.want, out)
+			}
+			if tc.err != nil && strings.Contains(out, "head=") {
+				t.Fatalf("a failed read still anchored a value:\n%s", out)
+			}
+		})
+	}
+}
 
 func TestOIDCTokenKeyFailClosed(t *testing.T) {
 	t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", "")

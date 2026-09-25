@@ -22,7 +22,9 @@ kubectl -n re0auth create secret generic re0auth-secrets \
 kustomize edit set image ghcr.io/re0auth/r0semi=ghcr.io/re0auth/r0semi@sha256:...
 ```
 
-镜像里没有配置和密钥；`issuer`、监听地址与密钥全部运行时注入。系统变更后：
+镜像里没有配置和密钥；`issuer`、监听地址与密钥全部运行时注入。
+
+系统变更后：
 
 ```sh
 kubectl -n re0auth rollout status deploy/re0auth
@@ -90,6 +92,31 @@ DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backu
   - 大量 429 → 调整 `server.rate_limit` / `rate_limit_burst`，或检查是否有客户端刷接口。
   - 大量 503 → 调整 `server.max_in_flight`，或排查慢查询/上游拖慢。
   - 登录后无会话 → `cookie_secure` 与实际 scheme 不一致。
+
+## 审计链锚点核对
+
+链能自己挡住改行、中间删行与伪造签名，但**挡不住从尾部删行**：剩下的每一环仍然成立。
+能看见它的唯一办法，是拿一个**记在库外**的链头去比对。所以服务每小时（以及每次启动）
+把链头写进日志：
+
+```
+INFO audit chain head anchored head=3f9c…    # 链还没有写入过时是 head=genesis
+```
+
+例行或事故复盘时的核对：
+
+```sh
+# 1) 从日志里取最新的一条锚点，记下 head=<hex>（只看到 genesis 说明链还没写过）
+# 2) 在库里找那一行——找不到，就是它之后的行被删过
+psql "$DATABASE_URL" -c "SELECT count(*) FROM audit_events WHERE row_hash = '\x<hex>'"
+```
+
+- **为什么必须问库**：读 API（`GET /v1/admin/audit`）与 `verify` 都**不回**每行的 `row_hash`，
+  所以「那一行还在不在」只能问表本身；而运维本来就拿得到库（备份/恢复、抹除都走这条路）。
+- **反向的迹象同样要读**：当前链头**等于**某条更早的锚点、而更晚的锚点不存在，说明链被退回到了那一刻。
+- 锚点行只在**持久化部署**里存在：内存模式的审计是环形缓冲，没有链，也没有 `Head()`。
+- 日志系统要放在**够不到数据库的那个凭据域**，否则一次凭据泄露就能同时改表与改锚点——
+  与 `scripts/backup-keys.sh` 对密钥备份的取舍相同。
 
 ## 数据删除与保留
 

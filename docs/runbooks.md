@@ -82,7 +82,8 @@
 2. 确认是不是有人直接改了 `audit_events` 表，或 `RE0AUTH_AUDIT_KEY` 被换过。
 
 **处置**：**按篡改处理，除非能证明是损坏**。保留现场（不要 `DELETE` 任何审计行），记录
-`first_bad_id` 与时间窗；若已接外部锚点，比对链头。见 [admin.md](./admin.md) §5。
+`first_bad_id` 与时间窗；并比对日志里最新的链头锚点（步骤见
+[operations.md](./operations.md#审计链锚点核对)），确认是不是尾部也被截断。见 [admin.md](./admin.md) §5。
 
 **升级**：立即升级为安全事件，见 [incident-response.md](./incident-response.md)；考虑一键撤销。
 
