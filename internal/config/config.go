@@ -20,6 +20,7 @@ func Read(path string, out any) error {
 	if path == "" {
 		return nil
 	}
+	//nolint:gosec // the path is the config flag from startup, never request input.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)

@@ -40,6 +40,25 @@ linters:
     # unconvert catches conversions of a value to its own type, which are usually
     # a sign of a half-finished refactor.
     - unconvert
+    # gosec is the security rule set, enabled as a curated subset rather than in
+    # full. The blanket set flags patterns this service uses on purpose — TapTap's
+    # MAC really does require HMAC-SHA1, and the config loader really does open a
+    # path taken from a flag — and a gate that is wrong on every run is one people
+    # learn to route around. G101 (hardcoded credentials) is left out for that
+    # reason: it fires on public OAuth endpoint URLs and on test fixtures, while
+    # gitleaks already scans the tree and the history for real secrets. A
+    # production site that legitimately trips one of the rules below carries a
+    # //nolint naming gosec and saying why.
+    - gosec
+
+  settings:
+    gosec:
+      includes:
+        - G304 # filesystem path from a variable
+        - G401 # weak crypto primitive (md5/sha1/des)
+        - G402 # TLS config that skips verification
+        - G404 # math/rand instead of crypto/rand
+        - G501 # import of a weak crypto package
 
   exclusions:
     generated: lax
@@ -51,3 +70,10 @@ linters:
         linters:
           - errcheck
           - bodyclose
+      # gosec's G304 flags any os.ReadFile of a variable; in a test that is a
+      # fixture path the test built itself. The one production read (config.Read)
+      # is annotated where it appears.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: G304
