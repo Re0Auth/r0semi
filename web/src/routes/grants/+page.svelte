@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { page } from '$app/state';
 	import { fade, fly } from 'svelte/transition';
 	import { quartOut } from 'svelte/easing';
 	import { api, ApiError, type Grant } from '$lib/api';
@@ -102,7 +103,7 @@
 {:else if phase === 'anonymous'}
 	<div class="mt-4 flex flex-col gap-4">
 		<Alert tone="warn" title="需要先登录">登录后才能看到已授权的应用。</Alert>
-		<SignIn />
+		<SignIn returnTo={`${page.url.pathname}${page.url.search}`} />
 	</div>
 {:else if phase === 'failed'}
 	<p class="mt-4 text-sm text-danger">{detail}</p>

@@ -6,9 +6,15 @@
 	interface Props {
 		/** Called with the provider id once the browser is on its way out. */
 		onleave?: () => void;
+		/**
+		 * Where to come back to after the IdP round trip. A consent or device
+		 * page passes its own URL so signing in does not drop the pending task;
+		 * the backend validates it as a same-origin relative path.
+		 */
+		returnTo?: string;
 	}
 
-	let { onleave }: Props = $props();
+	let { onleave, returnTo }: Props = $props();
 
 	let providers = $state<IDPProvider[]>([]);
 	let loading = $state(true);
@@ -38,7 +44,14 @@
 		onleave?.();
 		// A full navigation, not a fetch: the session cookie is set by whatever
 		// comes back from the provider, and this is a trip through a third party.
-		window.location.assign(provider.start_url);
+		// return_to is what keeps a consent or device task from being lost when the
+		// visitor was anonymous; the backend clamps it to a same-origin path.
+		let target = provider.start_url;
+		if (returnTo) {
+			const sep = target.includes('?') ? '&' : '?';
+			target += `${sep}return_to=${encodeURIComponent(returnTo)}`;
+		}
+		window.location.assign(target);
 	}
 </script>
 

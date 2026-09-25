@@ -1,4 +1,5 @@
 import { expect, test } from './fixtures';
+import { idpBase } from './env';
 import {
 	authorizeURL,
 	callWithToken,
@@ -32,6 +33,35 @@ test('a signed-out visitor is offered a way in, not a dead end', async ({ page }
 	// so a deployment with no provider configured shows a sentence instead of a
 	// button that leads to a 404.
 	await expect(page.getByRole('button', { name: /使用 GitHub 登录/ })).toBeVisible();
+});
+
+test('signing in from consent returns to the pending request', async ({ page, request }) => {
+	// Give the fake IdP the identity this test signs in as, without going through
+	// the /app login page: this test starts at the authorization request.
+	const identity = test.info().title;
+	const tell = await fetch(`${idpBase}/__identity/${encodeURIComponent(identity)}`, { method: 'POST' });
+	expect(tell.ok).toBe(true);
+
+	const { verifier, challenge } = pkce();
+	await page.goto(authorizeURL({ challenge, scopes: 'account.id' }));
+
+	// The visitor is anonymous on the consent page; the handle is bound to this
+	// browser session and must survive the IdP round trip.
+	await expect(page.getByText('需要先登录')).toBeVisible();
+	await page.getByRole('button', { name: /使用 GitHub 登录/ }).click();
+
+	// Before the fix this landed on /app/ and the pending request was silently
+	// abandoned. It must come back to the same handle, signed in.
+	await expect(page).toHaveURL(/\/app\/consent\?id=/);
+	await expect(page.getByText('Phi CLI')).toBeVisible();
+	await expect(page.getByRole('button', { name: '同意并继续' })).toBeVisible();
+
+	// And the task is still completable: approving yields a real code.
+	await page.getByRole('button', { name: '同意并继续' }).click();
+	const params = await callbackParams(page);
+	expect(params.get('code')).toBeTruthy();
+	const tokens = await exchangeCode(request, params.get('code')!, verifier);
+	expect(tokens.access_token).toBeTruthy();
 });
 
 test('a handle this browser never created is explained, never confirmed', async ({ page }) => {

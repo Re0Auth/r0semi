@@ -3,6 +3,7 @@
 	import { fade, fly } from 'svelte/transition';
 	import { quartOut } from 'svelte/easing';
 	import { base } from '$app/paths';
+	import { page } from '$app/state';
 	import { api, ApiError, type IDPProvider, type Session } from '$lib/api';
 	import { messageOf } from '$lib/errors';
 	import { focusFirstControl, restoreFocus } from '$lib/a11y';
@@ -161,7 +162,7 @@
 	{/if}
 	<p class="mt-4 text-sm text-ink-muted">用外部账号登录，首次登录即注册。</p>
 	<div class="mt-4">
-		<SignIn />
+		<SignIn returnTo={`${page.url.pathname}${page.url.search}`} />
 	</div>
 {:else if session}
 	{#if authError}

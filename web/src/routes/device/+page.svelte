@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { page } from '$app/state';
 	import { api, ApiError, type DevicePending } from '$lib/api';
 	import { messageOf } from '$lib/errors';
 	import ScopeList from '$lib/components/ScopeList.svelte';
@@ -165,7 +166,7 @@
 {#if phase === 'anonymous'}
 	<div class="mt-4 flex flex-col gap-4">
 		<Alert tone="warn" title="需要先登录">登录后才能确认设备代码。</Alert>
-		<SignIn />
+		<SignIn returnTo={`${page.url.pathname}${page.url.search}`} />
 	</div>
 {:else if phase === 'done'}
 	<div class="mt-4">

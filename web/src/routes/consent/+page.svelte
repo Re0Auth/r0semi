@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { page } from '$app/state';
 	import {
 		api,
 		ApiError,
@@ -152,7 +153,7 @@
 {:else if phase === 'anonymous'}
 	<div class="mt-4 flex flex-col gap-4">
 		<Alert tone="warn" title="需要先登录">登录后才能看到这个授权请求。</Alert>
-		<SignIn />
+		<SignIn returnTo={`${page.url.pathname}${page.url.search}`} />
 	</div>
 {:else if phase === 'gone'}
 	<div class="mt-4">

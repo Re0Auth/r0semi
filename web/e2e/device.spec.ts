@@ -1,4 +1,5 @@
 import { expect, test } from './fixtures';
+import { idpBase } from './env';
 import { beginDevice, callWithToken, pollDevice, signIn } from './helpers';
 
 // RFC 8628 in a browser. The device is a separate party in every test here: it
@@ -27,6 +28,28 @@ test('approving a device code lets the waiting device get a token', async ({ pag
 
 	const me = await callWithToken(request, '/v1/me', body.access_token);
 	expect(me.status).toBe(200);
+});
+
+test('signing in from the device page keeps the user code', async ({ page, request }) => {
+	const start = await beginDevice(request);
+	const identity = test.info().title;
+	const tell = await fetch(`${idpBase}/__identity/${encodeURIComponent(identity)}`, { method: 'POST' });
+	expect(tell.ok).toBe(true);
+
+	// An anonymous visitor arrives from verification_uri_complete.
+	await page.goto(`/app/device?user_code=${encodeURIComponent(start.user_code)}`);
+	await expect(page.getByText('需要先登录')).toBeVisible();
+	await page.getByRole('button', { name: /使用 GitHub 登录/ }).click();
+
+	// The code has to survive the IdP round trip, or the device waits forever.
+	await expect(page).toHaveURL(/\/app\/device\?.*user_code=/);
+	await expect(page.getByText('Phi CLI')).toBeVisible();
+	await page.getByRole('button', { name: '批准登录' }).click();
+	await expect(page.getByText('已批准')).toBeVisible();
+
+	const { status, body } = await pollDevice(request, start.device_code);
+	expect(status).toBe(200);
+	expect(body.access_token).toBeTruthy();
 });
 
 test('the code can be typed in, not only followed from a link', async ({ page, request }) => {
