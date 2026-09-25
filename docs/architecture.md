@@ -475,6 +475,9 @@ re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个
 
 > 切片 3–4（已完成）：Re0Auth 已删 `/v1/enrollments`、`internal/enrollment`、`internal/vault` 与旧 TapTap 适配器；
 > `vault`/`tapsign`/`taptapoauth`/`idp` 提升为公开库，随参考源一同发布；`referencesource` 也已提到顶层。
+>
+> 源侧的授权服务器用的是 `oauth` 里那套**手写引擎**（不是 OP）：两套引擎为何并存、各自面对谁，
+> 见 [authorization-engines-decision.md](./authorization-engines-decision.md)（ADR-0010）。
 
 ### 4.13 组合根与持久化（v1 进行中：`cmd/re0auth` + `internal/store/postgres`）
 
