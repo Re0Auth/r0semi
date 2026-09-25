@@ -317,9 +317,9 @@ func TestAdminKillSwitchBindingsTarget(t *testing.T) {
 	}
 }
 
-// Step-up: a mutating admin call needs a recent authentication. With a
-// vanishingly small window, a just-signed-in session is already stale, which is
-// the deterministic way to exercise the branch without sleeping.
+// Step-up: a mutating admin call needs a recent authentication. The window is
+// shrunk to a nanosecond and the test waits past it, so the branch is exercised
+// deterministically; a window of zero would disable the check instead.
 func TestAdminWriteRequiresRecentAuthentication(t *testing.T) {
 	manager := auth.NewManager(auth.Options{Secure: false})
 	s := &Server{
@@ -336,6 +336,10 @@ func TestAdminWriteRequiresRecentAuthentication(t *testing.T) {
 		}
 		csrf = manager.CSRFToken(r.Context())
 	})).ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	// Windows' clock resolution can put two calls in the same tick; wait so the
+	// session is unambiguously older than the nanosecond window.
+	time.Sleep(5 * time.Millisecond)
 
 	cookies := first.Result().Cookies()
 	if len(cookies) == 0 {
