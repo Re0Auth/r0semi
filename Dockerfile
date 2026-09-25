@@ -8,7 +8,9 @@
 # The stages are ordered so that mistake is impossible rather than remembered.
 
 # ---- frontend -------------------------------------------------------------
-FROM node:24-alpine AS web
+# Base images are pinned by digest, not tag: a tag can move under the build, and
+# the digest is what makes "the same Dockerfile" produce the same toolchain.
+FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web
 WORKDIR /src
 # corepack resolves pnpm from the `packageManager` field in web/package.json, so
 # the container uses the same version as CI and a laptop — not whatever `latest`
@@ -33,7 +35,7 @@ RUN cd web && pnpm run build
 RUN test -f internal/webui/dist/index.html
 
 # ---- backend --------------------------------------------------------------
-FROM golang:1.27-alpine AS build
+FROM golang:1.27-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -49,11 +51,17 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /out/re0auth ./cmd/re0auth
 
 # ---- runtime --------------------------------------------------------------
-# distroless/static: no shell, no package manager, no libc (the binary is static),
-# and it carries the CA certificates outbound TLS needs. `nonroot` runs as uid
-# 65532, so the process cannot write over its own image.
-FROM gcr.io/distroless/static-debian12:nonroot
+# scratch, not a distroless base: the binary is static (CGO_ENABLED=0), so the
+# runtime filesystem needs exactly two things — the binary and the CA bundle for
+# outbound TLS. A scratch image has no shell, package manager, libc or OS files,
+# and no base-image digest that can drift. The CA bundle is copied from the
+# pinned build stage, so it is the same trust store the binary was built against.
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/re0auth /re0auth
+# Numeric uid 65532 is the conventional nonroot id; scratch has no passwd file,
+# so it stays unnamed. The process cannot write over its own image.
+USER 65532:65532
 
 # The container listens on all interfaces; the process default (127.0.0.1:8080)
 # would be unreachable from outside the container. The issuer, the keys and the
@@ -62,7 +70,7 @@ COPY --from=build /out/re0auth /re0auth
 ENV RE0AUTH_ADDR=0.0.0.0:8080
 EXPOSE 8080
 
-# No HEALTHCHECK: distroless has no shell or curl to run one with. Point the
+# No HEALTHCHECK: scratch has no shell or curl to run one with. Point the
 # orchestrator at GET /healthz (liveness) and GET /readyz (readiness) instead;
 # those are the endpoints this service actually promises.
 ENTRYPOINT ["/re0auth"]

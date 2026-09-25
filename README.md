@@ -141,8 +141,10 @@ sha256sum -c SHA256SUMS    # macOS: shasum -a 256 -c SHA256SUMS
 ## 容器镜像
 
 `make docker` 用仓库根的多阶段 `Dockerfile` 构建镜像：前端（`pnpm` 构建，锁文件固定版本）→ 静态 Go
-二进制（前端 `go:embed` 进同一个文件）→ distroless 非 root 运行时。CI 每次改动都会构建一次（**不推送**），
-因为一个从没被构建过的 Dockerfile 就是一个不能用的 Dockerfile。
+二进制（前端 `go:embed` 进同一个文件）→ `scratch` 非 root 运行时（只带二进制与 CA 证书）。基础镜像按
+digest 固定，`internal/archtest` 会检查这一点。CI 每次改动都会构建一次；**tag 发布会把
+`linux/amd64` 与 `linux/arm64` 镜像推到 GHCR**，附带 SBOM 与 provenance 证明、Trivy 扫描（HIGH/CRITICAL
+失败即阻断）与 cosign 签名。
 
 镜像里**没有配置、也没有密钥**：issuer 与各把密钥都在运行时经环境变量注入（见上面的「快速开始」）。
 `RE0AUTH_ADDR` 在镜像里预设为 `0.0.0.0:8080`，否则进程默认的 `127.0.0.1` 从容器外不可达。

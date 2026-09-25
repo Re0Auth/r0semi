@@ -7,39 +7,85 @@ on:
   push:
     tags: ['v*']
 
-# gh release create writes a release. id-token is what keyless signing exchanges
-# for a short-lived certificate from Fulcio: there is no signing key to store,
-# leak or rotate, and the certificate records which workflow produced the
-# artifact — something a bare checksum cannot say.
+# gh release create writes a release; packages:write pushes the image to GHCR;
+# id-token is what keyless signing exchanges for a short-lived certificate from
+# Fulcio, and what buildx uses for provenance.
 permissions:
   contents: write
+  packages: write
   id-token: write
 
 jobs:
-  release:
+  # The tag gate is not a hand-picked subset. It is ci.yml itself, called as a
+  # reusable workflow, so a release cannot run with a check that CI has but this
+  # file forgot to copy. Whatever turns main red turns a tag red.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # A runnable image is part of a release, not a side effect of one: amd64 and
+  # arm64, an SBOM and provenance attestation, a signed digest, and a scan that
+  # fails the job on HIGH/CRITICAL vulnerabilities.
+  image:
+    needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-    # The Go suite refuses to *skip* the Postgres tests when CI is set
-    # (openTestDB fails instead of skipping), so the gate below needs a real
-    # server — the same one ci.yml uses.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: r0semi_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-    env:
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/r0semi_test?sslmode=disable
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # provenance and SBOM are attached to the pushed manifest, so the
+          # digest carries the build's own account of how it was made.
+          provenance: true
+          sbom: true
+
+      # Trivy is pinned by digest too: a scanner that can change under its tag is
+      # the same supply-chain problem the pinning below exists to avoid. The
+      # runtime image is scratch, so there is no OS package surface — this scan
+      # is about the Go binary's dependency graph and whatever the base stages
+      # left behind.
+      - name: scan the image
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.docker/config.json":/root/.docker/config.json:ro \
+            aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
+            image --exit-code 1 --severity HIGH,CRITICAL --no-progress \
+            "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
+
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: sign the image digest
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
+
+  release:
+    needs: [ci, image]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -66,26 +112,6 @@ jobs:
       # is what asserts the embed is the real app rather than the placeholder.
       - name: build the frontend
         run: make web
-
-      # A tag normally points at a commit that already passed ci.yml. "Normally"
-      # is not "always" — a tag can be pushed at a commit that never saw a pull
-      # request — so the gate re-runs the suite here rather than trusting the
-      # tag. It runs with the race detector, like ci.yml: a data race is not
-      # something to discover in a released binary, and the Postgres service this
-      # job already starts is what the race detector needs to exercise the
-      # durable paths too. The cost is minutes at tag time; the alternative is a
-      # published artifact whose only concurrency evidence is a run that did not
-      # check for it.
-      - name: gate
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "these files are not gofmt'd:"
-            echo "$unformatted"
-            exit 1
-          fi
-          go vet ./...
-          go test -race -p 1 -timeout 300s ./...
 
       # The SBOM generator `make release` shells out to. Pinned here and in the
       # Makefile, so what a release publishes cannot change because an upstream tag
