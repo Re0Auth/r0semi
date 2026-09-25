@@ -1,12 +1,15 @@
 package httpclient
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/failsafe-go/failsafe-go"
+	"github.com/failsafe-go/failsafe-go/retrypolicy"
 )
 
 // DoerFunc adapts a function to Doer.
@@ -38,14 +41,31 @@ const (
 	defaultMaxElapsedTime  = 15 * time.Second
 	// maxRetryAfter caps how long an upstream Retry-After can hold a request.
 	maxRetryAfter = 30 * time.Second
+	// backoffFactor is how much each attempt's delay grows by. Two is the
+	// conventional exponential schedule.
+	backoffFactor = 2.0
+	// jitterFactor randomizes each delay by ±50%, so a fleet of callers that
+	// all saw the same upstream failure does not come back in lockstep.
+	jitterFactor = 0.5
 )
 
 // Retry decorates a Doer with exponential backoff on transient failures.
 //
-// Only idempotent methods are retried by default: repeating a POST can create a
-// second resource. A retried attempt re-sends a fresh body, so a request with a
-// body must be replayable (http.NewRequest sets GetBody for common body types);
-// otherwise it is passed through untouched.
+// The loop, the schedule and the cancellation handling are failsafe-go's
+// retrypolicy. What stays here is the policy that library is configured with,
+// because these are this service's rules rather than general ones:
+//
+//   - only idempotent methods are retried, and only when the body can be
+//     replayed: repeating a POST can create a second resource;
+//   - 429/502/503/504 are transient, 500 is not;
+//   - Retry-After is honoured, in seconds or as an HTTP date, and capped.
+//
+// HandleIf replaces the library's default "any error is retryable" rule, so a
+// caller-side cancellation is classified as retryable=false and ends the
+// sequence, and AbortOnErrors makes the same statement where failsafe checks
+// cancellation between attempts. A cancelled request is reported as cancelled
+// even when the last attempt produced an error of its own: the caller needs to
+// tell "timed out" apart from "upstream is down".
 func Retry(next Doer, opts RetryOptions) Doer {
 	if opts.MaxRetries <= 0 {
 		opts.MaxRetries = defaultMaxRetries
@@ -60,66 +80,50 @@ func Retry(next Doer, opts RetryOptions) Doer {
 		opts.MaxElapsedTime = defaultMaxElapsedTime
 	}
 
+	policy := retrypolicy.NewBuilder[*http.Response]().
+		HandleIf(func(resp *http.Response, err error) bool {
+			if err != nil {
+				return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+			}
+			return resp != nil && retryableStatus(resp.StatusCode, opts.ExtraStatuses)
+		}).
+		AbortOnErrors(context.Canceled, context.DeadlineExceeded).
+		WithMaxRetries(opts.MaxRetries).
+		WithMaxDuration(opts.MaxElapsedTime).
+		WithBackoffFactor(opts.InitialInterval, opts.MaxInterval, backoffFactor).
+		WithJitterFactor(jitterFactor).
+		WithDelayFunc(retryAfterDelay).
+		// The caller sees the upstream's own last failure rather than a
+		// synthetic "retries exceeded" error from the policy.
+		ReturnLastFailure().
+		// Release the failed attempt's connection while the retry waits, so it
+		// is not queued behind a connection the previous attempt still holds.
+		// It runs only when a retry is actually scheduled, which is why the
+		// final response reaches the caller with its body intact.
+		OnRetry(func(event failsafe.ExecutionEvent[*http.Response]) {
+			drain(event.LastResult())
+		}).
+		Build()
+
 	return DoerFunc(func(req *http.Request) (*http.Response, error) {
 		if !idempotent(req.Method) || (req.Body != nil && req.GetBody == nil) {
 			return next.Do(req)
 		}
 
-		policy := backoff.NewExponentialBackOff()
-		policy.InitialInterval = opts.InitialInterval
-		policy.MaxInterval = opts.MaxInterval
-		policy.MaxElapsedTime = opts.MaxElapsedTime
-		policy.Reset()
-
-		var (
-			lastResp *http.Response
-			lastErr  error
-		)
-		for attempt := 0; ; attempt++ {
-			if attempt > 0 && req.Body != nil {
-				body, err := req.GetBody()
-				if err != nil {
-					return lastResp, err
+		attempt := 0
+		return failsafe.With[*http.Response](policy).
+			WithContext(req.Context()).
+			Get(func() (*http.Response, error) {
+				attempt++
+				if attempt > 1 && req.Body != nil {
+					body, err := req.GetBody()
+					if err != nil {
+						return nil, err
+					}
+					req.Body = body
 				}
-				req.Body = body
-			}
-
-			resp, err := next.Do(req)
-			lastResp, lastErr = resp, err
-			if err == nil && !retryableStatus(resp.StatusCode, opts.ExtraStatuses) {
-				return resp, nil
-			}
-			// A cancelled request is reported as such, even if the last attempt
-			// produced its own error: the caller needs to tell "timed out" apart
-			// from "upstream is down".
-			if ctxErr := req.Context().Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			if attempt >= opts.MaxRetries {
-				return lastResp, lastErr
-			}
-
-			delay := policy.NextBackOff()
-			if delay == backoff.Stop {
-				return lastResp, lastErr
-			}
-			if err == nil {
-				// Honour an explicit Retry-After, then release the connection.
-				if after := retryAfter(resp); after > delay {
-					delay = after
-				}
-				drain(resp)
-				lastResp = nil
-			}
-
-			timer := time.NewTimer(delay)
-			select {
-			case <-req.Context().Done():
-				timer.Stop()
-				return nil, req.Context().Err()
-			case <-timer.C:
-			}
-		}
+				return next.Do(req)
+			})
 	})
 }
 
@@ -145,8 +149,21 @@ func retryableStatus(status int, extra []int) bool {
 	return false
 }
 
+// retryAfterDelay turns the attempt's Retry-After into its delay. Returning -1
+// leaves the schedule to the configured backoff, which is what happens when the
+// upstream sent no hint (or one this parse rejects).
+func retryAfterDelay(exec failsafe.ExecutionAttempt[*http.Response]) time.Duration {
+	if after := retryAfter(exec.LastResult()); after > 0 {
+		return after
+	}
+	return -1
+}
+
 // retryAfter reads RFC 9110 Retry-After, in seconds or as an HTTP date.
 func retryAfter(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
+	}
 	value := resp.Header.Get("Retry-After")
 	if value == "" {
 		return 0

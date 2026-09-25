@@ -1,10 +1,14 @@
 package httpclient
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/failsafe-go/failsafe-go"
+	"github.com/failsafe-go/failsafe-go/circuitbreaker"
 )
 
 // ErrCircuitOpen is returned when a host's breaker is open and the request was
@@ -16,14 +20,12 @@ type BreakerOptions struct {
 	// FailureThreshold is how many consecutive qualifying failures trip the
 	// breaker. Defaults to 5.
 	FailureThreshold int
-	// Cooldown is how long the breaker stays open before it admits a trial
-	// request. Defaults to 30s.
+	// Cooldown is how long the breaker stays open before it admits trial
+	// requests. Defaults to 30s.
 	Cooldown time.Duration
 	// HalfOpenSuccesses is how many consecutive trial successes close the
 	// breaker. Defaults to 2.
 	HalfOpenSuccesses int
-	// Now, when set, is the clock. Used by tests.
-	Now func() time.Time
 }
 
 const (
@@ -37,19 +39,22 @@ const (
 // A host that keeps failing is skipped for a cooldown window instead of charging
 // every request a full timeout: the data plane already has a bulkhead and
 // per-request deadlines, and a source that is down would otherwise turn each user
-// read into a 20-second wait. After the cooldown one trial request is admitted;
+// read into a 20-second wait. After the cooldown trial requests are admitted;
 // the configured number of consecutive successes closes the breaker, and any
 // failure trips it again.
 //
 // Only failures that say something about the upstream count: a transport error
 // the caller did not cause, or a 5xx. A 4xx is the request's problem, and a
-// caller-side cancellation (the request context is done) is nobody's fault here.
-// State is keyed by URL host and kept for the process's life; the set of hosts is
-// the deployment's configured sources, so it is bounded.
+// caller-side cancellation is nobody's fault here, so neither is recorded.
 //
-// It composes as a RoundTripper so it sits in the transport chain alongside
-// Bulkhead and the result is still a plain *http.Client — usable both as a Doer
-// and as the concrete client the OAuth token exchange needs.
+// The state machine, the cooldown, the half-open probes and the recording are
+// failsafe-go's circuitbreaker. What remains here is the per-host map — the
+// library keys a breaker by its own instance, and this client needs one breaker
+// per upstream rather than one per process — and the failure classification
+// above, which is this service's rule rather than a general one.
+//
+// The map is keyed by URL host and kept for the process's life; the set of hosts
+// is the deployment's configured sources, so it is bounded.
 func CircuitBreaker(next http.RoundTripper, opts BreakerOptions) http.RoundTripper {
 	if opts.FailureThreshold <= 0 {
 		opts.FailureThreshold = defaultBreakerFailures
@@ -60,118 +65,62 @@ func CircuitBreaker(next http.RoundTripper, opts BreakerOptions) http.RoundTripp
 	if opts.HalfOpenSuccesses <= 0 {
 		opts.HalfOpenSuccesses = defaultBreakerHalfOpens
 	}
-	if opts.Now == nil {
-		opts.Now = time.Now
+	return &breakerTransport{
+		next:  next,
+		opts:  opts,
+		hosts: map[string]failsafe.Executor[*http.Response]{},
 	}
-	return &breakerTransport{next: next, opts: opts, hosts: map[string]*breakerState{}}
 }
 
-type breakerPhase int
-
-const (
-	breakerClosed breakerPhase = iota
-	breakerOpen
-	breakerHalfOpen
-)
-
-type breakerState struct {
-	phase      breakerPhase
-	failures   int
-	successes  int
-	openedAt   time.Time
-	trialInUse bool
-}
-
+// breakerTransport holds one executor per upstream host. The executor bundles
+// that host's breaker, so a request is judged against its own source and a
+// request that is rejected never reaches the transport below.
 type breakerTransport struct {
 	next  http.RoundTripper
 	opts  BreakerOptions
 	mu    sync.Mutex
-	hosts map[string]*breakerState
+	hosts map[string]failsafe.Executor[*http.Response]
 }
 
 func (b *breakerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	host := req.URL.Host
-	if !b.admit(host) {
+	exec := b.executorFor(req.URL.Host)
+	resp, err := exec.
+		WithContext(req.Context()).
+		Get(func() (*http.Response, error) { return b.next.RoundTrip(req) })
+	// The library's sentinel is translated into this package's, so a caller keeps
+	// one error to match on no matter which decorator rejected the request.
+	if errors.Is(err, circuitbreaker.ErrOpen) {
 		return nil, ErrCircuitOpen
 	}
-	resp, err := b.next.RoundTrip(req)
-	b.record(host, req, err, resp)
 	return resp, err
 }
 
-// admit reports whether a request may proceed, moving an expired open breaker to
-// half-open and reserving the single trial slot.
-func (b *breakerTransport) admit(host string) bool {
+// executorFor returns the host's executor, building it on first use.
+func (b *breakerTransport) executorFor(host string) failsafe.Executor[*http.Response] {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	st := b.stateFor(host)
-	switch st.phase {
-	case breakerOpen:
-		if b.opts.Now().Sub(st.openedAt) < b.opts.Cooldown {
-			return false
-		}
-		st.phase = breakerHalfOpen
-		st.successes = 0
-		st.trialInUse = true
-		return true
-	case breakerHalfOpen:
-		if st.trialInUse {
-			return false
-		}
-		st.trialInUse = true
-		return true
-	default:
-		return true
+	if exec, ok := b.hosts[host]; ok {
+		return exec
 	}
+	breaker := circuitbreaker.NewBuilder[*http.Response]().
+		// HandleIf replaces the library's default "any error is a failure", so
+		// a caller-side cancellation is not recorded against the host.
+		HandleIf(breakerFailure).
+		WithFailureThreshold(uint(b.opts.FailureThreshold)).
+		WithSuccessThreshold(uint(b.opts.HalfOpenSuccesses)).
+		WithDelay(b.opts.Cooldown).
+		Build()
+	exec := failsafe.With[*http.Response](breaker)
+	b.hosts[host] = exec
+	return exec
 }
 
-func (b *breakerTransport) record(host string, req *http.Request, err error, resp *http.Response) {
-	failed := false
-	switch {
-	case err != nil:
-		// A caller-side cancellation or deadline is not the upstream's fault.
-		failed = req.Context().Err() == nil
-	case resp != nil && resp.StatusCode >= http.StatusInternalServerError:
-		failed = true
+// breakerFailure reports whether an attempt says something about the upstream's
+// health. A transport error the caller did not cause, or a 5xx, does; anything
+// else — a 4xx, or a cancellation — is the request's own business.
+func breakerFailure(resp *http.Response, err error) bool {
+	if err != nil {
+		return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	st := b.stateFor(host)
-	switch st.phase {
-	case breakerOpen:
-		// Unreachable through admit; kept coherent anyway.
-	case breakerHalfOpen:
-		st.trialInUse = false
-		if failed {
-			st.phase = breakerOpen
-			st.openedAt = b.opts.Now()
-			return
-		}
-		st.successes++
-		if st.successes >= b.opts.HalfOpenSuccesses {
-			st.phase = breakerClosed
-			st.failures = 0
-			st.successes = 0
-		}
-	default:
-		if failed {
-			st.failures++
-			if st.failures >= b.opts.FailureThreshold {
-				st.phase = breakerOpen
-				st.openedAt = b.opts.Now()
-			}
-			return
-		}
-		st.failures = 0
-	}
-}
-
-func (b *breakerTransport) stateFor(host string) *breakerState {
-	st := b.hosts[host]
-	if st == nil {
-		st = &breakerState{}
-		b.hosts[host] = st
-	}
-	return st
+	return resp != nil && resp.StatusCode >= http.StatusInternalServerError
 }

@@ -5,8 +5,8 @@ go 1.27.1
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/alexedwards/scs/v2 v2.9.0
-	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/coreos/go-oidc/v3 v3.21.0
+	github.com/failsafe-go/failsafe-go v0.9.7
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/klauspost/compress v1.19.2
@@ -21,6 +21,7 @@ require (
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-chi/chi/v5 v5.3.2 // indirect

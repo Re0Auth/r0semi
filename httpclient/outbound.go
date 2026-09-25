@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/failsafe-go/failsafe-go/bulkhead"
 )
 
 // TransportConfig tunes the connection pool of an outbound *http.Transport.
@@ -90,49 +92,57 @@ func NewTransport(cfg TransportConfig) *http.Transport {
 
 // bulkheadTransport bounds the number of requests in flight at once.
 type bulkheadTransport struct {
-	next  http.RoundTripper
-	slots chan struct{}
+	next http.RoundTripper
+	// The permit is taken and returned by hand rather than by running the
+	// request through the policy, because the permit has to outlive RoundTrip:
+	// see Bulkhead.
+	bulkhead bulkhead.Bulkhead[*http.Response]
 }
 
 // Bulkhead bounds how many requests may be in flight through next at the same
-// time. A request that finds the cap reached waits for a slot, and gives up if
+// time. A request that finds the cap reached waits for a permit, and gives up if
 // its context is cancelled first. maxConcurrent <= 0 disables the cap.
 //
 // Waiting rather than failing is deliberate: this is a proxy, and a read the
 // user asked for is worth queueing for a moment. What it must not do is let one
 // slow source turn into unbounded goroutines, each holding a buffered body.
 //
-// The slot is held until the response body is closed, not merely until the
+// The permit is held until the response body is closed, not merely until the
 // headers arrive. That distinction is the whole point here: RoundTrip returns as
 // soon as the status line is in, and a caller that then reads a multi-megabyte
-// body would be outside the cap if the slot had already been released. The
-// caller must close the body — which the http.Client contract requires anyway —
-// or the slot is never returned.
+// body would be outside the cap if the permit had already been released. It is
+// why the permit is acquired and released explicitly: a failsafe policy's scope
+// is the executed function, and the work being bounded here ends when the caller
+// stops reading, not when RoundTrip returns. The caller must close the body —
+// which the http.Client contract requires anyway — or the permit is never
+// returned.
 func Bulkhead(next http.RoundTripper, maxConcurrent int) http.RoundTripper {
 	if maxConcurrent <= 0 {
 		return next
 	}
-	return &bulkheadTransport{next: next, slots: make(chan struct{}, maxConcurrent)}
+	return &bulkheadTransport{
+		next:     next,
+		bulkhead: bulkhead.NewBuilder[*http.Response](uint(maxConcurrent)).Build(),
+	}
 }
 
 func (b *bulkheadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	select {
-	case b.slots <- struct{}{}:
-	case <-req.Context().Done():
-		return nil, req.Context().Err()
+	// AcquirePermit returns the request's own context error when the caller
+	// gives up waiting, which is the error the caller can act on.
+	if err := b.bulkhead.AcquirePermit(req.Context()); err != nil {
+		return nil, err
 	}
 
 	resp, err := b.next.RoundTrip(req)
 	if err != nil {
-		<-b.slots
+		b.bulkhead.ReleasePermit()
 		return nil, err
 	}
 	if resp.Body == nil {
-		<-b.slots
+		b.bulkhead.ReleasePermit()
 		return resp, nil
 	}
-	release := func() { <-b.slots }
-	resp.Body = &bulkheadBody{ReadCloser: resp.Body, release: release}
+	resp.Body = &bulkheadBody{ReadCloser: resp.Body, release: b.bulkhead.ReleasePermit}
 	return resp, nil
 }
 

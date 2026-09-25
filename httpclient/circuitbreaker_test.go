@@ -64,12 +64,14 @@ func breakerReq(t *testing.T) *http.Request {
 // time, and it recovers on its own once the cooldown has passed.
 func TestCircuitBreakerOpensThenRecovers(t *testing.T) {
 	ft := &fakeTransport{err: errors.New("dial tcp: connection refused")}
-	now := time.Unix(0, 0)
+	// The cooldown is a real, short window rather than an injected clock: the
+	// breaker's clock is the library's, and what the recovery depends on is that
+	// the window really elapses. The wait after tripping is explicit.
+	const cooldown = 50 * time.Millisecond
 	cb := CircuitBreaker(ft, BreakerOptions{
 		FailureThreshold:  3,
-		Cooldown:          time.Minute,
+		Cooldown:          cooldown,
 		HalfOpenSuccesses: 2,
-		Now:               func() time.Time { return now },
 	})
 	req := breakerReq(t)
 
@@ -88,7 +90,7 @@ func TestCircuitBreakerOpensThenRecovers(t *testing.T) {
 
 	// After the cooldown, trials are admitted and successes close the breaker.
 	ft.set(nil, http.StatusOK)
-	now = now.Add(2 * time.Minute)
+	time.Sleep(cooldown + 20*time.Millisecond)
 	for i := 0; i < 2; i++ {
 		if _, err := cb.RoundTrip(req); err != nil {
 			t.Fatalf("trial %d = %v, want success", i, err)
