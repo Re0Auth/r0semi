@@ -171,16 +171,17 @@ jobs:
       # assembled page still does not work — a CSP that blocks the app's own
       # bootstrap, for instance, which is invisible to a header assertion.
       #
-      # Twice: once on the in-memory built-in engine, once on the OpenID Provider
-      # (E2E_DATABASE_URL points re0auth at the job's Postgres). The second is the
-      # shipping engine, so it must not be the one that is never exercised.
-      - name: browser tests (built-in engine)
+      # Twice: once with the in-memory OP store, once with Postgres
+      # (E2E_DATABASE_URL points re0auth at the job's Postgres). The engine is the
+      # same OpenID Provider in both; E2E_DATABASE_URL only moves where its state
+      # lives, so the Postgres store is not the one that is never exercised.
+      - name: browser tests (in-memory store)
         working-directory: web
         run: |
           pnpm exec playwright install --with-deps chromium
           pnpm exec playwright test
 
-      - name: browser tests (OpenID Provider engine)
+      - name: browser tests (Postgres store)
         working-directory: web
         run: E2E_DATABASE_URL="$TEST_DATABASE_URL" pnpm exec playwright test
 

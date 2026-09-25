@@ -10,7 +10,9 @@
 2. **身份与凭据彻底分离**。
    - `usr_...` 是 r0semi 账号；
    - 第三方 IdP 身份（GitHub/Google/Discord/QQ/微软）是挂在该账号下的**身份**；
-   - TapTap `sessionToken` 是该账号名下的一项**凭据资产**，可增、删、改、查、轮换、核弹。
+   - TapTap `sessionToken` 等**原始平台凭据由数据源自己持有**，Re0Auth 不接触、不托管；
+     Re0Auth 的 vault 只保存**数据源签发的派生令牌**（federation 绑定产生）。旧文档曾把
+     TapTap `sessionToken` 写成 r0semi 账号名下的托管资产，那是迁移前的模型，已作废。
 3. **登录 ≠ 托管**。没有托管任何凭据的账号也是完全合法的账号。
 
 **Re0Auth 现在是 OpenID Provider**：`usr_...` 就是 OIDC 的 `sub`（随机、稳定、伪匿名）。
@@ -30,18 +32,18 @@ User (usr_...)
 │     linked_at
 │     last_login_at
 ├── primary_identity_id               仅展示用，无特权
-└── credentials[]                     托管资产（vault，按来源命名空间）
-      identity  (usr_..., "phigros.taptap")
-      meta      { object_id, openid, unionid, ... }   ← 上游身份是元数据
-      secret    sessionToken 密文
+└── bindings[]                        数据源绑定（vault，按来源命名空间）
+      identity  (usr_..., "<game>.<source>")
+      meta      { display_name, scopes, ... }   ← 上游元数据，不含凭据
+      secret    数据源签发的派生令牌密文
 ```
 
 **身份键 = `(provider, subject)`。** 绝不用 email、username 或昵称作为键：它们会变、
 会回收，QQ 等平台甚至不返回 email。
 
-**凭据键 = `(usr_, credential_source)`**，`credential_source` 是具象来源标识，
-例如 `phigros.taptap`。同一个 TapTap 账号在不同 TDS 应用下会有不同 sessionToken，
-用来源标识而非裸 `taptap` 可避免未来多游戏接入时的冲突。
+**绑定键 = `(usr_, "<game>.<source>")`**，例如 `phigros.taptap`。Re0Auth 只持有该数据源
+为这次绑定签发的令牌；TapTap `sessionToken` 等原始凭据留在数据源侧，Re0Auth 的 vault 中
+不存在它们。上游身份标识（openid/unionid 等）由数据源持有，Re0Auth 侧不落库。
 
 ## 2. 三项安全不变量（强制）
 
@@ -70,7 +72,7 @@ I-2 + I-3 合起来同时堵死"特权主账号死锁"和"自动合并劫持"两
 典型事故：
 
 ```
-手机上用 GitHub 登录      → 新建 usr_A，托管了 TapTap
+手机上用 GitHub 登录      → 新建 usr_A，绑定了 TapTap 数据源
 电脑上用 Google 登录      → 该身份从未用过 → 又新建 usr_B
 用户："我的 TapTap 呢？"
 ```
@@ -80,7 +82,7 @@ v1 的处理：
 - 登录页必须清晰标注"**登录**"与"**绑定到当前账号**"是不同动作；
 - 已登录状态下发起 IdP 授权，默认进入**绑定**语义；
 - 绑定一个已占用身份 → **拒绝**，提示"请先登录该账号解绑"；
-- **不做**账号合并。合并会引发凭据归属冲突（两个 `usr_` 各自的资产如何取舍），
+- **不做**账号合并。合并会引发绑定归属冲突（两个 `usr_` 各自的绑定如何取舍），
   需要双方强控制证明，v1 一律延后（见 §9）。
 
 ## 5. `/auth` 平面：r0semi 作为 IdP 的 OAuth 客户端
@@ -166,10 +168,10 @@ GET /oauth/authorize?...
 
 ## 8. 凭据命名空间
 
-- vault 的 `Identity{Subject: usr_..., Provider: credential_source}`。
-- 上游身份标识（TapTap `openid`/`unionid`、LeanCloud `objectId`）作为**凭据元数据**存储，
-  **不再**作为 `Subject`。
-- 新增游戏 / 上游 = 新增一个 `credential_source` 值与对应适配器，vault 不变。
+- vault 的 `Identity{Subject: usr_..., Provider: "<game>.<source>"}`。
+- 保存的是数据源为这次绑定签发的派生令牌；原始平台凭据（TapTap `sessionToken`、
+  LeanCloud `objectId` 等）只在数据源侧，Re0Auth 没有可导出的凭据（D-5）。
+- 新增游戏 / 上游 = 在 `sources` 中新增一个数据源与对应 scope，vault 结构不变。
 
 ## 9. v1 明确不做 / 后续
 

@@ -2,7 +2,8 @@
 
 > 状态：**已接受（Phase 0）**。本文是定位变更的正式记录，取代
 > [positioning.md](./positioning.md) 中"不做身份"的旧表述。
-> 证据来自两个 spike：`docs/zitadel-oidc-spike.md`（引擎可行性）与 `spike/fosite`（对照）。
+> 证据来自当时两个 spike：`docs/zitadel-oidc-spike.md`（引擎可行性）与 `spike/fosite`（对照）。
+> 这两个目录已在迁移完成后从仓库删除，本文保留结论。
 > 代码迁移见 §6；**本文定稿后，Phase 1 才开始改代码。**
 
 ## 1. 决策
@@ -24,7 +25,7 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
    这是最直接的一脚。
 2. **它强化而非稀释原定位**：身份仍交给外部 IdP，Re0Auth 只是把"身份"和"数据授权"合并到**一次 OIDC 接入**里。
    没有自建账号体系，[account-model.md](./account-model.md) 的三条不变量（I-1/I-2/I-3）原样成立。
-3. **技术与依赖都已验证可行**（`spike/zitadel-oidc`）：设备码流原生支持、不透明引用令牌模型契合、
+3. **技术与依赖都已验证可行**（当时的 `spike/zitadel-oidc`，已删除）：设备码流原生支持、不透明引用令牌模型契合、
    仍只用 go-jose/v4、构建图 264 包（对照 fosite 490）。
 
 ## 3. 契约（v1 起生效）
@@ -45,8 +46,11 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 
 - 采用 **`github.com/zitadel/oidc/v3/pkg/op`**（legacy `Storage` API）。
 - 手写 `oauth/` 引擎退役；业务平面的 introspect 改为通过 OP 的令牌存储 / `AccessTokenVerifier`。
-- 依据：[zitadel-oidc-spike.md](./zitadel-oidc-spike.md)。对照 fosite 的结论：zitadel 在依赖、
+- 依据：当时的 `zitadel-oidc-spike.md`（已删除，仅存结论）。对照 fosite 的结论：zitadel 在依赖、
   设备流、令牌模型上全面更优，且是 OIDC 原生。
+- **2025 年对抗审计后的协议收紧**（POST-only、重复参数、RFC 9207 `iss`、discovery 真实性、PKCE 语法、
+  授权码单次消费、refresh 重放错误码、introspection 资源服务器白名单、整链撤销、设备 scope 与轮询节流、
+  `auth_time` 语义、签名密钥校验）记录在 [ADR-0005](./protocol-hardening-decision.md)，不改变本节选型。
 
 ## 5. 后果（必须接受）
 

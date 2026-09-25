@@ -26,8 +26,8 @@ const appPort = Number(process.env.E2E_PORT ?? 18099);
 const idpPort = Number(process.env.E2E_IDP_PORT ?? 18098);
 const appBase = `http://127.0.0.1:${appPort}`;
 const idpBase = `http://127.0.0.1:${idpPort}`;
-// When set, re0auth runs on Postgres and therefore uses the OpenID Provider
-// engine (ADR-0001); unset keeps the in-memory built-in engine.
+// When set, re0auth stores OP state in Postgres; unset uses the in-memory store.
+// Both run the same OpenID Provider engine (ADR-0001 P4b) — only the store differs.
 const dbUrl = process.env.E2E_DATABASE_URL ?? '';
 
 const CLIENT_ID = 'cli';

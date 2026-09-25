@@ -222,7 +222,7 @@ real**. An advertised capability that does not exist is worse than a missing one
 | 给源 / To the source | 说明 / Detail |
 |---|---|
 | 一个稳定域名 | 下游只接一次，就消费了你的数据 |
-| **更少的负载** | 响应缓存 + 并发合并（singleflight）+ 退避，替你把重复请求挡掉 |
+| **更少的负载** | 出站连接池 + 并发上限（bulkhead）+ 指数退避重试；同一绑定的刷新串行化。**当前没有响应缓存或 singleflight**，旧文档的这项承诺并未实现 |
 | 每用户归因 | 请求带你的每用户令牌，谁在用一目了然 |
 | 凭据不外泄 | 下游永远拿不到你的令牌 |
 | 一处撤销 | 解绑 / Kill Switch 调用你的吊销接口，且只在你声明支持时显示「全部退出」 |

@@ -113,6 +113,7 @@ Re0Auth 存的是"**能换到数据的东西**"。它的性质取决于数据源
 | 文档 | 内容 |
 |---|---|
 | [oidc-decision.md](./oidc-decision.md) | ADR-0001：采纳 OIDC、升格为 OpenID Provider 的决策与契约 |
+| [protocol-hardening-decision.md](./protocol-hardening-decision.md) | ADR-0005：协议面对抗审计后的收紧（方法、重复参数、`iss`、PKCE、内省、设备流、`auth_time`） |
 | [architecture.md](./architecture.md) | 组件运行时、金库、适配器、授权服务器、HTTP 层 |
 | [account-model.md](./account-model.md) | 身份与凭据分离、`/auth` 平面、渐进式绑定 |
 | [api-design.md](./api-design.md) | 对下游的 API 风格与端点 |

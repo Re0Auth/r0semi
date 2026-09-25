@@ -9,7 +9,7 @@
 |---|---|---|
 | `golang.org/x/oauth2` | `idp`（对外 IdP 客户端）、`federation`（对上游 AS 的客户端、PKCE） | OAuth 2.0 客户端的既成标准；`S256ChallengeOption` 等 |
 | `github.com/coreos/go-oidc/v3` | `idp` 的 OIDC 提供方（Google / 微软） | 验 `id_token` 的签名（issuer JWKS）、issuer、audience、过期；discovery 缓存。**OIDC 是被攻得最多的点，绝不自己写** |
-| `github.com/go-jose/go-jose/v4` | 间接：随 `go-oidc` 进来；测试里签 `id_token` | **只有一套 JOSE 栈**。DPoP/JWT 若将来要做，必须用它，绝不用第二套（如 `jwx`） |
+| `github.com/go-jose/go-jose/v4` | **直接依赖**：`oidcstore` 用 `jose.SignatureAlgorithm`、JWKS 类型；也是 `go-oidc` 的传递依赖 | **只有一套 JOSE 栈**。DPoP/JWT 若将来要做，必须用它，绝不用第二套（如 `jwx`） |
 | `github.com/alexedwards/scs/v2` | `internal/auth`（re0auth 会话）、`referencesource`（源侧会话） | 服务端会话、Cookie 属性、登录时轮换 |
 | `golang.org/x/time/rate` | `internal/ratelimit`（按 key 令牌桶），`httpapi` 限流中间件 | 标准令牌桶。**注意它内部用真实时钟，不要和注入的假时钟混用**（会静默算错补充速率） |
 | `github.com/cenkalti/backoff/v4` | `httpclient.Retry`（上游重试装饰器） | 成熟的指数退避 + 抖动策略；**只重试幂等方法**，POST 默认不重放 |
@@ -49,7 +49,7 @@
 
 | 候选 | 结论 |
 |---|---|
-| `ory/fosite`（OAuth 2.0 AS 引擎） | **评估后未采用。** spike（`spike/fosite`）证实两点致命代价：（a）**不实现 RFC 8628 设备码流**；（b）把 75 个 indirect 依赖、第二套 JOSE（go-jose/v3）与 logrus/grpc/OTel 拉进构建图。最终选择 OIDC 原生的 `zitadel/oidc/v3`（§1），依据见 [oidc-decision.md](./oidc-decision.md) |
+| `ory/fosite`（OAuth 2.0 AS 引擎） | **评估后未采用。** 当时的 spike（`spike/fosite`，已从仓库删除，仅存结论）证实两点致命代价：（a）**不实现 RFC 8628 设备码流**；（b）把 75 个 indirect 依赖、第二套 JOSE（go-jose/v3）与 logrus/grpc/OTel 拉进构建图。最终选择 OIDC 原生的 `zitadel/oidc/v3`（§1），依据见 [oidc-decision.md](./oidc-decision.md) |
 | `hashicorp/go-retryablehttp` | HTTP 重试的**专用**方案（认 `Retry-After`、幂等方法、包 `*http.Client`），比通用退避更贴场景。本项目选了 `backoff` 是因为它更贴合 `httpclient.Doer` 这个装饰器接缝；若将来重试逻辑变复杂，可换成它 |
 | 云 KMS 适配器（阿里云 KMS / AWS KMS / GCP KMS） | **暂不引入**。`KeyWrapper` 接缝已就位，每个适配器都是一小段代码。**代价是持续的**：云依赖、按次计费、厂商锁定、本地开发与自托管都变复杂。买到的是**可恢复性与可归因**（KEK 不在进程里、解封可审计、密钥可停用），**不是防止解密**——被攻破的进程可以用自己的身份去调 KMS（threat-model §6.0）。自托管不需要；官方公共实例需要 |
 | `github.com/awnumar/memguard` | 解决"Go 无法保证清零"。目前 `zeroize` + `runtime.KeepAlive` 是尽力而为，**这一限制应在 threat-model 中如实承认** |

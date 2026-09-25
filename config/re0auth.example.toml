@@ -55,6 +55,14 @@ trusted_proxies = []
 # Environment override: RE0AUTH_INTERNAL_ADDR="127.0.0.1:9090"
 internal_addr = ""
 
+# Client ids allowed to introspect tokens issued to OTHER clients — the resource
+# servers you trust. A client may always introspect its own tokens; empty is the
+# safe default. See ADR-0005.
+#
+#   introspection_clients = ["cli_resource_server"]
+# Environment override: RE0AUTH_INTROSPECTION_CLIENTS="cli_a,cli_b"
+introspection_clients = []
+
 [storage]
 # "postgres" or "memory". Omit the whole section to use memory (nothing survives
 # a restart; the server says so at startup). **Either way the authorization engine

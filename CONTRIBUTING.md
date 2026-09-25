@@ -36,9 +36,9 @@ CI 在 Linux 上带 Postgres 服务跑全量（含集成测试）。**"我机器
 
 - **字段、参数、JSON key 一律 `snake_case`**。
 - **协议平面**（`/oauth/`、`/.well-known/`）返回 `application/x-www-form-urlencoded` 的输入与 `{error, error_description}`；
-  **业务平面**（`/v1/`）返回 JSON 与 RFC 9457 `problem+json`。**两者绝不混用**，两平面各有独立子 mux / 错误写出器 / panic 恢复。
+  **业务平面**（`/v1/`）返回 JSON 与 RFC 9457 `problem+json`。**两者绝不混用**，各面有独立子 mux / 错误写出器 / panic 恢复；`/auth`、`/bind`、`/app` 等浏览器面是纯文本或重定向。
 - **令牌明文绝不落盘**：存储只存 `sha256(value)`。
-- **凭据绝不返回给下游**（唯一例外是显式 `critical` 导出 scope）。
+- **凭据绝不返回给下游**：没有例外。上游凭据在数据源手里，Re0Auth 本地保存的是源签发的令牌，账号导出、grant/binding 视图与 `raw` 都不包含任何凭据。
 - **元数据不能撒谎**：`/.well-known/*` 里广告的能力必须真的实现。曾出现过广告了 DPoP 却不校验的情况，现已用测试锁死。
 
 ## 分层与依赖方向（机器强制，不是自觉）

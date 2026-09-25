@@ -172,6 +172,10 @@ Kit 侧：`Hooks.CascadeRevoke` 非 nil 时端点与 discovery 字段一起出�
 
 规范化 scope 文法：`<game>.<resource>.<action>`，`action ∈ {read, write}`；另有全局 `account.read`。
 
+> **注意（Re0Auth 侧文法更宽）**：`upstreamkit.ValidCanonicalScope` 严格校验上面三段式；
+> 但 Re0Auth 自己的 catalogue（`oauth.Scope.valid`）只要求至少两段，因为 `account.id` 这类全局
+> scope 本来就不带 action。数据源必须按严格三段式实现；Re0Auth 的宽松只服务于自己的下游 scope。
+
 | scope | 含义 |
 |---|---|
 | `account.read` | 上游账号标识 |

@@ -17,7 +17,7 @@
 
 ---
 
-## 1. 两个平面，两套规则
+## 1. 协议面与业务面：两套规则（浏览器面见 §6）
 
 | | **协议平面** | **业务平面** |
 |---|---|---|
@@ -35,6 +35,16 @@
 **不转述库的内部信息**（`ErrorType=… Parent=…` 属于日志，不属于线上契约）。
 `internal/httpapi/plane_test.go` 的走查把「非 JSON 失败」判为失败，并且**按方法**走
 （`POST /oauth/authorize` 在其中：库注册该端点时不带方法约束）。
+
+**方法、重复参数与真实性（审计后的收紧）。** `token`、`introspect`、`revoke`、`device_authorization`
+只接受 POST（RFC 6749/7662/7009/8628），GET 返回 OAuth JSON 405，凭据不再进入 URL 与访问日志；
+重复的请求参数一律 400 `invalid_request`，因为库只取最后一个值会让校验与使用看到不同的值；授权响应
+（成功与失败）带 RFC 9207 `iss`；PKCE 的 challenge/verifier 按 RFC 7636 的 43–128 unreserved 字符校验；
+授权码在查询时即被消费，过期码直接拒绝。discovery 不再广告未实现的 implicit/hybrid、JWT bearer、
+private_key_jwt 与 profile/email claims，`response_types`/`grant_types`/认证方法按真实能力覆写。
+introspection 默认只允许 client 查询自己的 token，资源服务器需在
+`server.introspection_clients` / `RE0AUTH_INTROSPECTION_CLIENTS` 中显式列出；撤销任一令牌会同时撤销
+同一授权链的配对令牌（RFC 7009 §2.1）。取舍记录在 [protocol-hardening-decision.md](./protocol-hardening-decision.md)（ADR-0005）。
 
 **业务平面全部 `no-store`。** 这张表的「按资源语义」曾经落空——业务面一个 `Cache-Control` 都没有。
 但这里每个响应都是**认证后的按人数据**：会话引导与 admin 客户端列表下发 CSRF token，账号导出是某个人
@@ -83,7 +93,7 @@
   能指名单个 scope 时附 `scope="…"`。raw 透传按「该源任一资源 scope」粗粒度门禁，故省略 `scope=`。
   这是 RFC 6750 §3.1 区分「令牌不行」与「令牌太窄」的唯一标准手段——没有它，标准客户端只能看到
   一个裸 403，无法从协议层知道该去申请哪个 scope。
-- 初始错误码目录：
+- 初始错误码目录（当前实现；`credential_not_found`、`conflict`、`idempotency_key_reused` 已删除，见 §2.6）：
 
 | code | status | 含义 |
 |---|---|---|
@@ -91,10 +101,7 @@
 | `unauthenticated` | 401 | 缺少/无效令牌 |
 | `invalid_token` | 401 | 令牌被撤销或过期 |
 | `scope_not_granted` | 403 | 令牌缺少所需 scope |
-| `credential_not_found` | 404 | 该 provider 未托管凭据 |
 | `not_found` | 404 | 资源不存在 |
-| `conflict` | 409 | 状态冲突 |
-| `idempotency_key_reused` | 409 | 幂等键复用于不同请求体 |
 | `rate_limited` | 429 | 限流 |
 | `not_acceptable` | 406 | 客户端拒绝了所有可用内容编码且禁止 identity |
 | `upstream_unavailable` | 502 | 上游不可用 |
@@ -140,7 +147,7 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 列表为空是默认，也是没有反代时的正确答案；列表过宽等于把选择权又交回调用方。
 
 ### 2.8 可观测
-每个响应带 `X-Request-Id`；接受 W3C `traceparent`；problem 回带 `request_id`。
+每个响应带 `X-Request-Id`；problem 回带 `request_id`。W3C `traceparent` **当前不解析、不传播**（无 OTel exporter），文档此前声称接受它，与实现不符；是否引入 tracing 见运维决策。
 
 ### 2.9 版本与弃用
 路径 `/v1`，只做增量、不破坏。弃用用 `Deprecation` + `Sunset`（RFC 8594）头，并记录 changelog。
@@ -187,7 +194,10 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 
 ## 4. 业务平面端点（`/v1`）
 
-原则：**数据导向，不做透明代理**。返回 r0semi 自己的稳定结构，不透传上游原始 JSON。
+原则：**数据导向，不做透明代理**。`/v1/games/{game}/{resource}` 返回源声明的 schema 载荷；
+实现层只检查响应是 JSON 并原样转发，**不执行 schema 校验或结构转换**——稳定性由数据源遵守
+`upstream-protocol.md` 的 schema 契约保证，而不是由 Re0Auth 运行时强制。需要逐字透传上游原生
+响应时走 `raw`，它同样不做转换。
 
 | 方法 | 路径 | scope | 说明 |
 |---|---|---|---|
@@ -343,7 +353,7 @@ re0auth.r0semi.net
 **这个 host 上没有运维指标面。** `/metrics` 与 `/debug/pprof/` **不在**上表，因为它们不挂在公网监听器上，
 而是挂在 `server.internal_addr` 指定的**独立内部监听器**（不配置即不提供）。pprof 会导出进程内部状态，
 把它放在公网端口上等于公开它；单独一个监听器是「只限内部 / 管理端」这条要求的**结构性**保证，而不是
-一句约定。两者都在 `/v1` 与两平面的错误格式之外，见 [architecture.md](./architecture.md) §4.11。
+一句约定。两者都在 `/v1` 与三个平面的错误格式之外，见 [architecture.md](./architecture.md) §4.11。
 
 **运维探针**：`GET /healthz`（存活）只要进程能应答就返回 `200 ok`；`GET /readyz`（就绪）在依赖可用时返回 `200`，
 否则 `503 not ready`——有数据库时检查连接池，内存模式无物可查即恒就绪。两者都是纯文本、**不属任何平面**

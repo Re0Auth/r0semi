@@ -255,7 +255,7 @@ MVP scope 目录：`account.id`、`taptap.account.id`、`phigros.profile.read`�
 > **不会实现的**：上游凭据导出端点——要导出的**原始平台**凭据在数据源手里，而本地那份**源签发**的
 > 令牌永不交给下游，见 api-design.md §5。
 
-### 4.5 HTTP 层与两平面路由（v1 已实现：`internal/httpapi`）
+### 4.5 HTTP 层与三平面路由（v1 已实现：`internal/httpapi`）
 
 它不是 core.Component（是系统最外层），而是 `New(Config) (*Server, error)` + `Handler()`。
 
@@ -265,10 +265,11 @@ re0auth.r0semi.net
 ├── /.well-known/oauth-protected-resource      RFC 9728
 ├── /app/…     前端 SPA（`go:embed` 进二进制；`/app/consent`、`/app/device`、`/app/grants`、`/app/sources`）
 ├── /oauth/…   协议平面：form 编码 + OAuth 错误 + recoverProtocol
-└── /v1/…      业务平面：JSON + problem+json + recoverBusiness
+├── /v1/…      业务平面：JSON + problem+json + recoverBusiness
+└── /auth/、/bind、/app/…、未知路径  浏览器平面：纯文本或重定向（browser-plane-decision.md）
 ```
 
-**只有三个挂载点，而且前端被钉在自己的前缀上。** 前端是客户端路由，未知路径会回落到 SPA shell 而不是 404，
+**每个命名空间单独挂载，而且前端被钉在自己的前缀上。** 前端是客户端路由，未知路径会回落到 SPA shell 而不是 404，
 所以它一旦挂在 `/`，API 的 404 就会变成 HTML。`/app/` 的前缀也因此**必须**与 `web/vite.config.ts` 的
 `paths.base` 一致——这种不一致不会报错，只会静默路由不到任何东西，所以由测试直接比对那个配置文件。
 
@@ -342,14 +343,14 @@ HTTP 头和 `<meta>` 同时存在时，**两个 CSP 都强制执行**。`interna
 `internal/httpapi/frontend_test.go` 现在断言头**不得**重述 `script-src` 等指令。
 
 **限流**（`internal/ratelimit`，基于 `golang.org/x/time/rate`）：可选的 `Config.Limiter` 在会话中间件之外
-先拦住超预算的调用方；按客户端地址分桶、空闲驱逐。**两个平面各自的错误形态**：`/oauth/*` 与 `/.well-known/*`
-返回 OAuth 错误，其余返回 `problem+json` 的 `rate_limited`。
+先拦住超预算的调用方；按客户端地址分桶、空闲驱逐。**三个平面各自的错误形态**：`/oauth/*` 与 `/.well-known/*`
+返回 OAuth 错误，`/v1/*` 返回 `problem+json` 的 `rate_limited`，浏览器路径是纯文本。
 
 **出站韧性**（`httpclient.Retry`，基于 `cenkalti/backoff/v4`）：指数退避 + 抖动，认 `Retry-After`，
 **默认只重试幂等方法**（POST 不隐式重放）。选型见 [dependencies.md](./dependencies.md)。
 
 关键不变量（由 `internal/httpapi` 测试守护）：**协议平面绝不输出 problem+json，业务平面绝不输出
-`{error,error_description}`**；两平面各有独立子 mux、错误写出器与 panic 恢复，仅共享 request-id 中间件。
+`{error,error_description}`，浏览器平面两者都不输出**；三个平面各有独立子 mux、错误写出器与 panic 恢复，仅共享 request-id 中间件。
 
 ### 4.6 /auth 平面与会话（v1 已实现：`idp`、`internal/account`、`internal/auth`）
 
@@ -398,8 +399,9 @@ OP（`internal/oidchttp`，zitadel 引擎）处理，`httpapi` 只负责同意�
   作为 OAuth 核心；游戏相关的部分（用户认证 / 同意、账号、资源）由 hooks 提供。
 - `upstreamkit/conformance`：可执行的一致性套件，对任意数据源产出 findings
   （error / warning / skipped）；带 `AccessToken` 时额外检查数据面。
-- 参考上游在测试中由 Kit 构建并通过套件。**把真实 TapTap 适配器包装为数据源需要先把凭据
-  从 re0auth 移到数据源侧**，属后续工作。
+- 参考上游在测试中由 Kit 构建并通过套件。**真实 TapTap 适配器已迁到数据源侧**：
+  `referencesource` 用 `taptapoauth` + `tapsign` 完成 TapTap 登录与凭据兑换，Re0Auth 侧不再持有
+  原始平台凭据（见 §4.10 与 threat-model.md）。
 
 ### 4.9 数据联邦层（v1 已实现：`internal/federation`）
 
@@ -528,7 +530,8 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 
 会话额外做了一件事：`scs.Store` 的接口**不带 context**（scs 不传），所以适配器用 `context.Background`；
 过期会话在 `Find` 时按 scs 语义当作“未找到”并顺手删除，另有 15 分钟一次的 `SweepExpired` 定期清理
-（`Find` 只清那些还会被访问的）。OP 的过期授权请求 / code / 设备授权在读取时按过期处理，不另起 sweep。
+（`Find` 只清那些还会被访问的）。OP 的过期授权请求 / code / 设备授权在读取时按过期处理，并且**同一 15 分钟
+sweep 也会删除 OP 表中已过期的行**（`internal/store/postgres/sweep.go`）；内存模式的 janitor 同理。
 
 **进程生命周期**：`cmd/re0auth` 在 `SIGTERM`/`SIGINT` 时**优雅关闭**——先停止接受新连接，给在途请求最多 30s
 完成，再关闭剩余连接；后台清扫循环（会话 `SweepExpired`、内存 OP janitor）绑在同一个 signal context 上，
@@ -582,7 +585,7 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 - **完整性靠测试守住**，不补 16 张外键：`TestAccountDeletionLeavesNoOrphans`（需 Postgres，动态扫
   `information_schema` 里所有含 `subject`/`user_id` 列的表，逐一断言清零）+
   `TestEverySubjectColumnIsHandledByErasure`（无需数据库，解析 migration，新增的带 subject 列的表若没登记就构建失败）。
-  `audit_events` 是**显式豁免**：它 append-only，抹除走的是假名化而非删除（后续阶段）。
+  `audit_events` 是**显式豁免**：它 append-only，抹除走的是假名化而非删除（已实现，见 §4.15）。
 
 ### 4.14 审计完整性（v1 已实现：`internal/store/postgres/auditchain.go`）
 
@@ -647,7 +650,7 @@ pseudonym = HMAC(key, "…pseudonym/1" ‖ subject)              -- 写进 audit
 - **I5 fail-closed**：依赖不可用 → 组件 INACTIVE，绝不降级放行。
 - **I6 无动态代码**：v1 不加载运行时第三方代码；第三方适配器走进程外 gRPC。
 
-`go test ./...` 共 204+ 项（本机默认）+ 11 项 Postgres 集成测试（未设 `TEST_DATABASE_URL` 时跳过，在 Linux CI 执行），
+`go test ./...` 覆盖全部 Go 包（含 Postgres 集成测试；未设 `TEST_DATABASE_URL` 时集成测试跳过，在 Linux CI 执行），
 覆盖的安全不变量。**注意**：I1 / I5 的**运行时**守护在 `core`，而 `core` 未进生产（ADR-0002）；
 生产里被机器强制的是**包级依赖方向**，见 `internal/archtest`：
 
@@ -678,7 +681,7 @@ pseudonym = HMAC(key, "…pseudonym/1" ‖ subject)              -- 写进 audit
 critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期。
 
 `internal/httpapi` 用 `httptest` 跑完整 HTTP 往返：发现端点、授权码兑换、
-`/v1/me` 的 Bearer + scope 校验、自省 / 撤销、以及两平面错误格式互不泄漏。
+`/v1/me` 的 Bearer + scope 校验、自省 / 撤销、以及三个平面错误格式互不泄漏。
 
 `internal/auth` 用假 IdP + Cookie jar 跑完整登录/绑定往返：start 生成 PKCE、callback 兑换并落地会话、
 `identity_taken` 拒绝、`return_to` 防开放重定向、CSRF 令牌校验。
