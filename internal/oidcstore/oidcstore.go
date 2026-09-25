@@ -221,6 +221,41 @@ func (r *RefreshRequest) GetAuthTime() time.Time {
 	return *r.AuthTime
 }
 
+// SplitProtocolScopes partitions a scope set into the ones the catalogue
+// describes and the OIDC-standard flags it deliberately does not.
+//
+// The catalogue is about data permissions. `openid` and `offline_access` are
+// protocol flags, and `profile` / `email` / the other claim scopes are accepted
+// as no-ops because userinfo returns only `sub` (O-3). The consent, device and
+// token paths must all agree on this split, so it lives here rather than in one
+// caller.
+func SplitProtocolScopes(scopes []string) (described, protocol []string) {
+	for _, s := range scopes {
+		if StandardOIDCScope(s) {
+			protocol = append(protocol, s)
+			continue
+		}
+		described = append(described, s)
+	}
+	return described, protocol
+}
+
+// StandardOIDCScope reports whether scope is one the OP always accepts without
+// consulting the catalogue (O-3, O-6).
+func StandardOIDCScope(scope string) bool {
+	switch scope {
+	case oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeAddress, oidc.ScopeOfflineAccess:
+		return true
+	default:
+		return false
+	}
+}
+
+// DefaultDevicePollInterval is the minimum interval between device-code polls.
+// It is the same value the OP advertises, so the protocol layer and the storage
+// throttle cannot drift.
+const DefaultDevicePollInterval = 5 * time.Second
+
 // --- consent policy ---
 
 // NarrowScopes validates that an approval only narrows the requested scope set.

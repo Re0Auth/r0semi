@@ -22,6 +22,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/Re0Auth/r0semi/internal/authorization"
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -139,7 +140,7 @@ func New(cfg Config) (*Handler, error) {
 		SupportedUILocales: []language.Tag{language.English},
 		DeviceAuthorization: op.DeviceAuthorizationConfig{
 			Lifetime:     10 * time.Minute,
-			PollInterval: 5 * time.Second,
+			PollInterval: oidcstore.DefaultDevicePollInterval,
 			UserFormPath: cfg.DeviceUserFormPath,
 			UserCode:     op.UserCodeBase20,
 		},
@@ -477,14 +478,7 @@ func withCoreScopes(scopes []string) []string {
 // decision, where they must not be handed to the catalogue or dropped from the
 // grant.
 func splitProtocolScopes(scopes []string) (described, protocol []string) {
-	for _, s := range scopes {
-		if standardOIDCScope(s) {
-			protocol = append(protocol, s)
-			continue
-		}
-		described = append(described, s)
-	}
-	return described, protocol
+	return oidcstore.SplitProtocolScopes(scopes)
 }
 
 // requestParams returns a request's parameters from wherever this method carries
@@ -514,7 +508,7 @@ func requestParams(r *http.Request) url.Values {
 // not ask for.
 func (h *Handler) scopeProblem(client oauth.Client, scopes []string) string {
 	for _, scope := range scopes {
-		if standardOIDCScope(scope) {
+		if oidcstore.StandardOIDCScope(scope) {
 			continue
 		}
 		s := oauth.Scope(scope)
@@ -727,18 +721,6 @@ func knownOAuthPath(path string) bool {
 		"/" + pathUserinfo,
 		"/" + pathKeys,
 		"/" + pathDeviceAuthz:
-		return true
-	default:
-		return false
-	}
-}
-
-// standardOIDCScope reports whether scope is one the library always accepts
-// without consulting the catalog. offline_access is included because Re0Auth
-// treats it as a compatibility no-op (ADR-0001 O-6).
-func standardOIDCScope(scope string) bool {
-	switch scope {
-	case oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail, oidc.ScopePhone, oidc.ScopeAddress, oidc.ScopeOfflineAccess:
 		return true
 	default:
 		return false

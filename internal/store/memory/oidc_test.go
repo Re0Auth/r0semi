@@ -93,6 +93,73 @@ func TestUnknownDeviceCodeIsNotFound(t *testing.T) {
 	}
 }
 
+// A standard OIDC device client asks for `openid profile email`; those are
+// protocol flags the catalogue does not describe, so the flow must not fail on
+// them and must keep them on the granted set (otherwise no id_token is issued).
+func TestDeviceFlowAcceptsStandardOIDCScopes(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	expires := time.Now().Add(10 * time.Minute)
+	requested := []string{"openid", "profile", "email", "account.id", "phigros.score.read"}
+	if err := store.StoreDeviceAuthorization(ctx, "cli", "device-standard", "WXYZ-1234", expires, requested); err != nil {
+		t.Fatal(err)
+	}
+
+	auth, err := store.DescribeDeviceAuthorization(ctx, "wxyz-1234")
+	if err != nil {
+		t.Fatalf("describing an OIDC device request failed: %v", err)
+	}
+	// Only catalogue scopes are shown as permissions.
+	if len(auth.Scopes) != 2 {
+		t.Fatalf("described scopes = %v, want only the two catalogue scopes", auth.Scopes)
+	}
+	for _, d := range auth.Scopes {
+		if d.Scope == "openid" || d.Scope == "profile" || d.Scope == "email" {
+			t.Fatalf("protocol scope %q was rendered as a permission", d.Scope)
+		}
+	}
+
+	if err := store.DecideDeviceAuthorization(ctx, "WXYZ-1234", "usr_1", true,
+		[]oauth.Scope{oauth.ScopeAccountID}, nil); err != nil {
+		t.Fatalf("approving an OIDC device request failed: %v", err)
+	}
+	st, err := store.DeviceByUserCode(ctx, "WXYZ-1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"openid", "profile", "email", "account.id", oidc.ScopeOfflineAccess} {
+		if !oidcstore.HasScope(st.Scopes, want) {
+			t.Fatalf("granted scopes = %v, missing %q", st.Scopes, want)
+		}
+	}
+	if oidcstore.HasScope(st.Scopes, "phigros.score.read") {
+		t.Fatalf("narrowing did not drop phigros.score.read: %v", st.Scopes)
+	}
+}
+
+// RFC 8628 §3.5: polling faster than the advertised interval answers slow_down.
+// The library maps context.DeadlineExceeded to that error, so the store must
+// return it rather than authorization_pending forever.
+func TestDevicePollingIsThrottled(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	if err := store.StoreDeviceAuthorization(ctx, "cli", "device-poll", "POLL-1234",
+		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := store.GetDeviceAuthorizatonState(ctx, "cli", "device-poll")
+	if err != nil {
+		t.Fatalf("first poll refused: %v", err)
+	}
+	if first == nil || first.Done || first.Denied {
+		t.Fatalf("first poll state = %+v", first)
+	}
+	if _, err := store.GetDeviceAuthorizatonState(ctx, "cli", "device-poll"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("immediate second poll error = %v, want context.DeadlineExceeded (slow_down)", err)
+	}
+}
+
 func TestGrantsAreDerivedFromTokensAndRevocable(t *testing.T) {
 	store, _ := testStore(t)
 	ctx := context.Background()

@@ -164,6 +164,56 @@ func TestDeviceDecisionExplicitEmptyScopesIsRefused(t *testing.T) {
 	}
 }
 
+// A standard OIDC device client asks for `openid profile email` alongside a data
+// scope. Those protocol scopes must not make the flow fail, and `openid` must
+// survive the decision so the token response actually carries an id_token.
+func TestDeviceAuthorizationWithStandardOIDCScopes(t *testing.T) {
+	base, _ := newFlowEnv(t)
+	browser := newBrowser(t)
+
+	start := decodeResp(t, postForm(t, browser, base+"/oauth/device_authorization", url.Values{
+		"client_id": {"cli"}, "scope": {"openid profile email account.id"},
+	}))
+	deviceCode, _ := start["device_code"].(string)
+	userCode, _ := start["user_code"].(string)
+	if deviceCode == "" || userCode == "" {
+		t.Fatalf("device_authorization = %v", start)
+	}
+
+	signIn(t, browser, base)
+	view := decodeResp(t, getURL(t, browser, base+"/v1/device/verification?user_code="+url.QueryEscape(userCode)))
+	csrf, _ := view["csrf_token"].(string)
+	scopes, _ := view["scopes"].([]any)
+	if len(scopes) != 1 {
+		t.Fatalf("verification page scopes = %v, want only the catalogue scope", view["scopes"])
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"user_code": userCode, "decision": "approve", "scopes": []string{"account.id"},
+	})
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/device/decision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp := doReq(t, browser, req)
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("decision = %d: %s", resp.StatusCode, raw)
+	}
+	resp.Body.Close()
+
+	tokens := decodeResp(t, postForm(t, browser, base+"/oauth/token", url.Values{
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+		"device_code": {deviceCode},
+		"client_id":   {"cli"},
+	}))
+	if tokens["access_token"] == "" {
+		t.Fatalf("tokens = %v", tokens)
+	}
+	if idToken, _ := tokens["id_token"].(string); idToken == "" {
+		t.Fatal("openid was dropped from the device grant, so no id_token was issued")
+	}
+}
+
 // The verification GET binds the code to the session and carries no CSRF token.
 // That is recorded here as a decision rather than left as an accident, because the
 // obvious fixes are worse than the gap:

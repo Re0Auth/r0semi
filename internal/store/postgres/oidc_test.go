@@ -152,6 +152,53 @@ func TestExpiredAuthorizationCodeIsRefused(t *testing.T) {
 	}
 }
 
+// Mirrors memory.TestDeviceFlowAcceptsStandardOIDCScopes.
+func TestDeviceFlowAcceptsStandardOIDCScopes(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	requested := []string{"openid", "profile", "email", "account.id", "phigros.score.read"}
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "device-standard", "WXYZ-1234",
+		time.Now().Add(10*time.Minute), requested); err != nil {
+		t.Fatal(err)
+	}
+
+	auth, err := store.DescribeDeviceAuthorization(ctx, "wxyz-1234")
+	if err != nil {
+		t.Fatalf("describing an OIDC device request failed: %v", err)
+	}
+	if len(auth.Scopes) != 2 {
+		t.Fatalf("described scopes = %v, want only the two catalogue scopes", auth.Scopes)
+	}
+
+	if err := store.DecideDeviceAuthorization(ctx, "WXYZ-1234", "usr_1", true,
+		[]oauth.Scope{oauth.ScopeAccountID}, nil); err != nil {
+		t.Fatalf("approving an OIDC device request failed: %v", err)
+	}
+	st, err := store.DeviceByUserCode(ctx, "WXYZ-1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"openid", "profile", "email", "account.id", oidc.ScopeOfflineAccess} {
+		if !oidcstore.HasScope(st.Scopes, want) {
+			t.Fatalf("granted scopes = %v, missing %q", st.Scopes, want)
+		}
+	}
+}
+
+// Mirrors memory.TestDevicePollingIsThrottled: a premature poll is slow_down.
+func TestDevicePollingIsThrottled(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "device-poll", "POLL-1234",
+		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "device-poll"); err != nil {
+		t.Fatalf("first poll refused: %v", err)
+	}
+	if _, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "device-poll"); err == nil {
+		t.Fatal("an immediate second poll was answered instead of slow_down")
+	}
+}
+
 func newAuthRequest(t *testing.T, ctx context.Context, store *OIDCStore) op.AuthRequest {
 	t.Helper()
 	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{

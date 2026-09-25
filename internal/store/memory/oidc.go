@@ -99,6 +99,11 @@ type deviceRecord struct {
 	denied         bool
 	subject        string
 	authTime       time.Time
+	// lastPoll is when the device last asked. RFC 8628 §3.5 lets the server answer
+	// slow_down when a client polls faster than the advertised interval; the
+	// library maps context.DeadlineExceeded to exactly that error, so the throttle
+	// lives here.
+	lastPoll time.Time
 }
 
 // OIDCOptions configures a memory OIDCStore.
@@ -570,6 +575,16 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(_ context.Context, clientID, devi
 	if !ok || d.clientID != clientID {
 		return nil, errors.New("memory: device authorization not found")
 	}
+	// RFC 8628 §3.5: a client that polls faster than the advertised interval is
+	// told to slow down. The library turns context.DeadlineExceeded into that
+	// error, so the store returns it for a premature poll. Only pending polls are
+	// throttled: an approved record is consumed below and a denied one is final.
+	if !d.done && !d.denied && !d.lastPoll.IsZero() &&
+		s.now().Before(d.lastPoll.Add(oidcstore.DefaultDevicePollInterval)) {
+		d.lastPoll = s.now()
+		s.devices[h] = d
+		return nil, context.DeadlineExceeded
+	}
 	st := d.state()
 	if d.done && !d.denied {
 		// Single use. The library reads this once, right before it mints the
@@ -579,7 +594,10 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(_ context.Context, clientID, devi
 		// still-pending record is left in place for the library to answer.
 		delete(s.devices, h)
 		delete(s.userCodes, normalizeUserCode(d.userCode))
+		return st, nil
 	}
+	d.lastPoll = s.now()
+	s.devices[h] = d
 	return st, nil
 }
 
@@ -946,7 +964,11 @@ func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode st
 	if err != nil {
 		return oauth.DeviceAuthorization{}, oauth.ErrDeviceNotFound
 	}
-	descriptors, err := s.registry.Resolve(oidcstore.Scopes(st.Scopes), st.ClientID)
+	// The page shows data permissions; `openid`/`profile`/... are protocol flags
+	// the catalogue deliberately does not describe. Resolving the full request
+	// here made a standard OIDC device request fail.
+	described, _ := oidcstore.SplitProtocolScopes(st.Scopes)
+	descriptors, err := s.registry.Resolve(oidcstore.Scopes(described), st.ClientID)
 	if err != nil {
 		return oauth.DeviceAuthorization{}, err
 	}
@@ -975,7 +997,17 @@ func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, sub
 	if err != nil {
 		return err
 	}
-	descriptors, err := s.registry.Resolve(oidcstore.Scopes(granted), st.ClientID)
+	// Re-attach the protocol scopes the client requested: the consent UI renders
+	// only catalogue scopes, so a decision must not silently downgrade an OpenID
+	// device authorization to a plain OAuth one.
+	_, protocol := oidcstore.SplitProtocolScopes(st.Scopes)
+	for _, s := range protocol {
+		if !oidcstore.HasScope(granted, s) {
+			granted = append(granted, s)
+		}
+	}
+	described, _ := oidcstore.SplitProtocolScopes(granted)
+	descriptors, err := s.registry.Resolve(oidcstore.Scopes(described), st.ClientID)
 	if err != nil {
 		return err
 	}
