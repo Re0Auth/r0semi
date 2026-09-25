@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // serve drives one request through h without a server.
@@ -121,4 +122,105 @@ func TestInternalHandlerRejectsUnknownPaths(t *testing.T) {
 			t.Errorf("GET %s = %d, want 404", path, rec.Code)
 		}
 	}
+}
+
+// Every domain signal must reach the exposition with the labels its alerting
+// rule matches on. A metric that is recorded but never exported is a dashboard
+// panel that reads zero forever — the failure that looks identical to "nothing
+// happened".
+func TestDomainSignalsAreExported(t *testing.T) {
+	m := New()
+	m.ObserveLogin("github", LoginSuccess)
+	m.ObserveTokenIssued("authorization_code")
+	m.ObserveTokenError("refresh_token", "invalid_grant")
+	m.ObserveDeviceDecision(DeviceApproved)
+	m.ObserveRevocation(RevocationGrant)
+	m.ObserveTokensRevoked(RevocationKillSwitch, 3)
+	m.ObserveAdminAction(AdminKillSwitch)
+	m.ObserveAuditVerify(VerifyOK)
+	m.ObserveUpstreamFetch("phigros", "next-phi", UpstreamOK)
+	m.ObserveUpstreamRefresh(RefreshRejected)
+	m.ObserveVaultOperation("use", "ok", 2*time.Millisecond)
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		`re0auth_auth_logins_total{provider="github",result="success"} 1`,
+		`re0auth_tokens_issued_total{grant_type="authorization_code"} 1`,
+		`re0auth_token_errors_total{error="invalid_grant",grant_type="refresh_token"} 1`,
+		`re0auth_device_decisions_total{decision="approved"} 1`,
+		`re0auth_revocations_total{kind="grant"} 1`,
+		`re0auth_tokens_revoked_total{kind="kill_switch"} 3`,
+		`re0auth_admin_actions_total{action="kill_switch"} 1`,
+		`re0auth_audit_verify_total{result="ok"} 1`,
+		`re0auth_upstream_fetches_total{game="phigros",result="ok",source="next-phi"} 1`,
+		`re0auth_upstream_refreshes_total{result="rejected"} 1`,
+		`re0auth_vault_operations_total{operation="use",result="ok"} 1`,
+		`re0auth_vault_operation_duration_seconds_count{operation="use"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("exposition is missing %q\n--- exposition ---\n%s", want, body)
+		}
+	}
+}
+
+// A zero count must not create a series: a revocation that removed nothing is
+// not activity, and a `tokens_revoked_total{kind="…"} 0` line would make an idle
+// system look like a busy one.
+func TestTokensRevokedIgnoresNonPositiveCounts(t *testing.T) {
+	m := New()
+	m.ObserveTokensRevoked(RevocationErasure, 0)
+	m.ObserveTokensRevoked(RevocationErasure, -1)
+	if body := scrape(t, m); strings.Contains(body, "re0auth_tokens_revoked_total") {
+		t.Errorf("a non-positive count created a series\n%s", body)
+	}
+}
+
+// The label budget is the whole reason the normalizers exist. Values that come
+// from a request must not be able to grow the metric set, so an unknown
+// grant_type, error code or HTTP method collapses into one bounded bucket rather
+// than one time series per value an attacker invents.
+func TestUnknownLabelValuesAreCollapsed(t *testing.T) {
+	m := New()
+	m.ObserveTokenIssued("invented_grant")
+	m.ObserveTokenError("invented_grant", "invented_error")
+	handler := m.Middleware(
+		func(*http.Request) string { return "business" },
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }),
+	)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest("FROBNICATE", "/v1/me", nil))
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		`re0auth_tokens_issued_total{grant_type="other"} 1`,
+		`re0auth_token_errors_total{error="other",grant_type="other"} 1`,
+		`re0auth_http_requests_total{method="other",plane="business",status="200"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("exposition is missing %q\n--- exposition ---\n%s", want, body)
+		}
+	}
+	for _, forbidden := range []string{"invented_grant", "invented_error", "FROBNICATE"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("an unbounded label value %q reached the exposition\n%s", forbidden, body)
+		}
+	}
+}
+
+// The domain methods are called from paths that may not have been given
+// instrumentation — an in-memory test deployment, for one — so a nil *Metrics
+// must be inert rather than a panic in the middle of serving a request.
+func TestNilMetricsIsSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveLogin("github", LoginSuccess)
+	m.ObserveTokenIssued("authorization_code")
+	m.ObserveTokenError("refresh_token", "invalid_grant")
+	m.ObserveDeviceDecision(DeviceDenied)
+	m.ObserveRevocation(RevocationGrant)
+	m.ObserveTokensRevoked(RevocationKillSwitch, 3)
+	m.ObserveAdminAction(AdminSuspend)
+	m.ObserveAuditVerify(VerifyFailed)
+	m.ObserveUpstreamFetch("phigros", "next-phi", UpstreamDegraded)
+	m.ObserveUpstreamRefresh(RefreshTransient)
+	m.ObserveVaultOperation("use", "ok", time.Millisecond)
 }
