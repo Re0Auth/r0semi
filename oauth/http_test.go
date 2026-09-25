@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -91,5 +92,43 @@ func TestBuildRedirectAppendsAndSkipsEmpty(t *testing.T) {
 	}
 	if _, present := q["error"]; present {
 		t.Fatalf("an empty parameter was written: %v", q)
+	}
+}
+
+func TestBearerTokenReadsTheCredential(t *testing.T) {
+	for _, tc := range []struct{ header, want string }{
+		{"Bearer abc123", "abc123"},
+		// RFC 7235: the scheme is case-insensitive.
+		{"bearer abc123", "abc123"},
+		{"BEARER abc123", "abc123"},
+		// The space after the scheme is grammar, so extra whitespace around the
+		// token is not part of the credential.
+		{"Bearer   abc123  ", "abc123"},
+		// Another scheme is not a bearer token, and neither is an empty one.
+		{"Basic dXNlcjpwYXNz", ""},
+		{"Bearer", ""},
+		{"Bearer ", ""},
+		{"", ""},
+	} {
+		req := httptest.NewRequest("GET", "/v1/me", nil)
+		if tc.header != "" {
+			req.Header.Set("Authorization", tc.header)
+		}
+		if got := BearerToken(req); got != tc.want {
+			t.Errorf("BearerToken(%q) = %q, want %q", tc.header, got, tc.want)
+		}
+	}
+}
+
+func TestParseScopesSplitsOnWhitespace(t *testing.T) {
+	got := ParseScopes("account.id  phigros.score.read\topenid")
+	want := []Scope{"account.id", "phigros.score.read", "openid"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ParseScopes = %v, want %v", got, want)
+	}
+	// No scopes at all is nil, not one empty scope: a caller that ranges over the
+	// result must not see a scope the client never asked for.
+	if got := ParseScopes(""); got != nil {
+		t.Fatalf("ParseScopes(%q) = %v, want nil", "", got)
 	}
 }

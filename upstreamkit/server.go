@@ -192,7 +192,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	req := oauth.AuthorizationRequest{
 		ClientID:            q.Get("client_id"),
 		RedirectURI:         q.Get("redirect_uri"),
-		Scopes:              parseScopes(q.Get("scope")),
+		Scopes:              oauth.ParseScopes(q.Get("scope")),
 		State:               q.Get("state"),
 		CodeChallenge:       q.Get("code_challenge"),
 		CodeChallengeMethod: q.Get("code_challenge_method"),
@@ -269,7 +269,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 			ClientID:     clientID,
 			ClientSecret: clientSecret,
 			RefreshToken: r.PostFormValue("refresh_token"),
-			Scopes:       parseScopes(r.PostFormValue("scope")),
+			Scopes:       oauth.ParseScopes(r.PostFormValue("scope")),
 		})
 		if err != nil {
 			writeProtocolError(w, r, err)
@@ -375,7 +375,7 @@ func (s *Server) handleResource(w http.ResponseWriter, r *http.Request) {
 // authorize resolves the bearer token and enforces scope, writing the error
 // itself when it fails.
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, scope string) (oauth.TokenInfo, bool) {
-	token := bearerToken(r)
+	token := oauth.BearerToken(r)
 	if token == "" {
 		writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "an access token is required")
 		return oauth.TokenInfo{}, false
@@ -405,27 +405,6 @@ func (s *Server) writeResourceJSON(w http.ResponseWriter, value any) {
 
 func hasScope(scopes []oauth.Scope, want string) bool {
 	return slices.Contains(scopes, oauth.Scope(want))
-}
-
-func parseScopes(s string) []oauth.Scope {
-	if s == "" {
-		return nil
-	}
-	fields := strings.Fields(s)
-	out := make([]oauth.Scope, len(fields))
-	for i, f := range fields {
-		out[i] = oauth.Scope(f)
-	}
-	return out
-}
-
-func bearerToken(r *http.Request) string {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
-		return strings.TrimSpace(h[len(prefix):])
-	}
-	return ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

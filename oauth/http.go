@@ -8,6 +8,7 @@ package oauth
 import (
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // ClientCredentials reads a client's id and secret from a request, per RFC 6749
@@ -41,6 +42,41 @@ func unescapeForm(v string) string {
 		return decoded
 	}
 	return v
+}
+
+// BearerToken reads the credential from an `Authorization: Bearer` header, per
+// RFC 6750 §2.1. It returns "" when the header is absent or names another
+// scheme, which is what lets a caller answer 401 with a challenge.
+//
+// The scheme is matched case-insensitively because RFC 7235 defines it that way,
+// and the value is trimmed because the single space after the scheme is part of
+// the grammar rather than of the token.
+func BearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
+		return strings.TrimSpace(h[len(prefix):])
+	}
+	return ""
+}
+
+// ParseScopes splits a scope value into its members, per RFC 6749 §3.3: a
+// space-delimited list, where a blank value means "no scopes" rather than one
+// empty scope.
+//
+// It does not validate. Whether a scope is known, and whether the requesting
+// client may ask for it, is Registry.Resolve's question — and answering it here
+// would give the parse and the policy two places to disagree.
+func ParseScopes(s string) []Scope {
+	if s == "" {
+		return nil
+	}
+	fields := strings.Fields(s)
+	out := make([]Scope, len(fields))
+	for i, f := range fields {
+		out[i] = Scope(f)
+	}
+	return out
 }
 
 // BuildRedirect returns redirectURI with params appended to its query, skipping

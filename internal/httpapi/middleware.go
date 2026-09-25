@@ -496,7 +496,7 @@ type tokenHandler func(w http.ResponseWriter, r *http.Request, info oauth.TokenI
 // absent, invalid or expired one with 401 problem+json.
 func (s *Server) withBearer(next tokenHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := bearerToken(r)
+		tok := oauth.BearerToken(r)
 		if tok == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="r0semi"`)
 			s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "an access token is required")
@@ -548,13 +548,4 @@ func (s *Server) insufficientScope(w http.ResponseWriter, r *http.Request, requi
 	}
 	w.Header().Set("WWW-Authenticate", challenge)
 	s.writeProblem(w, r, http.StatusForbidden, "scope_not_granted", detail, opts...)
-}
-
-func bearerToken(r *http.Request) string {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
-		return strings.TrimSpace(h[len(prefix):])
-	}
-	return ""
 }
