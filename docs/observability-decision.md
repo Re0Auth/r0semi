@@ -21,8 +21,10 @@
    | `tokens_revoked_total` | `kind` | 被撤销的令牌条数 |
    | `admin_actions_total` | `action` | 运维面写操作 |
    | `audit_verify_total` | `result` | 审计链校验结果 |
-   | `upstream_fetches_total` | `game`, `source`, `result` | 数据面读上游的结果（ok/degraded/not_bound/unavailable） |
+   | `upstream_fetches_total` | `game`, `source`, `result` | 数据面读上游的结果（ok/degraded/not_bound/unavailable/circuit_open） |
+   | `upstream_fetch_duration_seconds` | `game`, `source`, `result` | 数据面读上游的时延 |
    | `upstream_refreshes_total` | `result` | 上游刷新结果（ok/rejected/transient/lost_race/no_refresh_token） |
+   | `upstream_circuit_transitions_total` | `state` | 上游熔断器进入的状态（open/half_open/closed）。补的是**不出网**的那一半：断路器打开后被拒的请求到不了网络，数据面自己的计数器因此安静 |
    | `vault_operations_total` | `operation`, `result` | vault 操作结果 |
    | `vault_operation_duration_seconds` | `operation` | vault 操作时延 |
 

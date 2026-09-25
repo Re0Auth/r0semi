@@ -105,10 +105,16 @@
 - **风险：failsafe-go 仍是 v0.x。** 这是本次决策**主要的、未消除的代价**：pre-1.0 意味着 API 可以在
   次要版本间破坏。缓解是 go.mod 的精确锁定，加上"升级按次要版本逐次评估、不批量跳版本"。
   对照 `zitadel/oidc/v3`（同为押注 pre-1.0 的稳定子集）的处理方式，见 [oidc-decision.md](./oidc-decision.md) §5.5。
-- **熔断状态没有指标。** 库提供 `OnStateChanged` / `OnOpen` / `OnHalfOpen` / `OnClose` 监听器，
-  但本次**不接线**：一个信号只有在"指标命名空间 → artifacts 一致性测试 → 告警规则 → 看板 → runbook"
-  这条链走完才算完成（[observability-decision.md](./observability-decision.md)），那是独立的一次决策，
-  不塞进这次重构。当前状态如实为"没有"。
+- **熔断状态没有指标（后续已接线）。** 库提供 `OnStateChanged` / `OnOpen` / `OnHalfOpen` / `OnClose`
+  监听器，本次**不接线**：一个信号只有在"指标命名空间 → artifacts 一致性测试 → 告警规则 → 看板 →
+  runbook"这条链走完才算完成（[observability-decision.md](./observability-decision.md)），那是独立的
+  一次决策，不塞进这次重构。**该决策随后落地**：`httpclient.CircuitMetrics` 细缝（公开库不 import
+  `internal/`，与 `vault.Metrics` 同形）+ 组合根注入观察者，指标
+  `re0auth_upstream_circuit_transitions_total{state="open|half_open|closed"}`，告警
+  `Re0AuthUpstreamCircuitOpened`，看板面板 “Upstream circuit transitions”，runbook
+  `docs/runbooks.md#re0authupstreamcircuitopened`。链的两端各有守卫：artifacts 一致性测试钉住
+  规则/看板引用的序列已声明，`TestCircuitBreakerReportsStateTransitions` 钉住三态都被报出来。
+  这条信号补的正是数据面看不见的那一半——断路器打开后被拒的请求不出网。
 
 ## 重新评估的触发条件
 
@@ -119,7 +125,8 @@
 3. **需要绕开库才能表达的策略**——若某条规则必须写进库的执行链之外（例如按 method 分别配置退避、
    或接入重试预算），说明抽象开始不匹配。
 4. **半开并发度被证明有害**——某个上游在恢复期的 N 个并发探测下再次被打倒。
-5. **需要把熔断状态变成可告警的信号**——按上面的完整链子做，而不是只加一个计数器。
+5. ~~**需要把熔断状态变成可告警的信号**~~——**已做**（见「残余」一节：按完整链路落地，而不是只加一个
+   计数器）。若将来要让告警**按源**区分（现在刻意不分，避免每源一条序列），那是另一次决策。
 
 ## 测试锚点
 
@@ -132,6 +139,7 @@
 - 4xx 不计入熔断、5xx 计入：`TestCircuitBreakerCounts5xxNot4xx`
 - 调用方取消不触发熔断：`TestCircuitBreakerIgnoresCallerCancellation`
 - 熔断打开后不再打到下游、冷却后恢复：`TestCircuitBreakerOpensThenRecovers`
+- 熔断的每一次状态变化都被报出来（open → half_open → closed）：`TestCircuitBreakerReportsStateTransitions`
 - 许可覆盖到 body 关闭、重复 Close 不会多还一次：`TestBulkheadHoldsSlotUntilBodyClosed`
 - 取消的请求不占用许可：`TestBulkheadHonoursContext`
 - 上限 ≤ 0 时返回原 transport（不套一层空壳）：`TestBulkheadDisabledWhenUnlimited`

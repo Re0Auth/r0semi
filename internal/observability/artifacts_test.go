@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Re0Auth/r0semi/httpclient"
 )
 
 // The alerting rules and the Grafana dashboard are operational artifacts that
@@ -63,6 +65,7 @@ func declaredMetricNames(t *testing.T) map[string]bool {
 	m.ObserveUpstreamFetch("phigros", "next-phi", UpstreamOK)
 	m.ObserveUpstreamFetchDuration("phigros", "next-phi", UpstreamOK, time.Millisecond)
 	m.ObserveUpstreamRefresh(RefreshRejected)
+	m.ObserveCircuitTransition(httpclient.CircuitOpen)
 	m.ObserveVaultOperation("use", "ok", time.Millisecond)
 	// The pool collector is registered from the composition root, not by New(); its
 	// names must be declared here too, since the dashboard and rules reference them.

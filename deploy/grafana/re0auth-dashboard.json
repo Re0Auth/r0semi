@@ -277,6 +277,21 @@
           "legendFormat": "max"
         }
       ]
+    },
+    {
+      "title": "Upstream circuit transitions",
+      "description": "Breaker state changes. `open` is a source declared unhealthy and skipped for the cooldown; `half_open` means trials are being admitted again, so a value stuck there is a source that never recovers. Refused requests never reach the network, which is why this is the only place the shedding shows up.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (state) (increase(re0auth_upstream_circuit_transitions_total[5m]))",
+          "legendFormat": "{{state}}"
+        }
+      ]
     }
   ],
   "refresh": "30s",

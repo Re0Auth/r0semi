@@ -75,6 +75,7 @@ type Metrics struct {
 	upstreamFetch         *prometheus.CounterVec
 	upstreamFetchDuration *prometheus.HistogramVec
 	upstreamRefresh       *prometheus.CounterVec
+	circuitTransitions    *prometheus.CounterVec
 	vaultOps              *prometheus.CounterVec
 	vaultLatency          *prometheus.HistogramVec
 }
@@ -126,6 +127,8 @@ func New() *Metrics {
 			"Data-plane read latency in seconds, by game, source and result.", "game", "source", "result"),
 		upstreamRefresh: counter("upstream_refreshes_total",
 			"Upstream token refreshes, by result.", "result"),
+		circuitTransitions: counter("upstream_circuit_transitions_total",
+			"Upstream circuit breaker state transitions, by the state entered.", "state"),
 		vaultOps: counter("vault_operations_total",
 			"Credential-vault operations, by operation and result.", "operation", "result"),
 		vaultLatency: histogram("vault_operation_duration_seconds",
@@ -135,7 +138,8 @@ func New() *Metrics {
 	reg.MustRegister(
 		m.logins, m.tokensIssued, m.tokenErrors, m.deviceDecision,
 		m.revocations, m.tokensRevoked, m.adminActions, m.auditVerify,
-		m.upstreamFetch, m.upstreamFetchDuration, m.upstreamRefresh, m.vaultOps, m.vaultLatency,
+		m.upstreamFetch, m.upstreamFetchDuration, m.upstreamRefresh, m.circuitTransitions,
+		m.vaultOps, m.vaultLatency,
 	)
 	// The runtime and process collectors are what make /metrics useful during an
 	// incident that is not a request: a goroutine leak, a GC cliff, an open
@@ -439,6 +443,20 @@ func (m *Metrics) ObserveUpstreamRefresh(result string) {
 		return
 	}
 	m.upstreamRefresh.WithLabelValues(result).Inc()
+}
+
+// ObserveCircuitTransition records a circuit breaker entering a state.
+//
+// It is the method httpclient's CircuitMetrics interface is satisfied by, so the
+// state names travel in from that package rather than being constants here — same
+// reason as ObserveVaultOperation. What this signal adds over the data plane's own
+// counters is the shedding: once a breaker is open the requests it refuses never
+// reach the network, so they show up nowhere else.
+func (m *Metrics) ObserveCircuitTransition(state string) {
+	if m == nil {
+		return
+	}
+	m.circuitTransitions.WithLabelValues(state).Inc()
 }
 
 // ObserveVaultOperation records a credential-vault operation and its latency.

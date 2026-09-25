@@ -333,8 +333,11 @@ func main() {
 		MaxConcurrent: federationMaxConcurrent,
 		// A source that keeps failing is skipped for a cooldown rather than
 		// charging every user read a full timeout. Defaults (5 failures, 30s) are
-		// the house values; see httpclient.BreakerOptions.
-		Breaker: &httpclient.BreakerOptions{},
+		// the house values; see httpclient.BreakerOptions. Transitions go to the
+		// instrumentation because a breaker that is open is the one thing the
+		// data plane's own signals cannot show: the requests it refuses never
+		// reach the network.
+		Breaker: &httpclient.BreakerOptions{Metrics: metrics},
 	})
 	federationService, err := federation.NewService(federation.Config{
 		Registry:   registry,

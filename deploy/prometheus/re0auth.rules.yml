@@ -163,6 +163,25 @@ groups:
             not Re0Auth's; the deployment's other sources are unaffected.
           runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authupstreamsourceunavailable
 
+      - alert: Re0AuthUpstreamCircuitOpened
+        # The consequence of a source that keeps failing: its breaker skips the
+        # host for a cooldown, so requests are refused without being attempted.
+        # It is a separate signal from the failures because an open breaker
+        # HIDES them — nothing the refused requests would have produced reaches
+        # the network, so the data plane's own counters go quiet exactly when the
+        # shedding starts.
+        expr: increase(re0auth_upstream_circuit_transitions_total{state="open"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An upstream circuit breaker opened"
+          description: >-
+            The source behind it was already failing before this fired. Find which
+            one on `re0auth_upstream_fetches_total` by game/source, then check the
+            `half_open` transitions: they mean trials are being admitted again.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authupstreamcircuitopened
+
       - alert: Re0AuthUpstreamSlowSource
         # SLI S7, latency dimension. A source that is slow but still answering is
         # invisible to the unavailable-ratio alert above; this is the one that

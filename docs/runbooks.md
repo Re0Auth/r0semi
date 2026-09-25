@@ -113,6 +113,28 @@
 
 ---
 
+## Re0AuthUpstreamCircuitOpened
+
+**含义**：某上游的熔断器在最近 10 分钟内**打开过**（`increase(re0auth_upstream_circuit_transitions_total{state="open"}[10m]) > 0`）。
+这通常跟在 `Re0AuthUpstreamSourceUnavailable` 后面：源连续失败到阈值，于是被跳过一段冷却期。
+
+**为什么单独告警**：断路器打开之后，被拒的请求**根本不出网**——数据面自己的计数器会安静下来，
+"在保护下游"与"没有再打上游"在这条信号之外长得一模一样。
+
+**诊断**：
+1. 面板 “Upstream circuit transitions”：`open` 的频率与 `half_open` 是否出现（出现说明正在试探恢复）。
+2. 面板 “Upstream fetch results (by source)”：定位是哪个源，并看它是超时还是 5xx。
+3. 源自己的状态页/日志；Re0Auth 侧不需要改配置就能恢复（冷却后自动半开）。
+
+**处置**：**一般不需要动手**——冷却结束会自动放出试探请求，成功若干次即闭合。需要人工介入的情形
+是：`half_open` 反复出现而 `closed` 从不出现（试探也在失败，源确实还在故障）；或同一个源每小时都在
+`open`（阈值/冷却与实际抖动不匹配，按 `httpclient.BreakerOptions` 的值评估是否需要调整）。
+
+**升级**：若同时伴随 S7 预算燃烧，按 [incident-response.md](./incident-response.md) 定级；单源故障
+不升级为安全事件。
+
+---
+
 ## Re0AuthRefreshRejections
 
 **含义**：`rate(upstream_refreshes_total{result="rejected"}[15m]) > 0`。

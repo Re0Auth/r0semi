@@ -5,11 +5,71 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// recordingCircuitMetrics captures the transitions a breaker reports, in order.
+type recordingCircuitMetrics struct {
+	mu     sync.Mutex
+	states []string
+}
+
+func (r *recordingCircuitMetrics) ObserveCircuitTransition(state string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.states = append(r.states, state)
+}
+
+func (r *recordingCircuitMetrics) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.states...)
+}
+
+// The transitions are the only signal this client emits, and the only way to see a
+// breaker that is open: the requests it refuses never reach the transport, so
+// nothing on the network side records them. The whole cycle is asserted — open,
+// half open, closed — because a breaker stuck in half-open is a source that never
+// recovers, and a listener that only reported "open" would not show it.
+func TestCircuitBreakerReportsStateTransitions(t *testing.T) {
+	ft := &fakeTransport{err: errors.New("dial tcp: connection refused")}
+	rec := &recordingCircuitMetrics{}
+	// A real, short cooldown rather than an injected clock, for the reason
+	// TestCircuitBreakerOpensThenRecovers gives: the breaker's clock is the
+	// library's, and what recovery depends on is that the window really elapses.
+	const cooldown = 50 * time.Millisecond
+	cb := CircuitBreaker(ft, BreakerOptions{
+		FailureThreshold:  2,
+		Cooldown:          cooldown,
+		HalfOpenSuccesses: 1,
+		Metrics:           rec,
+	})
+	req := breakerReq(t)
+
+	for i := 0; i < 2; i++ {
+		if _, err := cb.RoundTrip(req); err == nil {
+			t.Fatalf("attempt %d succeeded, want the transport's failure", i)
+		}
+	}
+	if got := rec.snapshot(); !slices.Equal(got, []string{CircuitOpen}) {
+		t.Fatalf("after tripping, transitions = %v, want [%s]", got, CircuitOpen)
+	}
+
+	// Past the cooldown the breaker admits a trial; a success closes it.
+	ft.set(nil, http.StatusOK)
+	time.Sleep(cooldown + 30*time.Millisecond)
+	if _, err := cb.RoundTrip(req); err != nil {
+		t.Fatalf("the trial request was refused: %v", err)
+	}
+	want := []string{CircuitOpen, CircuitHalfOpen, CircuitClosed}
+	if got := rec.snapshot(); !slices.Equal(got, want) {
+		t.Fatalf("transitions = %v, want %v", got, want)
+	}
+}
 
 // fakeTransport stands in for the network: it records how many round trips
 // reached it and answers with a fixed outcome, so a test can tell a short-

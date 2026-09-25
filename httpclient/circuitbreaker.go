@@ -15,6 +15,33 @@ import (
 // rejected without being attempted.
 var ErrCircuitOpen = errors.New("httpclient: circuit breaker is open")
 
+// CircuitMetrics observes a breaker's state transitions. It is optional: a nil
+// interface records nothing.
+//
+// httpclient is a public library and must not import this service's observability
+// package, so a deployment injects its own implementation — the same shape as
+// vault.Metrics.
+//
+// Only the state entered is reported, never the host: the host set is the
+// deployment's configured sources, so it is bounded, but a label per source on a
+// metric nobody groups by is a series per source for nothing — the source that is
+// failing is already named on the data plane's own signals. A transition is an
+// event, so this is read as `increase(...)`, which is how "a source just went
+// unhealthy" gets asked.
+type CircuitMetrics interface {
+	ObserveCircuitTransition(state string)
+}
+
+// The state vocabulary a CircuitMetrics implementation receives. They are this
+// package's own strings rather than the library's: a metrics label has to be a
+// fixed set, and the library spells its third state "half-open" while every other
+// label in this service is snake_case.
+const (
+	CircuitClosed   = "closed"
+	CircuitOpen     = "open"
+	CircuitHalfOpen = "half_open"
+)
+
 // BreakerOptions tunes a CircuitBreaker. A zero field takes its default.
 type BreakerOptions struct {
 	// FailureThreshold is how many consecutive qualifying failures trip the
@@ -26,6 +53,9 @@ type BreakerOptions struct {
 	// HalfOpenSuccesses is how many consecutive trial successes close the
 	// breaker. Defaults to 2.
 	HalfOpenSuccesses int
+	// Metrics, when set, observes state transitions. It is the only signal this
+	// client emits.
+	Metrics CircuitMetrics
 }
 
 const (
@@ -112,10 +142,37 @@ func (b *breakerTransport) executorFor(host string) failsafe.Executor[guardedRes
 		WithFailureThreshold(uint(b.opts.FailureThreshold)).
 		WithSuccessThreshold(uint(b.opts.HalfOpenSuccesses)).
 		WithDelay(b.opts.Cooldown).
+		// The listener is what makes the state visible outside this process: a
+		// breaker that is open is shedding requests that never reach the network,
+		// so no upstream signal can show it.
+		OnStateChanged(func(event circuitbreaker.StateChangedEvent) {
+			if b.opts.Metrics == nil {
+				return
+			}
+			if name := circuitStateName(event.NewState); name != "" {
+				b.opts.Metrics.ObserveCircuitTransition(name)
+			}
+		}).
 		Build()
 	exec := failsafe.With[guardedResponse](breaker)
 	b.hosts[host] = exec
 	return exec
+}
+
+// circuitStateName maps the library's state onto the label vocabulary above. An
+// unrecognised state reports "", and the caller drops it rather than exporting a
+// value the vocabulary does not contain.
+func circuitStateName(state circuitbreaker.State) string {
+	switch state {
+	case circuitbreaker.ClosedState:
+		return CircuitClosed
+	case circuitbreaker.OpenState:
+		return CircuitOpen
+	case circuitbreaker.HalfOpenState:
+		return CircuitHalfOpen
+	default:
+		return ""
+	}
 }
 
 // breakerFailure reports whether an attempt says something about the upstream's
