@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/hex"
 	"net/http"
 	"strconv"
 	"strings"
@@ -155,4 +156,22 @@ func (s *Server) handleAdminAuditVerify(w http.ResponseWriter, r *http.Request) 
 		FirstBadID: v.FirstBadID,
 		Reason:     v.Reason,
 	})
+}
+
+// handleAdminAuditHead returns the chain's current head hash, for an external
+// anchor to publish. Verifying the chain in place cannot detect rows deleted from
+// the end — the tail is simply shorter and every remaining link still holds — so
+// the anchor is the missing piece: a copy of the head kept where this database
+// cannot reach. A deployment that never publishes it has exactly the protection it
+// had before, and the read API is what a SIEM tails for the export half.
+func (s *Server) handleAdminAuditHead(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	head, err := s.auditReader.Head(r.Context())
+	if err != nil {
+		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read the audit chain head")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"head": hex.EncodeToString(head)})
 }

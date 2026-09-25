@@ -1,9 +1,13 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"time"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/account"
 )
 
@@ -54,6 +58,7 @@ func (s *Server) handleUnlinkIdentity(w http.ResponseWriter, r *http.Request) {
 
 	switch err := s.accounts.UnlinkIdentity(r.Context(), user, id); {
 	case err == nil:
+		s.recordUnlinkAudit(r.Context(), string(user), string(id))
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, account.ErrLastIdentity):
 		// I-2. Reaching this means the UI offered a button it should not have,
@@ -65,5 +70,23 @@ func (s *Server) handleUnlinkIdentity(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown identity")
 	default:
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not unlink the identity")
+	}
+}
+
+// recordUnlinkAudit records an identity unlink. A write failure is logged, not
+// returned: the identity is already gone, and a 500 over a missing audit line
+// would report a completed action as failed.
+func (s *Server) recordUnlinkAudit(ctx context.Context, subject, identityID string) {
+	if s.auditLog == nil {
+		return
+	}
+	if err := s.auditLog.Record(ctx, audit.Event{
+		Time:    time.Now().UTC(),
+		Action:  "auth.identity.unlink",
+		Subject: subject,
+		Outcome: audit.OutcomeOK,
+		Detail:  map[string]string{"identity_id": identityID},
+	}); err != nil {
+		slog.Error("audit record failed", "action", "auth.identity.unlink", "err", err)
 	}
 }

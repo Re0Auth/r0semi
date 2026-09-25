@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/Re0Auth/r0semi/internal/observability"
@@ -12,6 +13,36 @@ import (
 
 // deviceBindKind namespaces the browser session binding for device approvals.
 const deviceBindKind = "device"
+
+// deviceProblem classifies an error from the device engine into the business
+// plane's answer. It is a pure function so the one property that matters — an
+// internal fault never carries its text to the caller — is testable without
+// standing up the server. The problem code stays "invalid_request" for every
+// protocol error on purpose: the closed catalogue does not contain the OAuth
+// codes (invalid_scope, access_denied), and widening it would break the
+// server/spec/frontend equality test.
+func deviceProblem(err error) (status int, code, detail string) {
+	var oauthErr *oauth.Error
+	switch {
+	case errors.Is(err, oauth.ErrDeviceNotFound), errors.Is(err, oauth.ErrClientNotFound):
+		return http.StatusNotFound, "not_found", "unknown or expired user code"
+	case errors.As(err, &oauthErr):
+		return http.StatusBadRequest, "invalid_request", oauthErr.Description
+	default:
+		return http.StatusInternalServerError, "internal_error", "could not complete the request"
+	}
+}
+
+// writeDeviceProblem renders a device-engine failure. Only the internal case is
+// logged here; the two client-facing cases are the caller's own fault and carry
+// their own description.
+func (s *Server) writeDeviceProblem(w http.ResponseWriter, r *http.Request, err error) {
+	status, code, detail := deviceProblem(err)
+	if status == http.StatusInternalServerError {
+		slog.ErrorContext(r.Context(), "device request failed", "request_id", requestID(r), "err", err)
+	}
+	s.writeProblem(w, r, status, code, detail)
+}
 
 // handleDeviceVerification is the browser page the user reaches after entering
 // the user_code. It requires a signed-in user and binds the code to this
@@ -30,12 +61,8 @@ func (s *Server) handleDeviceVerification(w http.ResponseWriter, r *http.Request
 	}
 
 	auth, err := s.devices.DescribeDeviceAuthorization(r.Context(), userCode)
-	switch {
-	case errors.Is(err, oauth.ErrDeviceNotFound):
-		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown or expired user code")
-		return
-	case err != nil:
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", err.Error())
+	if err != nil {
+		s.writeDeviceProblem(w, r, err)
 		return
 	}
 
@@ -86,12 +113,8 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 
 	err := s.devices.DecideDeviceAuthorization(r.Context(), body.UserCode, string(user),
 		body.Decision == "approve", toScopes(body.Scopes), toScopes(body.Explicit))
-	switch {
-	case errors.Is(err, oauth.ErrDeviceNotFound):
-		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown or expired user code")
-		return
-	case err != nil:
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", err.Error())
+	if err != nil {
+		s.writeDeviceProblem(w, r, err)
 		return
 	}
 	decision := observability.DeviceDenied

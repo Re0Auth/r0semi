@@ -36,6 +36,12 @@ var ErrInvalidTarget = errors.New("admin: the kill switch needs exactly one targ
 // claim an action that never happened.
 var ErrBindingsUnavailable = errors.New("admin: this deployment cannot revoke data-source bindings")
 
+// ErrInvalidRegistration reports a registration request the caller got wrong — a
+// bad client type, a missing or unparseable redirect URI — as opposed to a failure
+// to persist it. The handler maps it, and only it, to a 400; anything else is an
+// internal error.
+var ErrInvalidRegistration = errors.New("admin: invalid registration")
+
 // Clients is the registration store the operator plane manages: the request-path
 // methods plus the administrative ones.
 type Clients interface {
@@ -88,6 +94,10 @@ type Revoker interface {
 type Service interface {
 	ListClients(ctx context.Context) ([]oauth.Client, error)
 	Register(ctx context.Context, actor string, req RegisterRequest) (Registration, error)
+	// RotateClientSecret issues a new secret for a confidential client and returns
+	// it once. The old secret stops working immediately; the client id and its
+	// grants survive, which is the point — a leak used to mean delete-and-re-register.
+	RotateClientSecret(ctx context.Context, actor, clientID string) (string, error)
 	SuspendClient(ctx context.Context, actor, clientID string) error
 	ActivateClient(ctx context.Context, actor, clientID string) error
 	DeleteClient(ctx context.Context, actor, clientID string) error
@@ -194,7 +204,7 @@ func (s *service) Register(ctx context.Context, actor string, req RegisterReques
 	}
 	client, err := oauth.NewClient(id, req.Name, req.Type, secret, req.RedirectURIs, req.AllowedScopes)
 	if err != nil {
-		return Registration{}, err
+		return Registration{}, fmt.Errorf("%w: %w", ErrInvalidRegistration, err)
 	}
 	if err := s.clients.Create(ctx, client); err != nil {
 		return Registration{}, err
@@ -203,6 +213,23 @@ func (s *service) Register(ctx context.Context, actor string, req RegisterReques
 		"type": string(client.Type),
 	})
 	return Registration{Client: client, Secret: secret}, nil
+}
+
+// RotateClientSecret implements Service. A new secret is generated and its digest
+// stored; the plaintext is returned once and never persisted. The old secret stops
+// authenticating the moment RotateSecret returns, so a caller must be ready to use
+// the new one.
+func (s *service) RotateClientSecret(ctx context.Context, actor, clientID string) (string, error) {
+	secret, err := newSecret()
+	if err != nil {
+		return "", err
+	}
+	err = s.clients.RotateSecret(ctx, clientID, oauth.NewSecretHash(secret))
+	s.record(ctx, actor, "admin.client.rotate_secret", clientID, outcome(err), nil)
+	if err != nil {
+		return "", err
+	}
+	return secret, nil
 }
 
 // SuspendClient implements Service. Suspension happens before the token purge so

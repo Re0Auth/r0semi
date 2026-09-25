@@ -24,6 +24,10 @@ const (
 // ErrClientNotFound reports an unknown client id.
 var ErrClientNotFound = errors.New("oauth: client not found")
 
+// ErrNoSecretToRotate reports a rotation asked of a client that has no secret to
+// rotate: a public client authenticates with PKCE, not a shared secret.
+var ErrNoSecretToRotate = errors.New("oauth: client has no secret to rotate")
+
 // ClientStatus is the administrative lifecycle of a registered client.
 //
 // A suspended client is not "denied": it is reported as unknown by every
@@ -86,10 +90,17 @@ func NewClient(id, name string, typ ClientType, secret string, redirects []strin
 		AllowedScopes: append([]Scope(nil), allowed...),
 	}
 	if secret != "" {
-		sum := sha256.Sum256([]byte(secret))
-		c.secretHash = sum[:]
+		c.secretHash = NewSecretHash(secret)
 	}
 	return c, nil
+}
+
+// NewSecretHash returns the stored digest of a client secret. Registration and
+// rotation use it to turn a freshly generated secret into the form a registry
+// persists; Authenticate is its counterpart.
+func NewSecretHash(secret string) []byte {
+	sum := sha256.Sum256([]byte(secret))
+	return sum[:]
 }
 
 // Authenticate checks a client secret in constant time.
@@ -178,6 +189,10 @@ type ClientAdmin interface {
 	List(ctx context.Context) ([]Client, error)
 	// SetStatus changes the lifecycle. An unknown id is ErrClientNotFound.
 	SetStatus(ctx context.Context, id string, status ClientStatus) error
+	// RotateSecret replaces a confidential client's secret digest. An unknown id
+	// is ErrClientNotFound; a public client is ErrNoSecretToRotate, because it has
+	// no secret and giving it one would break RestoreClient's validation.
+	RotateSecret(ctx context.Context, id string, secretHash []byte) error
 	// Delete removes the registration. Deleting an absent client is not an
 	// error, which keeps an operator's retry idempotent.
 	Delete(ctx context.Context, id string) error
@@ -241,6 +256,25 @@ func (r *MemoryClientRegistry) SetStatus(_ context.Context, id string, status Cl
 		return ErrClientNotFound
 	}
 	c.Status = status
+	r.byID[id] = c
+	return nil
+}
+
+// RotateSecret implements ClientAdmin.
+func (r *MemoryClientRegistry) RotateSecret(_ context.Context, id string, secretHash []byte) error {
+	if len(secretHash) == 0 {
+		return errors.New("oauth: a rotation needs a secret hash")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.byID[id]
+	if !ok {
+		return ErrClientNotFound
+	}
+	if c.Type != ClientConfidential {
+		return ErrNoSecretToRotate
+	}
+	c.secretHash = append([]byte(nil), secretHash...)
 	r.byID[id] = c
 	return nil
 }

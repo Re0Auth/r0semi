@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -145,7 +146,15 @@ func (s *Server) handleAdminRegisterClient(w http.ResponseWriter, r *http.Reques
 		AllowedScopes: toScopes(body.Scopes),
 	})
 	if err != nil {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", err.Error())
+		if errors.Is(err, admin.ErrInvalidRegistration) {
+			s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "the registration is invalid")
+			return
+		}
+		// The wire answer is generic; the error — a store fault, an entropy failure
+		// — goes to the log with the request id, where an operator can act on it.
+		slog.ErrorContext(r.Context(), "could not register a client",
+			"request_id", requestID(r), "err", err)
+		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not register the client")
 		return
 	}
 	s.metrics.ObserveAdminAction(observability.AdminRegister)
@@ -154,6 +163,31 @@ func (s *Server) handleAdminRegisterClient(w http.ResponseWriter, r *http.Reques
 		resp["client_secret"] = reg.Secret
 	}
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+// handleAdminRotateClientSecret issues a new secret for a confidential client.
+// The old secret stops working the moment this returns; the new one is shown
+// once, like registration's, because only its hash is stored.
+func (s *Server) handleAdminRotateClientSecret(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdminWrite(w, r) {
+		return
+	}
+	user, _ := s.sessions.User(r.Context())
+	secret, err := s.adminSvc.RotateClientSecret(r.Context(), string(user), r.PathValue("client_id"))
+	switch {
+	case errors.Is(err, admin.ErrNotFound):
+		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown client")
+	case errors.Is(err, oauth.ErrNoSecretToRotate):
+		s.writeProblem(w, r, http.StatusConflict, "invalid_request",
+			"a public client has no secret to rotate")
+	case err != nil:
+		slog.ErrorContext(r.Context(), "could not rotate a client secret",
+			"request_id", requestID(r), "err", err)
+		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not rotate the client secret")
+	default:
+		s.metrics.ObserveAdminAction(observability.AdminRotateSecret)
+		writeJSON(w, http.StatusOK, map[string]any{"client_secret": secret})
+	}
 }
 
 func (s *Server) handleAdminSuspendClient(w http.ResponseWriter, r *http.Request) {

@@ -24,6 +24,9 @@ type adminEnv struct {
 	clients *oauth.MemoryClientRegistry
 	store   *memory.OIDCStore
 	handler http.Handler
+	// srv is the assembled server, exposed so a test can swap a dependency (an
+	// admin service that fails on purpose) without rebuilding the whole stack.
+	srv *Server
 	// audit is the stub behind the audit read endpoints, exposed so a test can
 	// script its answer and inspect the query the handler built.
 	audit *stubAuditReader
@@ -126,7 +129,7 @@ func newAdminEnv(t *testing.T, allow bool) adminEnv {
 	t.Cleanup(server.Close)
 	return adminEnv{
 		base: server.URL, adminID: user.ID, clients: clients,
-		store: store, handler: api.Handler(), audit: auditStub,
+		store: store, handler: api.Handler(), srv: api, audit: auditStub,
 	}
 }
 

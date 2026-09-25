@@ -368,6 +368,8 @@ func (auditReadSink) Verify(context.Context) (audit.Verification, error) {
 	return audit.Verification{}, nil
 }
 
+func (auditReadSink) Head(context.Context) ([]byte, error) { return nil, nil }
+
 // The audit read API needs both a sink that can answer and an allowlist to read
 // through. Wiring only the first is what took the whole server down: the durable
 // run has a readable sink, so httpapi.New was handed an audit reader with no

@@ -18,7 +18,15 @@ type stubAuditReader struct {
 	query  audit.Query
 	page   audit.Page
 	verify audit.Verification
+	head   []byte
 	err    error
+}
+
+func (s *stubAuditReader) Head(context.Context) ([]byte, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.head, nil
 }
 
 func (s *stubAuditReader) Query(_ context.Context, q audit.Query) (audit.Page, error) {

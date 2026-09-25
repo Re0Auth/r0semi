@@ -1222,6 +1222,56 @@ paths:
         '429': { $ref: '#/components/responses/RateLimited' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /v1/admin/clients/{client_id}/rotate_secret:
+    post:
+      operationId: adminRotateClientSecret
+      tags: [admin]
+      summary: Issue a new secret for a confidential client.
+      description: |
+        Generates a new secret, stores only its hash, and returns the plaintext
+        **once**. The previous secret stops authenticating the moment this
+        returns, so the caller must be ready to switch. The client id and its
+        grants are unchanged — which is the point: a leaked secret used to mean
+        deleting and re-registering, losing both.
+
+        Refused for a public client, which has no secret to rotate.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: client_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/CSRFToken'
+      responses:
+        '200':
+          description: The new secret. It is shown exactly once.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [client_secret]
+                properties:
+                  client_secret: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403':
+          description: Missing or incorrect `X-CSRF-Token`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Unknown client, or the caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: The client is public and has no secret to rotate.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /v1/admin/clients/{client_id}:
     delete:
       operationId: adminDeleteClient
@@ -1437,8 +1487,11 @@ paths:
         overstate its reach.
 
         **What it does not cover:** deleting rows from the **end** of the log. That
-        is invisible without an external anchor, and this endpoint does not pretend
-        otherwise. See `docs/architecture.md` §4.14.
+        is invisible here — the tail is simply shorter and every remaining link
+        holds. `GET /v1/admin/audit/head` exposes the head hash for an external
+        system to anchor, which is what makes that case detectable; a deployment
+        that does not publish it keeps the earlier, weaker guarantee. See
+        `docs/architecture.md` §4.14.
       security:
         - sessionCookie: []
       responses:
@@ -1447,6 +1500,47 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AuditVerification' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: The caller is not an administrator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/admin/audit/head:
+    get:
+      operationId: adminAuditHead
+      tags: [admin]
+      summary: The current audit-chain head hash, for an external anchor.
+      description: |
+        Returns the chain's head hash as lowercase hex (empty while the log is
+        still at its genesis).
+
+        This is the piece that closes the gap the verify endpoint documents: rows
+        deleted from the **end** of the log leave every remaining link intact, so
+        verifying in place cannot see them. A copy of the head kept by a system
+        outside this database — republished whenever this value changes — makes
+        that truncation detectable. The endpoint exposes the value; the anchoring
+        (where it is stored, how often it is republished) is the deployment's.
+
+        For the records themselves, point a SIEM at `GET /v1/admin/audit`; this is
+        only the head.
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: The chain head hash.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [head]
+                properties:
+                  head:
+                    type: string
+                    description: Lowercase hex; empty at genesis.
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404':
           description: The caller is not an administrator.

@@ -134,6 +134,10 @@ type Config struct {
 	// It requires Sessions and a non-empty Admins allowlist, because reading the
 	// audit log means reading about every account.
 	Audit AuditReader
+	// AuditLog, when set, is the audit log's write side, for events that happen
+	// outside the auth and admin planes (identity unlink today). Optional; a nil
+	// logger records nothing.
+	AuditLog audit.Logger
 }
 
 // AuditReader is the audit log's read side, declared here so the HTTP layer does
@@ -141,6 +145,10 @@ type Config struct {
 type AuditReader interface {
 	Query(ctx context.Context, q audit.Query) (audit.Page, error)
 	Verify(ctx context.Context) (audit.Verification, error)
+	// Head returns the chain's current head hash. Handed to a system outside this
+	// database, it is what makes a truncated tail detectable, which Verify alone
+	// cannot do. See migration 0013 and docs/architecture.md §4.14.
+	Head(ctx context.Context) ([]byte, error)
 }
 
 // AccountDeleter erases an account across every store. It is the
@@ -208,6 +216,9 @@ type Server struct {
 	// auditReader reads the audit log for the operator plane; nil when that plane
 	// is not configured.
 	auditReader AuditReader
+	// auditLog records events this layer owns that no other plane covers (identity
+	// unlink); nil records nothing.
+	auditLog audit.Logger
 	// compressor negotiates and applies the response content coding.
 	compressor *compress.Compressor
 }
@@ -299,6 +310,7 @@ func New(cfg Config) (*Server, error) {
 		adminReauth:  cfg.AdminReauthWindow,
 		deleter:      cfg.Deleter,
 		auditReader:  cfg.Audit,
+		auditLog:     cfg.AuditLog,
 	}
 	compressor, err := compress.New(compress.Config{
 		Encodings: compress.Default(),
@@ -449,6 +461,7 @@ func (s *Server) specRoutes() []route {
 			route{http.MethodPost, "/v1/admin/clients", s.handleAdminRegisterClient},
 			route{http.MethodPost, "/v1/admin/clients/{client_id}/suspend", s.handleAdminSuspendClient},
 			route{http.MethodPost, "/v1/admin/clients/{client_id}/activate", s.handleAdminActivateClient},
+			route{http.MethodPost, "/v1/admin/clients/{client_id}/rotate_secret", s.handleAdminRotateClientSecret},
 			route{http.MethodDelete, "/v1/admin/clients/{client_id}", s.handleAdminDeleteClient},
 			route{http.MethodPost, "/v1/admin/kill_switch", s.handleAdminKillSwitch},
 		)
@@ -461,6 +474,7 @@ func (s *Server) specRoutes() []route {
 		routes = append(routes,
 			route{http.MethodGet, "/v1/admin/audit", s.handleAdminAudit},
 			route{http.MethodGet, "/v1/admin/audit/verify", s.handleAdminAuditVerify},
+			route{http.MethodGet, "/v1/admin/audit/head", s.handleAdminAuditHead},
 		)
 	}
 	return routes

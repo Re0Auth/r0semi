@@ -424,6 +424,34 @@ func (s *Clients) Delete(ctx context.Context, id string) error {
 	return err
 }
 
+// RotateSecret implements oauth.ClientAdmin. Only a confidential client has a
+// secret to rotate; a public client is refused with ErrNoSecretToRotate rather than
+// given a secret it would then fail to restore, because RestoreClient rejects a
+// public client that carries a secret hash.
+func (s *Clients) RotateSecret(ctx context.Context, id string, secretHash []byte) error {
+	if len(secretHash) == 0 {
+		return errors.New("postgres: a rotation needs a secret hash")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE oauth_clients SET secret_hash = $2 WHERE id = $1 AND type = 'confidential'`,
+		id, secretHash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	// No confidential row matched: distinguish "unknown" from "public".
+	var typ string
+	if err := s.pool.QueryRow(ctx, `SELECT type FROM oauth_clients WHERE id = $1`, id).Scan(&typ); err != nil {
+		if noRows(err) {
+			return oauth.ErrClientNotFound
+		}
+		return err
+	}
+	return oauth.ErrNoSecretToRotate
+}
+
 // scanClient reads one client row in the column order used above.
 func scanClient(row pgx.Row) (oauth.Client, error) {
 	var (
