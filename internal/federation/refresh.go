@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -142,8 +143,23 @@ func (s *service) refreshRejected(ctx context.Context, spent Binding) (Binding, 
 	if latest, err := s.bindings.Get(ctx, spent.User, spent.Game, spent.Source); err == nil && latest.Version != spent.Version {
 		return latest, nil
 	}
-	_ = s.bindings.Delete(ctx, spent.User, spent.Game, spent.Source)
-	_ = s.vault.Revoke(ctx, BindingIdentity(spent))
+	// The grant is genuinely gone. Remove the secret before the row, mirroring
+	// shredBinding: the secret is the part that could still be used, and a secret
+	// that outlives its row is a decryptable upstream token no endpoint can reach.
+	// This path already holds the per-binding lock a refresh took, so it cannot
+	// call shredBinding itself — that would re-enter the same lock.
+	if err := s.vault.Revoke(ctx, BindingIdentity(spent)); err != nil {
+		// Keep the row so the secret stays reachable by Unbind or the kill switch,
+		// and retryable on the next refresh. Logged, because an unrecorded orphan
+		// here is exactly what the rest of this package treats as a defect.
+		slog.ErrorContext(ctx, "could not revoke a rejected binding's secret; leaving the binding in place",
+			"user", string(spent.User), "game", spent.Game, "source", spent.Source, "err", err)
+		return Binding{}, &NotBoundError{Game: spent.Game, Source: spent.Source}
+	}
+	if err := s.bindings.Delete(ctx, spent.User, spent.Game, spent.Source); err != nil {
+		slog.ErrorContext(ctx, "could not delete a rejected binding",
+			"user", string(spent.User), "game", spent.Game, "source", spent.Source, "err", err)
+	}
 	return Binding{}, &NotBoundError{Game: spent.Game, Source: spent.Source}
 }
 

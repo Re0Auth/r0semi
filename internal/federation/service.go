@@ -206,11 +206,14 @@ func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 	var (
 		lastErr       error
 		lastSource    string
+		lastDuration  time.Duration
 		firstNotBound *NotBoundError
 		sawOther      bool
 	)
 	for i, src := range candidates {
+		start := time.Now()
 		result, err := s.trySource(ctx, src, req)
+		elapsed := time.Since(start)
 		if err == nil {
 			// Skipping the preferred source is what "degraded" reports.
 			result.Degraded = i > 0
@@ -219,9 +222,11 @@ func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 				outcome = observability.UpstreamDegraded
 			}
 			s.metrics.ObserveUpstreamFetch(req.Game, result.Source, outcome)
+			s.metrics.ObserveUpstreamFetchDuration(req.Game, result.Source, outcome, elapsed)
 			return result, nil
 		}
 		lastSource = src.Name
+		lastDuration = elapsed
 		var notBound *NotBoundError
 		if errors.As(err, &notBound) {
 			if firstNotBound == nil {
@@ -235,6 +240,8 @@ func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 
 	// If the only obstacle was missing bindings, guide the user to bind (once).
 	if !sawOther && firstNotBound != nil {
+		// No upstream call was made, so the latency histogram is left alone: a
+		// binding-store lookup is not what "the source is slow" means.
 		s.metrics.ObserveUpstreamFetch(req.Game, firstNotBound.Source, observability.UpstreamNotBound)
 		return FetchResult{}, firstNotBound
 	}
@@ -244,7 +251,12 @@ func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		return FetchResult{}, ErrUnknownResource
 	}
 	// Only names from the registry reach this line, so the labels stay bounded.
-	s.metrics.ObserveUpstreamFetch(req.Game, lastSource, observability.UpstreamUnavailable)
+	outcome := observability.UpstreamUnavailable
+	if errors.Is(lastErr, httpclient.ErrCircuitOpen) {
+		outcome = observability.UpstreamCircuitOpen
+	}
+	s.metrics.ObserveUpstreamFetch(req.Game, lastSource, outcome)
+	s.metrics.ObserveUpstreamFetchDuration(req.Game, lastSource, outcome, lastDuration)
 	return FetchResult{}, lastErr
 }
 
@@ -349,6 +361,7 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 	}
 
 	var out RawResult
+	start := time.Now()
 	err = s.callWithRefresh(ctx, src, binding, func(token string) error {
 		result, e := s.rawFetch(ctx, src, req.Path, req.Query, token)
 		if e != nil {
@@ -360,12 +373,19 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 		out = result
 		return nil
 	})
+	elapsed := time.Since(start)
 	if err != nil {
-		s.metrics.ObserveUpstreamFetch(req.Game, src.Name, observability.UpstreamUnavailable)
+		outcome := observability.UpstreamUnavailable
+		if errors.Is(err, httpclient.ErrCircuitOpen) {
+			outcome = observability.UpstreamCircuitOpen
+		}
+		s.metrics.ObserveUpstreamFetch(req.Game, src.Name, outcome)
+		s.metrics.ObserveUpstreamFetchDuration(req.Game, src.Name, outcome, elapsed)
 		return RawResult{}, err
 	}
 	out.Source = src.Name
 	s.metrics.ObserveUpstreamFetch(req.Game, src.Name, observability.UpstreamOK)
+	s.metrics.ObserveUpstreamFetchDuration(req.Game, src.Name, observability.UpstreamOK, elapsed)
 	return out, nil
 }
 

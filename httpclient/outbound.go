@@ -159,6 +159,9 @@ type OutboundConfig struct {
 	MaxConcurrent int
 	// Transport tunes the connection pool.
 	Transport TransportConfig
+	// Breaker, when set, adds a per-host circuit breaker. It sits outside the
+	// bulkhead, so a host that is down is skipped without spending a slot.
+	Breaker *BreakerOptions
 }
 
 const defaultOutboundTimeout = 20 * time.Second
@@ -174,6 +177,10 @@ func NewOutboundClient(cfg OutboundConfig) *http.Client {
 	rt := http.RoundTripper(NewTransport(cfg.Transport))
 	if cfg.MaxConcurrent > 0 {
 		rt = Bulkhead(rt, cfg.MaxConcurrent)
+	}
+	if cfg.Breaker != nil {
+		// Outside the bulkhead: an open breaker must reject before a slot is taken.
+		rt = CircuitBreaker(rt, *cfg.Breaker)
 	}
 	return &http.Client{Timeout: cfg.Timeout, Transport: rt}
 }
