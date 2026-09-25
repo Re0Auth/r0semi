@@ -1,0 +1,191 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "The Prometheus scraping Re0Auth's internal listener",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "title": "Request rate by plane",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (plane) (rate(re0auth_http_requests_total[5m]))",
+          "legendFormat": "{{plane}}"
+        }
+      ]
+    },
+    {
+      "title": "5xx error rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(re0auth_http_requests_total{status=~\"5..\"}[5m])) / sum(rate(re0auth_http_requests_total[5m]))",
+          "legendFormat": "5xx ratio"
+        }
+      ]
+    },
+    {
+      "title": "p99 latency by plane",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, plane) (rate(re0auth_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{plane}}"
+        }
+      ]
+    },
+    {
+      "title": "In-flight requests",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (plane) (re0auth_http_in_flight_requests)",
+          "legendFormat": "{{plane}}"
+        }
+      ]
+    },
+    {
+      "title": "Tokens issued vs errors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (grant_type) (rate(re0auth_tokens_issued_total[5m]))",
+          "legendFormat": "issued {{grant_type}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (error) (rate(re0auth_token_errors_total[5m]))",
+          "legendFormat": "error {{error}}"
+        }
+      ]
+    },
+    {
+      "title": "Login outcomes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (provider, result) (rate(re0auth_auth_logins_total[5m]))",
+          "legendFormat": "{{provider}} {{result}}"
+        }
+      ]
+    },
+    {
+      "title": "Revocations by kind",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (increase(re0auth_revocations_total[1h]))",
+          "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "title": "Upstream fetch results (by source)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (game, source, result) (rate(re0auth_upstream_fetches_total[5m]))",
+          "legendFormat": "{{game}}/{{source}} {{result}}"
+        }
+      ]
+    },
+    {
+      "title": "Vault operations (by result)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation, result) (rate(re0auth_vault_operations_total[5m]))",
+          "legendFormat": "{{operation}} {{result}}"
+        }
+      ]
+    },
+    {
+      "title": "Audit chain verification",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (increase(re0auth_audit_verify_total[1h]))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "title": "Telemetry volume (self-check)",
+      "description": "If these stop moving while traffic continues, the domain instrumentation is not being reached.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(re0auth_device_decisions_total[5m])) + sum(rate(re0auth_admin_actions_total[5m]))",
+          "legendFormat": "device + admin"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(re0auth_upstream_refreshes_total[5m]))",
+          "legendFormat": "refreshes"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["re0auth", "oauth", "oidc"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "Re0Auth",
+  "uid": "re0auth-overview",
+  "version": 1
+}

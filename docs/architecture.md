@@ -541,8 +541,10 @@ sweep 也会删除 OP 表中已过期的行**（`internal/store/postgres/sweep.g
 [api-design.md](./api-design.md) §6。
 
 **运维面在独立的内部监听器上**（`server.internal_addr` / `RE0AUTH_INTERNAL_ADDR`，空即不启用）：
-`/metrics`（Prometheus 黄金指标 —— 流量 / 错误 / 延迟 / 在途 —— 加 Go 运行时与进程采集器，见
-`internal/observability`）与 `/debug/pprof/`。它**必须与 `addr` 不同**（配置校验强制）：单独一个监听器
+`/metrics`（Prometheus 黄金指标 —— 流量 / 错误 / 延迟 / 在途 —— 加上**业务与安全信号**：登录结果、
+令牌签发与错误、撤销、上游读取与刷新、vault 操作、审计链校验、设备流与运维动作，见
+`internal/observability` 与 [observability-decision.md](./observability-decision.md)（ADR-0007）；
+再加 Go 运行时与进程采集器）与 `/debug/pprof/`。它**必须与 `addr` 不同**（配置校验强制）：单独一个监听器
 正是「这些端点无法经公网端口到达」的保证，而 pprof 会导出进程内部状态（goroutine 转储、堆、CPU profile），
 把 `internal_addr` 指向公网地址就是把它们公开。它按与主监听器同一套超时启动，并在同一个信号上优雅关闭
 （`serveUntilSignal` 现在接收一组 endpoint，两者一起排空）。

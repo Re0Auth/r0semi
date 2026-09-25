@@ -1,0 +1,52 @@
+# 服务目标与告警（SLI / SLO）
+
+> 决策见 [observability-decision.md](./observability-decision.md)（ADR-0007）。
+> 规则文件：`deploy/prometheus/re0auth.rules.yml`。面板：`deploy/grafana/re0auth-dashboard.json`。
+> 这里定义"什么算好"，规则表达"什么时候要人来看"，两者一一对应。
+
+## 1. SLI 与目标
+
+| # | SLI | 定义（PromQL 语义） | 目标（滚动 30 天） |
+|---|---|---|---|
+| S1 | 可用性 | 非 5xx 请求 / 全部请求，`re0auth_http_requests_total` | ≥ 99.9% |
+| S2 | 令牌端点成功率 | 成功签发 /（签发 + 错误），`tokens_issued_total` + `token_errors_total` | ≥ 99.5% |
+| S3 | 登录成功率 | `auth_logins_total{result="success"}` / 全部，按 provider | ≥ 95% |
+| S4 | 业务面时延 | `http_request_duration_seconds{plane="business"}` p99 | < 1s |
+| S5 | 审计链完整性 | `audit_verify_total{result="failed"}` | **恒为 0** |
+| S6 | 凭据可用性 | `vault_operations_total{result!="ok"}` 的比例 | < 0.1% |
+| S7 | 上游可用性 | `upstream_fetches_total{result="unavailable"}` 比例，按 source | < 5% |
+
+S5 是**硬目标**：审计链自洽是本服务对"日志被动过吗"唯一的控制，任何一次 `failed` 都是事件，不是趋势。
+
+## 2. 告警
+
+规则见 `deploy/prometheus/re0auth.rules.yml`。每条都标出它服务的 SLI 与处置方向。
+
+| 告警 | 条件（摘要） | 严重度 | 服务 | 先做什么 |
+|---|---|---|---|---|
+| `Re0AuthHighErrorRate` | 5xx 比例 > 1%，持续 10m | critical | S1 | 看 `/readyz` 与数据库；`operations.md` 排障一节 |
+| `Re0AuthSlowRequests` | 业务面 p99 > 1s，持续 10m | warning | S4 | 查上游来源是否变慢、连接池是否打满 |
+| `Re0AuthTokenEndpointErrorRate` | 令牌错误比例 > 5%，持续 10m | warning | S2 | 按 `error` 标签分组看是 `invalid_client` 还是 `invalid_grant` |
+| `Re0AuthLoginFailureRate` | 登录失败比例 > 30%，持续 15m | warning | S3 | 按 `provider` 看是否某一个 IdP 的发现/换票挂了 |
+| `Re0AuthAuditChainBroken` | `increase(audit_verify_total{result="failed"}[10m]) > 0` | critical | S5 | 按 `admin.md` §5 调查；`first_bad_id` 指向第一处不一致 |
+| `Re0AuthVaultOperationFailures` | 非 ok 比例 > 1%，持续 10m | critical | S6 | 看 `result`：`unconfigured_key` 意味着轮换没收尾，`decrypt_error` 意味着数据损坏 |
+| `Re0AuthUpstreamSourceUnavailable` | 某 source `unavailable` 比例 > 30%，持续 10m | warning | S7 | 确认该数据源自身是否可达；`not_bound` 不是故障，不触发 |
+| `Re0AuthRefreshRejections` | `rate(upstream_refreshes_total{result="rejected"}[15m]) > 0` | warning | S7 | 用户在被动重新绑定；查该源是否提前作废了 refresh token |
+| `Re0AuthKillSwitchFired` | `increase(revocations_total{kind="kill_switch"}[5m]) > 0` | info | — | 不是故障，是通知：有人拉了一键撤销，事故响应应该已经在进行 |
+
+## 3. 刻意不告警的
+
+- **`not_bound`。** 用户没连数据源是正常状态，不是上游故障。把它算进上游可用性会让每一次
+  "还没绑定"都变成告警。
+- **单条登录失败。** 打错 provider、Provider 拒绝授权都是用户行为；只在**比例**上告警。
+- **基准快慢。** 见 ADR-0007 决策 5：CI 不按阈值卡基准。
+- **`up`/抓取可达性。** 那是部署方 Prometheus 与 ServiceMonitor 的职责，不是本服务导出的指标。
+
+## 4. 接入
+
+部署方把内部监听器（`server.internal_addr`，默认 `:9090`）`/metrics` 接进 Prometheus，
+再把 `deploy/prometheus/re0auth.rules.yml` 作为规则文件加载（或翻译成自有告警系统）。
+`deploy/grafana/re0auth-dashboard.json` 可导入 Grafana，数据源指向同一个 Prometheus。
+
+规则里的 `job`/`instance` 选择子故意留空——抓取配置由部署方决定；规则只依赖 `re0auth_*` 指标名，
+因此不绑定任何一种 scrape 约定。

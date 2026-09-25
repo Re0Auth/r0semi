@@ -54,6 +54,10 @@ DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backu
 
 - `/healthz` 存活、`/readyz` 依赖（Postgres ping）；两者纯文本、免限流，不属任何平面。
 - `/metrics` 与 `/debug/pprof/` 在 `server.internal_addr` 的独立内部监听器上，绝不暴露公网。
+- `/metrics` 导出**黄金指标**（按平面的请求/错误/时延/在途）与**业务与安全信号**（登录结果、
+  令牌签发与错误、撤销、上游读取与刷新、vault 操作、审计链校验、设备流、运维动作）。
+  **SLO 与告警规则**见 [slo.md](./slo.md) 与 `deploy/prometheus/re0auth.rules.yml`，
+  面板见 `deploy/grafana/re0auth-dashboard.json`。接进 Prometheus 即可用，规则不绑定抓取约定。
 - 访问日志含 `request_id`、`trace_id`、plane 与客户端地址；**不记录 query string**。
   请求携带的 `traceparent` 会被采纳，否则生成一个，便于跨日志关联。
 - 限流：429 带 `Retry-After`，所有带限流的响应带 `RateLimit-Limit/Remaining/Reset`；

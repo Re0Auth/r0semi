@@ -1,0 +1,188 @@
+# Alerting rules for Re0Auth.
+#
+# Load this file into any Prometheus-compatible rule evaluator, pointed at a
+# scrape of the internal listener's /metrics (server.internal_addr, default
+# :9090). The expressions name only re0auth_* series and carry no job/instance
+# selector, so they do not bind to one scrape convention — a deployment's own
+# labels are applied where the rule is loaded.
+#
+# Each rule serves a SLI defined in docs/slo.md, and that file says what to do
+# when one fires. The thresholds are starting points, not law: they are set so a
+# real incident pages and a bad afternoon does not, which is the only property
+# that keeps an alert switched on.
+#
+# What is deliberately NOT here: a scrape-availability rule (that belongs to the
+# deployment's Prometheus/ServiceMonitor, not to the service's own metrics), and
+# anything keyed on `upstream_fetches_total{result="not_bound"}` — a user who has
+# not connected a source yet is normal, not an incident.
+
+groups:
+  - name: re0auth
+    rules:
+      - alert: Re0AuthHighErrorRate
+        # SLI S1: availability. Catches the class of failure that reaches a
+        # handler and still answers — a database fault, a panic recovered into a
+        # 500 — rather than a process that is simply down.
+        expr: |
+          sum(rate(re0auth_http_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(re0auth_http_requests_total[5m])) > 0.01
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Re0Auth is returning 5xx on more than 1% of requests"
+          description: >-
+            Check /readyz and the database first; docs/operations.md has the
+            triage list. A rise here with a healthy /readyz points at a failing
+            dependency or a code path that panics.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthSlowRequests
+        # SLI S4: business-plane latency. The business plane is where upstream
+        # calls happen, so this is the plane that moves first when a source slows.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(re0auth_http_request_duration_seconds_bucket{plane="business"}[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re0Auth business-plane p99 latency is above 1s"
+          description: >-
+            Look at the upstream sources (/v1/games/.../raw and normalized reads),
+            database latency, and the connection pool. A single slow source shows
+            up as upstream_fetches_total{result="unavailable"} on that source.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthTokenEndpointErrorRate
+        # SLI S2. The minimum-traffic guard keeps a single failed exchange on a
+        # quiet deployment from flapping the alert.
+        expr: |
+          (
+            sum(rate(re0auth_token_errors_total[5m]))
+              /
+            (sum(rate(re0auth_tokens_issued_total[5m])) + sum(rate(re0auth_token_errors_total[5m])))
+          ) > 0.05
+          and
+          (sum(rate(re0auth_tokens_issued_total[5m])) + sum(rate(re0auth_token_errors_total[5m]))) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re0Auth token endpoint is failing more than 5% of requests"
+          description: >-
+            Break it down by the `error` label: invalid_client is a client
+            credential problem, invalid_grant is a code/refresh replay or
+            expiry, invalid_scope is a registration mismatch.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthLoginFailureRate
+        # SLI S3. Failure is expected at a low rate (users cancel, providers
+        # deny); a sustained high rate means a provider's discovery or token
+        # exchange is broken.
+        expr: |
+          (
+            sum(rate(re0auth_auth_logins_total{result!="success"}[5m]))
+              /
+            sum(rate(re0auth_auth_logins_total[5m]))
+          ) > 0.3
+          and
+          sum(rate(re0auth_auth_logins_total[5m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 30% of sign-in attempts are failing"
+          description: >-
+            Group by `provider`: one provider failing points at that provider's
+            endpoints (provider_unavailable, exchange_failed); all providers
+            failing points at this service.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthAuditChainBroken
+        # SLI S5, a hard target: the chain verifying is the whole point of the
+        # audit log. Any failure is an incident, not a trend.
+        expr: increase(re0auth_audit_verify_total{result="failed"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The audit log chain failed to verify"
+          description: >-
+            GET /v1/admin/audit/verify reports first_bad_id, the row where the
+            chain first disagrees. Treat as tampering or corruption until proven
+            otherwise; docs/admin.md §5 has the read-side contract.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthVaultOperationFailures
+        # SLI S6. unconfigured_key means a key rotation was left unfinished;
+        # decrypt_error means ciphertext that no longer opens.
+        expr: |
+          (
+            sum(rate(re0auth_vault_operations_total{result!="ok"}[5m]))
+              /
+            sum(rate(re0auth_vault_operations_total[5m]))
+          ) > 0.01
+          and
+          sum(rate(re0auth_vault_operations_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Credential-vault operations are failing"
+          description: >-
+            Group by `result`: unconfigured_key means a retired KEK was removed
+            before a rotation finished; decrypt_error means corruption or a wrong
+            KEK. Both stop data-plane calls for the affected bindings.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthUpstreamSourceUnavailable
+        # SLI S7, per source. `not_bound` is excluded on purpose: a user who has
+        # not connected the source is not an outage.
+        expr: |
+          (
+            sum by (game, source) (rate(re0auth_upstream_fetches_total{result="unavailable"}[5m]))
+              /
+            sum by (game, source) (rate(re0auth_upstream_fetches_total[5m]))
+          ) > 0.3
+          and
+          sum by (game, source) (rate(re0auth_upstream_fetches_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A data source is unavailable for {{ $labels.game }}/{{ $labels.source }}"
+          description: >-
+            Confirm the source itself is reachable. This is the source's outage,
+            not Re0Auth's; the deployment's other sources are unaffected.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthRefreshRejections
+        # A rejected refresh means upstream tokens are being invalidated before
+        # Re0Auth expected, and users are being pushed into rebinding.
+        expr: rate(re0auth_upstream_refreshes_total{result="rejected"}[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Upstream refresh grants are being rejected"
+          description: >-
+            Users are being asked to reconnect a source. Check whether the source
+            rotated or revoked tokens early, or whether clock skew is expiring
+            bindings prematurely.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+
+      - alert: Re0AuthKillSwitchFired
+        # Not a fault: a notification that somebody pulled the incident lever.
+        expr: increase(re0auth_revocations_total{kind="kill_switch"}[5m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The operator Kill Switch was used"
+          description: >-
+            Bulk revocation was triggered from the operator plane. This is a
+            signal that an incident response is already underway; correlate with
+            the audit log's admin.kill_switch entry.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
