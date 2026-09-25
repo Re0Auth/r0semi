@@ -1,14 +1,17 @@
 package federation
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/Re0Auth/r0semi/vault"
@@ -60,6 +63,78 @@ func bindService(t *testing.T, issuer string) (Service, *MemoryBindingStore, vau
 		t.Fatal(err)
 	}
 	return svc, bindings, v
+}
+
+// putFailsStore is the row write failing while the vault is fine: the case the
+// bind path rolls back.
+type putFailsStore struct {
+	BindingStore
+	err error
+}
+
+func (p putFailsStore) Put(context.Context, Binding) error { return p.err }
+
+// A bind writes the upstream token to the vault BEFORE it records the binding row,
+// so a failing row write is rolled back. When the rollback fails too, the residue is
+// a decryptable upstream token with no row pointing at it: no endpoint can reach it
+// and only an account erasure clears it. That failure used to be dropped with `_ =`,
+// which made the residue invisible to the caller and to the operator. Both learn
+// about it now — the error is joined, and the log says what is stranded.
+func TestCompleteBindReportsARollbackThatFailed(t *testing.T) {
+	up, challenge := fakeTokenServer(t, "up-token")
+	reg, err := NewRegistry(Source{
+		Game: game, Name: sourceName, DisplayName: "Fake", Issuer: up.URL,
+		ClientID: "cid", ClientSecret: "sec", TokenClass: "revocable",
+		Resources: []Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: profileScope}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	putErr := errors.New("binding store is down")
+	revokeErr := errors.New("vault is sealed")
+	svc, err := NewService(Config{
+		Registry: reg,
+		Bindings: putFailsStore{err: putErr},
+		Vault:    revokeBrokenVault{Service: newVault(t), err: revokeErr},
+		Doer:     http.DefaultClient, HTTPClient: http.DefaultClient,
+		BaseURL: "https://re0auth.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture the log, so "an operator can see it" is a fact rather than a claim.
+	var logged bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ctx := context.Background()
+	ch, err := svc.BeginBind(ctx, "usr_1", game, sourceName, "/dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(ch.AuthorizeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*challenge = u.Query().Get("code_challenge")
+
+	_, _, err = svc.CompleteBind(ctx, "usr_1", ch.ID, "code-1")
+
+	switch {
+	case err == nil:
+		t.Fatal("a bind that could not be recorded was reported as a success")
+	case !errors.Is(err, putErr):
+		t.Fatalf("err = %v, want the store failure", err)
+	case !errors.Is(err, revokeErr):
+		t.Fatalf("err = %v, want the rollback failure joined in", err)
+	case !strings.Contains(err.Error(), "no binding"):
+		t.Fatalf("err = %v, want it to name the residue", err)
+	}
+	if !strings.Contains(logged.String(), "no binding") {
+		t.Fatalf("the stranded secret was not logged: %q", logged.String())
+	}
 }
 
 func TestBindFlow(t *testing.T) {

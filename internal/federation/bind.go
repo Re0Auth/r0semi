@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -177,6 +178,12 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 		// decryptable upstream token with no row pointing at it, which no endpoint
 		// can reach and only an account erasure would clear.
 		if rerr := s.vault.Revoke(ctx, BindingIdentity(binding)); rerr != nil {
+			// Logged as well as returned. No endpoint can reach the residue and only
+			// an account erasure clears it, so the caller seeing this error is not
+			// enough on its own: an operator has to learn that a decryptable upstream
+			// token is stranded.
+			slog.ErrorContext(ctx, "could not roll back a bind's vault secret; a secret is left with no binding",
+				"user", string(binding.User), "game", binding.Game, "source", binding.Source, "err", rerr)
 			return Binding{}, flow, errors.Join(err,
 				fmt.Errorf("federation: a secret is left in the vault with no binding: %w", rerr))
 		}
