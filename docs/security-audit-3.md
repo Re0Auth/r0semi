@@ -19,8 +19,8 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
 
 | # | 发现 | 不变量 | 根因 / 修法 | 守卫 |
 |---|---|---|---|---|
-| A3-1 | `GET /oauth/token` 绕过令牌响应契约：无 `openid` 也发 `id_token`，且无 `Cache-Control` | ①⑤ | `isToken` 判据带 `r.Method == POST`；库无方法约束。改为**只看路径** | `oidchttp`: `TestAdversarialTokenEndpointContractIsMethodIndependent` |
-| A3-2 | `GET /oauth/device_authorization` 绕过 client-scope 预检，签发未注册 scope | ① | 设备预检同样只在 POST 上跑。改为**与方法无关** | `oidchttp`: `TestAdversarialDeviceAuthorizationPrecheckIsMethodIndependent` |
+| A3-1 | `GET /oauth/token` 绕过令牌响应契约：无 `openid` 也发 `id_token`，且无 `Cache-Control` | ①⑤ | `isToken` 判据带 `r.Method == POST`；库无方法约束。改为**只看路径** | `oidchttp`: `TestAdversarialTokenEndpointRejectsGET` |
+| A3-2 | `GET /oauth/device_authorization` 绕过 client-scope 预检，签发未注册 scope | ① | 设备预检同样只在 POST 上跑。改为**与方法无关** | `oidchttp`: `TestAdversarialDeviceAuthorizationRejectsGET` |
 | A3-3 | 协议面 401 不带 RFC 6750 Bearer challenge | ③ | 库不写 challenge，本包自己的 401 写的是 `Basic`（客户端认证用）。为 `userinfo` 补 Bearer challenge | `oidchttp`: `TestAdversarialUserinfoUnauthorizedCarriesABearerChallenge` |
 | A3-5 | `Clients`/`Registry` 为 nil 时全部预检**静默失效**（fail-open） | ⑥ | `New` 不校验，`validate*` 里 `if h.clients == nil { return false }`。改为**必填**，去掉 fail-open 分支 | `oidchttp`: `TestAdversarialNewRequiresClientsAndRegistry` |
 | 结构性 | 平面走查用 `protocolPostOnly` 按「预期方法」走，正是它看不见上面两条 | ③ | 改为对库无方法约束的端点**每种方法各走一遍** | `httpapi`: `plane_test.go` 收紧后的走查 |
@@ -63,7 +63,7 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
 - **状态**：CONFIRMED（已执行）→ **已修复**
 - **影响**：一个从未请求 `openid`、因此也从未走过 OpenID 同意路径的 RP，拿到了**签名身份断言**——
   正是 `oidc-decision` 说**永不返回**的东西；且携带 `access_token`+`id_token` 的响应没有任何缓存指令。
-- **Pin**：`internal/oidchttp/adversary_test.go`，`TestAdversarialTokenEndpointContractIsMethodIndependent`。
+- **Pin**：`internal/oidchttp/adversary_test.go`，`TestAdversarialTokenEndpointRejectsGET`。
 
 ### A3-2 `GET /oauth/device_authorization` 绕过 client-scope 预检，签发客户端未注册的 scope
 
@@ -78,7 +78,7 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
 - **状态**：CONFIRMED（已执行）→ **已修复**
 - **影响**：决定「哪个 RP 能要 `phigros.*`」的注册闸门，被换一个 HTTP 方法绕过。人类同意页会列出
   被批准的 scope（受害者看得见自己批准了什么），损失的是**运营商约束 RP 触达范围的能力**，不是盲目的受害者侧提权。
-- **Pin**：同文件 `TestAdversarialDeviceAuthorizationPrecheckIsMethodIndependent`。
+- **Pin**：同文件 `TestAdversarialDeviceAuthorizationRejectsGET`。
 
 ### C3-1 撤销（含 Kill Switch）到不了已批准的设备授权，下一次轮询就复活
 
@@ -206,18 +206,45 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
 
 ## 未能到达（残余盲区）
 
-- **Postgres 相关的重现全部未执行**：本机无数据库，`internal/store/postgres` 全部跳过。B3-1 的原始症状、
-  B3-2 的落盘一半、以及 C3-1/C3-2 的 PG 一半都只有**读代码**的证据（各自的行引用已写出）。**CI 必须跑**。
-- **`-race` 未运行**（本机无 cgo）。C3-3 的结论不依赖竞态检测：它是**确定性**的机制复现。
-- **A3-4 的方向未复现**：需要 fixture 增加一个「窄范围机密客户端」。
-- **`oauth` 遗留引擎的设备决策是丢失更新**（`internal/oauth/device.go` 读整条记录、判定、整条写回，无谓词）：
-  读代码成立，但**从 re0auth 装配不可达**（`cmd/re0auth` 把 OP store 同时交给 OP 与 `DeviceStore`，
-  `upstreamkit` 不挂设备端点）。它是**公开库**，故对外部使用者是真缺陷——**假说**，留作独立条目。
-- **`slow_down` / 轮询节流在活路径上不存在**：库的 `CheckDeviceAuthorizationState` 不看 `PollInterval`，
-  内存记录没有 last-poll 字段——`docs/architecture.md` §4.4 把节流与 `slow_down` 描述成流程的一部分，
-  对**遗留 `oauth` 引擎**为真、对**实际挂载的 OP** 为假。这是**文档与实现不一致**，不是漏洞；RFC 8628 是 SHOULD。
-- **库自身的日志**（probe 项 5）未审计：本轮未检查 `zitadel/oidc pkg/op` 里是否有把
-  `Request`/`Form`/令牌塞进 `slog` 的调用。这是下一条最该补的缝。
+> 与 [security-audit-2.md](./security-audit-2.md) 的同名小节同步核对过一次：每条按**当前代码与 CI**
+> 标为**已闭环**或**仍开放**。已闭环的保留结论，但不再以盲区的身份留在清单里。
+
+**已闭环**
+
+- **Postgres 相关的重现现在都在 CI 里执行**：`test` 作业自带 `postgres:16` service，跑
+  `./internal/store/postgres/` 全量、以 `-race -p 1` 跑全套件，并用 `E2E_DATABASE_URL` 再跑一遍
+  Playwright（`.github/workflows/ci.yml`）。落盘侧的守卫是 `auditchain_test.go` 的
+  `TestAdversarialAuditChainCatchesAWholeLogMetadataStrip`（B3-1）与 `auditread_test.go` 的
+  `TestAdversarialAuditNoKeyPageCarriesTheAppliedLimit`（B3-2）。
+- **`-race` 未运行**：CI 以 `-race -p 1` 跑整套。C3-3 的结论不依赖竞态检测这一点不变（它是确定性复现），
+  但「并发论断没有检测器背书」不再是盲区。
+- **`slow_down` / 轮询节流在活路径上不存在**：**已实现**，不再是文档与实现不一致。
+  `internal/store/memory/oidc.go` 记录 `lastPoll`，在 `DefaultDevicePollInterval` 之内再次轮询即回
+  `slow_down`；`internal/store/postgres/oidc.go` 用 `last_poll` 列做同一件事，由迁移
+  `0016_oidc_device_last_poll.sql` 加入。守卫是 `memory/oidc_test.go` 的 `TestDevicePollingIsThrottled`
+  与 `postgres/oidc_test.go` 的同名测试，`docs/architecture.md` §4.4 与实现现在一致。
+  （库自己的 `CheckDeviceAuthorizationState` 仍不看 `PollInterval`——节流做在 store 层。）
+
+**仍开放**
+
+- **C3-1 / C3-2 的 Postgres 侧缺守卫**（核对时顺带发现的，不是新洞）：两条的内存侧守卫在
+  `internal/httpapi/device_adversary_test.go`（该套件跑的是内存 store）——
+  `TestAdversarialDeviceCodeIsSingleUse`、`TestAdversarialDeviceCodeIsRevokedByBulkRevocation` /
+  `...ByTheRevokeButton`。Postgres 侧**只有实现、没有断言**：`oidc.go` 的
+  `DELETE … RETURNING`（带 `done = true AND denied = false` 谓词）负责单次使用，撤销事务里的
+  `DELETE FROM oidc_devices WHERE subject = $1 AND client_id = $2` 负责不再复活；
+  而 `postgres/oidc_test.go` 的 `TestOIDCDeviceFlow` 只在注释里说「the device code is single use」，
+  没有断言**第二次兑换会失败**，`TestOIDCGrantsAndRevoke` 也没断言撤销会连带删掉设备授权。
+  同一个安全性质在两个 store 上应当有同名守卫——这一条待补。
+- **A3-4 的方向未复现**：需要 fixture 增加一个「窄范围机密客户端」。修法涉及设备流的客户端认证语义，
+  仍是待裁定的判断，见上文 A3-4。
+- **`oauth` 遗留引擎的设备决策是丢失更新**（`oauth/device.go` 读整条记录、判定、整条写回，无谓词）：
+  读代码成立，但**从 re0auth 装配不可达**（`cmd/re0auth` 只装配 `oauth.TokenAdmins`、
+  `oauth.NewMemoryClientRegistry` 与 `oauth.NewClient`；`upstreamkit` 不挂设备端点）。
+  它是**公开库**，故对外部使用者是真缺陷——仍是假说，留作独立条目。
+  （原文这里写作 `internal/oauth/device.go`，该包并不在 `internal/` 下。）
+- **库自身的日志**（probe 项 5）未审计：仍未检查 `zitadel/oidc` 的 `pkg/op` 里是否有把
+  `Request`/`Form`/令牌塞进 `slog` 的调用。第二轮与第三轮都把它列为下一条最该补的缝。
 
 ## 判断（文档化决定，不是缺陷）
 

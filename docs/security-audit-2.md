@@ -300,28 +300,52 @@ vault 的 `Identity` 与 `Meta` 明文落盘（threat-model §6.1）；审计链
 
 ## 未能到达（残余盲区）
 
-- **Postgres 相关的每一条都未被执行**：本机没有数据库、没有 Docker，`internal/store/postgres` 全部
-  跳过。A4-1 的 Postgres 一半、A5-1 的落盘一半、以及 A5-2 的原始症状都只有**读代码**的证据。
-  这是本轮最大的盲区，**CI 必须跑**。
-- **`-race` 未运行**（本机无 cgo）。所有并发论断来自锁与事务结构，而非竞态检测器。
-- **第三方库未审计**：`github.com/zitadel/oidc/v3` 的 `pkg/op` 在协议面热路径上，仓库里没有任何守卫覆盖它
-  （A1-2 与 A1-1 的根因都在**库与薄封装之间的缝**里，而不在库本身）。建议下一步
+> 本节在后续改动落地后**逐条核对过一次**，与 [security-audit-3.md](./security-audit-3.md) 的同名小节同步。
+> 每条现在都标着它是**已闭环**、**已由第三轮回答**还是**仍开放**——把已经修好的东西继续写成盲区，
+> 和漏记一个洞一样有害。
+
+**已闭环**
+
+- **Postgres 相关的每一条现在都在 CI 里真的执行**：`test` 作业自带 `postgres:16` service，跑
+  `./internal/store/postgres/` 全量、以 `-race -p 1` 跑全套件，并用 `E2E_DATABASE_URL` 再跑一遍
+  Playwright（`.github/workflows/ci.yml`）。当年只有「读代码到行」的那几条，各自的落盘侧守卫是：
+  - A4-1 的 Postgres 一半：`oidc_test.go` 的 `TestRevokeTokenCutsTheWholeGrant`——用 **refresh token 的值**
+    请求撤销，断言配对的 access token 随即不可自省，正是本轮「`GetRefreshTokenInfo` 返回什么，
+    `RevokeToken` 就必须能删掉什么」的判据。
+  - A5-1 的落盘一半：`auditpseudo_test.go` 的 `TestAuditPseudonymisesSubjectAndUnlinksOnDestroy`
+    （销毁后历史不复活、假名不重用）、`erasure_test.go` 的 `TestAccountDeletionLeavesNoOrphans`，
+    以及静态解析迁移的 `erasure_schema_test.go` 的 `TestEverySubjectColumnIsHandledByErasure`
+    （新增带 `subject`/`user_id` 的表却忘了抹除会在这里失败）。注意原文 Pin 里那句「抹除后扫全表，
+    断言原始 subject 不出现在任何列」**没有**以整表扫描的形式落地；同一类担忧现在由上面那条
+    迁移解析的静态守卫承担。
+  - A5-2 的夹具：`postgres_test.go` 的 `openTestDB` 已把 `audit_chain`、`audit_subject_keys` 加进
+    `TRUNCATE` 并重播 genesis，注释里写的正是本条发现——「链测试从第二个起必失败」不会再出现。
+- **`-race` 未运行**：CI 现在以 `-race -p 1` 跑整套，并发论断由竞态检测器背书，不再只靠锁与事务结构。
+  「本机无 cgo」这一事实没变，但它不再是盲区。
+- **凭据列守卫只覆盖 `federation_bindings` 一张表**：已改为扫**整个 live schema**
+  （`postgres_test.go` 的 `TestNoColumnInTheLiveSchemaCanHoldACredential`，带显式豁免清单），
+  外加一条不需要数据库的静态版（`credential_columns_test.go` 的 `TestNoColumnCanHoldACredential`）。
+  本轮点名的 `federation_bind_flows.pkce_verifier` 与 `audit_subject_keys.key` 都在覆盖内。
+- **业务平面响应不带 `Cache-Control`**：`responses.go` 的 `writeJSON` 统一 `no-store`
+  （`writeOAuthError` 同样），守卫是 `responses_test.go` 的 `TestBusinessPlaneResponsesAreNotCached`。
+- **bind 回滚自身的失败被 `_ =` 丢弃**（原「未验证的假说」第 3 条）：**已修**，即「修复总览」里的 A6-5——
+  `internal/federation/bind.go` 用 `errors.Join` 把回滚失败并进返回错误，不再吞掉。
+  原文把同一件事同时挂在「已修复」与「未验证假说」两处，是本文件的自相矛盾，此处一并消除。
+
+**已由第三轮回答**
+
+- **设备批准是非原子「读—判—写」**（原「未验证的假说」第 1 条）：第三轮 C3-3 正面处理——机制确证、可利用性证伪，
+  缺谓词仍在但构不出收益。守卫是 `internal/httpapi/device_adversary_test.go` 的
+  `TestAdversarialDeviceTokenSubjectIsAlwaysAnApprover` 与 `TestAdversarialDeviceDenyWinsWhicheverWriteOrder`，
+  见 [security-audit-3.md](./security-audit-3.md) C3-3。
+
+**仍开放**
+
+- **每 subject 的审计密钥若被写成零长度**（原「未验证的假说」第 2 条）：`internal/store/postgres/auditpseudo.go` 的
+  `loadKey` 仍无长度检查，同包的链密钥仍严格校验——「同一个包两种标准」这件事没有变。
+  变的是理由：当初「需要数据库才能确认 pgx 如何回读空 `bytea`」不再是阻碍，CI 里有真 Postgres。
+- **第三方库未审计**：`github.com/zitadel/oidc/v3` 的 `pkg/op` 仍在协议面热路径上，仓库里仍无守卫覆盖它
+  （A1-1/A1-2 的根因就在**库与薄封装之间的缝**里，而不在库本身）。第三轮把它再次列为「下一条最该补的缝」。
+  建议的起点：
   `grep -rn "log\.\|slog\." $(go env GOMODCACHE)/github.com/zitadel/oidc/v3@*/pkg/op/` 看是否有
   把 `Request`/`Form`/令牌塞进日志的调用。
-- **未验证的假说**（读代码成立、未复现，列在这里以免被当成已排除）：
-  - 设备批准是**「读—判—写」两步**而非原子（两个 store 都没有 `done = false` 谓词）。
-    我无法构造出收益：两个调用方都必须已在自己的会话里持有 `user_code`，且败者的 `st.Done`
-    预检会让**稍后**的尝试得到 404。但它是账号 store 里唯一靠非原子读改写维持不变量的地方。
-  - 每 subject 的审计密钥若被写成**零长度**，`loadKey` 没有长度检查，于是用空 HMAC key 生成假名
-    （`newAuditLogger` 对**链**密钥是严格检查的，同一个包里两种标准）。需要数据库才能确认 pgx
-    如何回读空 `bytea`。
-  - bind 回滚自身的失败被 `_ =` 丢弃（`bind.go:170-174`），可能留下**孤儿 vault 条目**；
-    该条目不可经任何端点到达（没有按 subject 枚举 vault 的读路径），属残留而非访问路径。
-- **`information_schema` 那个凭据列守卫只覆盖 `federation_bindings` 一张表**
-  （`postgres_test.go:805-847`），它的注释读起来比查询宽。没有机制覆盖「一般情况」，
-  而 `federation_bind_flows.pkce_verifier` 与新的 `audit_subject_keys.key` 就是守卫之外的
-  凭据形状列。这是**覆盖面缺口**而不是泄漏。
-- **业务平面响应不带 `Cache-Control`**（`responses.go:105-109` 只设 `Content-Type`；
-  协议面设了 `no-store`）。受影响的是 `/v1/account/export`、`/v1/sessions/current` 与
-  `/v1/admin/clients`（后两者含 CSRF token），且没有 `Vary`。缺 header 是 CONFIRMED，
-  可利用性是 HYPOTHESIS（需要启发式缓存或浏览器磁盘缓存）。
