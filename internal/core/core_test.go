@@ -2,6 +2,7 @@ package core_test
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -32,18 +33,6 @@ func (r *recorder) snapshot() []string {
 	return append([]string(nil), r.events...)
 }
 
-func equal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // I2: effects are reverted in reverse registration order.
 func TestEffectRunsLIFO(t *testing.T) {
 	app := core.New()
@@ -66,7 +55,7 @@ func TestEffectRunsLIFO(t *testing.T) {
 
 	app.Shutdown()
 
-	if got, want := rec.snapshot(), []string{"c", "b", "a"}; !equal(got, want) {
+	if got, want := rec.snapshot(), []string{"c", "b", "a"}; !slices.Equal(got, want) {
 		t.Fatalf("teardown order = %v, want %v", got, want)
 	}
 }
@@ -223,7 +212,7 @@ func TestReactiveActivationAndDeactivation(t *testing.T) {
 	if got := dependent.State(); got != core.StateActive {
 		t.Fatalf("dependent state = %s, want active", got)
 	}
-	if got, want := rec.snapshot(), []string{"prov:active", "dep:active:v1"}; !equal(got, want) {
+	if got, want := rec.snapshot(), []string{"prov:active", "dep:active:v1"}; !slices.Equal(got, want) {
 		t.Fatalf("activation events = %v, want %v", got, want)
 	}
 
@@ -234,7 +223,7 @@ func TestReactiveActivationAndDeactivation(t *testing.T) {
 		t.Fatalf("dependent state after remove = %s, want inactive", got)
 	}
 	// Dependents tear down before their provider.
-	if got, want := rec.snapshot(), []string{"prov:active", "dep:active:v1", "dep:inactive", "prov:inactive"}; !equal(got, want) {
+	if got, want := rec.snapshot(), []string{"prov:active", "dep:active:v1", "dep:inactive", "prov:inactive"}; !slices.Equal(got, want) {
 		t.Fatalf("teardown events = %v, want %v", got, want)
 	}
 }
@@ -295,7 +284,7 @@ func TestFailedApplyRollsBackEffects(t *testing.T) {
 	if got := f.State(); got != core.StateFailed {
 		t.Fatalf("state = %s, want failed", got)
 	}
-	if got, want := rec.snapshot(), []string{"reverted"}; !equal(got, want) {
+	if got, want := rec.snapshot(), []string{"reverted"}; !slices.Equal(got, want) {
 		t.Fatalf("rollback events = %v, want %v", got, want)
 	}
 }

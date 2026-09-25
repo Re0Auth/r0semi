@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -205,7 +206,7 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 	scopes := rt.Scopes
 	if len(req.Scopes) > 0 {
 		for _, sc := range req.Scopes {
-			if !containsScope(rt.Scopes, sc) {
+			if !slices.Contains(rt.Scopes, sc) {
 				return TokenResponse{}, protocolError("invalid_scope", "refresh cannot widen the granted scope")
 			}
 		}
@@ -339,15 +340,6 @@ func verifyPKCE(verifier, challenge, method string) bool {
 	sum := sha256.Sum256([]byte(verifier))
 	got := base64.RawURLEncoding.EncodeToString(sum[:])
 	return subtle.ConstantTimeCompare([]byte(got), []byte(challenge)) == 1
-}
-
-func containsScope(scopes []Scope, want Scope) bool {
-	for _, s := range scopes {
-		if s == want {
-			return true
-		}
-	}
-	return false
 }
 
 func joinScopes(scopes []Scope) string {

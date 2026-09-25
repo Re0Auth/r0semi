@@ -7,6 +7,7 @@
 package idp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -484,7 +485,7 @@ func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, n
 	}
 	return Identity{
 		Subject:     claims.Subject,
-		DisplayName: firstNonEmpty(claims.Name, claims.Email),
+		DisplayName: cmp.Or(claims.Name, claims.Email),
 		Email:       claims.Email,
 		AvatarURL:   claims.Picture,
 	}, nil
@@ -513,13 +514,6 @@ func (c *Client) idTokenVerifier(ctx context.Context) (*oidc.IDTokenVerifier, er
 		return nil, err
 	}
 	return provider.Verifier(&oidc.Config{ClientID: c.oauth.ClientID}), nil
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
 
 // fetchQQ handles QQ Connect's non-standard profile API: the openid arrives as

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/Re0Auth/r0semi/oauth"
@@ -403,12 +404,7 @@ func (s *Server) writeResourceJSON(w http.ResponseWriter, value any) {
 }
 
 func hasScope(scopes []oauth.Scope, want string) bool {
-	for _, s := range scopes {
-		if s.String() == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(scopes, oauth.Scope(want))
 }
 
 func parseScopes(s string) []oauth.Scope {

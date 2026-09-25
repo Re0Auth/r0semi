@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -321,7 +322,7 @@ func (s *service) DecideDeviceAuthorization(ctx context.Context, userCode, subje
 			return protocolError("invalid_request", "an approval must grant at least one scope; omit scopes to grant the requested set")
 		}
 		for _, sc := range scopes {
-			if !containsScope(rec.Scopes, sc) {
+			if !slices.Contains(rec.Scopes, sc) {
 				return protocolError("invalid_scope", "the decision cannot widen the requested scope")
 			}
 		}

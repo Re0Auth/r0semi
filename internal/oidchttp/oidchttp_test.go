@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -407,8 +408,8 @@ func TestConsentInteraction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !done.Done() || done.GetSubject() != "usr_1" ||
-		!containsString(done.GetScopes(), "account.id") ||
-		!containsString(done.GetScopes(), oidc.ScopeOfflineAccess) {
+		!slices.Contains(done.GetScopes(), "account.id") ||
+		!slices.Contains(done.GetScopes(), oidc.ScopeOfflineAccess) {
 		t.Fatalf("completed request = done=%v subject=%q scopes=%v", done.Done(), done.GetSubject(), done.GetScopes())
 	}
 
@@ -486,10 +487,10 @@ func TestApproveKeepsOpenIDWhenTheConsentScreenOmitsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsString(done.GetScopes(), oidc.ScopeOpenID) {
+	if !slices.Contains(done.GetScopes(), oidc.ScopeOpenID) {
 		t.Fatalf("granted scopes = %v, want openid preserved (otherwise no id_token)", done.GetScopes())
 	}
-	if !containsString(done.GetScopes(), "account.id") {
+	if !slices.Contains(done.GetScopes(), "account.id") {
 		t.Fatalf("granted scopes = %v, want the approved catalogue scope", done.GetScopes())
 	}
 }

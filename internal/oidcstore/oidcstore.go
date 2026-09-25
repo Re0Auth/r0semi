@@ -16,7 +16,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"strings"
+	"slices"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
@@ -354,12 +354,7 @@ func WithoutOfflineAccess(scopes []string) []string {
 
 // HasScope reports whether name is in the space-delimited-field list.
 func HasScope(scopes []string, name string) bool {
-	for _, s := range scopes {
-		if s == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(scopes, name)
 }
 
 // ScopeStrings converts typed scopes to their wire form.
@@ -410,6 +405,3 @@ func ClientIDOf(request op.TokenRequest) string {
 
 // ErrMissingSigner is returned when a store is built without a signing key.
 var ErrMissingSigner = errors.New("oidcstore: signer is required")
-
-// Trim is a tiny helper so callers do not each reimplement scope trimming.
-func Trim(s string) string { return strings.TrimSpace(s) }

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -556,7 +557,7 @@ func oauthErrorCode(path string, status int) string {
 func withCoreScopes(scopes []string) []string {
 	out := append([]string(nil), scopes...)
 	for _, s := range []string{oidc.ScopeOpenID, oidc.ScopeOfflineAccess} {
-		if !containsString(out, s) {
+		if !slices.Contains(out, s) {
 			out = append(out, s)
 		}
 	}
@@ -1060,7 +1061,7 @@ func (h *Handler) ApproveAuthorization(ctx context.Context, id, subject string, 
 		}
 		granted = make([]string, 0, len(scopes))
 		for _, sc := range scopes {
-			if !containsString(requested, sc.String()) {
+			if !slices.Contains(requested, sc.String()) {
 				return "", &oauth.Error{Code: "invalid_scope", Description: "the decision cannot widen the requested scope"}
 			}
 			granted = append(granted, sc.String())
@@ -1073,7 +1074,7 @@ func (h *Handler) ApproveAuthorization(ctx context.Context, id, subject string, 
 		// `openid` gets a response with no id_token in it.
 		_, protocol := splitProtocolScopes(requested)
 		for _, s := range protocol {
-			if !containsString(granted, s) {
+			if !slices.Contains(granted, s) {
 				granted = append(granted, s)
 			}
 		}
@@ -1135,20 +1136,11 @@ func toScopeList(in []string) []oauth.Scope {
 	return out
 }
 
-func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
-}
-
 // withOfflineAccess appends the OIDC offline_access scope if absent. It is how
 // Re0Auth keeps its "a code flow always yields a refresh token" contract while
 // still speaking OIDC (ADR-0001 O-6, revised).
 func withOfflineAccess(scopes []string) []string {
-	if containsString(scopes, oidc.ScopeOfflineAccess) {
+	if slices.Contains(scopes, oidc.ScopeOfflineAccess) {
 		return scopes
 	}
 	return append(scopes, oidc.ScopeOfflineAccess)

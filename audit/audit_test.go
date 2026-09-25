@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"slices"
 	"testing"
 )
 
@@ -13,18 +14,6 @@ func actions(events []Event) []string {
 	return out
 }
 
-func equal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // Below capacity, nothing is dropped and order is insertion order.
 func TestMemoryLoggerKeepsEverythingBelowCapacity(t *testing.T) {
 	l := NewMemoryLoggerWithCapacity(10)
@@ -34,7 +23,7 @@ func TestMemoryLoggerKeepsEverythingBelowCapacity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := actions(l.Events()); !equal(got, []string{"a", "b", "c"}) {
+	if got := actions(l.Events()); !slices.Equal(got, []string{"a", "b", "c"}) {
 		t.Fatalf("events = %v", got)
 	}
 }
@@ -50,7 +39,7 @@ func TestMemoryLoggerEvictsOldestFirst(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := actions(l.Events()); !equal(got, []string{"c", "d", "e"}) {
+	if got := actions(l.Events()); !slices.Equal(got, []string{"c", "d", "e"}) {
 		t.Fatalf("events = %v, want the three most recent in order", got)
 	}
 }
@@ -62,11 +51,11 @@ func TestMemoryLoggerAtExactlyCapacity(t *testing.T) {
 	for _, action := range []string{"a", "b"} {
 		_ = l.Record(ctx, Event{Action: action})
 	}
-	if got := actions(l.Events()); !equal(got, []string{"a", "b"}) {
+	if got := actions(l.Events()); !slices.Equal(got, []string{"a", "b"}) {
 		t.Fatalf("events = %v", got)
 	}
 	_ = l.Record(ctx, Event{Action: "c"})
-	if got := actions(l.Events()); !equal(got, []string{"b", "c"}) {
+	if got := actions(l.Events()); !slices.Equal(got, []string{"b", "c"}) {
 		t.Fatalf("events = %v, want the window to slide", got)
 	}
 }
@@ -77,7 +66,7 @@ func TestMemoryLoggerCapacityOfOne(t *testing.T) {
 	for _, action := range []string{"a", "b", "c"} {
 		_ = l.Record(ctx, Event{Action: action})
 	}
-	if got := actions(l.Events()); !equal(got, []string{"c"}) {
+	if got := actions(l.Events()); !slices.Equal(got, []string{"c"}) {
 		t.Fatalf("events = %v, want only the newest", got)
 	}
 }

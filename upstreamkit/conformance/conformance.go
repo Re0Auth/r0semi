@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -195,10 +196,10 @@ func (r *runner) checkOAuthMetadata() {
 		r.err("oauth.metadata", "invalid metadata JSON: %v", err)
 		return
 	}
-	if !contains(doc.CodeChallengeMethods, "S256") {
+	if !slices.Contains(doc.CodeChallengeMethods, "S256") {
 		r.err("oauth.pkce", "code_challenge_methods_supported must include S256")
 	}
-	if len(doc.ResponseTypes) > 0 && !contains(doc.ResponseTypes, "code") {
+	if len(doc.ResponseTypes) > 0 && !slices.Contains(doc.ResponseTypes, "code") {
 		r.err("oauth.response_type", "response_types_supported must include code")
 	}
 }
@@ -368,13 +369,4 @@ func (r *runner) checkDataPlane(disc upstreamkit.Discovery) {
 	} else if !strings.HasPrefix(contentType, "application/problem+json") {
 		r.warn("resource.unknown", "unknown resource did not use problem+json (got %q)", contentType)
 	}
-}
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }

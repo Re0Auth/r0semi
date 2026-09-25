@@ -2,6 +2,8 @@ package core
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -185,7 +187,7 @@ func (a *App) Check() []error {
 					case white:
 						dfs(p)
 					case gray:
-						cycle := append([]string(nil), stack[indexOf(stack, p):]...)
+						cycle := append([]string(nil), stack[slices.Index(stack, p):]...)
 						cycle = append(cycle, p)
 						msg := "dependency cycle: " + strings.Join(cycle, " -> ")
 						if !seen[msg] {
@@ -211,15 +213,6 @@ func (a *App) Check() []error {
 		errs = append(errs, fmt.Errorf("core: %s", m))
 	}
 	return errs
-}
-
-func indexOf(xs []string, s string) int {
-	for i, x := range xs {
-		if x == s {
-			return i
-		}
-	}
-	return 0
 }
 
 // bind publishes a value in the capability store and returns its withdrawal.
@@ -305,7 +298,7 @@ func (a *App) step(f *Fiber) bool {
 	// A fiber loads when it is inactive, or when its resolved providers have
 	// changed since its last attempt (which also governs retrying a failure).
 	needsLoad := satisfied && (f.state == StateInactive ||
-		(f.state == StateActive || f.state == StateFailed) && !targetsEqual(target, f.target))
+		(f.state == StateActive || f.state == StateFailed) && !maps.Equal(target, f.target))
 
 	switch {
 	case needsLoad:
@@ -388,18 +381,6 @@ func (a *App) resolveTargetLocked(f *Fiber) (map[KeyRef]*Fiber, bool) {
 		target[ref] = b.provider
 	}
 	return target, true
-}
-
-func targetsEqual(x, y map[KeyRef]*Fiber) bool {
-	if len(x) != len(y) {
-		return false
-	}
-	for k, v := range x {
-		if y[k] != v {
-			return false
-		}
-	}
-	return true
 }
 
 // forceUnload reverts a fiber's effects unconditionally.

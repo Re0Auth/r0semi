@@ -7,6 +7,7 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"strconv"
@@ -47,12 +48,7 @@ func Secret(envName, field string) (string, error) {
 // FirstNonEmpty returns the first non-empty value. It is how the precedence
 // "environment > file > default" is written at each call site.
 func FirstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
+	return cmp.Or(values...)
 }
 
 // Bool reads a boolean environment variable, falling back when it is unset.

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"slices"
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/federation"
@@ -160,12 +161,7 @@ func (s *Server) bindURL(game, source, returnTo string) string {
 }
 
 func hasScopeString(scopes []oauth.Scope, want string) bool {
-	for _, sc := range scopes {
-		if sc.String() == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(scopes, oauth.Scope(want))
 }
 
 func hasAnyScope(scopes []oauth.Scope, want []string) bool {

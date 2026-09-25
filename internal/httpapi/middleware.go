@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -518,10 +519,8 @@ func (s *Server) withBearer(next tokenHandler) http.HandlerFunc {
 // requireScope enforces one scope on an authenticated call, returning 403 with
 // the missing scope when it is absent.
 func (s *Server) requireScope(w http.ResponseWriter, r *http.Request, info oauth.TokenInfo, scope oauth.Scope) bool {
-	for _, got := range info.Scopes {
-		if got == scope {
-			return true
-		}
+	if slices.Contains(info.Scopes, scope) {
+		return true
 	}
 	s.insufficientScope(w, r, scope.String(), "this token does not include '"+scope.String()+"'")
 	return false
