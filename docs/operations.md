@@ -100,7 +100,7 @@ DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backu
 
 ## 升级
 
-1. 读 release notes 与 `docs/*-decision.md` 中受影响的 ADR；
+1. 读 [CHANGELOG.md](../CHANGELOG.md)、release notes 与 `docs/*-decision.md` 中受影响的 ADR；
 2. 在 staging 跑一次恢复演练到新版本；
 3. 滚动更新（PDB 保证至少一个可用副本），观察 `/readyz`、错误率与 429/503；
 4. 数据库迁移在启动时执行，多实例由 advisory lock 串行化；迁移前先做一次备份。

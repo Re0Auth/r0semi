@@ -12,11 +12,11 @@ Keep the PR description short and concrete. If a section does not apply, delete 
 
 ## Checklist
 
-- [ ] `gofmt -l .` is empty
-- [ ] `go vet ./...` passes
+- [ ] `make check` passes (gofmt, `go vet`, golangci-lint, the dependency firewall, `svelte-check`)
 - [ ] `go test ./...` passes
 - [ ] Storage-layer changes: `TEST_DATABASE_URL` integration tests were run
 - [ ] Contract changes (protocol, API, component capabilities) are reflected in `docs/`
+- [ ] Operator-visible or breaking changes are recorded in `CHANGELOG.md`
 - [ ] New behaviour has tests; a bug fix has a test that reproduced the bug
 - [ ] New dependencies are justified below and `NOTICE` is updated if needed
 

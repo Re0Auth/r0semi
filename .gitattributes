@@ -1,0 +1,10 @@
+# Everything in this repository is LF, on every platform, and this keeps it that
+# way. It is not cosmetic: scripts/*.sh carry a shebang and run on Linux, where a
+# stray CR turns the interpreter path into something the kernel cannot find — and
+# the failure it produces then says "bad interpreter" rather than why. .editorconfig
+# asks editors for the same; this is the half that holds when an editor ignores it.
+#
+# `text=auto` leaves files Git detects as binary alone, so nothing here needs a
+# per-type binary rule. The tree had no CR anywhere when this file was added, so it
+# renormalizes nothing.
+* text=auto eol=lf

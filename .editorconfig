@@ -1,0 +1,39 @@
+# The conventions this repository already follows, written down for editors.
+#
+# gofmt owns Go formatting and `gofmt -l .` is the gate, so this file does not
+# restate Go style. It carries the things an editor gets wrong unless it is told:
+# where the tree indents with tabs, that everything is LF, and that Markdown's
+# trailing two spaces are a hard line break rather than dirt.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# gofmt decides everything else about Go; this only stops an editor from
+# indenting with spaces before gofmt has to fix it.
+[*.go]
+indent_style = tab
+
+# The frontend is tab-indented (web/src, web/package.json). Changing this without
+# a formatter behind it just moves the churn onto unrelated lines.
+[*.{ts,svelte,css,json}]
+indent_style = tab
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.sql]
+indent_style = space
+indent_size = 2
+
+# Two trailing spaces are a hard line break in Markdown, and docs/ uses them.
+[*.md]
+trim_trailing_whitespace = false
+
+# A recipe line MUST begin with a tab; an editor that "fixes" that breaks make.
+[Makefile]
+indent_style = tab
