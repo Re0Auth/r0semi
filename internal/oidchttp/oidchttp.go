@@ -103,6 +103,11 @@ type Handler struct {
 	clients  oauth.ClientRegistry
 	registry *oauth.Registry
 	consent  ConsentStore
+	// issuer is the static authorization-server identifier, when one was
+	// configured. It is what RFC 9207 `iss` carries on paths that have no request
+	// to derive it from (DenyAuthorization). A dynamic-issuer deployment is a
+	// development shape; it derives `iss` per request on the HTTP paths.
+	issuer string
 }
 
 // New builds the provider.
@@ -178,6 +183,7 @@ func New(cfg Config) (*Handler, error) {
 		clients:  cfg.Clients,
 		registry: cfg.Registry,
 		consent:  cfg.Consent,
+		issuer:   strings.TrimRight(cfg.Issuer, "/"),
 	}, nil
 }
 
@@ -246,6 +252,8 @@ func stripUnsupportedDiscoveryFields(body []byte) []byte {
 	}
 	overrides := map[string]any{
 		"response_types_supported": []string{"code"},
+		// RFC 9207: the authorization response carries `iss`.
+		"authorization_response_iss_parameter_supported": true,
 		"grant_types_supported": []string{
 			"authorization_code",
 			"refresh_token",
@@ -303,6 +311,16 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 			"this endpoint requires POST")
 		return
 	}
+	// RFC 6749 §3.1: request parameters must not be repeated. The library's
+	// decoder takes the last value, so a parameter-smuggling attempt (a duplicate
+	// client_id, redirect_uri, code or scope) silently picked one — which is how
+	// an attacker can make a validation and a use see different values. Refuse
+	// the whole request instead of choosing a winner.
+	if dup := duplicatedParam(requestParams(r)); dup != "" {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
+			"duplicate parameter: "+dup)
+		return
+	}
 	// The authorize entrance, for either method. `/oauth/authorize/callback` is the
 	// library's own leg and is deliberately not included: it carries no client or
 	// scope parameters, and validating it as an entrance would break the flow.
@@ -335,6 +353,18 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	bw := newBufferedWriter()
 	h.provider.ServeHTTP(bw, r)
 	body := bw.body.Bytes()
+
+	// RFC 9207: every authorization response — success and error alike — carries
+	// `iss`, so a client can tell which authorization server answered and is not
+	// vulnerable to a mix-up attack. The library does not add it, so the redirect
+	// the provider wrote is rewritten here. Only absolute redirects are touched:
+	// the authorize endpoint's own redirect to the login/consent UI is relative
+	// and is not an authorization response.
+	if isAuthorizationResponse(r.URL.Path) && bw.status >= 300 && bw.status < 400 {
+		if loc := bw.header.Get("Location"); loc != "" {
+			bw.header.Set("Location", withIssuer(loc, h.issuerFor(r)))
+		}
+	}
 
 	switch {
 	case isToken:
@@ -533,6 +563,7 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 			"error":             "invalid_request",
 			"error_description": description,
 			"state":             q.Get("state"),
+			"iss":               h.issuerFor(r),
 		}
 		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
@@ -543,7 +574,7 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 		return true
 	}
 	if h.scopeProblem(client, strings.Fields(rawScope)) != "" {
-		params := map[string]string{"error": "invalid_scope", "state": q.Get("state")}
+		params := map[string]string{"error": "invalid_scope", "state": q.Get("state"), "iss": h.issuerFor(r)}
 		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
 	}
@@ -622,6 +653,53 @@ func writeOAuthJSONError(w http.ResponseWriter, status int, code, description st
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_description": description})
+}
+
+// isAuthorizationResponse reports whether path is one of the legs that returns an
+// authorization response to the client: the authorize endpoint itself (for an
+// error it can answer by redirect) and the provider callback that issues the code.
+func isAuthorizationResponse(path string) bool {
+	return path == "/"+pathAuthorize || path == "/"+pathAuthorize+"/callback"
+}
+
+// issuerFor returns the authorization-server identifier for this request. It
+// prefers the configured static issuer and derives from the request host only for
+// the dynamic-issuer shape used by tests and development.
+func (h *Handler) issuerFor(r *http.Request) string {
+	if h.issuer != "" {
+		return h.issuer
+	}
+	if h.provider != nil {
+		return strings.TrimRight(h.provider.IssuerFromRequest(r), "/")
+	}
+	return ""
+}
+
+// withIssuer adds the RFC 9207 `iss` parameter to an absolute redirect. A
+// relative redirect is not an authorization response and is returned untouched.
+func withIssuer(location, issuer string) string {
+	if location == "" || issuer == "" {
+		return location
+	}
+	u, err := url.Parse(location)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return location
+	}
+	q := u.Query()
+	q.Set("iss", issuer)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// duplicatedParam returns the name of the first parameter that appears more than
+// once, or "" when every parameter is single-valued.
+func duplicatedParam(values url.Values) string {
+	for name, vs := range values {
+		if len(vs) > 1 {
+			return name
+		}
+	}
+	return ""
 }
 
 // endpointRequiresPOST names the protocol endpoints that must only ever accept
@@ -894,6 +972,8 @@ func (h *Handler) DenyAuthorization(ctx context.Context, id string) (string, err
 	if err != nil {
 		return "", err
 	}
+	// RFC 9207 applies to denied responses too.
+	redirect = withIssuer(redirect, h.issuer)
 	_ = h.provider.Storage().DeleteAuthRequest(ctx, id)
 	return redirect, nil
 }

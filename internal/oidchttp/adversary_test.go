@@ -212,6 +212,52 @@ func TestAdversarialIntrospectionAndRevocationRejectGET(t *testing.T) {
 	}
 }
 
+// RFC 6749 §3.1 forbids repeated request parameters. The library's decoder
+// takes the last value, so a duplicate let validation and use disagree.
+func TestAdversarialDuplicateParametersAreRejected(t *testing.T) {
+	f := newFixture(t)
+	verifier := strings.Repeat("a", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// Duplicate client_id on the authorize entrance.
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {f.webID, f.deviceID},
+		"redirect_uri":          {"https://client.example/cb"},
+		"scope":                 {"account.id"},
+		"state":                 {"st"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	resp := get(t, noRedirect, f.server.URL+"/oauth/authorize?"+q.Encode())
+	body := adversaryBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("duplicate client_id = %d, want 400: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "error") {
+		t.Fatalf("duplicate refusal is not an OAuth error: %s", body)
+	}
+
+	// Duplicate code on the token endpoint.
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {"one", "two"},
+		"client_id":     {f.webID},
+		"client_secret": {"s3cret"},
+		"redirect_uri":  {"https://client.example/cb"},
+		"code_verifier": {verifier},
+	}
+	resp, err := http.PostForm(f.server.URL+"/oauth/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = adversaryBody(t, resp)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("duplicate code = %d, want 400: %s", resp.StatusCode, body)
+	}
+}
+
 // A protected resource's 401 must carry an RFC 6750 Bearer challenge, so a
 // standard RP can tell "this token is bad, refresh it" from a transport error.
 // userinfo is such a resource; neither the library nor this package's client-auth

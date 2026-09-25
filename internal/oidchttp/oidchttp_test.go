@@ -189,6 +189,10 @@ func codeFlow(t testing.TB, f fixture, scopes []string) map[string]any {
 	if code == "" {
 		t.Fatalf("no code in %s", cb)
 	}
+	// RFC 9207: an authorization response must identify its issuer.
+	if got := cb.Query().Get("iss"); got != f.server.URL {
+		t.Fatalf("authorization response iss = %q, want %q", got, f.server.URL)
+	}
 
 	tokens, status := postToken(t, f.server.URL, f.webID, "s3cret", url.Values{
 		"grant_type":    {"authorization_code"},
@@ -231,6 +235,19 @@ func TestDiscoveryAndKeys(t *testing.T) {
 	// advertised either. The library would advertise it by default.
 	if _, ok := disc["end_session_endpoint"]; ok {
 		t.Fatal("discovery advertises end_session_endpoint, which ADR-0001 O-9 says is out of contract")
+	}
+	// RFC 9207: the issuer parameter is emitted, so it must be advertised.
+	if disc["authorization_response_iss_parameter_supported"] != true {
+		t.Fatalf("authorization_response_iss_parameter_supported = %v, want true", disc["authorization_response_iss_parameter_supported"])
+	}
+	// The library's defaults advertise implicit/hybrid and unsupported grants.
+	if got := disc["response_types_supported"]; got != nil {
+		if types, _ := got.([]any); len(types) != 1 || types[0] != "code" {
+			t.Fatalf("response_types_supported = %v, want [code]", got)
+		}
+	}
+	if grants, _ := disc["grant_types_supported"].([]any); len(grants) != 3 {
+		t.Fatalf("grant_types_supported = %v, want the three implemented grants", disc["grant_types_supported"])
 	}
 
 	rfcResp := get(t, noRedirect, f.server.URL+RFC8414Path)
