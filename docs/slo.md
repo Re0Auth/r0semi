@@ -18,20 +18,42 @@
 
 S5 是**硬目标**：审计链自洽是本服务对"日志被动过吗"唯一的控制，任何一次 `failed` 都是事件，不是趋势。
 
+### 1.1 错误预算与燃尽率
+
+S1 的 99.9% 目标等价于 30 天滚动窗口内 **0.1% 的错误预算**。规则文件的 `re0auth-slo` 组把各窗口的
+错误比例物化成 `re0auth:errors:ratio_*` 记录规则，再由两条多窗口燃尽率告警消费：
+
+| 告警 | 长窗 | 短窗 | 燃尽倍率 | 严重度 | 含义 |
+|---|---|---|---|---|---|
+| `Re0AuthErrorBudgetFastBurn` | 1h | 5m | 14.4× | critical | 按此速度几天烧完 30 天预算，立即处置 |
+| `Re0AuthErrorBudgetSlowBurn` | 6h | 30m | 6× | warning | 稳定消耗，通常开单排查 |
+
+燃尽倍率 × 0.1% 即允许的错误比例（14.4×0.1% = 1.44%）。§2 的阈值告警是短窗代理；这两条才是
+真正跟踪 30 天预算的告警。预算耗尽的策略：**冻结非必要变更、优先恢复可用性**，随后按
+[incident-response.md](./incident-response.md) 复盘。记录规则名用冒号（`re0auth:...`）而非下划线，
+以免被 artifacts 测试的 `re0auth_` 指标扫描误当成导出序列。
+
 ## 2. 告警
 
-规则见 `deploy/prometheus/re0auth.rules.yml`。每条都标出它服务的 SLI 与处置方向。
+规则见 `deploy/prometheus/re0auth.rules.yml`，每条告警的处置步骤见
+[runbooks.md](./runbooks.md)。下表标出每条服务的 SLI。
 
 | 告警 | 条件（摘要） | 严重度 | 服务 | 先做什么 |
 |---|---|---|---|---|
-| `Re0AuthHighErrorRate` | 5xx 比例 > 1%，持续 10m | critical | S1 | 看 `/readyz` 与数据库；`operations.md` 排障一节 |
+| `Re0AuthHighErrorRate` | 5xx 比例 > 1%，持续 10m | critical | S1 | 看 `/readyz` 与数据库；见 runbooks |
+| `Re0AuthErrorBudgetFastBurn` | 1h 与 5m 错误率同时 > 14.4×0.1% | critical | S1 | 按可用性事件处置并升级 |
+| `Re0AuthErrorBudgetSlowBurn` | 6h 与 30m 错误率同时 > 6×0.1% | warning | S1 | 开单排查持续的小比例 5xx |
 | `Re0AuthSlowRequests` | 业务面 p99 > 1s，持续 10m | warning | S4 | 查上游来源是否变慢、连接池是否打满 |
 | `Re0AuthTokenEndpointErrorRate` | 令牌错误比例 > 5%，持续 10m | warning | S2 | 按 `error` 标签分组看是 `invalid_client` 还是 `invalid_grant` |
 | `Re0AuthLoginFailureRate` | 登录失败比例 > 30%，持续 15m | warning | S3 | 按 `provider` 看是否某一个 IdP 的发现/换票挂了 |
 | `Re0AuthAuditChainBroken` | `increase(audit_verify_total{result="failed"}[10m]) > 0` | critical | S5 | 按 `admin.md` §5 调查；`first_bad_id` 指向第一处不一致 |
 | `Re0AuthVaultOperationFailures` | 非 ok 比例 > 1%，持续 10m | critical | S6 | 看 `result`：`unconfigured_key` 意味着轮换没收尾，`decrypt_error` 意味着数据损坏 |
 | `Re0AuthUpstreamSourceUnavailable` | 某 source `unavailable` 比例 > 30%，持续 10m | warning | S7 | 确认该数据源自身是否可达；`not_bound` 不是故障，不触发 |
+| `Re0AuthUpstreamSlowSource` | 某 source `ok` 读取 p95 > 2s，持续 15m | warning | S7 | 区分网络还是源本身慢；长期慢可降级该源 |
 | `Re0AuthRefreshRejections` | `rate(upstream_refreshes_total{result="rejected"}[15m]) > 0` | warning | S7 | 用户在被动重新绑定；查该源是否提前作废了 refresh token |
+| `Re0AuthGoroutineLeak` | `go_goroutines` 持续高于阈值（默认 5000） | warning | — | 抓 `/debug/pprof/goroutine?debug=2` 查堆积 |
+| `Re0AuthMemoryHigh` | `process_resident_memory_bytes` 持续高于阈值（默认 400MiB） | warning | — | 看 `/debug/pprof/heap`，先防 OOMKill 再查根因 |
+| `Re0AuthFileDescriptorsHigh` | `process_open_fds / process_max_fds > 0.8`，持续 15m | warning | — | 查连接泄漏；提 ulimit 只买时间 |
 | `Re0AuthKillSwitchFired` | `increase(revocations_total{kind="kill_switch"}[5m]) > 0` | info | — | 不是故障，是通知：有人拉了一键撤销，事故响应应该已经在进行 |
 
 ## 3. 刻意不告警的

@@ -61,8 +61,12 @@ func declaredMetricNames(t *testing.T) map[string]bool {
 	m.ObserveAdminAction(AdminKillSwitch)
 	m.ObserveAuditVerify(VerifyOK)
 	m.ObserveUpstreamFetch("phigros", "next-phi", UpstreamOK)
+	m.ObserveUpstreamFetchDuration("phigros", "next-phi", UpstreamOK, time.Millisecond)
 	m.ObserveUpstreamRefresh(RefreshRejected)
 	m.ObserveVaultOperation("use", "ok", time.Millisecond)
+	// The pool collector is registered from the composition root, not by New(); its
+	// names must be declared here too, since the dashboard and rules reference them.
+	_ = m.RegisterPoolStats(func() PoolStats { return fakePoolStats{} })
 
 	names := make(map[string]bool)
 	for _, line := range strings.Split(scrape(t, m), "\n") {
@@ -93,6 +97,7 @@ func TestAlertRulesReferenceDeclaredMetrics(t *testing.T) {
 			Name  string `yaml:"name"`
 			Rules []struct {
 				Alert       string            `yaml:"alert"`
+				Record      string            `yaml:"record"`
 				Expr        string            `yaml:"expr"`
 				For         string            `yaml:"for"`
 				Labels      map[string]string `yaml:"labels"`
@@ -110,8 +115,18 @@ func TestAlertRulesReferenceDeclaredMetrics(t *testing.T) {
 	seen := make(map[string]bool)
 	for _, g := range doc.Groups {
 		for _, r := range g.Rules {
+			if r.Record != "" {
+				// A recording rule materialises an SLI for the burn-rate alerts to
+				// read; it has no severity or runbook, but its expression must still
+				// name declared metrics.
+				if r.Expr == "" {
+					t.Errorf("recording rule %q in group %q has no expr", r.Record, g.Name)
+				}
+				assertDeclaredMetrics(t, declared, r.Expr)
+				continue
+			}
 			if r.Alert == "" {
-				t.Errorf("group %q has a rule with no alert name", g.Name)
+				t.Errorf("a rule in group %q has neither an alert nor a record name", g.Name)
 				continue
 			}
 			if seen[r.Alert] {
@@ -140,18 +155,26 @@ func TestAlertRulesReferenceDeclaredMetrics(t *testing.T) {
 			if r.Annotations["summary"] == "" || r.Annotations["runbook_url"] == "" {
 				t.Errorf("alert %q needs a summary and a runbook_url", r.Alert)
 			}
-			for _, name := range metricToken.FindAllString(r.Expr, -1) {
-				if name == "re0auth_" { // the prose form "re0auth_*" in a comment
-					continue
-				}
-				if !declared[name] {
-					t.Errorf("alert %q references %q, which this package does not declare", r.Alert, name)
-				}
-			}
+			assertDeclaredMetrics(t, declared, r.Expr)
 		}
 	}
 	if len(seen) < 8 {
 		t.Errorf("only %d alerts defined; expected the full SLO set from docs/slo.md", len(seen))
+	}
+}
+
+// assertDeclaredMetrics fails on any re0auth_ metric named in expr that this
+// package does not declare. The recording-rule names (re0auth:...) use a colon,
+// so metricToken does not match them and they need no declaration.
+func assertDeclaredMetrics(t *testing.T, declared map[string]bool, expr string) {
+	t.Helper()
+	for _, name := range metricToken.FindAllString(expr, -1) {
+		if name == "re0auth_" { // the prose form "re0auth_*" in a comment
+			continue
+		}
+		if !declared[name] {
+			t.Errorf("expression references %q, which this package does not declare", name)
+		}
 	}
 }
 
@@ -181,10 +204,7 @@ func TestDashboardReferencesDeclaredMetrics(t *testing.T) {
 	// Every metric named anywhere in the file must be declared, not only those in
 	// target expressions — a typo in a description is a smaller sin, but the same
 	// scan is what keeps this from having to know the schema.
-	var names []string
-	for _, name := range metricToken.FindAllString(string(raw), -1) {
-		names = append(names, name)
-	}
+	names := metricToken.FindAllString(string(raw), -1)
 	sort.Strings(names)
 	for _, name := range names {
 		if name == "re0auth_" {

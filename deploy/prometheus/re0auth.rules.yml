@@ -6,10 +6,14 @@
 # selector, so they do not bind to one scrape convention — a deployment's own
 # labels are applied where the rule is loaded.
 #
-# Each rule serves a SLI defined in docs/slo.md, and that file says what to do
-# when one fires. The thresholds are starting points, not law: they are set so a
-# real incident pages and a bad afternoon does not, which is the only property
-# that keeps an alert switched on.
+# Each rule serves a SLI defined in docs/slo.md, and each points at a per-alert
+# runbook in docs/runbooks.md (not at the design doc). The thresholds are starting
+# points, not law: they are set so a real incident pages and a bad afternoon does
+# not, which is the only property that keeps an alert switched on.
+#
+# Two groups. `re0auth` holds the fault and notification alerts. `re0auth-slo`
+# holds the recording rules that materialise the SLIs plus the multiwindow
+# burn-rate alerts, which are what actually track the 30-day error budget.
 #
 # What is deliberately NOT here: a scrape-availability rule (that belongs to the
 # deployment's Prometheus/ServiceMonitor, not to the service's own metrics), and
@@ -33,10 +37,10 @@ groups:
         annotations:
           summary: "Re0Auth is returning 5xx on more than 1% of requests"
           description: >-
-            Check /readyz and the database first; docs/operations.md has the
+            Check /readyz and the database first; docs/runbooks.md has the
             triage list. A rise here with a healthy /readyz points at a failing
             dependency or a code path that panics.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authhigherrorrate
 
       - alert: Re0AuthSlowRequests
         # SLI S4: business-plane latency. The business plane is where upstream
@@ -51,10 +55,10 @@ groups:
         annotations:
           summary: "Re0Auth business-plane p99 latency is above 1s"
           description: >-
-            Look at the upstream sources (/v1/games/.../raw and normalized reads),
-            database latency, and the connection pool. A single slow source shows
-            up as upstream_fetches_total{result="unavailable"} on that source.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+            Look at the per-source latency panel, database latency, and the
+            connection pool. A single slow source also trips
+            Re0AuthUpstreamSlowSource.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authslowrequests
 
       - alert: Re0AuthTokenEndpointErrorRate
         # SLI S2. The minimum-traffic guard keeps a single failed exchange on a
@@ -76,7 +80,7 @@ groups:
             Break it down by the `error` label: invalid_client is a client
             credential problem, invalid_grant is a code/refresh replay or
             expiry, invalid_scope is a registration mismatch.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authtokenendpointerrorrate
 
       - alert: Re0AuthLoginFailureRate
         # SLI S3. Failure is expected at a low rate (users cancel, providers
@@ -99,7 +103,7 @@ groups:
             Group by `provider`: one provider failing points at that provider's
             endpoints (provider_unavailable, exchange_failed); all providers
             failing points at this service.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authloginfailurerate
 
       - alert: Re0AuthAuditChainBroken
         # SLI S5, a hard target: the chain verifying is the whole point of the
@@ -113,8 +117,8 @@ groups:
           description: >-
             GET /v1/admin/audit/verify reports first_bad_id, the row where the
             chain first disagrees. Treat as tampering or corruption until proven
-            otherwise; docs/admin.md §5 has the read-side contract.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+            otherwise; docs/runbooks.md and docs/admin.md §5 have the contract.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authauditchainbroken
 
       - alert: Re0AuthVaultOperationFailures
         # SLI S6. unconfigured_key means a key rotation was left unfinished;
@@ -136,7 +140,7 @@ groups:
             Group by `result`: unconfigured_key means a retired KEK was removed
             before a rotation finished; decrypt_error means corruption or a wrong
             KEK. Both stop data-plane calls for the affected bindings.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authvaultoperationfailures
 
       - alert: Re0AuthUpstreamSourceUnavailable
         # SLI S7, per source. `not_bound` is excluded on purpose: a user who has
@@ -157,7 +161,25 @@ groups:
           description: >-
             Confirm the source itself is reachable. This is the source's outage,
             not Re0Auth's; the deployment's other sources are unaffected.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authupstreamsourceunavailable
+
+      - alert: Re0AuthUpstreamSlowSource
+        # SLI S7, latency dimension. A source that is slow but still answering is
+        # invisible to the unavailable-ratio alert above; this is the one that
+        # catches it.
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, game, source) (rate(re0auth_upstream_fetch_duration_seconds_bucket{result="ok"}[5m]))
+          ) > 2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data source {{ $labels.game }}/{{ $labels.source }} is slow (p95 > 2s)"
+          description: >-
+            Compare the per-source latency panel against the source's own status.
+            A persistently slow source can be degraded so traffic prefers another.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authupstreamslowsource
 
       - alert: Re0AuthRefreshRejections
         # A rejected refresh means upstream tokens are being invalidated before
@@ -172,7 +194,7 @@ groups:
             Users are being asked to reconnect a source. Check whether the source
             rotated or revoked tokens early, or whether clock skew is expiring
             bindings prematurely.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authrefreshrejections
 
       - alert: Re0AuthKillSwitchFired
         # Not a fault: a notification that somebody pulled the incident lever.
@@ -185,4 +207,115 @@ groups:
             Bulk revocation was triggered from the operator plane. This is a
             signal that an incident response is already underway; correlate with
             the audit log's admin.kill_switch entry.
-          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/slo.md
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authkillswitchfired
+
+      - alert: Re0AuthGoroutineLeak
+        # A non-request runtime signal: the go_* collector is exported for exactly
+        # this, and nothing else consumes it. The threshold must be tuned to the
+        # deployment's concurrency; it is a leak detector, not a load alarm.
+        expr: go_goroutines > 5000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re0Auth goroutine count is high and sustained"
+          description: >-
+            Grab /debug/pprof/goroutine?debug=2 on the internal listener and look
+            for a stack piling up (an uncancelled context, an unclosed body).
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authgoroutineleak
+
+      - alert: Re0AuthMemoryHigh
+        # Threshold should match the deployment's memory limit (k8s default limit
+        # is 512Mi); it is 400MiB here to warn before an OOMKill. A non-request
+        # signal, hence no re0auth_ series.
+        expr: process_resident_memory_bytes > 400e6
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re0Auth resident memory is high"
+          description: >-
+            Check /debug/pprof/heap and the DB pool panel. Raise the limit or add
+            replicas before an OOMKill, then find the cause (an unbounded map, a
+            log buffer).
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authmemoryhigh
+
+      - alert: Re0AuthFileDescriptorsHigh
+        # Saturation of a resource the service cannot grow on its own. Most fds are
+        # sockets: upstream, database and HTTP connections.
+        expr: process_open_fds / process_max_fds > 0.8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re0Auth is running out of file descriptors"
+          description: >-
+            Look for a connection leak (an unclosed body, an unreleased pool
+            connection). Raising the container ulimit buys time but is not the
+            fix.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authfiledescriptorshigh
+
+  - name: re0auth-slo
+    rules:
+      # Recording rules materialise the S1 error ratio over several windows so the
+      # burn-rate alerts below read a name instead of recomputing a long rate at
+      # evaluation time. Names use a colon (re0auth:...), so the artifacts test's
+      # re0auth_ metric scan does not mistake them for exported series.
+      - record: re0auth:errors:ratio_5m
+        expr: |
+          sum(rate(re0auth_http_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(re0auth_http_requests_total[5m]))
+
+      - record: re0auth:errors:ratio_30m
+        expr: |
+          sum(rate(re0auth_http_requests_total{status=~"5.."}[30m]))
+            /
+          sum(rate(re0auth_http_requests_total[30m]))
+
+      - record: re0auth:errors:ratio_1h
+        expr: |
+          sum(rate(re0auth_http_requests_total{status=~"5.."}[1h]))
+            /
+          sum(rate(re0auth_http_requests_total[1h]))
+
+      - record: re0auth:errors:ratio_6h
+        expr: |
+          sum(rate(re0auth_http_requests_total{status=~"5.."}[6h]))
+            /
+          sum(rate(re0auth_http_requests_total[6h]))
+
+      - alert: Re0AuthErrorBudgetFastBurn
+        # S1 error budget, fast burn: 14.4x the 0.1% budget (S1 target 99.9%) over a
+        # 1h long window, confirmed by a 5m short window. At this rate the 30-day
+        # budget is gone in a few days, so it pages.
+        expr: |
+          re0auth:errors:ratio_1h > (14.4 * 0.001)
+          and
+          re0auth:errors:ratio_5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Re0Auth is burning its availability error budget fast"
+          description: >-
+            Treat as an availability incident: follow Re0AuthHighErrorRate and
+            escalate. See docs/runbooks.md.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0autherrorbudgetfastburn
+
+      - alert: Re0AuthErrorBudgetSlowBurn
+        # S1 error budget, slow burn: 6x the budget over a 6h long window confirmed
+        # by 30m. A ticket, not a page.
+        expr: |
+          re0auth:errors:ratio_6h > (6 * 0.001)
+          and
+          re0auth:errors:ratio_30m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Re0Auth is burning its availability error budget steadily"
+          description: >-
+            Investigate the sustained low-rate 5xx; a flaky dependency is the usual
+            cause. See docs/runbooks.md.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0autherrorbudgetslowburn

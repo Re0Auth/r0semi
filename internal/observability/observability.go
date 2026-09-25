@@ -26,6 +26,17 @@ import (
 // Prometheus cannot confuse them with another service's.
 const namespace = "re0auth"
 
+// latencyBuckets are the histogram buckets for HTTP request and vault-operation
+// latency. They are tuned to this service rather than Prometheus's defaults: the
+// auth hot paths run in tens of microseconds, which the default's 5ms floor cannot
+// resolve at all, and the business-plane p99 SLO is 1s, which the default's 1→2.5s
+// jump estimates from a range wider than the SLO itself. The set keeps
+// sub-millisecond resolution at the fast end and brackets 1s closely at the slow
+// end.
+var latencyBuckets = []float64{
+	0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+}
+
 // Metrics is the service's Prometheus instrumentation.
 //
 // Two layers. The first is the four golden signals of any HTTP service — traffic
@@ -53,18 +64,19 @@ type Metrics struct {
 	inFlight *prometheus.GaugeVec
 
 	// Domain signals. See the Observe* methods for what feeds each.
-	logins          *prometheus.CounterVec
-	tokensIssued    *prometheus.CounterVec
-	tokenErrors     *prometheus.CounterVec
-	deviceDecision  *prometheus.CounterVec
-	revocations     *prometheus.CounterVec
-	tokensRevoked   *prometheus.CounterVec
-	adminActions    *prometheus.CounterVec
-	auditVerify     *prometheus.CounterVec
-	upstreamFetch   *prometheus.CounterVec
-	upstreamRefresh *prometheus.CounterVec
-	vaultOps        *prometheus.CounterVec
-	vaultLatency    *prometheus.HistogramVec
+	logins                *prometheus.CounterVec
+	tokensIssued          *prometheus.CounterVec
+	tokenErrors           *prometheus.CounterVec
+	deviceDecision        *prometheus.CounterVec
+	revocations           *prometheus.CounterVec
+	tokensRevoked         *prometheus.CounterVec
+	adminActions          *prometheus.CounterVec
+	auditVerify           *prometheus.CounterVec
+	upstreamFetch         *prometheus.CounterVec
+	upstreamFetchDuration *prometheus.HistogramVec
+	upstreamRefresh       *prometheus.CounterVec
+	vaultOps              *prometheus.CounterVec
+	vaultLatency          *prometheus.HistogramVec
 }
 
 // New builds the instrumentation on its own registry. A private registry rather
@@ -84,7 +96,7 @@ func New() *Metrics {
 			Namespace: namespace,
 			Name:      "http_request_duration_seconds",
 			Help:      "HTTP request latency in seconds, by plane and method.",
-			Buckets:   prometheus.DefBuckets,
+			Buckets:   latencyBuckets,
 		}, []string{"plane", "method"}),
 		inFlight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -110,6 +122,8 @@ func New() *Metrics {
 			"Audit-chain verification outcomes, by result.", "result"),
 		upstreamFetch: counter("upstream_fetches_total",
 			"Data-plane reads proxied to a configured source, by game, source and result.", "game", "source", "result"),
+		upstreamFetchDuration: histogram("upstream_fetch_duration_seconds",
+			"Data-plane read latency in seconds, by game, source and result.", "game", "source", "result"),
 		upstreamRefresh: counter("upstream_refreshes_total",
 			"Upstream token refreshes, by result.", "result"),
 		vaultOps: counter("vault_operations_total",
@@ -121,7 +135,7 @@ func New() *Metrics {
 	reg.MustRegister(
 		m.logins, m.tokensIssued, m.tokenErrors, m.deviceDecision,
 		m.revocations, m.tokensRevoked, m.adminActions, m.auditVerify,
-		m.upstreamFetch, m.upstreamRefresh, m.vaultOps, m.vaultLatency,
+		m.upstreamFetch, m.upstreamFetchDuration, m.upstreamRefresh, m.vaultOps, m.vaultLatency,
 	)
 	// The runtime and process collectors are what make /metrics useful during an
 	// incident that is not a request: a goroutine leak, a GC cliff, an open
@@ -142,8 +156,112 @@ func counter(name, help string, labels ...string) *prometheus.CounterVec {
 
 func histogram(name, help string, labels ...string) *prometheus.HistogramVec {
 	return prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: namespace, Name: name, Help: help, Buckets: prometheus.DefBuckets,
+		Namespace: namespace, Name: name, Help: help, Buckets: latencyBuckets,
 	}, labels)
+}
+
+// Register adds an external collector to this service's registry. It exists for
+// signals this package does not own — most visibly the Postgres pool, whose
+// numbers live in the store — so they export under the same re0auth_ namespace
+// without this package having to know about the store.
+//
+// It returns the registration error rather than panicking: metrics are not
+// required for the service to serve (see the package doc), so a duplicate or
+// invalid collector is something to log, not something to die on.
+func (m *Metrics) Register(c prometheus.Collector) error {
+	return m.registry.Register(c)
+}
+
+// PoolStats is the subset of pgxpool's statistics this package exports. It is an
+// interface so the metrics package does not depend on the database driver, and so
+// a test can declare the pool metric names without a live pool. *pgxpool.Stat
+// satisfies it structurally; the composition root passes one in.
+type PoolStats interface {
+	TotalConns() int32
+	IdleConns() int32
+	AcquiredConns() int32
+	MaxConns() int32
+	AcquireCount() int64
+	EmptyAcquireCount() int64
+	CanceledAcquireCount() int64
+	NewConnsCount() int64
+	AcquireDuration() time.Duration
+}
+
+// RegisterPoolStats registers a collector that exports a connection pool's
+// statistics as re0auth_db_pool_* series. The names live here so the dashboard and
+// rules that read them have one source of truth the artifacts test can see.
+//
+// stats is a function rather than a value because the pool's numbers are read at
+// scrape time; a gauge refreshed by a background loop would add a tick of
+// staleness to exactly the signal — saturation — an incident is about.
+func (m *Metrics) RegisterPoolStats(stats func() PoolStats) error {
+	return m.registry.Register(newPoolCollector(stats))
+}
+
+// poolCollector exports a pool's statistics under the re0auth_db_pool_* names.
+type poolCollector struct {
+	stats func() PoolStats
+
+	totalConns      *prometheus.Desc
+	idleConns       *prometheus.Desc
+	acquiredConns   *prometheus.Desc
+	maxConns        *prometheus.Desc
+	acquireCount    *prometheus.Desc
+	emptyAcquire    *prometheus.Desc
+	canceledAcquire *prometheus.Desc
+	newConns        *prometheus.Desc
+	acquireDuration *prometheus.Desc
+}
+
+func newPoolCollector(stats func() PoolStats) *poolCollector {
+	const sub = "db_pool"
+	desc := func(name, help string) *prometheus.Desc {
+		return prometheus.NewDesc(prometheus.BuildFQName(namespace, sub, name), help, nil, nil)
+	}
+	return &poolCollector{
+		stats:           stats,
+		totalConns:      desc("total_conns", "Connections currently held by the pool."),
+		idleConns:       desc("idle_conns", "Idle connections in the pool."),
+		acquiredConns:   desc("acquired_conns", "Connections currently acquired by a caller."),
+		maxConns:        desc("max_conns", "Maximum connections this pool may open."),
+		acquireCount:    desc("acquire_count_total", "Successful connection acquisitions."),
+		emptyAcquire:    desc("empty_acquire_count_total", "Acquisitions that had to wait for a connection."),
+		canceledAcquire: desc("canceled_acquire_count_total", "Acquisitions abandoned with their context."),
+		newConns:        desc("new_conns_count_total", "New connections opened by the pool."),
+		acquireDuration: desc("acquire_duration_seconds_total", "Cumulative time spent acquiring connections."),
+	}
+}
+
+func (c *poolCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.totalConns
+	ch <- c.idleConns
+	ch <- c.acquiredConns
+	ch <- c.maxConns
+	ch <- c.acquireCount
+	ch <- c.emptyAcquire
+	ch <- c.canceledAcquire
+	ch <- c.newConns
+	ch <- c.acquireDuration
+}
+
+func (c *poolCollector) Collect(ch chan<- prometheus.Metric) {
+	s := c.stats()
+	gauge := func(d *prometheus.Desc, v float64) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v)
+	}
+	counter := func(d *prometheus.Desc, v float64) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, v)
+	}
+	gauge(c.totalConns, float64(s.TotalConns()))
+	gauge(c.idleConns, float64(s.IdleConns()))
+	gauge(c.acquiredConns, float64(s.AcquiredConns()))
+	gauge(c.maxConns, float64(s.MaxConns()))
+	counter(c.acquireCount, float64(s.AcquireCount()))
+	counter(c.emptyAcquire, float64(s.EmptyAcquireCount()))
+	counter(c.canceledAcquire, float64(s.CanceledAcquireCount()))
+	counter(c.newConns, float64(s.NewConnsCount()))
+	counter(c.acquireDuration, s.AcquireDuration().Seconds())
 }
 
 // Handler returns the Prometheus scrape handler for this registry.
@@ -194,17 +312,22 @@ const (
 	DeviceDenied   = "denied"
 
 	// Operator-plane actions.
-	AdminRegister   = "register"
-	AdminSuspend    = "suspend"
-	AdminActivate   = "activate"
-	AdminDelete     = "delete"
-	AdminKillSwitch = "kill_switch"
+	AdminRegister     = "register"
+	AdminRotateSecret = "rotate_secret"
+	AdminSuspend      = "suspend"
+	AdminActivate     = "activate"
+	AdminDelete       = "delete"
+	AdminKillSwitch   = "kill_switch"
 
 	// Upstream data-plane read results.
 	UpstreamOK          = "ok"
 	UpstreamDegraded    = "degraded"
 	UpstreamNotBound    = "not_bound"
 	UpstreamUnavailable = "unavailable"
+	// UpstreamCircuitOpen is a read refused locally because the source's circuit
+	// breaker is open. It is distinct from unavailable so an operator can tell
+	// "we stopped calling" from "the source is down".
+	UpstreamCircuitOpen = "circuit_open"
 
 	// Upstream refresh results.
 	RefreshOK        = "ok"
@@ -297,6 +420,17 @@ func (m *Metrics) ObserveUpstreamFetch(game, source, result string) {
 		return
 	}
 	m.upstreamFetch.WithLabelValues(game, source, result).Inc()
+}
+
+// ObserveUpstreamFetchDuration records how long one data-plane read took, using
+// the same (game, source, result) labels as ObserveUpstreamFetch so a slow
+// source can be found by name instead of inferred from an outcome. It is not
+// observed for the not-bound case, where no upstream call was made.
+func (m *Metrics) ObserveUpstreamFetchDuration(game, source, result string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.upstreamFetchDuration.WithLabelValues(game, source, result).Observe(d.Seconds())
 }
 
 // ObserveUpstreamRefresh records one attempt to refresh an upstream token.

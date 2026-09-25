@@ -177,6 +177,106 @@
           "legendFormat": "refreshes"
         }
       ]
+    },
+    {
+      "title": "Upstream fetch latency p95 (by source)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, game, source) (rate(re0auth_upstream_fetch_duration_seconds_bucket{result=\"ok\"}[5m])))",
+          "legendFormat": "{{game}}/{{source}}"
+        }
+      ]
+    },
+    {
+      "title": "DB pool connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "re0auth_db_pool_acquired_conns",
+          "legendFormat": "acquired"
+        },
+        {
+          "refId": "B",
+          "expr": "re0auth_db_pool_idle_conns",
+          "legendFormat": "idle"
+        },
+        {
+          "refId": "C",
+          "expr": "re0auth_db_pool_max_conns",
+          "legendFormat": "max"
+        }
+      ]
+    },
+    {
+      "title": "DB pool acquire waits",
+      "description": "Acquisitions that had to wait for a free connection. A rising rate means the pool is saturating.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(re0auth_db_pool_empty_acquire_count_total[5m])",
+          "legendFormat": "empty acquires/s"
+        }
+      ]
+    },
+    {
+      "title": "Goroutines",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "go_goroutines",
+          "legendFormat": "goroutines"
+        }
+      ]
+    },
+    {
+      "title": "Resident memory",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "process_resident_memory_bytes",
+          "legendFormat": "RSS"
+        }
+      ]
+    },
+    {
+      "title": "Open file descriptors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "process_open_fds",
+          "legendFormat": "open"
+        },
+        {
+          "refId": "B",
+          "expr": "process_max_fds",
+          "legendFormat": "max"
+        }
+      ]
     }
   ],
   "refresh": "30s",
