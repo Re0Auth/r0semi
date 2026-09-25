@@ -399,7 +399,12 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 		if owner != clientID {
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
+		// RFC 7009 §2.1: revoke the whole grant, not just the presented token. The
+		// refresh token minted with this access token carries the same id_hash.
 		if _, err := s.pool.Exec(ctx, `DELETE FROM oidc_access_tokens WHERE id_hash = $1`, h); err != nil {
+			return oidc.ErrServerError().WithParent(err)
+		}
+		if _, err := s.pool.Exec(ctx, `DELETE FROM oidc_refresh_tokens WHERE id_hash = $1`, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)
 		}
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
@@ -409,6 +414,13 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	if err := s.pool.QueryRow(ctx, `SELECT client_id FROM oidc_refresh_tokens WHERE token_hash = $1`, h).Scan(&owner); err == nil {
 		if owner != clientID {
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+		}
+		// Delete the paired access token first; the refresh row is the only place
+		// that names it.
+		if _, err := s.pool.Exec(ctx, `
+			DELETE FROM oidc_access_tokens
+			 WHERE id_hash IN (SELECT id_hash FROM oidc_refresh_tokens WHERE token_hash = $1)`, h); err != nil {
+			return oidc.ErrServerError().WithParent(err)
 		}
 		if _, err := s.pool.Exec(ctx, `DELETE FROM oidc_refresh_tokens WHERE token_hash = $1`, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)

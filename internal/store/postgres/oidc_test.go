@@ -152,6 +152,35 @@ func TestExpiredAuthorizationCodeIsRefused(t *testing.T) {
 	}
 }
 
+// Mirrors memory.TestRevokeTokenCutsTheWholeGrant.
+func TestRevokeTokenCutsTheWholeGrant(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	req := &oidcstore.AuthRequest{ClientID: "oidc-web", Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	accessID, refreshValue, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeToken(ctx, accessID, "usr_1", "oidc-web"); err != nil {
+		t.Fatalf("revoking the access token failed: %v", err)
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, refreshValue); err == nil {
+		t.Fatal("the paired refresh token survived access-token revocation")
+	}
+
+	accessID2, refreshValue2, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeToken(ctx, refreshValue2, "", "oidc-web"); err != nil {
+		t.Fatalf("revoking the refresh token failed: %v", err)
+	}
+	var introspect oidc.IntrospectionResponse
+	if err := store.SetIntrospectionFromToken(ctx, &introspect, accessID2, "usr_1", "oidc-web"); err == nil {
+		t.Fatal("the paired access token survived refresh-token revocation")
+	}
+}
+
 // Mirrors memory.TestCompleteLoginPreservesRecordedAuthTime.
 func TestCompleteLoginPreservesRecordedAuthTime(t *testing.T) {
 	store, _, ctx := oidcFixture(t)

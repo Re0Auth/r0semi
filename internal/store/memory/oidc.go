@@ -409,6 +409,13 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
 		delete(s.accessTokens, h)
+		// RFC 7009 §2.1: revoking a token should revoke the whole grant. The
+		// refresh token minted alongside this access token shares its id hash.
+		for k, rt := range s.refreshTokens {
+			if rt.idHash == h {
+				delete(s.refreshTokens, k)
+			}
+		}
 		s.mu.Unlock()
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
@@ -419,6 +426,8 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
 		delete(s.refreshTokens, h)
+		// The paired access token is keyed by the same id hash.
+		delete(s.accessTokens, t.idHash)
 		s.mu.Unlock()
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil

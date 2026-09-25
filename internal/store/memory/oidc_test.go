@@ -267,6 +267,37 @@ func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
 	}
 }
 
+// RFC 7009 §2.1: revoking either token should cut the whole grant, not just the
+// presented one.
+func TestRevokeTokenCutsTheWholeGrant(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	req := &oidcstore.AuthRequest{ClientID: "cli", Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	accessID, refreshValue, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeToken(ctx, accessID, "usr_1", "cli"); err != nil {
+		t.Fatalf("revoking the access token failed: %v", err)
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, refreshValue); err == nil {
+		t.Fatal("the paired refresh token survived access-token revocation")
+	}
+
+	accessID2, refreshValue2, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeToken(ctx, refreshValue2, "", "cli"); err != nil {
+		t.Fatalf("revoking the refresh token failed: %v", err)
+	}
+	var introspect oidc.IntrospectionResponse
+	if err := store.SetIntrospectionFromToken(ctx, &introspect, accessID2, "usr_1", "cli"); err == nil {
+		t.Fatal("the paired access token survived refresh-token revocation")
+	}
+}
+
 // auth_time must be the session's authentication time, not when consent was
 // decided. The login hook records it before CompleteLogin, which must preserve it.
 func TestCompleteLoginPreservesRecordedAuthTime(t *testing.T) {
