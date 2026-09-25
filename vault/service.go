@@ -34,6 +34,38 @@ type Service interface {
 	Rotate(ctx context.Context) (Rotation, error)
 }
 
+// Metrics observes credential-vault operations. It is optional: a nil interface
+// records nothing.
+//
+// vault is a public library and must not import this service's observability
+// package, so a deployment injects its own implementation with WithMetrics. The
+// vocabulary travels in the strings:
+//
+//   - operation: "use", "enroll" or "revoke";
+//   - result: "ok", "not_found", "repo_error", "key_unavailable",
+//     "decrypt_error" or "audit_error";
+//   - d: wall-clock duration of the whole operation — for Use, that includes the
+//     audit write and the caller's callback, so it is the latency a caller sees.
+type Metrics interface {
+	ObserveVaultOperation(operation, result string, d time.Duration)
+}
+
+// The vault's label vocabulary. They are unexported because the only consumer is
+// this package; a Metrics implementation receives them as opaque strings.
+const (
+	metricOpUse    = "use"
+	metricOpEnroll = "enroll"
+	metricOpRevoke = "revoke"
+
+	metricOK             = "ok"
+	metricNotFound       = "not_found"
+	metricRepoError      = "repo_error"
+	metricKeyUnavailable = "key_unavailable"
+	metricDecryptError   = "decrypt_error"
+	metricAuditError     = "audit_error"
+	metricError          = "error"
+)
+
 type service struct {
 	repo Repo
 	// current wraps new DEKs, and is the target of a rotation.
@@ -42,12 +74,31 @@ type service struct {
 	// record. A record is unwrapped by the key that wrapped it, which is the only
 	// thing that makes rotation possible: without the old key, a record written
 	// before the rotation cannot be re-wrapped, and is simply unreadable.
-	keys  map[string]KeyWrapper
-	audit audit.Logger
+	keys    map[string]KeyWrapper
+	audit   audit.Logger
+	metrics Metrics
 }
 
 // Option tunes a Service.
 type Option func(*service) error
+
+// WithMetrics attaches an observer for vault operations. It is optional: without
+// it, operations run unobserved.
+func WithMetrics(m Metrics) Option {
+	return func(s *service) error {
+		s.metrics = m
+		return nil
+	}
+}
+
+// observe records one completed operation. A nil observer is a no-op, so the
+// call sites below need no branch.
+func (s *service) observe(operation, result string, start time.Time) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.ObserveVaultOperation(operation, result, time.Since(start))
+}
 
 // WithRetiredKeys declares additional KEKs that may still have wrapped records.
 //
@@ -121,6 +172,7 @@ func NewService(repo Repo, kek KeyWrapper, logger audit.Logger, opts ...Option) 
 }
 
 func (s *service) Enroll(ctx context.Context, id Identity, secret []byte, meta map[string]string) error {
+	start := time.Now()
 	if err := id.validate(); err != nil {
 		return err
 	}
@@ -128,16 +180,19 @@ func (s *service) Enroll(ctx context.Context, id Identity, secret []byte, meta m
 
 	dek := make([]byte, dekSize)
 	if err := fillRandom(dek); err != nil {
+		s.observe(metricOpEnroll, metricError, start)
 		return err
 	}
 	defer Scrub(dek)
 
 	wrapped, err := s.current.Wrap(ctx, dek, aad)
 	if err != nil {
+		s.observe(metricOpEnroll, metricError, start)
 		return fmt.Errorf("vault: wrap DEK: %w", err)
 	}
 	nonce, ct, err := sealSecret(dek, secret, aad)
 	if err != nil {
+		s.observe(metricOpEnroll, metricError, start)
 		return err
 	}
 
@@ -153,17 +208,24 @@ func (s *service) Enroll(ctx context.Context, id Identity, secret []byte, meta m
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}); err != nil {
+		s.observe(metricOpEnroll, metricRepoError, start)
 		return fmt.Errorf("vault: persist credential: %w", err)
 	}
-	return s.record(ctx, audit.Event{
+	if err := s.record(ctx, audit.Event{
 		Action:   "vault.enroll",
 		Subject:  id.Subject,
 		Provider: id.Provider,
 		Outcome:  audit.OutcomeOK,
-	})
+	}); err != nil {
+		s.observe(metricOpEnroll, metricAuditError, start)
+		return err
+	}
+	s.observe(metricOpEnroll, metricOK, start)
+	return nil
 }
 
 func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) error) error {
+	start := time.Now()
 	if err := id.validate(); err != nil {
 		return err
 	}
@@ -179,6 +241,14 @@ func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) e
 			Provider: id.Provider,
 			Outcome:  audit.OutcomeDenied,
 		})
+		// A missing record and a failing repository are different incidents: the
+		// first is a caller asking for a credential that was never there, the
+		// second is the storage layer itself.
+		result := metricRepoError
+		if errors.Is(err, ErrNotFound) {
+			result = metricNotFound
+		}
+		s.observe(metricOpUse, result, start)
 		return err
 	}
 
@@ -190,6 +260,7 @@ func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) e
 		_ = s.record(ctx, audit.Event{
 			Action: "vault.use", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeError,
 		})
+		s.observe(metricOpUse, metricKeyUnavailable, start)
 		return fmt.Errorf("vault: %s was wrapped by key %q, which is not configured; "+
 			"declare it as a retired key if this deployment rotated away from it", id, rec.KEKID)
 	}
@@ -198,6 +269,7 @@ func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) e
 		_ = s.record(ctx, audit.Event{
 			Action: "vault.use", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeError,
 		})
+		s.observe(metricOpUse, metricDecryptError, start)
 		return fmt.Errorf("vault: unwrap DEK: %w", err)
 	}
 	defer Scrub(dek)
@@ -207,6 +279,7 @@ func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) e
 		_ = s.record(ctx, audit.Event{
 			Action: "vault.use", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeError,
 		})
+		s.observe(metricOpUse, metricDecryptError, start)
 		return err
 	}
 	defer Scrub(plain)
@@ -216,24 +289,36 @@ func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) e
 	if err := s.record(ctx, audit.Event{
 		Action: "vault.use", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeOK,
 	}); err != nil {
+		s.observe(metricOpUse, metricAuditError, start)
 		return err
 	}
 
-	return fn(plain)
+	// The callback's own error is the caller's outcome, not the vault's: the
+	// credential was opened and handed over, which is what this signal means.
+	result := fn(plain)
+	s.observe(metricOpUse, metricOK, start)
+	return result
 }
 
 func (s *service) Revoke(ctx context.Context, id Identity) error {
+	start := time.Now()
 	if err := id.validate(); err != nil {
 		return err
 	}
 	// Removing the wrapped DEK crypto-shreds the credential: the ciphertext,
 	// even if it lingers, is no longer decryptable.
 	if err := s.repo.Delete(ctx, id); err != nil && !errors.Is(err, ErrNotFound) {
+		s.observe(metricOpRevoke, metricRepoError, start)
 		return fmt.Errorf("vault: delete credential: %w", err)
 	}
-	return s.record(ctx, audit.Event{
+	if err := s.record(ctx, audit.Event{
 		Action: "vault.revoke", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeOK,
-	})
+	}); err != nil {
+		s.observe(metricOpRevoke, metricAuditError, start)
+		return err
+	}
+	s.observe(metricOpRevoke, metricOK, start)
+	return nil
 }
 
 func (s *service) Exists(ctx context.Context, id Identity) (bool, error) {
