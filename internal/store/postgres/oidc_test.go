@@ -248,6 +248,71 @@ func TestDevicePollingIsThrottled(t *testing.T) {
 	}
 }
 
+// Mirrors httpapi.TestAdversarialDeviceCodeIsSingleUse: the library reads the state
+// once, right before minting, and has no consume step of its own. The store's
+// `DELETE ... RETURNING` is what makes the device code single use — without it a
+// held device_code keeps minting fresh token pairs for its whole TTL, and every
+// replay also outruns any revocation that happened in between.
+func TestDeviceCodeIsSingleUse(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "device-once", "ONCE-1234",
+		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveDevice(ctx, "ONCE-1234", "usr_1", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The approved authorization is handed over exactly once. Asserting this first is
+	// what keeps the check below from passing on a fixture that stored nothing.
+	first, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "device-once")
+	if err != nil {
+		t.Fatalf("the approved authorization was not handed over: %v", err)
+	}
+	if !first.Done || first.Subject != "usr_1" {
+		t.Fatalf("first read = %+v, want the approved state", first)
+	}
+
+	// The second read has nothing left to give: the row is gone, so what comes back
+	// is the slow_down path or a not-found, never another approved state.
+	if second, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "device-once"); err == nil && second.Done {
+		t.Fatalf("a second read handed the same authorization over again: %+v", second)
+	}
+}
+
+// Mirrors httpapi.TestAdversarialDeviceCodeIsRevokedByTheRevokeButton: revocation has
+// to reach the approved device authorization, not only the tokens it already minted.
+// Leaving the row behind let the holder of the device_code mint a fresh pair after
+// the user revoked the grant — the revocation reported success and the next poll
+// undid it.
+func TestRevokingAGrantDeletesItsDeviceAuthorization(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "device-revoked", "REVK-1234",
+		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveDevice(ctx, "REVK-1234", "usr_1", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Precondition, read without consuming: there is an approved authorization to
+	// revoke. Without it this test would pass on a fixture that created nothing.
+	if st, err := store.deviceState(ctx, `device_code_hash = $1`, hashValue("device-revoked")); err != nil || !st.Done {
+		t.Fatalf("precondition: approved device state = %+v (%v)", st, err)
+	}
+
+	if err := store.RevokeGrant(ctx, "usr_1", "oidc-device"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.deviceState(ctx, `device_code_hash = $1`, hashValue("device-revoked")); err == nil {
+		t.Fatal("the approved device authorization survived the revocation")
+	}
+	// And the path the library actually takes agrees with the direct read.
+	if st, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "device-revoked"); err == nil && st.Done {
+		t.Fatalf("the device code still hands out tokens after revocation: %+v", st)
+	}
+}
+
 func newAuthRequest(t *testing.T, ctx context.Context, store *OIDCStore) op.AuthRequest {
 	t.Helper()
 	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
