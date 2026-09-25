@@ -298,6 +298,9 @@ func main() {
 		Federation: federationService,
 		Frontend:   webui.FS(),
 		Limiter:    buildLimiter(cfg),
+		// Concurrency cap, separate from the rate limiter: rate bounds arrivals,
+		// this bounds work in progress.
+		MaxInFlight: cfg.MaxInFlight,
 		// Which peers may speak for the client through X-Forwarded-For. Empty
 		// means none, so the peer address is the client.
 		TrustedProxies: cfg.TrustedProxies,

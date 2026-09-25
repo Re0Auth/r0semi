@@ -60,6 +60,9 @@ type serverSection struct {
 	// and the deployment that wanted limiting off would silently get the default.
 	RateLimit      *float64 `toml:"rate_limit"`
 	RateLimitBurst *int     `toml:"rate_limit_burst"`
+	// MaxInFlight bounds concurrent requests. Pointer for the same reason as
+	// rate_limit: absent takes the default, explicit 0 disables the cap.
+	MaxInFlight *int `toml:"max_in_flight"`
 	// TrustedProxies are the networks whose X-Forwarded-For header is believed
 	// when attributing a request to a client. Empty means none: the peer address
 	// is the client. Set it only to your own reverse proxies' addresses.
@@ -192,6 +195,8 @@ type settings struct {
 	// RateLimit is per client address, per second. Zero means no limiter.
 	RateLimit      float64
 	RateLimitBurst int
+	// MaxInFlight caps concurrent requests. Zero disables the cap.
+	MaxInFlight int
 	// TrustedProxies are the networks whose X-Forwarded-For is believed when
 	// resolving the client address. Empty means no proxy is trusted.
 	TrustedProxies []netip.Prefix
@@ -252,6 +257,10 @@ const authorizationRequestTTL = 30 * time.Minute
 const (
 	defaultRateLimit      = 50.0
 	defaultRateLimitBurst = 100
+	// defaultMaxInFlight is high enough not to shape ordinary traffic and low
+	// enough that a burst of slow requests cannot exhaust database connections and
+	// memory before the limiter reacts.
+	defaultMaxInFlight = 512
 )
 
 // loadConfig reads the TOML file at path (empty = environment only), applies the
@@ -263,10 +272,14 @@ func loadConfig(path string) (settings, error) {
 		return settings{}, err
 	}
 
+	cookieSecure, err := config.Bool("RE0AUTH_COOKIE_SECURE", f.Server.CookieSecure)
+	if err != nil {
+		return settings{}, err
+	}
 	cfg := settings{
 		Addr:         config.FirstNonEmpty(os.Getenv("RE0AUTH_ADDR"), f.Server.Addr, "127.0.0.1:8080"),
 		Issuer:       strings.TrimRight(config.FirstNonEmpty(os.Getenv("RE0AUTH_ISSUER"), f.Server.Issuer), "/"),
-		CookieSecure: config.Bool("RE0AUTH_COOKIE_SECURE", f.Server.CookieSecure),
+		CookieSecure: cookieSecure,
 		KEKID:        config.FirstNonEmpty(os.Getenv("RE0AUTH_KEK_ID"), f.Vault.KEKID, "kek-1"),
 		DatabaseURL:  os.Getenv("DATABASE_URL"),
 		InternalAddr: config.FirstNonEmpty(os.Getenv("RE0AUTH_INTERNAL_ADDR"), f.Server.InternalAddr),
@@ -306,6 +319,18 @@ func loadConfig(path string) (settings, error) {
 		// Fail closed rather than let the limiter clamp it: a burst of zero is not
 		// what anyone means, and silently running with one is worse than saying so.
 		return settings{}, errors.New("server.rate_limit_burst must be at least 1 when rate_limit is set")
+	}
+
+	maxInFlight := defaultMaxInFlight
+	if f.Server.MaxInFlight != nil {
+		maxInFlight = *f.Server.MaxInFlight
+	}
+	cfg.MaxInFlight, err = config.Int("RE0AUTH_MAX_IN_FLIGHT", maxInFlight)
+	if err != nil {
+		return settings{}, err
+	}
+	if cfg.MaxInFlight < 0 {
+		return settings{}, errors.New("server.max_in_flight cannot be negative (use 0 to disable the cap)")
 	}
 
 	// Trusted proxies. The environment overrides the file, like every other

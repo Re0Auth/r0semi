@@ -84,6 +84,26 @@ func (l *Limiter) AllowN(key string, n int) bool {
 	return b.limiter.AllowN(now, n)
 }
 
+// Status reports the bucket's quota, remaining tokens and the delay until one
+// more token is available. It is what the RateLimit-* response headers are made
+// from. It does not consume a token; unknown keys report the full burst.
+func (l *Limiter) Status(key string) (limit int, remaining int, reset time.Duration) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		return l.burst, l.burst, 0
+	}
+	remaining = int(b.limiter.TokensAt(now))
+	reservation := b.limiter.ReserveN(now, 1)
+	if reservation.OK() {
+		reset = reservation.DelayFrom(now)
+		reservation.Cancel()
+	}
+	return l.burst, remaining, reset
+}
+
 // RetryAfter reports how long until one more event for key would be allowed. It
 // is a hint for the Retry-After header.
 func (l *Limiter) RetryAfter(key string) time.Duration {

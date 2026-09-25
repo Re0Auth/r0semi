@@ -16,7 +16,10 @@ import (
 
 type ctxKey int
 
-const requestIDCtxKey ctxKey = iota
+const (
+	requestIDCtxKey ctxKey = iota
+	traceIDCtxKey
+)
 
 // Security response headers. They are applied to every response on both planes,
 // for the same reason request ids are: the rule is identical on either side and
@@ -121,6 +124,62 @@ func requestID(r *http.Request) string {
 	return ""
 }
 
+// withTrace adopts the caller's W3C trace context when it is well formed and
+// generates one otherwise, so every request has a trace id to log and to
+// propagate to upstreams. It is deliberately minimal: this service does not run
+// an OpenTelemetry exporter, so the id is correlated, not exported. An invalid
+// traceparent is ignored rather than rejected — a broken tracing header is not a
+// reason to fail an authorization request.
+func withTrace(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := traceIDFromTraceparent(r.Header.Get("traceparent"))
+		if traceID == "" {
+			traceID = newTraceID()
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), traceIDCtxKey, traceID)))
+	})
+}
+
+// traceIDFromTraceparent parses the version 00 form
+// `00-<32 hex trace-id>-<16 hex span-id>-<2 hex flags>`. Anything else yields "".
+func traceIDFromTraceparent(header string) string {
+	if header == "" {
+		return ""
+	}
+	parts := strings.Split(header, "-")
+	if len(parts) != 4 || parts[0] != "00" {
+		return ""
+	}
+	traceID, spanID, flags := parts[1], parts[2], parts[3]
+	if len(traceID) != 32 || len(spanID) != 16 || len(flags) != 2 {
+		return ""
+	}
+	for _, s := range []string{traceID, spanID, flags} {
+		if _, err := hex.DecodeString(s); err != nil {
+			return ""
+		}
+	}
+	if traceID == strings.Repeat("0", 32) {
+		return ""
+	}
+	return traceID
+}
+
+func newTraceID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+func traceID(r *http.Request) string {
+	if id, ok := r.Context().Value(traceIDCtxKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
 // withAccessLog writes one line per request: what was asked for, what came back,
 // how long it took, and under which request id.
 //
@@ -160,6 +219,7 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			slog.Int64("bytes", rec.bytes),
 			slog.String("plane", planeOf(r.URL.Path).String()),
 			slog.String("request_id", requestID(r)),
+			slog.String("trace_id", traceID(r)),
 			slog.String("client", s.clientKey(r)),
 		)
 	})
@@ -236,6 +296,8 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 			return
 		}
 		key := s.clientKey(r)
+		limit, remaining, reset := s.limiter.Status(key)
+		setRateLimitHeaders(w, limit, remaining, reset)
 		if !s.limiter.Allow(key) {
 			if after := s.limiter.RetryAfter(key); after > 0 {
 				seconds := int(after.Seconds() + 0.999)
@@ -258,8 +320,52 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// clientKey derives the limiter key from the request's client address.
-//
+// setRateLimitHeaders publishes the bucket's state as the IETF RateLimit-* fields
+// so a client can back off before being rejected rather than after.
+func setRateLimitHeaders(w http.ResponseWriter, limit, remaining int, reset time.Duration) {
+	h := w.Header()
+	h.Set("RateLimit-Limit", strconv.Itoa(limit))
+	h.Set("RateLimit-Remaining", strconv.Itoa(remaining))
+	seconds := int(reset.Seconds() + 0.999)
+	if seconds < 0 {
+		seconds = 0
+	}
+	h.Set("RateLimit-Reset", strconv.Itoa(seconds))
+}
+
+// withInFlightLimit is the inbound counterpart of the outbound bulkhead: a hard
+// cap on requests being served at once. The limiter bounds rate over time; this
+// bounds concurrency, which is what protects memory and database connections
+// when many slow requests arrive together. Probes are exempt for the same reason
+// the limiter exempts them, and the refusal is rendered per plane.
+func (s *Server) withInFlightLimit(next http.Handler) http.Handler {
+	if s.maxInFlight <= 0 {
+		return next
+	}
+	sem := make(chan struct{}, s.maxInFlight)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isProbe(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			switch planeOf(r.URL.Path) {
+			case planeProtocol:
+				writeOAuthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "server busy")
+			case planeBusiness:
+				s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "server busy")
+			default:
+				http.Error(w, "server busy", http.StatusServiceUnavailable)
+			}
+		}
+	})
+}
+
 // It delegates to clientAddr, which is the peer address unless the peer is a
 // configured trusted proxy — in which case the proxy's X-Forwarded-For is
 // believed as far as the first hop we do not trust. Without a trust list a

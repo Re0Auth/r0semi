@@ -153,3 +153,86 @@ func TestRateLimitAtTheProtocolNamespaceRoot(t *testing.T) {
 		})
 	}
 }
+
+// The RateLimit-* headers let a client back off before it is rejected rather than
+// after, which is the whole point of publishing the bucket state.
+func TestRateLimitHeadersExposeTheBucket(t *testing.T) {
+	env := newTestEnv(t)
+	limited, err := New(Config{
+		Issuer:            testIssuer,
+		OIDC:              env.handler,
+		TokenIntrospector: env.handler,
+		GrantStore:        env.store,
+		DeviceStore:       env.store,
+		Limiter:           ratelimit.New(1, 5),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	req.RemoteAddr = "203.0.113.11:1234"
+	rec := httptest.NewRecorder()
+	limited.Handler().ServeHTTP(rec, req)
+	if got := rec.Header().Get("RateLimit-Limit"); got != "5" {
+		t.Fatalf("RateLimit-Limit = %q, want 5", got)
+	}
+	if got := rec.Header().Get("RateLimit-Remaining"); got == "" {
+		t.Fatal("RateLimit-Remaining is missing")
+	}
+	if got := rec.Header().Get("RateLimit-Reset"); got == "" {
+		t.Fatal("RateLimit-Reset is missing")
+	}
+}
+
+// The in-flight cap is the inbound bulkhead: when it is full, a request is
+// refused in its own plane's shape rather than queued without bound.
+func TestInFlightCapRefusesInPlaneShape(t *testing.T) {
+	s := &Server{maxInFlight: 1}
+	block := make(chan struct{})
+	release := make(chan struct{})
+	handler := s.withInFlightLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(block)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-block
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/me", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("saturated request = %d, want 503", rec.Code)
+	}
+	assertProblemPlane(t, rec)
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+	close(release)
+}
+
+// A well-formed traceparent is adopted as this request's trace id; an invalid one
+// is ignored rather than rejected, and a fresh id is generated.
+func TestTraceparentIsAdoptedOrReplaced(t *testing.T) {
+	const incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	var got string
+	handler := withTrace(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = traceID(r)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	req.Header.Set("traceparent", incoming)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if got != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatalf("trace id = %q, want the incoming trace id", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	req.Header.Set("traceparent", "not-a-traceparent")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if len(got) != 32 {
+		t.Fatalf("invalid traceparent was not replaced with a generated id: %q", got)
+	}
+}

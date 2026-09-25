@@ -55,14 +55,20 @@ func FirstNonEmpty(values ...string) string {
 }
 
 // Bool reads a boolean environment variable, falling back when it is unset.
-func Bool(key string, fallback bool) bool {
-	switch os.Getenv(key) {
+//
+// A value that is present but not a boolean is an error, on the same terms as
+// Float and Int: "RE0AUTH_COOKIE_SECURE=yes" otherwise runs with whatever the
+// file said and looks applied while it is not.
+func Bool(key string, fallback bool) (bool, error) {
+	switch raw := os.Getenv(key); raw {
+	case "":
+		return fallback, nil
 	case "true", "1":
-		return true
+		return true, nil
 	case "false", "0":
-		return false
+		return false, nil
 	default:
-		return fallback
+		return false, fmt.Errorf("%s=%q is not a boolean (true/false/1/0)", key, raw)
 	}
 }
 
