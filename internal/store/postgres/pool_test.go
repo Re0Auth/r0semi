@@ -1,8 +1,11 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The test DSN is parsed, never dialled: building the configuration is a pure
@@ -107,5 +110,29 @@ func TestPoolOptionsNegativeStatementTimeoutIsNotSent(t *testing.T) {
 	}
 	if got, ok := cfg.ConnConfig.RuntimeParams["statement_timeout"]; ok {
 		t.Errorf("statement_timeout = %q, want it to be absent", got)
+	}
+}
+
+// PoolStats must reflect the pool's configuration: it is what the metrics layer
+// exports, and *pgxpool.Stat has to satisfy observability.PoolStats for the
+// composition root to compile at all. The pool is built from a DSN that is never
+// dialled — pgxpool connects lazily — so this needs no database.
+func TestPoolStatsReflectsPoolConfig(t *testing.T) {
+	opts := DefaultPoolOptions()
+	opts.MinConns = 0 // do not open any connection at construction
+	cfg, err := poolConfig(poolTestDSN, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	if got := (&DB{pool: pool}).PoolStats().MaxConns(); got != 16 {
+		t.Errorf("PoolStats().MaxConns() = %d, want 16", got)
 	}
 }

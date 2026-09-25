@@ -53,6 +53,8 @@ var (
 	configFlag = flag.String("config", "", "path to the TOML config file (default: RE0AUTH_CONFIG, then config/re0auth.toml)")
 	rotateKeys = flag.Bool("rotate-keys", false,
 		"re-wrap every stored credential's DEK under the current KEK, then exit")
+	migrateDown = flag.Bool("migrate-down", false,
+		"roll back the most recently applied migration, then exit")
 	showVersion = flag.Bool("version", false, "print the build version and exit")
 )
 
@@ -202,6 +204,13 @@ func main() {
 		stop()
 	}()
 
+	// Before openStorage, because Open migrates up: a rollback issued after it
+	// would be undone by the act of opening the database.
+	if *migrateDown {
+		migrateDownAndReport(ctx, cfg)
+		return
+	}
+
 	store, err := openStorage(ctx, cfg)
 	if err != nil {
 		die("storage", err)
@@ -229,6 +238,16 @@ func main() {
 	// golden signals are not the only thing it carries: the security-relevant
 	// domain signals are what the alerting rules fire on (ADR-0007).
 	metrics := observability.New()
+
+	// The connection pool is the one dependency whose saturation /readyz reports
+	// only as a 503. Export it, so an incident has the number the runbook tells the
+	// operator to look at. Registered after the registry exists, which is why this
+	// is here rather than an Open option.
+	if store.db != nil {
+		if err := metrics.RegisterPoolStats(func() observability.PoolStats { return store.db.PoolStats() }); err != nil {
+			slog.Warn("could not register connection-pool metrics", "err", err)
+		}
+	}
 
 	vaultService, err := openVault(cfg, store.credentials, logger, metrics)
 	if err != nil {
@@ -261,8 +280,13 @@ func main() {
 		slog.Warn("no identity provider is configured; nobody can sign in")
 	}
 
-	sessions := auth.NewManager(auth.Options{Secure: cfg.CookieSecure, Store: store.sessions, Index: store.sessionIndex})
-	authHandler, err := auth.NewHandler(sessions, idpRegistry, store.accounts, auth.WithMetrics(metrics))
+	sessions := auth.NewManager(auth.Options{
+		Secure: cfg.CookieSecure, Store: store.sessions, Index: store.sessionIndex,
+		// Sign-out is an authentication event; the same durable log records it.
+		Audit: logger,
+	})
+	authHandler, err := auth.NewHandler(sessions, idpRegistry, store.accounts,
+		auth.WithMetrics(metrics), auth.WithAudit(logger))
 	if err != nil {
 		die("auth", err)
 	}
@@ -281,6 +305,10 @@ func main() {
 	federationClient := httpclient.NewOutboundClient(httpclient.OutboundConfig{
 		Timeout:       20 * time.Second,
 		MaxConcurrent: federationMaxConcurrent,
+		// A source that keeps failing is skipped for a cooldown rather than
+		// charging every user read a full timeout. Defaults (5 failures, 30s) are
+		// the house values; see httpclient.BreakerOptions.
+		Breaker: &httpclient.BreakerOptions{},
 	})
 	federationService, err := federation.NewService(federation.Config{
 		Registry:   registry,
@@ -319,6 +347,9 @@ func main() {
 		// The golden-signal instrumentation, labelled by plane. Always on; see
 		// where it is built above.
 		Metrics: metrics,
+		// The write side, for the events this layer owns (identity unlink). The
+		// auth and admin planes are given the same logger directly.
+		AuditLog: logger,
 	}
 	// Every deployment runs the OpenID Provider (ADR-0001 P4b). The only thing a
 	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
@@ -720,6 +751,23 @@ func openVault(cfg settings, credentials vault.Repo, logger audit.Logger, metric
 		opts = append(opts, vault.WithRetiredKeys(retired...))
 	}
 	return vault.NewService(credentials, wrapper, logger, opts...)
+}
+
+// migrateDownAndReport rolls the schema back one step and exits. One step, not a
+// target: the common need is "undo the migration I just applied", and a partial
+// rollback to an arbitrary version is a decision better made deliberately, with the
+// migration files in hand. See docs/migration-decision.md (ADR-0008) for why
+// restore-from-backup, not down, is the rollback story.
+func migrateDownAndReport(ctx context.Context, cfg settings) {
+	if cfg.DatabaseURL == "" {
+		die("migrate-down", errors.New("no DATABASE_URL is configured; there is nothing to roll back"))
+	}
+	if err := postgres.MigrateDown(ctx, cfg.DatabaseURL, postgres.PoolOptions{
+		ConnectTimeout: cfg.Pool.ConnectTimeout,
+	}); err != nil {
+		die("migrate-down", err)
+	}
+	slog.Info("rolled back the most recent migration")
 }
 
 // rotateAndReport re-wraps the vault under the current KEK.

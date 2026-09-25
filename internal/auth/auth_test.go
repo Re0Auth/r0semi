@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/testoidc"
@@ -26,6 +27,8 @@ type harness struct {
 	// oidc is the fake OpenID Provider behind the Google login. Tests must echo
 	// its nonce, because Google is an OIDC provider and its id_token is verified.
 	oidc *testoidc.Server
+	// audit is the log sign-in, sign-up, link and sign-out events are recorded to.
+	audit *audit.MemoryLogger
 }
 
 // fakeIDP serves, per provider, a token endpoint and a userinfo endpoint.
@@ -98,9 +101,10 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 
-	manager := NewManager(Options{Secure: false})
+	auditLog := audit.NewMemoryLogger()
+	manager := NewManager(Options{Secure: false, Audit: auditLog})
 	accounts := account.NewMemoryStore()
-	handler, err := NewHandler(manager, registry, accounts)
+	handler, err := NewHandler(manager, registry, accounts, WithAudit(auditLog))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +142,7 @@ func newHarness(t *testing.T) *harness {
 			return http.ErrUseLastResponse
 		},
 	}
-	return &harness{server: server, manager: manager, accounts: accounts, client: client, oidc: oidc}
+	return &harness{server: server, manager: manager, accounts: accounts, client: client, oidc: oidc, audit: auditLog}
 }
 
 func (h *harness) get(t *testing.T, target string) *http.Response {

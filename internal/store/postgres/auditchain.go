@@ -254,6 +254,18 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 	return v, nil
 }
 
+// Head returns the chain's current head hash. It is the value an external anchor
+// publishes: handed to a system outside this database, it makes a truncated tail
+// detectable — the one thing Verify cannot see on its own (see the note in
+// migration 0013). A log whose head is still the genesis returns an empty slice.
+func (l *AuditLogger) Head(ctx context.Context) ([]byte, error) {
+	var head []byte
+	if err := l.pool.QueryRow(ctx, `SELECT head_hash FROM audit_chain WHERE only_row`).Scan(&head); err != nil {
+		return nil, fmt.Errorf("postgres: audit: head: %w", err)
+	}
+	return head, nil
+}
+
 // newAuditLogger validates the key and returns the sink.
 func newAuditLogger(pool *pgxpool.Pool, key []byte) (*AuditLogger, error) {
 	switch {

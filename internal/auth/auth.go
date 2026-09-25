@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/alexedwards/scs/v2"
 	"github.com/alexedwards/scs/v2/memstore"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/observability"
@@ -52,6 +54,9 @@ type Options struct {
 	// Index maps a session token to the account it belongs to. Optional: without
 	// it, the Kill Switch can sign the whole deployment out but not one account.
 	Index SessionIndex
+	// Audit, when set, receives sign-out events. Optional; a nil logger records
+	// nothing, the same contract the metrics option has.
+	Audit audit.Logger
 }
 
 // SessionIndex maps a session token to the account it belongs to.
@@ -68,6 +73,7 @@ type SessionIndex interface {
 type Manager struct {
 	sessions *scs.SessionManager
 	index    SessionIndex
+	auditLog audit.Logger
 }
 
 // NewManager builds a session manager with secure cookie defaults.
@@ -104,7 +110,7 @@ func NewManager(opts Options) *Manager {
 	sm.Cookie.Path = "/"
 	sm.Cookie.Persist = true
 
-	return &Manager{sessions: sm, index: opts.Index}
+	return &Manager{sessions: sm, index: opts.Index, auditLog: opts.Audit}
 }
 
 // LoadAndSave is the session middleware. It must wrap every browser-facing
@@ -174,14 +180,42 @@ func (m *Manager) SignIn(ctx context.Context, user account.UserID) error {
 	return nil
 }
 
-// SignOut destroys the session.
+// SignOut destroys the session and records the event. A write failure is logged,
+// not returned: the session is already gone, and refusing to admit it would leave
+// the user signed out with no record, which is the opposite of what the log is for.
 func (m *Manager) SignOut(ctx context.Context) error {
+	subject := ""
+	if user, ok := m.User(ctx); ok {
+		subject = string(user)
+	}
 	if m.index != nil {
 		if token := m.sessions.Token(ctx); token != "" {
 			_ = m.index.Forget(ctx, token)
 		}
 	}
-	return m.sessions.Destroy(ctx)
+	err := m.sessions.Destroy(ctx)
+	outcome := audit.OutcomeOK
+	if err != nil {
+		outcome = audit.OutcomeError
+	}
+	recordAudit(ctx, m.auditLog, audit.Event{Action: "auth.logout", Subject: subject, Outcome: outcome})
+	return err
+}
+
+// recordAudit writes one authentication event. A write failure is logged, not
+// returned: unlike the vault, nothing irreversible is gated on the record, so
+// refusing a sign-in over an audit gap would trade availability for a missing
+// line — the same trade admin.record makes. A nil logger records nothing.
+func recordAudit(ctx context.Context, l audit.Logger, e audit.Event) {
+	if l == nil {
+		return
+	}
+	if e.Time.IsZero() {
+		e.Time = time.Now().UTC()
+	}
+	if err := l.Record(ctx, e); err != nil {
+		slog.Error("auth audit record failed", "action", e.Action, "subject", e.Subject, "err", err)
+	}
 }
 
 // CSRFToken returns the session's CSRF token, creating one if needed. The
@@ -279,6 +313,9 @@ type Handler struct {
 	// metrics observes sign-in outcomes. Optional; a nil *observability.Metrics
 	// records nothing (its methods are nil-safe).
 	metrics *observability.Metrics
+	// auditLog records authentication events. Optional; a nil logger records
+	// nothing.
+	auditLog audit.Logger
 }
 
 // HandlerOption tunes a Handler.
@@ -287,6 +324,13 @@ type HandlerOption func(*Handler)
 // WithMetrics attaches business metrics to the login plane. It is optional.
 func WithMetrics(m *observability.Metrics) HandlerOption {
 	return func(h *Handler) { h.metrics = m }
+}
+
+// WithAudit attaches the audit log. It is optional, but a deployment with a
+// durable log should pass it: who authenticated as whom, and when, is the
+// question the log exists to answer.
+func WithAudit(l audit.Logger) HandlerOption {
+	return func(h *Handler) { h.auditLog = l }
 }
 
 // NewHandler builds the /auth handler.
@@ -314,11 +358,44 @@ func (h *Handler) observeLogin(provider, result string) {
 	h.metrics.ObserveLogin(provider, result)
 }
 
+// recordAuth writes one authentication event. code, when set, is the same bounded
+// failure code the metric uses — never a request value.
+func (h *Handler) recordAuth(ctx context.Context, action string, provider idp.Provider, subject, outcome, code string) {
+	var detail map[string]string
+	if code != "" {
+		detail = map[string]string{"code": code}
+	}
+	recordAudit(ctx, h.auditLog, audit.Event{
+		Action: action, Subject: subject, Provider: string(provider), Outcome: outcome, Detail: detail,
+	})
+}
+
+// denyLogin records a sign-in that the request or the provider refused: the
+// metric and the audit line, with no subject because none is known yet.
+func (h *Handler) denyLogin(ctx context.Context, provider, code string) {
+	h.observeLogin(provider, code)
+	h.recordAuth(ctx, "auth.login", idp.Provider(provider), "", audit.OutcomeDenied, code)
+}
+
 // failLogin records the failure and hands the browser back with the reason, the
 // two halves a failed callback has to do.
 func (h *Handler) failLogin(w http.ResponseWriter, r *http.Request, provider idp.Provider, returnTo, code string) {
 	h.observeLogin(string(provider), code)
+	h.recordAuth(r.Context(), "auth.login", provider, "", outcomeFor(code), code)
 	redirectError(w, r, returnTo, code)
+}
+
+// outcomeFor maps a login failure code to an audit outcome: a refusal the
+// provider or the request caused is "denied", anything else is this service
+// failing to complete the flow.
+func outcomeFor(code string) string {
+	switch code {
+	case "denied", "identity_taken", "unknown_provider", "invalid_state",
+		"provider_mismatch", "invalid_request", "not_signed_in":
+		return audit.OutcomeDenied
+	default:
+		return audit.OutcomeError
+	}
 }
 
 // Register mounts the routes on mux.
@@ -349,7 +426,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
 	if !ok {
-		h.observeLogin("unknown", "unknown_provider")
+		h.denyLogin(r.Context(), "unknown", "unknown_provider")
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -400,7 +477,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
 	if !ok {
-		h.observeLogin("unknown", "unknown_provider")
+		h.denyLogin(r.Context(), "unknown", "unknown_provider")
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -409,7 +486,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	want := h.manager.sessions.GetString(ctx, keyFlowState)
 	if want == "" || subtle.ConstantTimeCompare([]byte(state), []byte(want)) != 1 {
-		h.observeLogin(string(provider), "invalid_state")
+		h.denyLogin(ctx, string(provider), "invalid_state")
 		http.Error(w, "invalid state", http.StatusBadRequest)
 		return
 	}
@@ -421,7 +498,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	h.clearFlow(ctx)
 
 	if flowProvider != string(provider) {
-		h.observeLogin(string(provider), "provider_mismatch")
+		h.denyLogin(ctx, string(provider), "provider_mismatch")
 		http.Error(w, "provider mismatch", http.StatusBadRequest)
 		return
 	}
@@ -463,6 +540,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.observeLogin(string(provider), observability.LoginSuccess)
+		h.recordAuth(ctx, "auth.identity.link", provider, string(user), audit.OutcomeOK, "")
 		http.Redirect(w, r, returnTo, http.StatusSeeOther)
 		return
 	}
@@ -475,6 +553,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 			h.failLogin(w, r, provider, returnTo, "signup_failed")
 			return
 		}
+		h.recordAuth(ctx, "auth.signup", provider, string(created.ID), audit.OutcomeOK, "")
 		user = created.ID
 	case err != nil:
 		h.failLogin(w, r, provider, returnTo, "lookup_failed")
@@ -488,6 +567,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.observeLogin(string(provider), observability.LoginSuccess)
+	h.recordAuth(ctx, "auth.login", provider, string(user), audit.OutcomeOK, "")
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
 }
 

@@ -201,6 +201,12 @@ func (db *DB) Close() { db.pool.Close() }
 // orchestrator should stop routing to it until it can.
 func (db *DB) Ping(ctx context.Context) error { return db.pool.Ping(ctx) }
 
+// PoolStats returns the pool's live statistics. The metrics package exports them
+// under re0auth_db_pool_*; *pgxpool.Stat satisfies its PoolStats interface
+// structurally, so the composition root wires the two together and neither
+// package has to name the other's type.
+func (db *DB) PoolStats() *pgxpool.Stat { return db.pool.Stat() }
+
 // Accounts returns the account store.
 func (db *DB) Accounts() *Accounts { return &Accounts{pool: db.pool} }
 
@@ -233,17 +239,10 @@ func (db *DB) Audit(key []byte) (*AuditLogger, error) {
 	return newAuditLogger(db.pool, key)
 }
 
-// Migrate applies every pending goose migration under an advisory lock, so two
-// instances starting at once cannot race. The lock is held on a dedicated pool
-// connection for the whole run; goose itself runs on a database/sql handle
-// (the pgx stdlib driver), because that is the seam it exposes.
+// withMigrationLock runs fn against a goose provider under the migration advisory
+// lock, so two instances acting at once cannot race, on a connection of its own.
 //
-// It also adopts a pre-goose `schema_migrations` table when it finds one: its
-// rows are copied into goose's version table (preserving the applied_at
-// timestamps), then it is dropped. A database that has never run a migration
-// simply gets a fresh goose_db_version.
-//
-// The lock is held on a connection of its own rather than one borrowed from the
+// The lock is held on a dedicated connection rather than one borrowed from the
 // pool, for two reasons that both come from the pool's statement_timeout:
 //
 //   - waiting for another instance to finish migrating is legitimate and can take
@@ -253,13 +252,18 @@ func (db *DB) Audit(key []byte) (*AuditLogger, error) {
 //     `SET statement_timeout = 0` here would leak back into the pool and quietly
 //     disable the bound for every later request. A standalone connection has
 //     nothing to leak into, and is closed when the migration finishes.
-func (db *DB) Migrate(ctx context.Context) error {
-	connCfg, err := pgx.ParseConfig(db.dsn)
+//
+// goose itself runs on a database/sql handle (the pgx stdlib driver), because
+// that is the seam it exposes. Both directions of migration share this setup, so
+// up and down cannot drift apart.
+func withMigrationLock(ctx context.Context, dsn string, connectTimeout time.Duration,
+	fn func(context.Context, *sql.DB, *goose.Provider) error) error {
+	connCfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return fmt.Errorf("postgres: migrate: parse dsn: %w", err)
 	}
-	if db.connectTimeout > 0 {
-		connCfg.ConnectTimeout = db.connectTimeout
+	if connectTimeout > 0 {
+		connCfg.ConnectTimeout = connectTimeout
 	}
 	conn, err := pgx.ConnectConfig(ctx, connCfg)
 	if err != nil {
@@ -275,7 +279,7 @@ func (db *DB) Migrate(ctx context.Context) error {
 		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
 	}()
 
-	sqlDB, err := sql.Open("pgx", db.dsn)
+	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return fmt.Errorf("postgres: migrate: open database/sql handle: %w", err)
 	}
@@ -289,13 +293,43 @@ func (db *DB) Migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("postgres: migrate: provider: %w", err)
 	}
-	if err := adoptLegacyMigrations(ctx, sqlDB, provider); err != nil {
-		return err
-	}
-	if _, err := provider.Up(ctx); err != nil {
-		return fmt.Errorf("postgres: migrate: up: %w", err)
-	}
-	return nil
+	return fn(ctx, sqlDB, provider)
+}
+
+// Migrate applies every pending goose migration. It also adopts a pre-goose
+// `schema_migrations` table when it finds one: its rows are copied into goose's
+// version table (preserving the applied_at timestamps), then it is dropped. A
+// database that has never run a migration simply gets a fresh goose_db_version.
+func (db *DB) Migrate(ctx context.Context) error {
+	return withMigrationLock(ctx, db.dsn, db.connectTimeout,
+		func(ctx context.Context, sqlDB *sql.DB, provider *goose.Provider) error {
+			if err := adoptLegacyMigrations(ctx, sqlDB, provider); err != nil {
+				return err
+			}
+			if _, err := provider.Up(ctx); err != nil {
+				return fmt.Errorf("postgres: migrate: up: %w", err)
+			}
+			return nil
+		})
+}
+
+// MigrateDown rolls back the most recently applied migration. It is a package
+// function rather than a *DB method because the caller that needs it must NOT have
+// opened the pool first: Open migrates up, so a rollback issued after it would be
+// undone by the very act of opening the database.
+//
+// Down migrations exist for the operator who has to undo one step, not as the
+// rollback story. The story is restore-from-backup (see docs/migration-decision.md,
+// ADR-0008): a down that drops a column loses the data in it, and a deploy that
+// went wrong is usually better served by the last-known-good dump.
+func MigrateDown(ctx context.Context, dsn string, opts PoolOptions) error {
+	return withMigrationLock(ctx, dsn, opts.normalized().ConnectTimeout,
+		func(ctx context.Context, _ *sql.DB, provider *goose.Provider) error {
+			if _, err := provider.Down(ctx); err != nil {
+				return fmt.Errorf("postgres: migrate: down: %w", err)
+			}
+			return nil
+		})
 }
 
 // adoptLegacyMigrations copies a pre-goose `schema_migrations` table into
