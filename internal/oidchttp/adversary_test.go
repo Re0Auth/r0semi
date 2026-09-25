@@ -652,3 +652,130 @@ func TestAdversarialProtocolErrorsDoNotLogCredentials(t *testing.T) {
 		}
 	}
 }
+
+// The guard above drives requests that FAIL, which is all it can assert: the library
+// logs on its error paths. A credential that is actually MINTED is the other half —
+// a log line carrying a fresh access_token or refresh_token would be a leak nothing
+// in that test could see, because no request in it succeeds.
+//
+// So this one runs the happy path end to end with the capture in place: authorize,
+// exchange, userinfo with the minted token, then refresh (which mints a second
+// pair). Everything the service hands a client at least once has to stay out of the
+// log — including the code verifier, which is the one input the RP never sends twice.
+func TestAdversarialSuccessfulExchangesDoNotLogTokens(t *testing.T) {
+	f := newFixture(t)
+	cap := captureDefaultLog(t)
+
+	verifier := strings.Repeat("v", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	// offline_access is what makes the engine issue a refresh token at all, and openid
+	// is what makes it sign an id_token: the three kinds of credential the log must
+	// never carry.
+	code := adversaryCode(t, f, []string{"openid", "account.id", "offline_access"}, challenge)
+
+	resp, err := adversaryPost(t, f, "/oauth/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {f.webID},
+		"client_secret": {"s3cret"},
+		"redirect_uri":  {"https://client.example/cb"},
+		"code_verifier": {verifier},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := adversaryBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the exchange was refused: %d %s", resp.StatusCode, body)
+	}
+	var minted struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+	}
+	if err := json.Unmarshal(body, &minted); err != nil {
+		t.Fatal(err)
+	}
+	if minted.AccessToken == "" || minted.RefreshToken == "" || minted.IDToken == "" {
+		t.Fatalf("the exchange minted nothing to look for: %s", body)
+	}
+
+	// The minted token through the endpoint that reads it back.
+	req, err := http.NewRequest(http.MethodGet, f.server.URL+"/oauth/userinfo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+minted.AccessToken)
+	uiResp, err := noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uiBody := adversaryBody(t, uiResp)
+	if uiResp.StatusCode != http.StatusOK {
+		t.Fatalf("userinfo refused the minted token: %d %s", uiResp.StatusCode, uiBody)
+	}
+
+	// And the refresh, which mints a second pair.
+	resp, err = adversaryPost(t, f, "/oauth/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {minted.RefreshToken},
+		"client_id":     {f.webID},
+		"client_secret": {"s3cret"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshBody := adversaryBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the refresh was refused: %d %s", resp.StatusCode, refreshBody)
+	}
+	var rotated struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(refreshBody, &rotated); err != nil {
+		t.Fatal(err)
+	}
+
+	// One failure, because the happy path above logs nothing at all: the library
+	// writes only on its error paths, so searching an empty capture for a credential
+	// would prove nothing. A code that was never issued is the cheapest way to make
+	// the library log, while the credentials being looked for are the minted ones.
+	const strayCode = "SECRET-STRAY-CODE-0001"
+	resp, err = adversaryPost(t, f, "/oauth/token", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {strayCode},
+		"client_id":     {f.webID},
+		"client_secret": {"s3cret"},
+		"redirect_uri":  {"https://client.example/cb"},
+		"code_verifier": {verifier},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("an authorization code that was never issued was exchanged")
+	}
+	_ = adversaryBody(t, resp)
+
+	logged := cap.String()
+	if strings.TrimSpace(logged) == "" {
+		t.Fatal("nothing was logged, so this guard would pass vacuously")
+	}
+	for name, secret := range map[string]string{
+		"the authorization code": code,
+		"the code verifier":      verifier,
+		"the stray code":         strayCode,
+		"the access token":       minted.AccessToken,
+		"the refresh token":      minted.RefreshToken,
+		"the id token":           minted.IDToken,
+		"the rotated access":     rotated.AccessToken,
+		"the rotated refresh":    rotated.RefreshToken,
+		"the client secret":      "s3cret",
+	} {
+		if secret != "" && strings.Contains(logged, secret) {
+			t.Errorf("%s reached the log:\n%s", name, logged)
+		}
+	}
+}
