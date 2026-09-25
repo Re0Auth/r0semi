@@ -20,6 +20,10 @@
 	let providers = $state<IDPProvider[]>([]);
 	let detail = $state('');
 	let signingOut = $state(false);
+	let exporting = $state(false);
+	let deleting = $state(false);
+	let confirmingDelete = $state(false);
+	let deletionDone = $state(false);
 	// A login or identity operation that failed reports here rather than through
 	// `phase`: it must not throw the whole page away, and it has to be visible to a
 	// visitor who is still anonymous, which is exactly the state a denied login
@@ -137,6 +141,58 @@
 		url.searchParams.set('mode', 'link');
 		url.searchParams.set('return_to', `${base}/`);
 		window.location.assign(url.toString());
+	}
+
+	// The data-protection half of the account page: what Re0Auth holds, and the
+	// way to take it away. Both go through the same session-scoped API the rest of
+	// the page uses; the download is a local blob, not a second server endpoint.
+	async function exportData() {
+		if (!session) return;
+		exporting = true;
+		authError = '';
+		try {
+			const data = await api.exportAccount();
+			const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `re0auth-account-${data.profile.user_id}.json`;
+			a.click();
+			URL.revokeObjectURL(url);
+		} catch (err) {
+			if (err instanceof ApiError && err.needsSignIn) {
+				session = null;
+				phase = 'anonymous';
+				return;
+			}
+			authError = messageOf(err);
+		} finally {
+			exporting = false;
+		}
+	}
+
+	async function deleteAccount() {
+		if (!session) return;
+		deleting = true;
+		authError = '';
+		try {
+			await api.deleteAccount(session.csrf_token);
+			// The session is gone server-side; show the signed-out page with a
+			// closing statement rather than a silent disappearance.
+			session = null;
+			confirmingDelete = false;
+			phase = 'anonymous';
+			deletionDone = true;
+		} catch (err) {
+			if (err instanceof ApiError && err.needsSignIn) {
+				session = null;
+				phase = 'anonymous';
+				return;
+			}
+			authError = messageOf(err);
+		} finally {
+			deleting = false;
+		}
 	}</script>
 
 <svelte:head>
@@ -167,6 +223,11 @@
 {:else if phase === 'failed'}
 	<p class="mt-4 text-sm text-danger">{detail}</p>
 {:else if phase === 'anonymous'}
+	{#if deletionDone}
+		<div class="mt-4">
+			<Alert tone="info" title="账号已删除">这个账号的数据已被清除，之后可以重新注册。</Alert>
+		</div>
+	{/if}
 	{#if authError}
 		<div class="mt-4">
 			<Alert tone="danger" title="登录没有完成">{authError}</Alert>
@@ -275,6 +336,45 @@
 					onclick={signOut}>退出登录</Button
 				>
 			</div>
+		</Card>
+
+		<!--
+			Data protection lives beside identity management, not buried in a settings
+			page: export and erasure are the two rights that have to be reachable
+			without reading documentation. Erasure is irreversible, so it is behind a
+			second step and names exactly what it does.
+		-->
+		<Card>
+			<div class="border-b border-line px-4 py-3">
+				<p class="text-sm font-medium">数据与隐私</p>
+			</div>
+			<div class="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+				<p class="text-xs text-ink-muted">导出一份账号数据的 JSON 副本。不包含任何凭据。</p>
+				<Button variant="secondary" class="w-full sm:w-auto" loading={exporting} onclick={exportData}>
+					导出我的数据
+				</Button>
+			</div>
+			{#if confirmingDelete}
+				<div
+					class="flex flex-col gap-3 border-t border-danger/40 bg-danger-soft px-4 py-3 contrast-more:border-danger sm:flex-row sm:items-center sm:justify-between"
+					use:focusFirstControl
+				>
+					<p class="text-sm text-pretty">
+						删除会清除账号、身份、数据源连接与已发出的令牌，且无法撤销。
+					</p>
+					<div class="flex flex-wrap gap-2">
+						<Button variant="quiet" onclick={() => (confirmingDelete = false)}>取消</Button>
+						<Button variant="danger" loading={deleting} onclick={deleteAccount}>确认删除账号</Button>
+					</div>
+				</div>
+			{:else}
+				<div class="flex flex-col gap-3 border-t border-line px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+					<p class="text-xs text-ink-muted">永久删除这个账号及其全部数据。</p>
+					<Button variant="danger" class="w-full sm:w-auto" onclick={() => (confirmingDelete = true)}>
+						删除账号
+					</Button>
+				</div>
+			{/if}
 		</Card>
 	</div>
 {/if}

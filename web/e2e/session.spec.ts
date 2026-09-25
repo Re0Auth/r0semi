@@ -38,3 +38,22 @@ test('signing out does not revoke an already-issued access token', async ({ page
 	const after = await callWithToken(request, '/v1/me', tokens.access_token);
 	expect(after.status).toBe(200);
 });
+
+// The two data-protection controls have to be reachable from the account page,
+// not only over the API: an unshipped right is not a right.
+test('the account can export its data and then erase itself', async ({ page }) => {
+	await signIn(page);
+
+	const download = page.waitForEvent('download');
+	await page.getByRole('button', { name: '导出我的数据' }).click();
+	expect((await download).suggestedFilename()).toMatch(/^re0auth-account-usr_/);
+
+	// Erasure is irreversible, so it takes a second step that names the act.
+	await page.getByRole('button', { name: '删除账号' }).click();
+	await expect(page.getByText('无法撤销')).toBeVisible();
+	await page.getByRole('button', { name: '确认删除账号' }).click();
+
+	await expect(page.getByText('账号已删除')).toBeVisible();
+	// Gone in the store, not only in the UI.
+	expect((await page.request.get('/v1/sessions/current')).status()).toBe(401);
+});

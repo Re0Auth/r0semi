@@ -221,10 +221,31 @@ export interface Binding {
 
 /** What a data source did when told to drop the token it issued. */
 export type UpstreamRevocation = 'done' | 'unsupported' | 'unavailable' | 'nothing';
-
 export interface UnbindResult {
 	upstream: UpstreamRevocation;
 	upstream_error?: string;
+}
+
+/** The downloaded account document. Credentials are excluded by construction. */
+export interface AccountExport {
+	exported_at: string;
+	profile: {
+		user_id: string;
+		primary_identity_id: string;
+		created_at: string;
+	};
+	identities: Identity[];
+	bindings: Binding[];
+	grants: Grant[];
+	notice: {
+		credentials_excluded: boolean;
+		reason: string;
+	};
+}
+
+/** What the erasure removed, per store. */
+export interface AccountDeletion {
+	result: Record<string, unknown>;
 }
 
 function local(code: LocalProblemCode, detail: string): Problem {
@@ -384,6 +405,19 @@ export const api = {
 	listAllSources: () => call<{ data: FederationSource[] }>('GET', '/v1/sources'),
 
 	listBindings: () => call<{ data: Binding[] }>('GET', '/v1/bindings'),
+
+	// The account's own data, assembled by the server from the same view builders
+	// the list endpoints use. no-store, session-scoped, and no CSRF because it
+	// changes nothing.
+	exportAccount: () => call<AccountExport>('GET', '/v1/account/export'),
+
+	// Erasure is idempotent server-side; the acknowledgement is required by the
+	// server so the act cannot happen without naming what it does.
+	deleteAccount: (csrf: string) =>
+		call<AccountDeletion>('DELETE', '/v1/account', {
+			body: { acknowledge: 'deletes_my_account' },
+			csrf
+		}),
 
 	// 200 with a body, not 204: whether the source was actually told is part of
 	// the answer, and a bare success would overstate what happened.
