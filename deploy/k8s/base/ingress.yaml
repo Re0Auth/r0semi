@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: re0auth
+  namespace: re0auth
+  annotations:
+    # TLS terminates here; the issuer is https and the app is configured with
+    # cookie_secure = true for the same reason.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # The server drains for up to 30s; the proxy must wait for it, not cut it off.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [auth.example.com]
+      secretName: re0auth-tls
+  rules:
+    - host: auth.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: re0auth
+                port: { name: http }

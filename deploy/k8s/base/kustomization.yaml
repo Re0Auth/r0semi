@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: re0auth
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - ingress.yaml
+# Pin a released tag or, better, a digest:
+#   kustomize edit set image ghcr.io/re0auth/r0semi=ghcr.io/re0auth/r0semi@sha256:...
+images:
+  - name: ghcr.io/re0auth/r0semi
+    newTag: latest

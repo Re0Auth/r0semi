@@ -134,11 +134,13 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 
 ### 2.7 限流
 
-超限返回 `429`（业务面 problem+json，协议面则是对应的 OAuth 错误）+ `Retry-After`。
-**目前已实现的只有这一部分。**
+超限返回 `429`（业务面 problem+json，协议面则是对应的 OAuth 错误）+ `Retry-After`；
+带限流的响应同时发布 `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset`，让客户端在
+被拒之前就能退避。
 
-`RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` 尚未实现：当前限流器按**客户端地址**
-分桶，而非按已认证的客户端，这三个头的语义因此还没有确定的归属。等按客户端限流落地时再一并加上。
+限流器按**客户端地址**分桶，而非按已认证的客户端；按 client/user 的配额模型尚未定义，见
+[operations-decision.md](./operations-decision.md)（ADR-0006）。并发的硬上限是另一个开关：
+`server.max_in_flight` / `RE0AUTH_MAX_IN_FLIGHT`，打满时按平面返回 503 + `Retry-After: 1`。
 
 **地址怎么算**（`server.trusted_proxies` / `RE0AUTH_TRUSTED_PROXIES`）：默认取**对端地址**，
 `X-Forwarded-For` 一律忽略——否则调用方自填一个头就能自选分桶，限流形同虚设。只有当对端落在
@@ -147,7 +149,9 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 列表为空是默认，也是没有反代时的正确答案；列表过宽等于把选择权又交回调用方。
 
 ### 2.8 可观测
-每个响应带 `X-Request-Id`；problem 回带 `request_id`。W3C `traceparent` **当前不解析、不传播**（无 OTel exporter），文档此前声称接受它，与实现不符；是否引入 tracing 见运维决策。
+每个响应带 `X-Request-Id`；problem 回带 `request_id`。请求携带的 W3C `traceparent` 会被解析，
+trace id 写入访问日志；未携带或格式非法时生成一个。**不运行 OTel exporter、不上报 span**——
+追踪当前只用于日志关联，取舍见 [operations-decision.md](./operations-decision.md)（ADR-0006）。
 
 ### 2.9 版本与弃用
 路径 `/v1`，只做增量、不破坏。弃用用 `Deprecation` + `Sunset`（RFC 8594）头，并记录 changelog。

@@ -1,0 +1,43 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: re0auth
+  namespace: re0auth
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: re0auth }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Public traffic arrives only through the ingress controller. Everything else
+    # in the cluster is denied by default.
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+      ports:
+        - { protocol: TCP, port: 8080 }
+    # Scrapers and operators reach the internal listener.
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { protocol: TCP, port: 9090 }
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Postgres in-cluster.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: postgres }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    # Upstream IdPs and data sources over TLS.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+      ports:
+        - { protocol: TCP, port: 443 }

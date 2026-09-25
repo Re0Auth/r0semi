@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: re0auth
+  namespace: re0auth
+  labels: { app.kubernetes.io/name: re0auth }
+spec:
+  selector: { app.kubernetes.io/name: re0auth }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+# The operational surface is cluster-internal only. It carries /metrics and
+# /debug/pprof, so it must never be reachable from outside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: re0auth-internal
+  namespace: re0auth
+  labels: { app.kubernetes.io/name: re0auth }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: re0auth }
+  ports:
+    - { name: internal, port: 9090, targetPort: internal }

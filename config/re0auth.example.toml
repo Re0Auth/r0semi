@@ -29,6 +29,13 @@ cookie_secure = true
 rate_limit       = 50
 rate_limit_burst = 100
 
+# Hard cap on requests served concurrently, separate from the rate limiter. 0
+# disables it. A request arriving while the cap is full gets a plane-shaped 503
+# with Retry-After: 1.
+#
+# Environment override: RE0AUTH_MAX_IN_FLIGHT="512"
+max_in_flight = 512
+
 # The networks whose X-Forwarded-For header is believed when attributing a
 # request to a client. **Leave this empty unless Re0Auth sits behind your own
 # reverse proxy.** Empty means the peer address is the client, and a fabricated

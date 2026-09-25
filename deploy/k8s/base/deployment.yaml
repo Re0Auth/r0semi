@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: re0auth
+  namespace: re0auth
+  labels: { app.kubernetes.io/name: re0auth }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: re0auth }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: re0auth }
+    spec:
+      serviceAccountName: re0auth
+      # Longer than the server's own 30s drain, so the pod outlives the requests
+      # it is finishing instead of being killed mid-shutdown.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: re0auth }
+      containers:
+        - name: re0auth
+          image: ghcr.io/re0auth/r0semi:latest # kustomize image override pins the tag/digest
+          imagePullPolicy: IfNotPresent
+          args: ["-config=/etc/re0auth/re0auth.toml"]
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: internal, containerPort: 9090 }
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: re0auth-secrets, key: database-url }
+            - name: RE0AUTH_KEK
+              valueFrom:
+                secretKeyRef: { name: re0auth-secrets, key: kek }
+            - name: RE0AUTH_OIDC_TOKEN_KEY
+              valueFrom:
+                secretKeyRef: { name: re0auth-secrets, key: oidc-token-key }
+            - name: RE0AUTH_OIDC_SIGNING_KEY
+              valueFrom:
+                secretKeyRef: { name: re0auth-secrets, key: oidc-signing-key }
+            - name: RE0AUTH_AUDIT_KEY
+              valueFrom:
+                secretKeyRef: { name: re0auth-secrets, key: audit-key }
+          volumeMounts:
+            - { name: config, mountPath: /etc/re0auth, readOnly: true }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # requests/limits are not optional: a container without them can take
+          # the node's memory with it and get every co-tenant evicted.
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: re0auth-config }

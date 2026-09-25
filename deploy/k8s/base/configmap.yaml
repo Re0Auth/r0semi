@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: re0auth-config
+  namespace: re0auth
+data:
+  # Structure only. Every secret is named by env var and supplied through
+  # re0auth-secrets, so this object can be committed and reviewed.
+  re0auth.toml: |
+    [server]
+    issuer        = "https://auth.example.com"
+    addr          = "0.0.0.0:8080"
+    internal_addr = "0.0.0.0:9090"
+    cookie_secure = true
+    rate_limit       = 50
+    rate_limit_burst = 100
+    max_in_flight    = 512
+    trusted_proxies  = ["10.0.0.0/8"]
+
+    [storage]
+    driver  = "postgres"
+    dsn_env = "DATABASE_URL"
+
+    [vault]
+    kek_env = "RE0AUTH_KEK"
+    kek_id  = "kek-1"
+
+    [admin]
+    subjects = []
