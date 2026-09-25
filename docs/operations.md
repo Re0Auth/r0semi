@@ -24,6 +24,14 @@ kustomize edit set image ghcr.io/re0auth/r0semi=ghcr.io/re0auth/r0semi@sha256:..
 
 镜像里没有配置和密钥；`issuer`、监听地址与密钥全部运行时注入。
 
+base 里有两件 **cluster 侧的前置**，它不替你做，因为它们都是"应用基线之后才会暴露"的问题：
+
+- **TLS**：Ingress 用 `re0auth-tls` 这个 secret 终止 TLS，而 base **不创建**它——否则等于把
+  cert-manager 变成基线的硬依赖。装了 cert-manager 就用 `ingress.yaml` 里注释掉的那个
+  `Certificate`；用别的签发方式，就自己签发并创建同名 secret。
+- **镜像**：base 钉的是最近一个已发布 tag（目前只有 `v0.0.0-rc.1`）。生产按上面的
+  `kustomize edit set image` 换成 digest。
+
 系统变更后：
 
 ```sh

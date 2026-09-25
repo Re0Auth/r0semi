@@ -24,3 +24,24 @@ spec:
               service:
                 name: re0auth
                 port: { name: http }
+
+# The secret above is the deployment's to create. This base deliberately does not
+# create it: shipping a Certificate would make cert-manager a hard requirement of
+# applying the baseline, and an operator who uses another issuer would have to
+# delete it before starting. With cert-manager installed, apply this:
+#
+# apiVersion: cert-manager.io/v1
+# kind: Certificate
+# metadata:
+#   name: re0auth-tls
+#   namespace: re0auth
+# spec:
+#   secretName: re0auth-tls
+#   dnsNames: [auth.example.com]
+#   issuerRef:
+#     name: letsencrypt
+#     kind: ClusterIssuer
+#
+# Whichever way it is issued, docs/operations.md must keep naming it: a prerequisite
+# an operator cannot find is a dangling one, and internal/archtest checks that it is
+# named there.

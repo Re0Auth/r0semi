@@ -12,6 +12,11 @@ resources:
   - ingress.yaml
 # Pin a released tag or, better, a digest:
 #   kustomize edit set image ghcr.io/re0auth/r0semi=ghcr.io/re0auth/r0semi@sha256:...
+#
+# The tag below is the most recent published release, not `latest`: a floating
+# reference means a redeploy silently picks up whatever was pushed last, which is
+# the opposite of what a baseline is for. `internal/archtest` fails if this file
+# ever goes back to a floating tag.
 images:
   - name: ghcr.io/re0auth/r0semi
-    newTag: latest
+    newTag: v0.0.0-rc.1

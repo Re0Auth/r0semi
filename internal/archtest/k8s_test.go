@@ -82,6 +82,83 @@ func TestKubernetesBaselineHasProbesAndLimits(t *testing.T) {
 	}
 }
 
+// TestKubernetesBaselinePinsItsImageAndNamesItsTLSSecret: a baseline is a claim about
+// what a deployment needs, and two things in it are easy to leave dangling.
+//
+// The image. `latest` is a floating reference: a redeploy silently picks up whatever
+// was pushed last, which is the opposite of what pinning a release means. The file
+// says "pin a released tag or, better, a digest" in a comment; this makes it a check.
+//
+// The TLS secret. The Ingress terminates TLS with a secret the base does not create,
+// so a fresh cluster applies an Ingress that can never serve. That prerequisite is
+// allowed to be the deployment's job — shipping a Certificate would make cert-manager
+// a hard requirement — but it has to be named where an operator will read it.
+func TestKubernetesBaselinePinsItsImageAndNamesItsTLSSecret(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(root, "deploy", "k8s", "base")
+
+	raw, err := os.ReadFile(filepath.Join(base, "kustomization.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kustomization struct {
+		Images []struct {
+			Name   string `yaml:"name"`
+			NewTag string `yaml:"newTag"`
+			Digest string `yaml:"digest"`
+		} `yaml:"images"`
+	}
+	if err := yaml.Unmarshal(raw, &kustomization); err != nil {
+		t.Fatal(err)
+	}
+	if len(kustomization.Images) == 0 {
+		t.Fatal("the base images nothing, so it deploys whatever the Deployment names")
+	}
+	for _, img := range kustomization.Images {
+		if img.Digest != "" {
+			continue
+		}
+		if img.NewTag == "" || img.NewTag == "latest" {
+			t.Errorf("%s is not pinned (newTag=%q digest=%q); pin a released tag or a digest",
+				img.Name, img.NewTag, img.Digest)
+		}
+	}
+
+	ingressRaw, err := os.ReadFile(filepath.Join(base, "ingress.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ingress struct {
+		Spec struct {
+			TLS []struct {
+				SecretName string `yaml:"secretName"`
+			} `yaml:"tls"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(ingressRaw, &ingress); err != nil {
+		t.Fatal(err)
+	}
+	if len(ingress.Spec.TLS) == 0 {
+		t.Fatal("the Ingress terminates no TLS, and the base is expected to")
+	}
+	operations, err := os.ReadFile(filepath.Join(root, "docs", "operations.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range ingress.Spec.TLS {
+		if entry.SecretName == "" {
+			continue
+		}
+		if !strings.Contains(string(operations), entry.SecretName) {
+			t.Errorf("the Ingress needs the TLS secret %q and docs/operations.md never names it; "+
+				"a prerequisite an operator cannot find is a dangling one", entry.SecretName)
+		}
+	}
+}
+
 func readYAMLDocs(t *testing.T, dir string) []map[string]any {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
