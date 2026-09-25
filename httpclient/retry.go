@@ -66,6 +66,10 @@ const (
 // cancellation between attempts. A cancelled request is reported as cancelled
 // even when the last attempt produced an error of its own: the caller needs to
 // tell "timed out" apart from "upstream is down".
+//
+// The choice of library, the rejected alternatives, and the three deliberate
+// semantic changes this replacement made are recorded in
+// docs/resilience-decision.md (ADR-0009).
 func Retry(next Doer, opts RetryOptions) Doer {
 	if opts.MaxRetries <= 0 {
 		opts.MaxRetries = defaultMaxRetries

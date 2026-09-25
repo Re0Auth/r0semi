@@ -12,7 +12,7 @@
 | `github.com/go-jose/go-jose/v4` | **直接依赖**：`oidcstore` 用 `jose.SignatureAlgorithm`、JWKS 类型；也是 `go-oidc` 的传递依赖 | **只有一套 JOSE 栈**。DPoP/JWT 若将来要做，必须用它，绝不用第二套（如 `jwx`） |
 | `github.com/alexedwards/scs/v2` | `internal/auth`（re0auth 会话）、`referencesource`（源侧会话） | 服务端会话、Cookie 属性、登录时轮换 |
 | `golang.org/x/time/rate` | `internal/ratelimit`（按 key 令牌桶），`httpapi` 限流中间件 | 标准令牌桶。**注意它内部用真实时钟，不要和注入的假时钟混用**（会静默算错补充速率） |
-| `github.com/failsafe-go/failsafe-go` | `httpclient`：重试（`retrypolicy`）、按上游的熔断器（`circuitbreaker`）、出站 bulkhead（`bulkhead`） | 韧性三件套一个库，替换掉此前手写的重试循环与熔断状态机。**策略留在本仓库，机制交给库**：幂等方法白名单、429/502/503/504 可重试而 500 不可、`Retry-After`（含 HTTP-date）与上限都是本项目规则，仍写在 `httpclient` 里；循环、退避与调度、熔断状态机与半开探测、许可计数都来自库。bulkhead 用的是它的**手动许可** API（`AcquirePermit`/`ReleasePermit`），因为许可必须活过 `RoundTrip`、覆盖整段响应体传输，而策略的作用域只是被执行的函数。**版本是 v0.x**：go.mod 精确锁定，升级按次要版本逐次评估 |
+| `github.com/failsafe-go/failsafe-go` | `httpclient`：重试（`retrypolicy`）、按上游的熔断器（`circuitbreaker`）、出站 bulkhead（`bulkhead`） | 韧性三件套一个库，替换掉此前手写的重试循环与熔断状态机。**策略留在本仓库，机制交给库**：幂等方法白名单、429/502/503/504 可重试而 500 不可、`Retry-After`（含 HTTP-date）与上限都是本项目规则，仍写在 `httpclient` 里；循环、退避与调度、熔断状态机与半开探测、许可计数都来自库。bulkhead 用的是它的**手动许可** API（`AcquirePermit`/`ReleasePermit`），因为许可必须活过 `RoundTrip`、覆盖整段响应体传输，而策略的作用域只是被执行的函数。**版本是 v0.x**：go.mod 精确锁定，升级按次要版本逐次评估。选型、被否的方案与三处语义变化见 [resilience-decision.md](./resilience-decision.md)（ADR-0009） |
 | `github.com/jackc/pgx/v5` (+`pgxpool`) | `internal/store/postgres` | Postgres 驱动。选它而不是 `database/sql` 是因为 v5 的泛型行扫描（`CollectRows`/`RowToStructByName`）能直接消除大量手写 `Scan` 错误 |
 | `github.com/pressly/goose/v3` | `internal/store/postgres` 的迁移执行 | 成熟的 SQL 迁移库：标准 `-- +goose Up/Down` 注解、按版本排序与乱序检测、advisory-lock session locker，并自带 `goose_db_version` 版本表。**不校验已应用迁移文件的内容**（goose 无 checksum），所以它换掉的是手写 runner，不是"内容完整性"保证 |
 | `github.com/zitadel/oidc/v3` | `internal/store/postgres` 的 `op.Storage`（ADR-0001：OpenID Provider） | OIDC 原生：设备码流（RFC 8628）内置、不透明引用令牌模型、`AuthRequest` 由实现者拥有（scope 收窄/同意可挂载）。**稳定 API 是 legacy `Storage`，新版 `Server` API 到 v4 前 experimental**。仍只用 `go-jose/v4`，不引第二套 JOSE（对照 fosite 见 [oidc-decision.md](./oidc-decision.md)） |
@@ -50,7 +50,7 @@
 | 候选 | 结论 |
 |---|---|
 | `ory/fosite`（OAuth 2.0 AS 引擎） | **评估后未采用。** 当时的 spike（`spike/fosite`，已从仓库删除，仅存结论）证实两点致命代价：（a）**不实现 RFC 8628 设备码流**；（b）把 75 个 indirect 依赖、第二套 JOSE（go-jose/v3）与 logrus/grpc/OTel 拉进构建图。最终选择 OIDC 原生的 `zitadel/oidc/v3`（§1），依据见 [oidc-decision.md](./oidc-decision.md) |
-| `hashicorp/go-retryablehttp` | HTTP 重试的**专用**方案（认 `Retry-After`、幂等方法、包 `*http.Client`）。当时选了 `backoff` 是因为它更贴合 `httpclient.Doer` 这个装饰器接缝，并留下"若将来重试逻辑变复杂，可换成它"的话。**这个条件后来满足了，但答案不是它**：真正变复杂的是围绕重试的三件事——熔断、并发上限、以及 `Retry-After`/错误分类——而 retryablehttp 只覆盖其中一件。最终换成 `failsafe-go`（见 §1），三件一起收进同一个抽象，`backoff` 随之移除 |
+| `hashicorp/go-retryablehttp` | HTTP 重试的**专用**方案（认 `Retry-After`、幂等方法、包 `*http.Client`）。当时选了 `backoff` 是因为它更贴合 `httpclient.Doer` 这个装饰器接缝，并留下"若将来重试逻辑变复杂，可换成它"的话。**这个条件后来满足了，但答案不是它**：真正变复杂的是围绕重试的三件事——熔断、并发上限、以及 `Retry-After`/错误分类——而 retryablehttp 只覆盖其中一件。最终换成 `failsafe-go`（见 §1），三件一起收进同一个抽象，`backoff` 随之移除。决策与取舍见 [resilience-decision.md](./resilience-decision.md)（ADR-0009） |
 | 云 KMS 适配器（阿里云 KMS / AWS KMS / GCP KMS） | **暂不引入**。`KeyWrapper` 接缝已就位，每个适配器都是一小段代码。**代价是持续的**：云依赖、按次计费、厂商锁定、本地开发与自托管都变复杂。买到的是**可恢复性与可归因**（KEK 不在进程里、解封可审计、密钥可停用），**不是防止解密**——被攻破的进程可以用自己的身份去调 KMS（threat-model §6.0）。自托管不需要；官方公共实例需要 |
 | `github.com/awnumar/memguard` | 解决"Go 无法保证清零"。目前 `zeroize` + `runtime.KeepAlive` 是尽力而为，**这一限制应在 threat-model 中如实承认** |
 | `jackc/pgx/v5` + `sqlc` | **已引入 `pgx`**（`internal/store/postgres`）。尚未引入 `sqlc`：目前查询不多，手写 pgx 更直接；查询量上来后再上代码生成 |

@@ -349,7 +349,8 @@ HTTP 头和 `<meta>` 同时存在时，**两个 CSP 都强制执行**。`interna
 **出站韧性**（`httpclient`，基于 `failsafe-go`）：重试（指数退避 + 抖动，认 `Retry-After`）、按上游 host 的
 熔断器、出站 bulkhead 三件套。**策略在本仓库、机制在库里**：**默认只重试幂等方法**（POST 不隐式重放），
 429/502/503/504 可重试而 500 不可，这些规则仍在 `httpclient`；循环、退避调度与熔断状态机来自库。
-bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆盖到响应头。选型见 [dependencies.md](./dependencies.md)。
+bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆盖到响应头。选型、被否的方案与三处语义变化见
+[resilience-decision.md](./resilience-decision.md)（ADR-0009），依赖表见 [dependencies.md](./dependencies.md)。
 
 关键不变量（由 `internal/httpapi` 测试守护）：**协议平面绝不输出 problem+json，业务平面绝不输出
 `{error,error_description}`，浏览器平面两者都不输出**；三个平面各有独立子 mux、错误写出器与 panic 恢复，仅共享 request-id 中间件。

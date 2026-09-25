@@ -55,6 +55,9 @@ const (
 //
 // The map is keyed by URL host and kept for the process's life; the set of hosts
 // is the deployment's configured sources, so it is bounded.
+//
+// docs/resilience-decision.md (ADR-0009) records why this is a library and what
+// changed when it stopped being one.
 func CircuitBreaker(next http.RoundTripper, opts BreakerOptions) http.RoundTripper {
 	if opts.FailureThreshold <= 0 {
 		opts.FailureThreshold = defaultBreakerFailures
