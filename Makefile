@@ -32,6 +32,15 @@ bundle: web
 test:
 	go test ./...
 
+# Statement coverage, per package, lowest first — the same table CI writes to its
+# job summary, from the same code (cmd/covertable), so the two cannot drift. The
+# Postgres tests skip without TEST_DATABASE_URL, so a local run reads lower than
+# CI's; both are honest about what they actually ran.
+cover:
+	go test -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+	go run ./cmd/covertable coverage.out
+	@rm -f coverage.out
+
 # Capacity benchmarks. They build their own server on the in-memory stores, so
 # no database is needed. The numbers are reported, not asserted: a benchmark gate
 # that fails on a slow machine is a gate people delete. CI runs this to prove the

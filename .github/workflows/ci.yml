@@ -46,13 +46,13 @@ jobs:
 
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/r0semi_test?sslmode=disable
-      # The floor enforced below. It is set just under what the suite reaches
-      # with the Postgres tests *skipped* (measured locally: 64.6%), so both a
-      # laptop without a database and this job clear it; the job's own figure is
-      # higher, because the Postgres tests execute here. Raise it when the real
-      # number rises. Never lower it to turn a red build green — a floor that
-      # moves to meet the code is not a floor.
-      COVERAGE_FLOOR: '60'
+      # The floor enforced below. It is set below what the suite reaches with the
+      # Postgres tests *skipped* (measured locally: 66.0%), so both a laptop without
+      # a database and this job clear it; the job's own figure is higher, because the
+      # Postgres tests execute here. Raise it when the real number rises. Never lower
+      # it to turn a red build green — a floor that moves to meet the code is not a
+      # floor.
+      COVERAGE_FLOOR: '62'
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -171,6 +171,21 @@ jobs:
             echo "::error::coverage ${total}% is below the floor of ${COVERAGE_FLOOR}%"
             exit 1
           fi
+
+      # The floor is enforced above; this makes the number *readable*. Without a
+      # service like Codecov, per-package coverage is invisible in a review, and a
+      # package that barely clears the floor looks exactly like one at 90%. The
+      # table goes to the job summary, lowest first, and `make cover` produces it
+      # from the same tool, so the two cannot drift.
+      - name: coverage summary
+        run: |
+          go run ./cmd/covertable coverage.out | tee coverage-table.txt
+          {
+            echo 'Per-package statement coverage, lowest first:'
+            echo '```'
+            cat coverage-table.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Verbose, so the log proves each integration test executed rather than
       # skipped: the package summary reads "ok" in both cases.

@@ -30,6 +30,10 @@ go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 `svelte-check`）。**linter 是硬要求**：没装就拒绝运行并打印上面那条安装命令，与 `sbom`
 对 SBOM 生成器的做法一致——本地绿必须等于 CI 绿，跳过 linter 的绿是假的。
 
+覆盖率：`make cover` 打印**按包**的语句覆盖率（从低到高）。CI 有一条 62% 的总量下限，并把同一张表
+写进 job summary；本地没有 `TEST_DATABASE_URL` 时 Postgres 那几个包会显著偏低，那是跳过的诚实结果，
+不是失败。
+
 单元测试使用内存实现，**任何平台都能跑，不需要数据库**。
 
 ### Postgres 集成测试（可选，但改动存储层时必跑）
