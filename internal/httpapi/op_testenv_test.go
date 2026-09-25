@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Re0Auth/r0semi/internal/auth"
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/internal/oidchttp"
 	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/internal/store/memory"
@@ -22,8 +23,22 @@ import (
 //
 // Tests that exercise the session-bound consent flow pass a session manager; the
 // rest pass nil, and the login hook then points at a path the tests parse.
-func newOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry, sessions *auth.Manager) (*oidchttp.Handler, *memory.OIDCStore) {
+//
+// The optional metrics argument mirrors the composition root, which hands the OP
+// handler the same metrics set as the HTTP layer. A test proving the protocol
+// plane's signals must build the handler with them, because the wiring lives
+// inside oidchttp: a handler built without metrics records nothing, however the
+// Config on the outside is set.
+//
+// It takes a testing.TB rather than a *testing.T so the capacity benchmarks can
+// build the same wired backend the tests do, instead of a second wiring that
+// could drift from it.
+func newOPBackend(t testing.TB, issuer string, clients oauth.ClientRegistry, sessions *auth.Manager, metrics ...*observability.Metrics) (*oidchttp.Handler, *memory.OIDCStore) {
 	t.Helper()
+	var m *observability.Metrics
+	if len(metrics) > 0 {
+		m = metrics[0]
+	}
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -59,6 +74,7 @@ func newOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry, ses
 		Clients:       clients,
 		Registry:      oauth.DefaultRegistry(),
 		Consent:       store,
+		Metrics:       m,
 	})
 	if err != nil {
 		t.Fatal(err)
