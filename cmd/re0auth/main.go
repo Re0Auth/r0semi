@@ -219,7 +219,18 @@ func main() {
 		go sweepLoop(ctx, store.sweep, 15*time.Minute)
 	}
 
-	vaultService, err := openVault(cfg, store.credentials, logger)
+	// The Prometheus instrumentation. It is always built: whether it is *exported*
+	// depends on an internal address being configured, but recording is cheap and
+	// a metric that only starts once someone remembers to enable it is missing
+	// from exactly the incident it was meant to explain.
+	//
+	// It is built here, before any component, because the vault, the login plane,
+	// the OpenID Provider and the federation service all record into it. The HTTP
+	// golden signals are not the only thing it carries: the security-relevant
+	// domain signals are what the alerting rules fire on (ADR-0007).
+	metrics := observability.New()
+
+	vaultService, err := openVault(cfg, store.credentials, logger, metrics)
 	if err != nil {
 		die("vault", err)
 	}
@@ -251,7 +262,7 @@ func main() {
 	}
 
 	sessions := auth.NewManager(auth.Options{Secure: cfg.CookieSecure, Store: store.sessions, Index: store.sessionIndex})
-	authHandler, err := auth.NewHandler(sessions, idpRegistry, store.accounts)
+	authHandler, err := auth.NewHandler(sessions, idpRegistry, store.accounts, auth.WithMetrics(metrics))
 	if err != nil {
 		die("auth", err)
 	}
@@ -279,16 +290,11 @@ func main() {
 		Doer:       federationClient,
 		HTTPClient: federationClient,
 		BaseURL:    cfg.Issuer,
+		Metrics:    metrics,
 	})
 	if err != nil {
 		die("federation", err)
 	}
-
-	// The Prometheus instrumentation. It is always built: whether it is *exported*
-	// depends on an internal address being configured, but recording is cheap and
-	// a metric that only starts once someone remembers to enable it is missing
-	// from exactly the incident it was meant to explain.
-	metrics := observability.New()
 
 	apiConfig := httpapi.Config{
 		Issuer:     cfg.Issuer,
@@ -316,7 +322,7 @@ func main() {
 	}
 	// Every deployment runs the OpenID Provider (ADR-0001 P4b). The only thing a
 	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
-	oidcHandler, oidcStore, err := openOIDC(ctx, cfg, store, sessions, logger)
+	oidcHandler, oidcStore, err := openOIDC(ctx, cfg, store, sessions, logger, metrics)
 	if err != nil {
 		die("oidc", err)
 	}
@@ -689,7 +695,7 @@ func sweepLoop(ctx context.Context, sweep func(context.Context) (int64, error), 
 	}
 }
 
-func openVault(cfg settings, credentials vault.Repo, logger audit.Logger) (vault.Service, error) {
+func openVault(cfg settings, credentials vault.Repo, logger audit.Logger, metrics *observability.Metrics) (vault.Service, error) {
 	// The KEK is an external trust boundary, which is why the wrapper is injected
 	// rather than derived: replacing this with a KMS-backed KeyWrapper is a
 	// deployment decision, not a code change. What that would and would not buy is
@@ -698,21 +704,22 @@ func openVault(cfg settings, credentials vault.Repo, logger audit.Logger) (vault
 	if err != nil {
 		return nil, err
 	}
-	if len(cfg.RetiredKEKs) == 0 {
-		return vault.NewService(credentials, wrapper, logger)
-	}
+	opts := []vault.Option{vault.WithMetrics(metrics)}
 
 	// Retired keys can only unwrap. Without them a rotation could not read what it
 	// is re-wrapping, which is the whole reason they are configurable at all.
-	retired := make([]vault.KeyWrapper, 0, len(cfg.RetiredKEKs))
-	for _, r := range cfg.RetiredKEKs {
-		w, err := vault.NewLocalKeyWrapper(r.ID, r.KEK)
-		if err != nil {
-			return nil, err
+	if len(cfg.RetiredKEKs) > 0 {
+		retired := make([]vault.KeyWrapper, 0, len(cfg.RetiredKEKs))
+		for _, r := range cfg.RetiredKEKs {
+			w, err := vault.NewLocalKeyWrapper(r.ID, r.KEK)
+			if err != nil {
+				return nil, err
+			}
+			retired = append(retired, w)
 		}
-		retired = append(retired, w)
+		opts = append(opts, vault.WithRetiredKeys(retired...))
 	}
-	return vault.NewService(credentials, wrapper, logger, vault.WithRetiredKeys(retired...))
+	return vault.NewService(credentials, wrapper, logger, opts...)
 }
 
 // rotateAndReport re-wraps the vault under the current KEK.
@@ -754,7 +761,7 @@ type oidcBackend interface {
 // openOIDC builds the OpenID Provider store and HTTP handler. The store is
 // Postgres when a database is configured and in-memory otherwise (ADR-0001 P4b);
 // the handler and every policy around it are identical either way.
-func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.Manager, logger audit.Logger) (*oidchttp.Handler, oidcBackend, error) {
+func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.Manager, logger audit.Logger, metrics *observability.Metrics) (*oidchttp.Handler, oidcBackend, error) {
 	tokenKey, err := oidcTokenKey()
 	if err != nil {
 		return nil, nil, err
@@ -848,6 +855,7 @@ func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.M
 		Registry:         registry,
 		Consent:          oidcStore,
 		RetiredTokenKeys: retiredTokens,
+		Metrics:          metrics,
 	})
 	if err != nil {
 		return nil, nil, err
