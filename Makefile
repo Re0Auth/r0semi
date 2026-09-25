@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test bench check lint e2e play dist sbom checksums release docker clean
+.PHONY: all web build test bench check lint load e2e play dist sbom checksums release docker clean bundle
 
 all: web build
 
@@ -21,6 +21,13 @@ web:
 
 build:
 	go build ./cmd/re0auth ./cmd/referencesource
+
+# The SPA's weight budget. It depends on `web` because it measures what the build
+# produced: the script refuses to measure the embed placeholder, since a budget
+# that passes on an empty directory is worse than no budget. CI runs the same
+# check right after its own build.
+bundle: web
+	cd web && pnpm run check:bundle
 
 test:
 	go test ./...

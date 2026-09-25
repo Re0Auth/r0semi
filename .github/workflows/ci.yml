@@ -101,6 +101,15 @@ jobs:
         working-directory: web
         run: pnpm run check
 
+      # The SPA is embedded in every binary and image, so its weight is paid by
+      # every deployment, and nothing else in the build notices when it grows.
+      # It runs here, right after the build, because the script refuses to measure
+      # the placeholder — a budget that passes on an empty directory is worse than
+      # no budget.
+      - name: bundle budget
+        working-directory: web
+        run: pnpm run check:bundle
+
       - name: cache playwright browsers
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:

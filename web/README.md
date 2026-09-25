@@ -61,8 +61,16 @@ returns to `return_to=/` lands on the app rather than a 404.
 
 ```sh
 pnpm run check        # svelte-check (types)
+pnpm run build && pnpm run check:bundle   # the SPA's weight budget (see below)
 pnpm run test:e2e     # Playwright; builds and starts its own re0auth + fake IdP
 ```
+
+`check:bundle` measures what actually ships — the SPA is embedded in every binary
+and image, so its weight is paid by every deployment. The budget lives in
+`scripts/check-bundle-size.mjs` and is raised deliberately (in a commit that says
+why) rather than nudged to make a red build green. It refuses to measure the embed
+placeholder: a budget that passes on an empty directory is worse than no budget, so
+run it after a build.
 
 The e2e suite (`web/e2e/`) is where the login, consent, device and binding flows
 are covered end to end, through the real shipping code, with a fake IdP at the
