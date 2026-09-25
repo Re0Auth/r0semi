@@ -13,6 +13,53 @@ func keyWith(fill byte) *AuditLogger {
 	return &AuditLogger{key: bytes.Repeat([]byte{fill}, 32), cache: map[string][]byte{}}
 }
 
+// A stored key that is not the length this package mints must fail the read rather
+// than be used or treated as absent. Using it would compute pseudonyms under a
+// short (or empty) HMAC key; treating it as absent would mint a second key for a
+// subject that already has one and split its history across two pseudonyms. The
+// chain key has always been checked this way — this is the missing half.
+func TestSubjectKeyLengthIsChecked(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  []byte
+	}{
+		{"absent", nil},
+		{"empty", []byte{}},
+		{"short", bytes.Repeat([]byte{0x01}, 31)},
+		{"long", bytes.Repeat([]byte{0x01}, 33)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkSubjectKey(tc.key); err == nil {
+				t.Fatalf("a %d-byte subject key was accepted", len(tc.key))
+			}
+		})
+	}
+	if err := checkSubjectKey(bytes.Repeat([]byte{0x01}, 32)); err != nil {
+		t.Fatalf("a key this package mints was refused: %v", err)
+	}
+}
+
+// And the check sits on the read path, not only in a helper: a key row written by
+// something other than this package — a hand edit, a restore that truncated a
+// value — must fail the write instead of pseudonymising the subject under it.
+func TestAuditRefusesAKeyRowItDidNotMint(t *testing.T) {
+	db := openTestDB(t)
+	logger := openAudit(t, db)
+	ctx := context.Background()
+
+	if _, err := db.pool.Exec(ctx,
+		`INSERT INTO audit_subject_keys (idx, key) VALUES ($1, $2)`,
+		logger.subjectIndex("usr_short_key"), []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	err := logger.Record(ctx, audit.Event{
+		Action: "vault.use", Subject: "usr_short_key", Provider: "phigros.taptap", Outcome: audit.OutcomeOK,
+	})
+	if err == nil {
+		t.Fatal("an empty key row was used to pseudonymise a subject")
+	}
+}
+
 // TestPseudonymIsStableForOneKey: the same account must get the same handle every
 // time, or its history would be scattered across unrelated pseudonyms.
 func TestPseudonymIsStableForOneKey(t *testing.T) {

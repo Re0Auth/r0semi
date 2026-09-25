@@ -31,6 +31,11 @@ const pseudonymBytes = 16
 // never depends on the cache being warm.
 const pseudoCacheMax = 4096
 
+// auditSubjectKeySize is the per-subject pseudonym key's length, in bytes. It is
+// the same 32 bytes the chain key uses, and it is enforced on every read for the
+// same reason: a key this package did not mint must not compute pseudonyms.
+const auditSubjectKeySize = 32
+
 // mac computes a domain-separated HMAC under the audit key.
 func (l *AuditLogger) mac(label string, msg []byte) []byte {
 	m := hmac.New(sha256.New, l.key)
@@ -78,8 +83,27 @@ func (l *AuditLogger) loadKey(ctx context.Context, subject string) ([]byte, erro
 	case err != nil:
 		return nil, fmt.Errorf("postgres: audit: look up subject key: %w", err)
 	}
+	if err := checkSubjectKey(key); err != nil {
+		return nil, err
+	}
 	l.remember(subject, key)
 	return key, nil
+}
+
+// checkSubjectKey refuses a stored key whose length this package never writes.
+//
+// The read path treats "no row" as "no key yet" and mints one, so a wrong-length
+// row must not be reported that way: minting a second key for a subject that
+// already has one would split its history across two pseudonyms, and using the
+// short key would compute them under an empty HMAC key. The chain key is held to
+// the same standard (newAuditLogger) — a row this package did not write is a
+// failure to report, not a state to paper over.
+func checkSubjectKey(key []byte) error {
+	if len(key) != auditSubjectKeySize {
+		return fmt.Errorf("postgres: audit: the subject key must be %d bytes, got %d",
+			auditSubjectKeySize, len(key))
+	}
+	return nil
 }
 
 // subjectKey returns the per-subject key, creating it on first use.
@@ -95,7 +119,7 @@ func (l *AuditLogger) subjectKey(ctx context.Context, subject string) ([]byte, e
 	}
 
 	idx := l.subjectIndex(subject)
-	fresh := make([]byte, 32)
+	fresh := make([]byte, auditSubjectKeySize)
 	if _, err := rand.Read(fresh); err != nil {
 		return nil, fmt.Errorf("postgres: audit: generate subject key: %w", err)
 	}
@@ -109,6 +133,9 @@ func (l *AuditLogger) subjectKey(ctx context.Context, subject string) ([]byte, e
 	if err := l.pool.QueryRow(ctx,
 		`SELECT key FROM audit_subject_keys WHERE idx = $1`, idx).Scan(&key); err != nil {
 		return nil, fmt.Errorf("postgres: audit: read subject key: %w", err)
+	}
+	if err := checkSubjectKey(key); err != nil {
+		return nil, err
 	}
 	l.remember(subject, key)
 	return key, nil
