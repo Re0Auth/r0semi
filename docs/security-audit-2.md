@@ -339,13 +339,19 @@ vault 的 `Identity` 与 `Meta` 明文落盘（threat-model §6.1）；审计链
   `TestAdversarialDeviceTokenSubjectIsAlwaysAnApprover` 与 `TestAdversarialDeviceDenyWinsWhicheverWriteOrder`，
   见 [security-audit-3.md](./security-audit-3.md) C3-3。
 
-**仍开放**
+**后来闭环的（本节原先列在「仍开放」）**
 
-- **每 subject 的审计密钥若被写成零长度**（原「未验证的假说」第 2 条）：`internal/store/postgres/auditpseudo.go` 的
-  `loadKey` 仍无长度检查，同包的链密钥仍严格校验——「同一个包两种标准」这件事没有变。
-  变的是理由：当初「需要数据库才能确认 pgx 如何回读空 `bytea`」不再是阻碍，CI 里有真 Postgres。
-- **第三方库未审计**：`github.com/zitadel/oidc/v3` 的 `pkg/op` 仍在协议面热路径上，仓库里仍无守卫覆盖它
-  （A1-1/A1-2 的根因就在**库与薄封装之间的缝**里，而不在库本身）。第三轮把它再次列为「下一条最该补的缝」。
-  建议的起点：
-  `grep -rn "log\.\|slog\." $(go env GOMODCACHE)/github.com/zitadel/oidc/v3@*/pkg/op/` 看是否有
-  把 `Request`/`Form`/令牌塞进日志的调用。
+- **每 subject 的审计密钥若被写成零长度**（原「未验证的假说」第 2 条）：**已修**。长度被定义成常量，
+  读路径的两处都过 `checkSubjectKey`（`internal/store/postgres/auditpseudo.go`）；守卫是纯函数层的
+  `TestSubjectKeyLengthIsChecked` 与 Postgres 侧的 `TestAuditRefusesAKeyRowItDidNotMint`
+  （后者顺带回答了当初「需要数据库才能确认 pgx 如何回读空 `bytea`」这个悬而未决的问题）。
+  处置选择**失败**而不是「当作没有密钥」，理由写在 `checkSubjectKey` 的注释里：读路径把「没有行」
+  当「还没有密钥」并铸一把新的，若把长度错的行也归入这一类，就会给一个已有密钥的 subject 再铸一把，
+  把它的历史劈成两个假名。
+- **第三方库未审计**：**第四轮已闭环**。它把这条缝当成靶子：枚举了 `zitadel/oidc v3.51.3` 在这些路径上
+  写什么（`pkg/op/error.go` 的 `oidc_error` 带 `description` 与整条 `parent` 链；
+  `pkg/oidc/authorization.go` 的 `LogValue` 记录 scopes/response_type/client_id/redirect_uri，
+  **不**记录 `code_challenge` 与 `state`），并落成守卫
+  `internal/oidchttp` 的 `TestAdversarialProtocolErrorsDoNotLogCredentials`（把进程默认 slog 换成捕获器，
+  A1-1/A1-2 的根因就在**库与薄封装之间的缝**里，这正是那条缝的守卫）。随后又补上成功路径的一半：
+  `TestAdversarialSuccessfulExchangesDoNotLogTokens`。

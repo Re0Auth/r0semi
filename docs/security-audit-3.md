@@ -186,6 +186,13 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
   过掉封装的检查，拿到未注册的 scope。
 - **处置**：**未修**——修法涉及设备流的客户端认证语义（是否要求 secret），属于需要裁定的判断，
   留作独立决策而不是顺手改。已在本轮记录。
+- **处置（第四轮，commit `5376ca3`）**：**已修并留守卫**。当时说"需要先裁定设备流的客户端认证语义"，
+  第四轮把裁定落成了规则本身：**一个请求只能声明一个客户端身份**——表单 `client_id` 与 Basic 同时
+  出现且不一致时直接拒绝，即使所求 scope 正是 Basic 那一方注册过的（偏好任何一方，正是这个洞能活过
+  两轮的原因）。守卫是 `internal/oidchttp` 的
+  `TestAdversarialDeviceAuthorizationRefusesTwoClientIdentities`，它同时钉住两条**诚实路径仍然可用**
+  （机密客户端只用 Basic、公开客户端只在表单里写自己），避免"修"成一个更大的拒绝。fixture 也补上了
+  当时缺的那个形状——窄范围机密客户端（`oidchttp_test.go` 的 `narrowID`，其注释即本条）。
 
 ## 探过但**没**破的（这些值得变成守卫）
 
@@ -225,26 +232,35 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
   与 `postgres/oidc_test.go` 的同名测试，`docs/architecture.md` §4.4 与实现现在一致。
   （库自己的 `CheckDeviceAuthorizationState` 仍不看 `PollInterval`——节流做在 store 层。）
 
+**后来闭环的（本节原先列在「仍开放」）**
+
+- **C3-1 / C3-2 的 Postgres 侧缺守卫**：**已补**。`internal/store/postgres/oidc_test.go` 现在有与内存侧
+  同名的两条：`TestDeviceCodeIsSingleUse`（先断言第一次读**确实**交出已批准状态，再断言第二次不再交出）
+  与 `TestRevokingAGrantDeletesItsDeviceAuthorization`（用不消费的 `deviceState` 做前置条件，
+  撤销后断言该行消失）。两者本地是显式 SKIP，由 CI 的 `postgres:16` service 执行。
+- **A3-4 未复现 / 未修**：**第四轮已修**，见上文该条的处置与守卫。
+- **库自身的日志（probe 项 5）未审计**：**第四轮已闭环**。它把这条缝当靶子：枚举了
+  `zitadel/oidc v3.51.3` 在这些路径上写什么（`pkg/op/error.go` 的 `oidc_error` 带 `description`
+  与整条 `parent` 链；`pkg/oidc/authorization.go` 的 `LogValue` 记录 scopes/response_type/client_id/
+  redirect_uri，**不**记录 `code_challenge` 与 `state`），并落成守卫
+  `TestAdversarialProtocolErrorsDoNotLogCredentials`（把进程默认 slog 换成捕获器）。
+  随后又补上成功路径的一半：`TestAdversarialSuccessfulExchangesDoNotLogTokens` 跑完整的
+  authorize → 兑换 → userinfo → 刷新，断言**铸出来的** access/refresh/id token 与 `code_verifier`
+  都不在日志里——失败路径的守卫看不到"真的发了令牌"这种情形。
+
 **仍开放**
 
-- **C3-1 / C3-2 的 Postgres 侧缺守卫**（核对时顺带发现的，不是新洞）：两条的内存侧守卫在
-  `internal/httpapi/device_adversary_test.go`（该套件跑的是内存 store）——
-  `TestAdversarialDeviceCodeIsSingleUse`、`TestAdversarialDeviceCodeIsRevokedByBulkRevocation` /
-  `...ByTheRevokeButton`。Postgres 侧**只有实现、没有断言**：`oidc.go` 的
-  `DELETE … RETURNING`（带 `done = true AND denied = false` 谓词）负责单次使用，撤销事务里的
-  `DELETE FROM oidc_devices WHERE subject = $1 AND client_id = $2` 负责不再复活；
-  而 `postgres/oidc_test.go` 的 `TestOIDCDeviceFlow` 只在注释里说「the device code is single use」，
-  没有断言**第二次兑换会失败**，`TestOIDCGrantsAndRevoke` 也没断言撤销会连带删掉设备授权。
-  同一个安全性质在两个 store 上应当有同名守卫——这一条待补。
-- **A3-4 的方向未复现**：需要 fixture 增加一个「窄范围机密客户端」。修法涉及设备流的客户端认证语义，
-  仍是待裁定的判断，见上文 A3-4。
 - **`oauth` 遗留引擎的设备决策是丢失更新**（`oauth/device.go` 读整条记录、判定、整条写回，无谓词）：
   读代码成立，但**从 re0auth 装配不可达**（`cmd/re0auth` 只装配 `oauth.TokenAdmins`、
   `oauth.NewMemoryClientRegistry` 与 `oauth.NewClient`；`upstreamkit` 不挂设备端点）。
   它是**公开库**，故对外部使用者是真缺陷——仍是假说，留作独立条目。
   （原文这里写作 `internal/oauth/device.go`，该包并不在 `internal/` 下。）
-- **库自身的日志**（probe 项 5）未审计：仍未检查 `zitadel/oidc` 的 `pkg/op` 里是否有把
-  `Request`/`Form`/令牌塞进 `slog` 的调用。第二轮与第三轮都把它列为下一条最该补的缝。
+
+**两条常驻注意**
+
+- 库日志守卫枚举的是**当前版本**（`zitadel/oidc v3.51.3`）的行为：升级该依赖时，那两个守卫就是检查点——
+  若新版本开始把请求体或令牌写进日志，它们会失败。这正是把结论落成守卫而不是散文的用处。
+- Postgres 侧的守卫在本地一律显式 SKIP（无 DSN），由 CI 执行；「我机器上能跑」不是证据，反之亦然。
 
 ## 判断（文档化决定，不是缺陷）
 
