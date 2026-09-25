@@ -152,6 +152,26 @@ func TestExpiredAuthorizationCodeIsRefused(t *testing.T) {
 	}
 }
 
+// Mirrors memory.TestCompleteLoginPreservesRecordedAuthTime.
+func TestCompleteLoginPreservesRecordedAuthTime(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	ar := newAuthRequest(t, ctx, store)
+	signedIn := time.Now().Add(-30 * time.Minute).UTC().Truncate(time.Second)
+	if err := store.SetAuthTime(ctx, ar.GetID(), signedIn); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	done, err := store.AuthRequestByID(ctx, ar.GetID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !done.GetAuthTime().Equal(signedIn) {
+		t.Fatalf("auth_time = %s, want the recorded sign-in time %s", done.GetAuthTime(), signedIn)
+	}
+}
+
 // Mirrors memory.TestDeviceFlowAcceptsStandardOIDCScopes.
 func TestDeviceFlowAcceptsStandardOIDCScopes(t *testing.T) {
 	store, _, ctx := oidcFixture(t)

@@ -15,6 +15,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -51,6 +52,36 @@ func NewSigner(id string, key *rsa.PrivateKey) *Signer {
 func (s *Signer) WithRetired(keys ...RetiredSigningKey) *Signer {
 	s.retired = append(s.retired, keys...)
 	return s
+}
+
+// ValidateSigner rejects a signing key set that could not produce verifiable
+// id_tokens: no key, a key below 2048 bits, an empty or duplicate kid, or a kid
+// reused between current and retired. A JWKS with duplicate kids is ambiguous,
+// and a small RSA key is not a defensible signature at this tier.
+func ValidateSigner(s *Signer) error {
+	if s == nil || s.key == nil {
+		return errors.New("oidcstore: signing key is required")
+	}
+	if s.id == "" {
+		return errors.New("oidcstore: signing key id is required")
+	}
+	if s.key.N.BitLen() < 2048 {
+		return fmt.Errorf("oidcstore: signing key must be at least 2048 bits, got %d", s.key.N.BitLen())
+	}
+	seen := map[string]bool{s.id: true}
+	for _, r := range s.retired {
+		if r.ID == "" {
+			return errors.New("oidcstore: retired signing key id is required")
+		}
+		if r.Public == nil {
+			return fmt.Errorf("oidcstore: retired signing key %q has no public key", r.ID)
+		}
+		if seen[r.ID] {
+			return fmt.Errorf("oidcstore: duplicate signing key id %q", r.ID)
+		}
+		seen[r.ID] = true
+	}
+	return nil
 }
 
 // ID implements op.SigningKey.

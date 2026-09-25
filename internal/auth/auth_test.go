@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
@@ -432,6 +433,26 @@ func TestSignInAndSignOutKeepTheSubjectIndex(t *testing.T) {
 	if len(index.forgotten) != 1 || index.forgotten[0] != signedIn {
 		t.Fatalf("forgotten = %+v, want the signed-in token", index.forgotten)
 	}
+}
+
+// auth_time is recorded when the human signs in, so the OP can put the real
+// authentication time in the ID token instead of the later consent decision.
+func TestAuthenticatedAtIsRecordedOnSignIn(t *testing.T) {
+	manager := NewManager(Options{Secure: false})
+	rec := httptest.NewRecorder()
+	before := time.Now().Add(-time.Second)
+	manager.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := manager.SignIn(r.Context(), "usr_1"); err != nil {
+			t.Errorf("sign in: %v", err)
+		}
+		at, ok := manager.AuthenticatedAt(r.Context())
+		if !ok {
+			t.Fatal("AuthenticatedAt reported no sign-in time")
+		}
+		if at.Before(before) || at.After(time.Now().Add(time.Second)) {
+			t.Fatalf("auth time = %s, want the sign-in moment", at)
+		}
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 }
 
 // A session that cannot be indexed must not be handed out: an operator has to be

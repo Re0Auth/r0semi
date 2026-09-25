@@ -28,6 +28,7 @@ import (
 const (
 	keyUser         = "usr"
 	keyCSRF         = "csrf"
+	keyAuthTime     = "auth_time"
 	keyFlowState    = "flow_state"
 	keyFlowProvider = "flow_provider"
 	keyFlowMode     = "flow_mode"
@@ -120,6 +121,20 @@ func (m *Manager) User(ctx context.Context) (account.UserID, bool) {
 	return account.UserID(v), true
 }
 
+// AuthenticatedAt returns when this session signed in. It is what the OP records
+// as auth_time instead of the later consent decision.
+func (m *Manager) AuthenticatedAt(ctx context.Context) (time.Time, bool) {
+	v := m.sessions.GetString(ctx, keyAuthTime)
+	if v == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // SignIn stores the account and rotates the session id, so a pre-login session
 // cannot be fixated onto the authenticated user.
 //
@@ -136,6 +151,10 @@ func (m *Manager) SignIn(ctx context.Context, user account.UserID) error {
 		}
 	}
 	m.sessions.Put(ctx, keyUser, string(user))
+	// auth_time is when the human actually authenticated, not when a later
+	// authorization decision happens. The OP's ID token must carry the former, so
+	// it is recorded at sign-in and read back by the login hook.
+	m.sessions.Put(ctx, keyAuthTime, time.Now().UTC().Format(time.RFC3339Nano))
 	if err := m.sessions.RenewToken(ctx); err != nil {
 		return err
 	}

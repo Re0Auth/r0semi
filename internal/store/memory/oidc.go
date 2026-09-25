@@ -706,6 +706,19 @@ func (s *OIDCStore) Counts() Counts {
 
 // --- consent / device UI helpers (app-owned, not part of op.Storage) ---
 
+// SetAuthTime records when the human authenticated, so CompleteLogin does not
+// overwrite it with the consent-decision time.
+func (s *OIDCStore) SetAuthTime(_ context.Context, id string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.authRequests[id]
+	if !ok {
+		return errors.New("memory: auth request not found")
+	}
+	a.AuthTime = &at
+	return nil
+}
+
 // CompleteLogin attaches the subject and the approved (possibly narrowed)
 // scopes to a pending authorization request.
 func (s *OIDCStore) CompleteLogin(_ context.Context, id, subject string, scopes []string) error {
@@ -718,8 +731,12 @@ func (s *OIDCStore) CompleteLogin(_ context.Context, id, subject string, scopes 
 	a.Subject = subject
 	a.Scopes = append([]string(nil), scopes...)
 	a.IsDone = true
-	now := s.now()
-	a.AuthTime = &now
+	// Preserve the session's real authentication time when the login hook set it;
+	// only fall back to the decision time when it did not.
+	if a.AuthTime == nil {
+		now := s.now()
+		a.AuthTime = &now
+	}
 	return nil
 }
 

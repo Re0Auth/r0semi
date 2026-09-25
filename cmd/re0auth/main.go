@@ -732,6 +732,9 @@ type oidcBackend interface {
 	op.Storage
 	op.DeviceAuthorizationStorage
 	CompleteLogin(ctx context.Context, id, subject string, scopes []string) error
+	// SetAuthTime records the session's real authentication time on a pending
+	// request, so the ID token does not report the consent decision as auth_time.
+	SetAuthTime(ctx context.Context, id string, at time.Time) error
 	Grants(ctx context.Context, subject string) ([]oauth.Grant, error)
 	RevokeGrant(ctx context.Context, subject, clientID string) error
 	RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error)
@@ -766,15 +769,25 @@ func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.M
 		scopes = append(scopes, d.Scope.String())
 	}
 	signer := oidcstore.NewSigner("re0auth", key).WithRetired(retiredSigning...)
+	if err := oidcstore.ValidateSigner(signer); err != nil {
+		return nil, nil, err
+	}
+	// Declared before the login hook so the hook can record the session's real
+	// authentication time on the pending request.
+	var oidcStore oidcBackend
 	login := func(ctx context.Context, id string) string {
 		// Bind the request to the browser that started it, so a relayed id cannot
 		// be approved elsewhere. GetClientByClientID hands us the request context,
 		// which is where the session lives.
 		sessions.Bind(ctx, "authz", id)
+		if at, ok := sessions.AuthenticatedAt(ctx); ok {
+			if err := oidcStore.SetAuthTime(ctx, id, at); err != nil {
+				slog.Warn("could not record auth_time on the authorization request", "err", err)
+			}
+		}
 		return webui.BasePath + "/consent?id=" + url.QueryEscape(id)
 	}
 
-	var oidcStore oidcBackend
 	if store.db != nil {
 		oidcStore, err = store.db.OIDC(store.clients, postgres.OIDCOptions{
 			Registry:   registry,

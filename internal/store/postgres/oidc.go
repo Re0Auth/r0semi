@@ -638,13 +638,26 @@ func (s *OIDCStore) deviceState(ctx context.Context, where string, args ...any) 
 
 // --- consent / device UI helpers (app-owned, not part of op.Storage) ---
 
+// SetAuthTime records when the human authenticated, so CompleteLogin does not
+// overwrite it with the consent-decision time.
+func (s *OIDCStore) SetAuthTime(ctx context.Context, id string, at time.Time) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE oidc_auth_requests SET auth_time = $2 WHERE id = $1`, id, at)
+	if err != nil {
+		return fmt.Errorf("postgres: set auth time: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("postgres: auth request not found")
+	}
+	return nil
+}
+
 // CompleteLogin attaches the subject and the approved (possibly narrowed)
 // scopes to a pending authorization request. It is what the consent screen
 // calls before the callback.
 func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scopes []string) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oidc_auth_requests
-		   SET subject = $2, scopes = $3, done = true, auth_time = now()
+		   SET subject = $2, scopes = $3, done = true, auth_time = COALESCE(auth_time, now())
 		 WHERE id = $1`, id, subject, oidcstore.NonNil(scopes))
 	if err != nil {
 		return fmt.Errorf("postgres: complete login: %w", err)

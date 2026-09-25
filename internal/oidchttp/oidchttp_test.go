@@ -162,6 +162,7 @@ func codeFlow(t testing.TB, f fixture, scopes []string) map[string]any {
 		"redirect_uri":          {"https://client.example/cb"},
 		"scope":                 {strings.Join(scopes, " ")},
 		"state":                 {"state-1234567890"},
+		"nonce":                 {"nonce-1234567890"},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 	}
@@ -537,6 +538,60 @@ func TestRefreshGrantRotatesAndSpendsTheOldToken(t *testing.T) {
 	// everything.
 	if _, status := refresh(second); status != http.StatusOK {
 		t.Fatalf("the replacement refresh token was rejected: %d", status)
+	}
+}
+
+// The ID token was never decoded by a test: every claim except `sub` was
+// asserted only in prose. This pins the actual JWT payload, so a library upgrade
+// or a signing change cannot silently drop iss/aud/azp/nonce/hashes.
+func TestIDTokenClaims(t *testing.T) {
+	f := newFixture(t)
+	tokens := codeFlow(t, f, []string{"openid", "account.id"})
+	raw, _ := tokens["id_token"].(string)
+	if raw == "" {
+		t.Fatalf("no id_token issued: %v", tokens)
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		t.Fatalf("id_token is not a compact JWS: %q", raw)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims["iss"] != f.server.URL {
+		t.Fatalf("iss = %v, want %q", claims["iss"], f.server.URL)
+	}
+	if claims["azp"] != f.webID {
+		t.Fatalf("azp = %v, want %q", claims["azp"], f.webID)
+	}
+	switch aud := claims["aud"].(type) {
+	case string:
+		if aud != f.webID {
+			t.Fatalf("aud = %q, want %q", aud, f.webID)
+		}
+	case []any:
+		if len(aud) != 1 || aud[0] != f.webID {
+			t.Fatalf("aud = %v, want [%q]", aud, f.webID)
+		}
+	default:
+		t.Fatalf("aud has unexpected type %T", claims["aud"])
+	}
+	if claims["nonce"] != "nonce-1234567890" {
+		t.Fatalf("nonce = %v, want the authorize nonce", claims["nonce"])
+	}
+	authTime, ok := claims["auth_time"].(float64)
+	if !ok || authTime <= 0 {
+		t.Fatalf("auth_time = %v, want a positive number", claims["auth_time"])
+	}
+	for _, claim := range []string{"at_hash", "c_hash"} {
+		if s, _ := claims[claim].(string); s == "" {
+			t.Fatalf("%s is missing from the id_token claims", claim)
+		}
 	}
 }
 

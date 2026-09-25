@@ -267,6 +267,38 @@ func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
 	}
 }
 
+// auth_time must be the session's authentication time, not when consent was
+// decided. The login hook records it before CompleteLogin, which must preserve it.
+func TestCompleteLoginPreservesRecordedAuthTime(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+		ClientID:            "cli",
+		RedirectURI:         "https://app.example/cb",
+		ResponseType:        oidc.ResponseTypeCode,
+		Scopes:              []string{"account.id"},
+		CodeChallenge:       "challenge-1234567890",
+		CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedIn := time.Now().Add(-30 * time.Minute).UTC().Truncate(time.Second)
+	if err := store.SetAuthTime(ctx, ar.GetID(), signedIn); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	done, err := store.AuthRequestByID(ctx, ar.GetID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !done.GetAuthTime().Equal(signedIn) {
+		t.Fatalf("auth_time = %s, want the recorded sign-in time %s", done.GetAuthTime(), signedIn)
+	}
+}
+
 // The lookup itself is the claim, so a code cannot be exchanged twice even if two
 // requests race for it. The library only deletes the request after minting, so a
 // read-then-delete would let both win.

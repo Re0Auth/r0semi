@@ -59,6 +59,39 @@ func TestNarrowScopesExplicitEmptyIsRefused(t *testing.T) {
 	}
 }
 
+// A signing key set that cannot produce verifiable id_tokens must be refused at
+// startup rather than served: no key, too-small RSA, or duplicate kids.
+func TestValidateSigner(t *testing.T) {
+	good, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ValidateSigner(NewSigner("kid", good)); err != nil {
+		t.Fatalf("valid signer refused: %v", err)
+	}
+	if err := ValidateSigner(NewSigner("kid", small)); err == nil {
+		t.Fatal("a 1024-bit signing key was accepted")
+	}
+	if err := ValidateSigner(NewSigner("", good)); err == nil {
+		t.Fatal("an empty signing key id was accepted")
+	}
+	if err := ValidateSigner(NewSigner("kid", good).WithRetired(RetiredSigningKey{ID: "kid", Public: &retired.PublicKey})); err == nil {
+		t.Fatal("a duplicate kid was accepted")
+	}
+	if err := ValidateSigner(NewSigner("kid", good).WithRetired(RetiredSigningKey{ID: "old", Public: &retired.PublicKey})); err != nil {
+		t.Fatalf("a valid retired key was refused: %v", err)
+	}
+}
+
 func TestRequireExplicitConsent(t *testing.T) {
 	critical := oauth.Descriptor{
 		Scope: "phigros.score.write", Title: "Write", ExplicitConsent: true,
