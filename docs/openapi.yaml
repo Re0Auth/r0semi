@@ -1402,9 +1402,15 @@ paths:
 
         ## What the log does not contain
 
-        It holds pseudonymised subjects and no credentials. `detail` carries
-        non-secret context (client ids, request ids, counts) by convention, and
-        nothing in the codebase puts a token or a secret in it.
+        It holds pseudonymised subjects and no credentials: `detail` never carries a
+        token or a secret.
+
+        It does carry an account id in exactly one case, on purpose. An `admin.*`
+        event records the operator who acted, in `detail["actor"]`, as a plain
+        `usr_…` rather than a pseudonym — "who suspended this client" has to stay
+        answerable, and operators are outside the trust boundary (see `SECURITY.md`),
+        so their actions are accountable by design. The residue is that erasing an
+        operator's own account does not de-link those rows.
 
         ## Reading it is an operator act
 
@@ -1992,7 +1998,10 @@ components:
         detail:
           type: object
           additionalProperties: { type: string }
-          description: Non-secret context. By convention it never holds a credential.
+          description: |
+            Non-secret context; it never holds a credential. Exactly one case holds an
+            account id on purpose: an `admin.*` event names the acting operator in
+            `actor` as a plain `usr_…`, so that "who did this" stays answerable.
 
     AuditVerification:
       type: object

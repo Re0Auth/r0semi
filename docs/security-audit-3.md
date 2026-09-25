@@ -268,6 +268,11 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
   `detail` 现在是文档化、可远程读取的契约字段，而 `docs/openapi.yaml` 把它描述成「按约定只装非秘密上下文
   （client id、request id、计数）」。**那句话对每一条 `admin.*` 事件都是假的。** 处置：改那句话，或把 actor
   换成 `lifecycle` 那样的形态（记 `self: true|false` 而非 id）。本轮先记，不顺手改契约。
+- **已裁定并落地（后一轮）**：保留操作员 id（企业审计合规），**改那句话**——`docs/openapi.yaml`
+  的端点说明与 `AuditEntry.detail` 的 schema 现在都写明「`detail` 绝不装凭据；`admin.*` 会记
+  发起操作的操作员 `usr_…`，这是有意的，因为操作员在信任边界之外」，并记下残余：操作员日后抹除
+  自己的账号不会解除这些行的关联。与 `docs/admin.md` §5、`docs/architecture.md` 的同一处描述
+  现在一致——**三处说的是同一件事**，而不是各自表述。
 - **未认证的 `/v1/admin/*` 返回 401 而非 404**：可让探测器得知本部署有运维面。`openapi.yaml` 已文档化该 401，
   且对每个 `/v1/admin/*` 都成立，非审计特有。保持现状。
 
