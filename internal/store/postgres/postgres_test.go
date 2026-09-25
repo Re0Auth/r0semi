@@ -641,7 +641,10 @@ func TestBindingsRoundTrip(t *testing.T) {
 
 	want := federation.Binding{
 		User: "usr_1", Game: "phigros", Source: "fake",
-		TokenType: "Bearer", Expiry: expiry, HasRefresh: true, Version: 1,
+		// Above MaxInt64 on purpose: the store persists a random uint64 through
+		// int64, and this pins that the round trip is bit-exact rather than
+		// dependent on the driver's integer codec accepting a high-bit value.
+		TokenType: "Bearer", Expiry: expiry, HasRefresh: true, Version: 1<<63 + 5,
 	}
 	if err := bindings.Put(ctx, want); err != nil {
 		t.Fatal(err)
@@ -650,8 +653,8 @@ func TestBindingsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.User != want.User || got.TokenType != want.TokenType || !got.HasRefresh || got.Version != 1 {
-		t.Fatalf("binding = %+v", got)
+	if got.User != want.User || got.TokenType != want.TokenType || !got.HasRefresh || got.Version != want.Version {
+		t.Fatalf("binding = %+v, want version %d", got, want.Version)
 	}
 	if !got.Expiry.Equal(expiry) {
 		t.Fatalf("expiry = %v, want %v", got.Expiry, expiry)

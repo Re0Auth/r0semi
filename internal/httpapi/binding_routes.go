@@ -51,6 +51,10 @@ func (s *Server) handleListBindings(w http.ResponseWriter, r *http.Request) {
 	}
 	bindings, err := s.federate.Bindings(r.Context(), user)
 	if err != nil {
+		// The wire answer is generic; the error itself (a database fault, a scan
+		// failure) goes to the log, where an operator can act on it.
+		slog.ErrorContext(r.Context(), "could not read bindings",
+			"user", string(user), "request_id", requestID(r), "err", err)
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read bindings")
 		return
 	}

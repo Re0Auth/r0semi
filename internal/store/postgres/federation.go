@@ -125,12 +125,19 @@ func scanBinding(row rowScanner) (federation.Binding, error) {
 		binding federation.Binding
 		userID  string
 		expiry  *time.Time
+		// version is scanned through int64 on purpose. The stored value is a
+		// random uint64 written as int64(v); scanning the bigint straight into a
+		// uint64 leaves the conversion to the driver's codec, which is not a
+		// promise this project wants to depend on. Reading the signed value and
+		// converting back is bit-exact and driver-agnostic.
+		version int64
 	)
 	if err := row.Scan(&userID, &binding.Game, &binding.Source, &binding.TokenType,
-		&expiry, &binding.HasRefresh, &binding.Version); err != nil {
+		&expiry, &binding.HasRefresh, &version); err != nil {
 		return federation.Binding{}, err
 	}
 	binding.User = account.UserID(userID)
+	binding.Version = uint64(version)
 	if expiry != nil {
 		binding.Expiry = *expiry
 	}
