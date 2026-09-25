@@ -217,6 +217,9 @@ func TestDiscoveryAndKeys(t *testing.T) {
 	if oidcResp.StatusCode != http.StatusOK {
 		t.Fatalf("OIDC discovery status = %d", oidcResp.StatusCode)
 	}
+	if cc := oidcResp.Header.Get("Cache-Control"); !strings.Contains(cc, "max-age") {
+		t.Fatalf("discovery Cache-Control = %q, want an explicit max-age", cc)
+	}
 	var disc map[string]any
 	if err := json.Unmarshal(oidcBody, &disc); err != nil {
 		t.Fatal(err)

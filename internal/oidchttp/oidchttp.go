@@ -226,6 +226,9 @@ func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path st
 	clone := r.Clone(r.Context())
 	clone.URL.Path = path
 	bw := newBufferedWriter()
+	// Discovery is public metadata; clients and intermediaries may cache it, and
+	// an explicit max-age is what keeps them from re-fetching it per request.
+	bw.header.Set("Cache-Control", "public, max-age=300")
 	h.provider.ServeHTTP(bw, clone)
 	bw.flush(w, stripUnsupportedDiscoveryFields(bw.body.Bytes()))
 }
@@ -410,6 +413,16 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Cache policy per endpoint. Secrets must not be cached at all; the public
+	// metadata documents are cacheable, and saying so stops every client from
+	// re-fetching them on each request.
+	switch r.URL.Path {
+	case "/" + pathIntrospection, "/" + pathUserinfo:
+		bw.header.Set("Cache-Control", "no-store")
+		bw.header.Set("Pragma", "no-cache")
+	case "/" + pathKeys:
+		bw.header.Set("Cache-Control", "public, max-age=300")
+	}
 	switch {
 	case isToken:
 		if bw.status == http.StatusOK {

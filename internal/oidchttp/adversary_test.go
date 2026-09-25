@@ -339,6 +339,9 @@ func TestAdversarialIntrospectionIsScopedToItsOwner(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+			t.Fatalf("introspection Cache-Control = %q, want no-store", cc)
+		}
 		return adversaryJSON(t, resp)
 	}
 
@@ -403,6 +406,9 @@ func TestAdversarialUserinfoUnauthorizedCarriesABearerChallenge(t *testing.T) {
 	challenge := resp.Header.Get("WWW-Authenticate")
 	if !strings.HasPrefix(challenge, "Bearer") || !strings.Contains(challenge, `error="invalid_token"`) {
 		t.Fatalf("userinfo 401 challenge = %q, want a Bearer challenge with error=\"invalid_token\"", challenge)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("userinfo Cache-Control = %q, want no-store", cc)
 	}
 }
 
