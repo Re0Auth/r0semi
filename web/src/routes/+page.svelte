@@ -74,6 +74,9 @@
 			case 'link_failed':
 			case 'identity_failed':
 			case 'exchange_failed':
+			case 'lookup_failed':
+			case 'session_failed':
+			case 'invalid_request':
 				return '登录没有完成，请重试。';
 			default:
 				return `登录没有完成（${code}）。`;

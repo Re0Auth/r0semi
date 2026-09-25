@@ -385,17 +385,71 @@ func (h *Handler) failLogin(w http.ResponseWriter, r *http.Request, provider idp
 	redirectError(w, r, returnTo, code)
 }
 
-// outcomeFor maps a login failure code to an audit outcome: a refusal the
-// provider or the request caused is "denied", anything else is this service
-// failing to complete the flow.
+// The login plane's failure codes.
+//
+// They are a contract with the SPA: each one is redirected back as `?error=<code>`
+// and turned into a sentence by web/src/routes/+page.svelte. They are constants so
+// that TestLoginFailureCodesAreExplainedByTheFrontend can iterate them instead of
+// comparing two hand-copied lists — which is how the two drifted: this package
+// redirected `denied` while the SPA's map, the documented contract
+// (docs/account-model.md) and the browser suite all read `access_denied`.
+const (
+	codeAccessDenied        = "access_denied"
+	codeProviderUnavailable = "provider_unavailable"
+	codeInvalidRequest      = "invalid_request"
+	codeExchangeFailed      = "exchange_failed"
+	codeIdentityFailed      = "identity_failed"
+	codeNotSignedIn         = "not_signed_in"
+	codeIdentityTaken       = "identity_taken"
+	codeLinkFailed          = "link_failed"
+	codeSignupFailed        = "signup_failed"
+	codeLookupFailed        = "lookup_failed"
+	codeSessionFailed       = "session_failed"
+	codeUnknownProvider     = "unknown_provider"
+	codeInvalidState        = "invalid_state"
+	codeProviderMismatch    = "provider_mismatch"
+)
+
+// loginCodes classifies every code this handler can emit: a refusal the provider or
+// the request caused is "denied", anything else is this service failing to complete
+// the flow. The value is what the audit record and the login metric carry, so a new
+// code that is not added here is reported as an error rather than quietly counted as
+// a denial.
+var loginCodes = map[string]string{
+	codeAccessDenied:        audit.OutcomeDenied,
+	codeIdentityTaken:       audit.OutcomeDenied,
+	codeUnknownProvider:     audit.OutcomeDenied,
+	codeInvalidState:        audit.OutcomeDenied,
+	codeProviderMismatch:    audit.OutcomeDenied,
+	codeInvalidRequest:      audit.OutcomeDenied,
+	codeNotSignedIn:         audit.OutcomeDenied,
+	codeProviderUnavailable: audit.OutcomeError,
+	codeExchangeFailed:      audit.OutcomeError,
+	codeIdentityFailed:      audit.OutcomeError,
+	codeLinkFailed:          audit.OutcomeError,
+	codeSignupFailed:        audit.OutcomeError,
+	codeLookupFailed:        audit.OutcomeError,
+	codeSessionFailed:       audit.OutcomeError,
+}
+
+// redirectCodes are the codes the SPA can see: the ones failLogin puts in `?error=`.
+// The rest (an unknown provider, a forged state, a provider mismatch) end at a 400
+// page with no redirect, so the frontend has no sentence for them and needs none —
+// the distinction is what keeps the two lists comparable rather than merely equal.
+var redirectCodes = []string{
+	codeAccessDenied, codeProviderUnavailable, codeInvalidRequest, codeExchangeFailed,
+	codeIdentityFailed, codeNotSignedIn, codeIdentityTaken, codeLinkFailed,
+	codeSignupFailed, codeLookupFailed, codeSessionFailed,
+}
+
+// outcomeFor maps a login failure code to its audit outcome. A code that is not
+// classified is reported as an error: guessing "denied" would let a bug look like a
+// user's decision in the audit log.
 func outcomeFor(code string) string {
-	switch code {
-	case "denied", "identity_taken", "unknown_provider", "invalid_state",
-		"provider_mismatch", "invalid_request", "not_signed_in":
-		return audit.OutcomeDenied
-	default:
-		return audit.OutcomeError
+	if outcome, ok := loginCodes[code]; ok {
+		return outcome
 	}
+	return audit.OutcomeError
 }
 
 // Register mounts the routes on mux.
@@ -426,7 +480,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
 	if !ok {
-		h.denyLogin(r.Context(), "unknown", "unknown_provider")
+		h.denyLogin(r.Context(), "unknown", codeUnknownProvider)
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -467,7 +521,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		// A provider whose discovery is unreachable, or that is misconfigured, is a
 		// deployment problem the person cannot see. Send them back with a reason
 		// rather than a dead-end 502 page they can do nothing with.
-		h.failLogin(w, r, provider, returnTo, "provider_unavailable")
+		h.failLogin(w, r, provider, returnTo, codeProviderUnavailable)
 		return
 	}
 	http.Redirect(w, r, authURL, http.StatusFound)
@@ -477,7 +531,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
 	if !ok {
-		h.denyLogin(r.Context(), "unknown", "unknown_provider")
+		h.denyLogin(r.Context(), "unknown", codeUnknownProvider)
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -486,7 +540,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	want := h.manager.sessions.GetString(ctx, keyFlowState)
 	if want == "" || subtle.ConstantTimeCompare([]byte(state), []byte(want)) != 1 {
-		h.denyLogin(ctx, string(provider), "invalid_state")
+		h.denyLogin(ctx, string(provider), codeInvalidState)
 		http.Error(w, "invalid state", http.StatusBadRequest)
 		return
 	}
@@ -498,45 +552,50 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	h.clearFlow(ctx)
 
 	if flowProvider != string(provider) {
-		h.denyLogin(ctx, string(provider), "provider_mismatch")
+		h.denyLogin(ctx, string(provider), codeProviderMismatch)
 		http.Error(w, "provider mismatch", http.StatusBadRequest)
 		return
 	}
 	if denied := r.URL.Query().Get("error"); denied != "" {
 		// The provider's own `error` value is reflected input, so it is not used
 		// as a label: the bounded fact is that the provider refused.
-		h.failLogin(w, r, provider, returnTo, "denied")
+		//
+		// The code is `access_denied`, not `denied`: the SPA's message map, the
+		// account model's documented `error=access_denied`, and the browser suite
+		// all read that name, and a value only this file knew left a refusal
+		// showing the generic "login did not finish" fallback.
+		h.failLogin(w, r, provider, returnTo, "access_denied")
 		return
 	}
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		h.failLogin(w, r, provider, returnTo, "invalid_request")
+		h.failLogin(w, r, provider, returnTo, codeInvalidRequest)
 		return
 	}
 
 	token, err := client.Exchange(ctx, code, verifier)
 	if err != nil {
-		h.failLogin(w, r, provider, returnTo, "exchange_failed")
+		h.failLogin(w, r, provider, returnTo, codeExchangeFailed)
 		return
 	}
 	ident, err := client.Identity(ctx, token, nonce)
 	if err != nil {
-		h.failLogin(w, r, provider, returnTo, "identity_failed")
+		h.failLogin(w, r, provider, returnTo, codeIdentityFailed)
 		return
 	}
 
 	if mode == "link" {
 		user, ok := h.manager.User(ctx)
 		if !ok {
-			h.failLogin(w, r, provider, returnTo, "not_signed_in")
+			h.failLogin(w, r, provider, returnTo, codeNotSignedIn)
 			return
 		}
 		if _, err := h.accounts.LinkIdentity(ctx, user, ident); err != nil {
 			if errors.Is(err, account.ErrIdentityTaken) {
-				h.failLogin(w, r, provider, returnTo, "identity_taken")
+				h.failLogin(w, r, provider, returnTo, codeIdentityTaken)
 				return
 			}
-			h.failLogin(w, r, provider, returnTo, "link_failed")
+			h.failLogin(w, r, provider, returnTo, codeLinkFailed)
 			return
 		}
 		h.observeLogin(string(provider), observability.LoginSuccess)
@@ -550,20 +609,20 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, account.ErrNotFound):
 		created, _, cerr := h.accounts.CreateWithIdentity(ctx, ident)
 		if cerr != nil {
-			h.failLogin(w, r, provider, returnTo, "signup_failed")
+			h.failLogin(w, r, provider, returnTo, codeSignupFailed)
 			return
 		}
 		h.recordAuth(ctx, "auth.signup", provider, string(created.ID), audit.OutcomeOK, "")
 		user = created.ID
 	case err != nil:
-		h.failLogin(w, r, provider, returnTo, "lookup_failed")
+		h.failLogin(w, r, provider, returnTo, codeLookupFailed)
 		return
 	default:
 		_ = h.accounts.TouchLogin(ctx, ident.Provider, ident.Subject)
 	}
 
 	if err := h.manager.SignIn(ctx, user); err != nil {
-		h.failLogin(w, r, provider, returnTo, "session_failed")
+		h.failLogin(w, r, provider, returnTo, codeSessionFailed)
 		return
 	}
 	h.observeLogin(string(provider), observability.LoginSuccess)
