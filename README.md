@@ -81,6 +81,7 @@ make build
 gofmt -l .
 go vet ./...
 go test ./...
+make bench    # capacity benchmarks; CI runs these on every change
 ```
 
 前端：

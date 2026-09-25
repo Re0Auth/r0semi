@@ -249,6 +249,39 @@ jobs:
           echo "sbom components: $components"
           test "$components" -gt 10
 
+  bench:
+    # The capacity benchmarks are compiled and executed on every change, so one
+    # that stopped running — a renamed helper, a fixture that no longer compiles
+    # — fails here instead of being discovered when somebody asks for a number.
+    #
+    # The figures are reported, not thresholded. A benchmark gate that fails on a
+    # slow or busy runner is a gate people delete, and a number that people
+    # delete the gate to avoid is worse than no number. The floor is only that
+    # results were produced at all, which is the anti-vacuous check: an empty
+    # benchmark set passes every other gate there is.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: benchmarks
+        run: |
+          # -benchtime=200x keeps the job quick; the per-op figures are stable
+          # enough at that count to compare by eye, and the loop count is not
+          # what this gate is about.
+          go test -run '^$' -bench . -benchmem -benchtime=200x ./... | tee bench.txt
+          results=$(grep -c 'ns/op' bench.txt || true)
+          echo "benchmark results: $results"
+          if [ "$results" -lt 3 ]; then
+            echo "::error::expected at least 3 benchmark results, got $results"
+            exit 1
+          fi
+
   lint:
     # Static analysis as its own gate. It needs no Postgres, no Node and no
     # frontend build, so it is the fastest job to fail and it says exactly one

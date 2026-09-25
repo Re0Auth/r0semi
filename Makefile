@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test check e2e play dist sbom checksums release docker clean
+.PHONY: all web build test bench check e2e play dist sbom checksums release docker clean
 
 all: web build
 
@@ -24,6 +24,15 @@ build:
 
 test:
 	go test ./...
+
+# Capacity benchmarks. They build their own server on the in-memory stores, so
+# no database is needed. The numbers are reported, not asserted: a benchmark gate
+# that fails on a slow machine is a gate people delete. CI runs this to prove the
+# benchmarks still execute — a benchmark whose fixture stopped compiling is a
+# number that silently stopped existing — and its floor is "results were
+# produced", not a threshold.
+bench:
+	go test -run '^$$' -bench . -benchmem ./...
 
 # Browser tests. They build and start their own re0auth plus a fake identity
 # provider, so nothing else needs to be running — and there is no test-only way
