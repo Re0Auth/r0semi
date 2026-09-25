@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/observability"
 )
 
 // bindingView is one connected data source.
@@ -156,6 +157,7 @@ func (s *Server) handleUnbind(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not disconnect the source")
 		return
 	}
+	s.metrics.ObserveRevocation(observability.RevocationBinding)
 	writeJSON(w, http.StatusOK, unbindView{
 		Upstream:      string(result.Upstream),
 		UpstreamError: result.UpstreamError,
@@ -236,5 +238,6 @@ func (s *Server) handleCascadeRevoke(w http.ResponseWriter, r *http.Request) {
 			"the data source could not end the session; try again or check the source's status")
 		return
 	}
+	s.metrics.ObserveRevocation(observability.RevocationCascade)
 	writeJSON(w, http.StatusOK, unbindView{Upstream: string(result.Upstream)})
 }

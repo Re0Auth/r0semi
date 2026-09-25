@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -88,5 +89,6 @@ func (s *Server) handleRevokeGrant(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not revoke the grant")
 		return
 	}
+	s.metrics.ObserveRevocation(observability.RevocationGrant)
 	w.WriteHeader(http.StatusNoContent)
 }

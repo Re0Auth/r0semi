@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
+	"github.com/Re0Auth/r0semi/internal/observability"
 )
 
 // auditEntryView is one audit record as an operator sees it.
@@ -138,9 +139,15 @@ func (s *Server) handleAdminAuditVerify(w http.ResponseWriter, r *http.Request) 
 	}
 	v, err := s.auditReader.Verify(r.Context())
 	if err != nil {
+		s.metrics.ObserveAuditVerify(observability.VerifyError)
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not verify the audit log")
 		return
 	}
+	result := observability.VerifyOK
+	if !v.OK {
+		result = observability.VerifyFailed
+	}
+	s.metrics.ObserveAuditVerify(result)
 	writeJSON(w, http.StatusOK, auditVerifyView{
 		OK:         v.OK,
 		Chained:    v.Chained,

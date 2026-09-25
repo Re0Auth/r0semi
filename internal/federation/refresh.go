@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+
+	"github.com/Re0Auth/r0semi/internal/observability"
 )
 
 // refreshSkew refreshes a little before actual expiry, to absorb clock skew.
@@ -49,6 +51,7 @@ func (s *service) refreshBinding(ctx context.Context, src Source, current Bindin
 		return fresh, nil
 	}
 	if !fresh.HasRefresh {
+		s.metrics.ObserveUpstreamRefresh(observability.RefreshNoToken)
 		return Binding{}, ErrNoRefreshToken
 	}
 
@@ -81,10 +84,17 @@ func (s *service) refreshBinding(ctx context.Context, src Source, current Bindin
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, errRefreshRejected) {
+		switch {
+		case errors.Is(err, errRefreshRejected):
+			s.metrics.ObserveUpstreamRefresh(observability.RefreshRejected)
 			return s.refreshRejected(ctx, fresh)
+		case errors.Is(err, ErrNoRefreshToken):
+			s.metrics.ObserveUpstreamRefresh(observability.RefreshNoToken)
+			return Binding{}, err
+		default:
+			s.metrics.ObserveUpstreamRefresh(observability.RefreshTransient)
+			return Binding{}, err
 		}
-		return Binding{}, err
 	}
 
 	// Claim the version FIRST, and write the secret only if the claim held.
@@ -104,6 +114,7 @@ func (s *service) refreshBinding(ctx context.Context, src Source, current Bindin
 	if !won {
 		// Another process — or an unbind — got there first. Its row is the truth,
 		// and we must not touch the vault.
+		s.metrics.ObserveUpstreamRefresh(observability.RefreshLost)
 		return s.bindings.Get(ctx, fresh.User, fresh.Game, fresh.Source)
 	}
 	if err := s.storeBindingSecret(ctx, updated, rotated); err != nil {
@@ -111,8 +122,10 @@ func (s *service) refreshBinding(ctx context.Context, src Source, current Bindin
 		// broken binding rather than a silent divergence: the next call presents
 		// the old token, is rejected, and the rejection path cleans up. Worth
 		// stating plainly — this is the one case the ordering trade buys.
+		s.metrics.ObserveUpstreamRefresh(observability.RefreshTransient)
 		return Binding{}, err
 	}
+	s.metrics.ObserveUpstreamRefresh(observability.RefreshOK)
 	return updated, nil
 }
 

@@ -22,6 +22,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/Re0Auth/r0semi/internal/authorization"
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -83,6 +84,10 @@ type Config struct {
 	// client may always introspect its own tokens; without an entry here nobody
 	// else's are visible. Empty is the safe default.
 	IntrospectionClients []string
+	// Metrics, when set, records token issuance and token-endpoint failures. Nil
+	// records nothing; the *observability.Metrics methods are nil-safe, so a
+	// deployment that does not want them simply omits this.
+	Metrics *observability.Metrics
 }
 
 // ConsentStore is what the consent screen needs beyond op.Storage: marking an
@@ -117,6 +122,9 @@ type Handler struct {
 	// introspectionClients is the allowlist of client ids that may see tokens
 	// issued to other clients.
 	introspectionClients map[string]bool
+	// metrics observes token issuance and token-endpoint failures. Optional; a nil
+	// *observability.Metrics records nothing.
+	metrics *observability.Metrics
 }
 
 // New builds the provider.
@@ -200,6 +208,7 @@ func New(cfg Config) (*Handler, error) {
 		consent:              cfg.Consent,
 		issuer:               strings.TrimRight(cfg.Issuer, "/"),
 		introspectionClients: allowedIntrospectors,
+		metrics:              cfg.Metrics,
 	}, nil
 }
 
@@ -425,8 +434,16 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case isToken:
+		// The grant an exchange carried, and whether it produced a token. This is
+		// the protocol plane's core health signal: an issue rate and an error
+		// breakdown by grant type and OAuth error code. The grant_type is
+		// normalized inside observability, because it arrives from the request.
+		grantType := requestParams(r).Get("grant_type")
 		if bw.status == http.StatusOK {
 			body = sanitizeTokenResponse(body)
+			h.metrics.ObserveTokenIssued(grantType)
+		} else {
+			h.metrics.ObserveTokenError(grantType, tokenErrorCode(body, bw.status))
 		}
 		// RFC 6749 §5.1 requires these on every token response, error included: a
 		// cached token (or error) is a cached secret.
@@ -491,6 +508,19 @@ func normalizeOAuthFailure(bw *bufferedWriter, path string) []byte {
 	}
 	bw.header.Set("Content-Type", "application/json")
 	return out
+}
+
+// tokenErrorCode reads the OAuth error code out of a token error body, so the
+// metric can name the failure. A body that is not OAuth JSON falls back to the
+// code the status alone implies.
+func tokenErrorCode(body []byte, status int) string {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil && payload.Error != "" {
+		return payload.Error
+	}
+	return oauthErrorCode("/"+pathToken, status)
 }
 
 // oauthErrorCode names the failure a bare status stands for.

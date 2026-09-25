@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Re0Auth/r0semi/internal/admin"
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -147,6 +148,7 @@ func (s *Server) handleAdminRegisterClient(w http.ResponseWriter, r *http.Reques
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	s.metrics.ObserveAdminAction(observability.AdminRegister)
 	resp := map[string]any{"client": newAdminClientView(reg.Client)}
 	if reg.Secret != "" {
 		resp["client_secret"] = reg.Secret
@@ -170,7 +172,9 @@ func (s *Server) adminSetClientStatus(w http.ResponseWriter, r *http.Request, su
 	user, _ := s.sessions.User(r.Context())
 
 	var err error
+	action := observability.AdminActivate
 	if suspend {
+		action = observability.AdminSuspend
 		err = s.adminSvc.SuspendClient(r.Context(), string(user), clientID)
 	} else {
 		err = s.adminSvc.ActivateClient(r.Context(), string(user), clientID)
@@ -181,6 +185,7 @@ func (s *Server) adminSetClientStatus(w http.ResponseWriter, r *http.Request, su
 	case err != nil:
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not change the client status")
 	default:
+		s.metrics.ObserveAdminAction(action)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -194,6 +199,7 @@ func (s *Server) handleAdminDeleteClient(w http.ResponseWriter, r *http.Request)
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not delete the client")
 		return
 	}
+	s.metrics.ObserveAdminAction(observability.AdminDelete)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -241,6 +247,9 @@ func (s *Server) handleAdminKillSwitch(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "the kill switch could not complete")
 	default:
+		s.metrics.ObserveAdminAction(observability.AdminKillSwitch)
+		s.metrics.ObserveRevocation(observability.RevocationKillSwitch)
+		s.metrics.ObserveTokensRevoked(observability.RevocationKillSwitch, report.TokensRevoked)
 		writeJSON(w, http.StatusOK, report)
 	}
 }

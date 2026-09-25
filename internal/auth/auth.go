@@ -20,6 +20,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/internal/safeurl"
 )
 
@@ -275,10 +276,21 @@ type Handler struct {
 	manager  *Manager
 	registry *idp.Registry
 	accounts account.Store
+	// metrics observes sign-in outcomes. Optional; a nil *observability.Metrics
+	// records nothing (its methods are nil-safe).
+	metrics *observability.Metrics
+}
+
+// HandlerOption tunes a Handler.
+type HandlerOption func(*Handler)
+
+// WithMetrics attaches business metrics to the login plane. It is optional.
+func WithMetrics(m *observability.Metrics) HandlerOption {
+	return func(h *Handler) { h.metrics = m }
 }
 
 // NewHandler builds the /auth handler.
-func NewHandler(m *Manager, registry *idp.Registry, accounts account.Store) (*Handler, error) {
+func NewHandler(m *Manager, registry *idp.Registry, accounts account.Store, opts ...HandlerOption) (*Handler, error) {
 	switch {
 	case m == nil:
 		return nil, errors.New("auth: session Manager is required")
@@ -287,7 +299,26 @@ func NewHandler(m *Manager, registry *idp.Registry, accounts account.Store) (*Ha
 	case accounts == nil:
 		return nil, errors.New("auth: account Store is required")
 	}
-	return &Handler{manager: m, registry: registry, accounts: accounts}, nil
+	h := &Handler{manager: m, registry: registry, accounts: accounts}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h, nil
+}
+
+// observeLogin records one sign-in attempt that reached a terminal outcome. The
+// provider label is a configured name or "unknown"; the result is a short code,
+// never a raw value from the request (the identity provider's own `error`
+// parameter is reflected, so it is deliberately not passed through).
+func (h *Handler) observeLogin(provider, result string) {
+	h.metrics.ObserveLogin(provider, result)
+}
+
+// failLogin records the failure and hands the browser back with the reason, the
+// two halves a failed callback has to do.
+func (h *Handler) failLogin(w http.ResponseWriter, r *http.Request, provider idp.Provider, returnTo, code string) {
+	h.observeLogin(string(provider), code)
+	redirectError(w, r, returnTo, code)
 }
 
 // Register mounts the routes on mux.
@@ -318,6 +349,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
 	if !ok {
+		h.observeLogin("unknown", "unknown_provider")
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -358,7 +390,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		// A provider whose discovery is unreachable, or that is misconfigured, is a
 		// deployment problem the person cannot see. Send them back with a reason
 		// rather than a dead-end 502 page they can do nothing with.
-		redirectError(w, r, returnTo, "provider_unavailable")
+		h.failLogin(w, r, provider, returnTo, "provider_unavailable")
 		return
 	}
 	http.Redirect(w, r, authURL, http.StatusFound)
@@ -368,6 +400,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	provider := idp.Provider(r.PathValue("provider"))
 	client, ok := h.registry.Get(provider)
 	if !ok {
+		h.observeLogin("unknown", "unknown_provider")
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -376,6 +409,7 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	want := h.manager.sessions.GetString(ctx, keyFlowState)
 	if want == "" || subtle.ConstantTimeCompare([]byte(state), []byte(want)) != 1 {
+		h.observeLogin(string(provider), "invalid_state")
 		http.Error(w, "invalid state", http.StatusBadRequest)
 		return
 	}
@@ -387,44 +421,48 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	h.clearFlow(ctx)
 
 	if flowProvider != string(provider) {
+		h.observeLogin(string(provider), "provider_mismatch")
 		http.Error(w, "provider mismatch", http.StatusBadRequest)
 		return
 	}
 	if denied := r.URL.Query().Get("error"); denied != "" {
-		redirectError(w, r, returnTo, denied)
+		// The provider's own `error` value is reflected input, so it is not used
+		// as a label: the bounded fact is that the provider refused.
+		h.failLogin(w, r, provider, returnTo, "denied")
 		return
 	}
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		redirectError(w, r, returnTo, "invalid_request")
+		h.failLogin(w, r, provider, returnTo, "invalid_request")
 		return
 	}
 
 	token, err := client.Exchange(ctx, code, verifier)
 	if err != nil {
-		redirectError(w, r, returnTo, "exchange_failed")
+		h.failLogin(w, r, provider, returnTo, "exchange_failed")
 		return
 	}
 	ident, err := client.Identity(ctx, token, nonce)
 	if err != nil {
-		redirectError(w, r, returnTo, "identity_failed")
+		h.failLogin(w, r, provider, returnTo, "identity_failed")
 		return
 	}
 
 	if mode == "link" {
 		user, ok := h.manager.User(ctx)
 		if !ok {
-			redirectError(w, r, returnTo, "not_signed_in")
+			h.failLogin(w, r, provider, returnTo, "not_signed_in")
 			return
 		}
 		if _, err := h.accounts.LinkIdentity(ctx, user, ident); err != nil {
 			if errors.Is(err, account.ErrIdentityTaken) {
-				redirectError(w, r, returnTo, "identity_taken")
+				h.failLogin(w, r, provider, returnTo, "identity_taken")
 				return
 			}
-			redirectError(w, r, returnTo, "link_failed")
+			h.failLogin(w, r, provider, returnTo, "link_failed")
 			return
 		}
+		h.observeLogin(string(provider), observability.LoginSuccess)
 		http.Redirect(w, r, returnTo, http.StatusSeeOther)
 		return
 	}
@@ -434,21 +472,22 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, account.ErrNotFound):
 		created, _, cerr := h.accounts.CreateWithIdentity(ctx, ident)
 		if cerr != nil {
-			redirectError(w, r, returnTo, "signup_failed")
+			h.failLogin(w, r, provider, returnTo, "signup_failed")
 			return
 		}
 		user = created.ID
 	case err != nil:
-		redirectError(w, r, returnTo, "lookup_failed")
+		h.failLogin(w, r, provider, returnTo, "lookup_failed")
 		return
 	default:
 		_ = h.accounts.TouchLogin(ctx, ident.Provider, ident.Subject)
 	}
 
 	if err := h.manager.SignIn(ctx, user); err != nil {
-		redirectError(w, r, returnTo, "session_failed")
+		h.failLogin(w, r, provider, returnTo, "session_failed")
 		return
 	}
+	h.observeLogin(string(provider), observability.LoginSuccess)
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
 }
 

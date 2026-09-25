@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/Re0Auth/r0semi/internal/lifecycle"
+	"github.com/Re0Auth/r0semi/internal/observability"
 )
 
 // deleteAccountRequest is the body a deletion must carry.
@@ -58,6 +59,8 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 			"the account could not be erased; it is safe to try again")
 		return
 	}
+	s.metrics.ObserveRevocation(observability.RevocationErasure)
+	s.metrics.ObserveTokensRevoked(observability.RevocationErasure, result.Tokens)
 
 	// The session is gone as of the erasure, so destroy the cookie for this
 	// response: without this the browser keeps a cookie pointing at a row that no

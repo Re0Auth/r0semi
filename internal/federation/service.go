@@ -15,6 +15,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/httpclient"
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/vault"
 )
 
@@ -118,6 +119,9 @@ type Config struct {
 	// BindTTL is how long a pending bind stays valid. Defaults to 10 minutes.
 	BindTTL time.Duration
 	Now     func() time.Time
+	// Metrics, when set, records upstream reads and token refreshes. Nil records
+	// nothing; the *observability.Metrics methods are nil-safe.
+	Metrics *observability.Metrics
 }
 
 // NewService validates cfg and returns a Service.
@@ -159,6 +163,7 @@ func NewService(cfg Config) (Service, error) {
 		bindTTL:    cfg.BindTTL,
 		locks:      &keyedMutex{},
 		now:        cfg.Now,
+		metrics:    cfg.Metrics,
 	}, nil
 }
 
@@ -173,6 +178,9 @@ type service struct {
 	bindTTL    time.Duration
 	locks      *keyedMutex
 	now        func() time.Time
+	// metrics observes upstream reads and refreshes. Optional; a nil
+	// *observability.Metrics records nothing.
+	metrics *observability.Metrics
 }
 
 func (s *service) Sources(game string) []Source { return s.registry.Sources(game) }
@@ -197,6 +205,7 @@ func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 
 	var (
 		lastErr       error
+		lastSource    string
 		firstNotBound *NotBoundError
 		sawOther      bool
 	)
@@ -205,8 +214,14 @@ func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		if err == nil {
 			// Skipping the preferred source is what "degraded" reports.
 			result.Degraded = i > 0
+			outcome := observability.UpstreamOK
+			if result.Degraded {
+				outcome = observability.UpstreamDegraded
+			}
+			s.metrics.ObserveUpstreamFetch(req.Game, result.Source, outcome)
 			return result, nil
 		}
+		lastSource = src.Name
 		var notBound *NotBoundError
 		if errors.As(err, &notBound) {
 			if firstNotBound == nil {
@@ -220,11 +235,16 @@ func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 
 	// If the only obstacle was missing bindings, guide the user to bind (once).
 	if !sawOther && firstNotBound != nil {
+		s.metrics.ObserveUpstreamFetch(req.Game, firstNotBound.Source, observability.UpstreamNotBound)
 		return FetchResult{}, firstNotBound
 	}
 	if lastErr == nil {
+		// No candidate could even be tried (an unknown or retired source): that is
+		// a client error, not an upstream failure, so it is not recorded here.
 		return FetchResult{}, ErrUnknownResource
 	}
+	// Only names from the registry reach this line, so the labels stay bounded.
+	s.metrics.ObserveUpstreamFetch(req.Game, lastSource, observability.UpstreamUnavailable)
 	return FetchResult{}, lastErr
 }
 
@@ -320,9 +340,11 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 
 	binding, err := s.bindings.Get(ctx, req.User, req.Game, src.Name)
 	if errors.Is(err, ErrNotBound) {
+		s.metrics.ObserveUpstreamFetch(req.Game, src.Name, observability.UpstreamNotBound)
 		return RawResult{}, &NotBoundError{Game: req.Game, Source: src.Name}
 	}
 	if err != nil {
+		s.metrics.ObserveUpstreamFetch(req.Game, src.Name, observability.UpstreamUnavailable)
 		return RawResult{}, err
 	}
 
@@ -339,9 +361,11 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 		return nil
 	})
 	if err != nil {
+		s.metrics.ObserveUpstreamFetch(req.Game, src.Name, observability.UpstreamUnavailable)
 		return RawResult{}, err
 	}
 	out.Source = src.Name
+	s.metrics.ObserveUpstreamFetch(req.Game, src.Name, observability.UpstreamOK)
 	return out, nil
 }
 

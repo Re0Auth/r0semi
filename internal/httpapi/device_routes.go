@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/Re0Auth/r0semi/internal/observability"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -93,6 +94,11 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	decision := observability.DeviceDenied
+	if body.Decision == "approve" {
+		decision = observability.DeviceApproved
+	}
+	s.metrics.ObserveDeviceDecision(decision)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"state": map[bool]string{true: "approved", false: "denied"}[body.Decision == "approve"],
 	})
