@@ -322,6 +322,19 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 			"duplicate parameter: "+dup)
 		return
 	}
+	// RFC 7636 §4.4/§4.6: the verifier is the same 43–128 unreserved-character
+	// form as the challenge. The library only hashes and compares, so a malformed
+	// verifier would otherwise be accepted whenever it happened to hash correctly.
+	if r.URL.Path == "/"+pathToken && r.Method == http.MethodPost {
+		form := requestParams(r)
+		if form.Get("grant_type") == "authorization_code" {
+			if v := form.Get("code_verifier"); v != "" && !validPKCEValue(v) {
+				writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
+					"code_verifier must be 43-128 unreserved characters")
+				return
+			}
+		}
+	}
 	// The authorize entrance, for either method. `/oauth/authorize/callback` is the
 	// library's own leg and is deliberately not included: it carries no client or
 	// scope parameters, and validating it as an entrance would break the flow.
@@ -562,6 +575,19 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
 	}
+	// RFC 7636 §4.1/§4.2: the challenge is 43–128 characters from the unreserved
+	// set. The library only compares hashes, so a malformed value was accepted and
+	// stored; rejecting it at the entrance keeps the code record well-formed.
+	if !validPKCEValue(challenge) {
+		params := map[string]string{
+			"error":             "invalid_request",
+			"error_description": "code_challenge must be 43-128 unreserved characters",
+			"state":             q.Get("state"),
+			"iss":               h.issuerFor(r),
+		}
+		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+		return true
+	}
 	rawScope := q.Get("scope")
 	if rawScope == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "scope is required")
@@ -647,6 +673,24 @@ func writeOAuthJSONError(w http.ResponseWriter, status int, code, description st
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_description": description})
+}
+
+// validPKCEValue reports whether s is a well-formed RFC 7636 code challenge or
+// verifier: 43 to 128 characters from ALPHA / DIGIT / "-" / "." / "_" / "~".
+func validPKCEValue(s string) bool {
+	if len(s) < 43 || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-', c == '.', c == '_', c == '~':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // isAuthorizationResponse reports whether path is one of the legs that returns an

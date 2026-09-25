@@ -241,7 +241,7 @@ func TestAuthorizationCodeFlowOverHTTP(t *testing.T) {
 	scope := []oauth.Scope{oauth.ScopeAccountID, oauth.ScopePhigrosScore}
 	env.register(t, "app", oauth.ClientPublic, "", scope)
 
-	const verifier = "verifier-verifier-verifier-verifier"
+	const verifier = "verifier-verifier-verifier-verifier-verifier"
 	code := env.issueCode(t, "app", scope, verifier)
 
 	rec := env.exchange(t, "app", "", code, verifier, nil)
@@ -328,7 +328,7 @@ func TestInsufficientScopeIsForbidden(t *testing.T) {
 	env := newTestEnv(t)
 	env.register(t, "scoreonly", oauth.ClientPublic, "", []oauth.Scope{oauth.ScopePhigrosScore})
 
-	const verifier = "verifier-verifier-verifier-verifier"
+	const verifier = "verifier-verifier-verifier-verifier-verifier"
 	code := env.issueCode(t, "scoreonly", []oauth.Scope{oauth.ScopePhigrosScore}, verifier)
 	tok := decodeJSON(t, env.exchange(t, "scoreonly", "", code, verifier, nil))
 	at, _ := tok["access_token"].(string)
@@ -407,7 +407,7 @@ func TestIntrospectAndRevoke(t *testing.T) {
 	env := newTestEnv(t)
 	env.register(t, "conf", oauth.ClientConfidential, "s3cret", []oauth.Scope{oauth.ScopeAccountID})
 
-	const verifier = "verifier-verifier-verifier-verifier"
+	const verifier = "verifier-verifier-verifier-verifier-verifier"
 	code := env.issueCode(t, "conf", []oauth.Scope{oauth.ScopeAccountID}, verifier)
 	tok := decodeJSON(t, env.exchange(t, "conf", "s3cret", code, verifier, nil))
 	at, _ := tok["access_token"].(string)
@@ -455,7 +455,7 @@ func TestConfidentialTokenUsesBasicAuth(t *testing.T) {
 	env := newTestEnv(t)
 	env.register(t, "conf", oauth.ClientConfidential, "s3cret", []oauth.Scope{oauth.ScopeAccountID})
 
-	const verifier = "verifier-verifier-verifier-verifier"
+	const verifier = "verifier-verifier-verifier-verifier-verifier"
 	code := env.issueCode(t, "conf", []oauth.Scope{oauth.ScopeAccountID}, verifier)
 
 	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("conf:s3cret"))

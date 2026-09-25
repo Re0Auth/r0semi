@@ -357,7 +357,7 @@ func TestAuthorizationHandleIsBoundToBrowser(t *testing.T) {
 
 	first := newBrowser(t)
 	signIn(t, first, base)
-	handle := authorize(t, first, base, "verifier-verifier-verifier-verifier", "account.id", "st")
+	handle := authorize(t, first, base, "verifier-verifier-verifier-verifier-verifier", "account.id", "st")
 
 	// A second browser signs in as the same user but never started this request.
 	second := newBrowser(t)
@@ -373,7 +373,7 @@ func TestConsentRequiresSignIn(t *testing.T) {
 	base, _ := newFlowEnv(t)
 	owner := newBrowser(t)
 	signIn(t, owner, base)
-	handle := authorize(t, owner, base, "verifier-verifier-verifier-verifier", "account.id", "st")
+	handle := authorize(t, owner, base, "verifier-verifier-verifier-verifier-verifier", "account.id", "st")
 
 	anon := newBrowser(t)
 	resp := getURL(t, anon, base+"/v1/authorization_requests/"+handle)
@@ -390,7 +390,7 @@ func TestDecisionRequiresCSRF(t *testing.T) {
 	base, _ := newFlowEnv(t)
 	browser := newBrowser(t)
 	signIn(t, browser, base)
-	handle := authorize(t, browser, base, "verifier-verifier-verifier-verifier", "account.id", "st")
+	handle := authorize(t, browser, base, "verifier-verifier-verifier-verifier-verifier", "account.id", "st")
 
 	body := strings.NewReader(`{"decision":"approve"}`)
 	req, _ := http.NewRequest(http.MethodPost, base+"/v1/authorization_requests/"+handle+"/decision", body)
@@ -411,7 +411,7 @@ func TestAuthorizeUnknownClientUsesOAuthError(t *testing.T) {
 		"client_id":             {"ghost"},
 		"redirect_uri":          {"https://evil.example/cb"},
 		"scope":                 {"account.id"},
-		"code_challenge":        {pkce("v")},
+		"code_challenge":        {pkce("verifier-verifier-verifier-verifier-verifier")},
 		"code_challenge_method": {"S256"},
 	}.Encode()
 	resp := getURL(t, browser, base+"/oauth/authorize?"+q)
@@ -435,7 +435,7 @@ func TestAuthorizeBadScopeRedirectsToClient(t *testing.T) {
 		"redirect_uri":          {"https://app.example/cb"},
 		"scope":                 {"phigros.b30.read"},
 		"state":                 {"st-err"},
-		"code_challenge":        {pkce("v")},
+		"code_challenge":        {pkce("verifier-verifier-verifier-verifier-verifier")},
 		"code_challenge_method": {"S256"},
 	}.Encode()
 	resp := getURL(t, browser, base+"/oauth/authorize?"+q)

@@ -120,7 +120,7 @@ func TestGrantsListsWhatWasGranted(t *testing.T) {
 		t.Fatal("a grant appeared before anything was authorized")
 	}
 
-	_, scope, _ := grantFlow(t, browser, base, "verifier-verifier-verifier-verifier", "account.id phigros.score.read")
+	_, scope, _ := grantFlow(t, browser, base, "verifier-verifier-verifier-verifier-verifier", "account.id phigros.score.read")
 	if !strings.Contains(scope, "account.id") {
 		t.Fatalf("scope = %q", scope)
 	}
@@ -152,7 +152,7 @@ func TestRevokeGrantRequiresCSRF(t *testing.T) {
 	base, _ := newFlowEnv(t)
 	browser := newBrowser(t)
 	signIn(t, browser, base)
-	grantFlow(t, browser, base, "verifier-verifier-verifier-verifier", "account.id")
+	grantFlow(t, browser, base, "verifier-verifier-verifier-verifier-verifier", "account.id")
 
 	req, _ := http.NewRequest(http.MethodDelete, base+"/v1/grants/cli", nil)
 	resp := doReq(t, browser, req)
@@ -170,7 +170,7 @@ func TestRevokeGrantEndsTheAccess(t *testing.T) {
 	base, _ := newFlowEnv(t)
 	browser := newBrowser(t)
 	signIn(t, browser, base)
-	access, _, csrf := grantFlow(t, browser, base, "verifier-verifier-verifier-verifier", "account.id")
+	access, _, csrf := grantFlow(t, browser, base, "verifier-verifier-verifier-verifier-verifier", "account.id")
 
 	// The token works.
 	me, _ := http.NewRequest(http.MethodGet, base+"/v1/me", nil)
@@ -220,7 +220,7 @@ func TestRevokeGrantIgnoresClientsWithNothingToRevoke(t *testing.T) {
 	base, _ := newFlowEnv(t)
 	browser := newBrowser(t)
 	signIn(t, browser, base)
-	access, _, csrf := grantFlow(t, browser, base, "verifier-verifier-verifier-verifier", "account.id")
+	access, _, csrf := grantFlow(t, browser, base, "verifier-verifier-verifier-verifier-verifier", "account.id")
 
 	revoke, _ := http.NewRequest(http.MethodDelete, base+"/v1/grants/someone-else", nil)
 	revoke.Header.Set("X-CSRF-Token", csrf)

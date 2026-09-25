@@ -138,7 +138,7 @@ func TestAdversarialPostAuthorizeRejectsUnregisteredScope(t *testing.T) {
 		"redirect_uri":          {"https://app.example/cb"},
 		"scope":                 {"account.id phigros.b30.read"},
 		"state":                 {"st"},
-		"code_challenge":        {pkce("verifier-verifier-verifier-verifier-x")},
+		"code_challenge":        {pkce("verifier-verifier-verifier-verifier-verifier-extra")},
 		"code_challenge_method": {"S256"},
 	}
 
@@ -238,7 +238,7 @@ func TestAdversarialRevokeWithRefreshTokenActuallyRevokes(t *testing.T) {
 	env := newTestEnv(t)
 	const secret = "s3cret"
 	env.register(t, "conf", oauth.ClientConfidential, secret, []oauth.Scope{oauth.ScopeAccountID})
-	const verifier = "verifier-verifier-verifier-verifier-conf"
+	const verifier = "verifier-verifier-verifier-verifier-verifier"
 
 	// offline_access is what makes the OP issue a refresh token.
 	scopes := []oauth.Scope{oauth.ScopeAccountID, oauth.Scope("offline_access")}

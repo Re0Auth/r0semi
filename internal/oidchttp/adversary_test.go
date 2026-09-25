@@ -258,6 +258,54 @@ func TestAdversarialDuplicateParametersAreRejected(t *testing.T) {
 	}
 }
 
+// RFC 7636 §4.1/§4.2: challenge and verifier are 43–128 unreserved characters.
+// The library only compares hashes, so a malformed value was accepted and stored.
+func TestAdversarialMalformedPKCEValuesAreRejected(t *testing.T) {
+	f := newFixture(t)
+
+	// A 42-character challenge is one short of the minimum.
+	short := strings.Repeat("c", 42)
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {f.webID},
+		"redirect_uri":          {"https://client.example/cb"},
+		"scope":                 {"account.id"},
+		"state":                 {"st"},
+		"code_challenge":        {short},
+		"code_challenge_method": {"S256"},
+	}
+	resp := get(t, noRedirect, f.server.URL+"/oauth/authorize?"+q.Encode())
+	if resp.StatusCode != http.StatusFound {
+		body := adversaryBody(t, resp)
+		t.Fatalf("authorize status = %d, want 302: %s", resp.StatusCode, body)
+	}
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	if loc.Query().Get("error") != "invalid_request" {
+		t.Fatalf("malformed challenge was accepted: %s", loc)
+	}
+
+	// A malformed verifier is refused before the exchange is attempted.
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {"anything"},
+		"client_id":     {f.webID},
+		"client_secret": {"s3cret"},
+		"redirect_uri":  {"https://client.example/cb"},
+		"code_verifier": {"too-short"},
+	}
+	tokenResp, err := http.PostForm(f.server.URL+"/oauth/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := adversaryBody(t, tokenResp)
+	if tokenResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed verifier status = %d, want 400: %s", tokenResp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "code_verifier") {
+		t.Fatalf("refusal does not name the verifier: %s", body)
+	}
+}
+
 // A protected resource's 401 must carry an RFC 6750 Bearer challenge, so a
 // standard RP can tell "this token is bad, refresh it" from a transport error.
 // userinfo is such a resource; neither the library nor this package's client-auth
@@ -310,7 +358,7 @@ func TestSeamProbesHeld(t *testing.T) {
 		"client_id":             {f.deviceID},
 		"redirect_uri":          {"https://device.example/cb"},
 		"scope":                 {"phigros.score.read"},
-		"code_challenge":        {"c"},
+		"code_challenge":        {strings.Repeat("c", 43)},
 		"code_challenge_method": {"S256"},
 		"state":                 {"s"},
 	})
