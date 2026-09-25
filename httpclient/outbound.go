@@ -96,7 +96,7 @@ type bulkheadTransport struct {
 	// The permit is taken and returned by hand rather than by running the
 	// request through the policy, because the permit has to outlive RoundTrip:
 	// see Bulkhead.
-	bulkhead bulkhead.Bulkhead[*http.Response]
+	bulkhead bulkhead.Bulkhead[guardedResponse]
 }
 
 // Bulkhead bounds how many requests may be in flight through next at the same
@@ -122,7 +122,7 @@ func Bulkhead(next http.RoundTripper, maxConcurrent int) http.RoundTripper {
 	}
 	return &bulkheadTransport{
 		next:     next,
-		bulkhead: bulkhead.NewBuilder[*http.Response](uint(maxConcurrent)).Build(),
+		bulkhead: bulkhead.NewBuilder[guardedResponse](uint(maxConcurrent)).Build(),
 	}
 }
 

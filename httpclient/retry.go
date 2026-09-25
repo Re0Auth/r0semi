@@ -84,7 +84,7 @@ func Retry(next Doer, opts RetryOptions) Doer {
 		opts.MaxElapsedTime = defaultMaxElapsedTime
 	}
 
-	policy := retrypolicy.NewBuilder[*http.Response]().
+	policy := retrypolicy.NewBuilder[guardedResponse]().
 		HandleIf(func(resp *http.Response, err error) bool {
 			if err != nil {
 				return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
@@ -104,7 +104,7 @@ func Retry(next Doer, opts RetryOptions) Doer {
 		// is not queued behind a connection the previous attempt still holds.
 		// It runs only when a retry is actually scheduled, which is why the
 		// final response reaches the caller with its body intact.
-		OnRetry(func(event failsafe.ExecutionEvent[*http.Response]) {
+		OnRetry(func(event failsafe.ExecutionEvent[guardedResponse]) {
 			drain(event.LastResult())
 		}).
 		Build()
@@ -115,7 +115,7 @@ func Retry(next Doer, opts RetryOptions) Doer {
 		}
 
 		attempt := 0
-		return failsafe.With[*http.Response](policy).
+		return failsafe.With[guardedResponse](policy).
 			WithContext(req.Context()).
 			Get(func() (*http.Response, error) {
 				attempt++
@@ -156,7 +156,7 @@ func retryableStatus(status int, extra []int) bool {
 // retryAfterDelay turns the attempt's Retry-After into its delay. Returning -1
 // leaves the schedule to the configured backoff, which is what happens when the
 // upstream sent no hint (or one this parse rejects).
-func retryAfterDelay(exec failsafe.ExecutionAttempt[*http.Response]) time.Duration {
+func retryAfterDelay(exec failsafe.ExecutionAttempt[guardedResponse]) time.Duration {
 	if after := retryAfter(exec.LastResult()); after > 0 {
 		return after
 	}

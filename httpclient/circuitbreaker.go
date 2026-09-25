@@ -71,7 +71,7 @@ func CircuitBreaker(next http.RoundTripper, opts BreakerOptions) http.RoundTripp
 	return &breakerTransport{
 		next:  next,
 		opts:  opts,
-		hosts: map[string]failsafe.Executor[*http.Response]{},
+		hosts: map[string]failsafe.Executor[guardedResponse]{},
 	}
 }
 
@@ -82,7 +82,7 @@ type breakerTransport struct {
 	next  http.RoundTripper
 	opts  BreakerOptions
 	mu    sync.Mutex
-	hosts map[string]failsafe.Executor[*http.Response]
+	hosts map[string]failsafe.Executor[guardedResponse]
 }
 
 func (b *breakerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -99,13 +99,13 @@ func (b *breakerTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 // executorFor returns the host's executor, building it on first use.
-func (b *breakerTransport) executorFor(host string) failsafe.Executor[*http.Response] {
+func (b *breakerTransport) executorFor(host string) failsafe.Executor[guardedResponse] {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if exec, ok := b.hosts[host]; ok {
 		return exec
 	}
-	breaker := circuitbreaker.NewBuilder[*http.Response]().
+	breaker := circuitbreaker.NewBuilder[guardedResponse]().
 		// HandleIf replaces the library's default "any error is a failure", so
 		// a caller-side cancellation is not recorded against the host.
 		HandleIf(breakerFailure).
@@ -113,7 +113,7 @@ func (b *breakerTransport) executorFor(host string) failsafe.Executor[*http.Resp
 		WithSuccessThreshold(uint(b.opts.HalfOpenSuccesses)).
 		WithDelay(b.opts.Cooldown).
 		Build()
-	exec := failsafe.With[*http.Response](breaker)
+	exec := failsafe.With[guardedResponse](breaker)
 	b.hosts[host] = exec
 	return exec
 }
