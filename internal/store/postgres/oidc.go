@@ -162,14 +162,47 @@ func (s *OIDCStore) AuthRequestByID(ctx context.Context, id string) (op.AuthRequ
 		  FROM oidc_auth_requests WHERE id = $1`, id)
 }
 
-// AuthRequestByCode implements op.Storage.
+// AuthRequestByCode implements op.Storage. It consumes the code in one
+// transaction: the DELETE is the claim, so two concurrent exchanges cannot both
+// find the code. It also checks expires_at here — the previous query ignored it,
+// so an expired code stayed redeemable until the periodic sweep ran. The library
+// deletes the request again after minting, which is a harmless no-op.
 func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.AuthRequest, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var requestID string
-	if err := s.pool.QueryRow(ctx,
-		`SELECT request_id FROM oidc_codes WHERE code_hash = $1`, hashValue(code)).Scan(&requestID); err != nil {
+	if err := tx.QueryRow(ctx,
+		`DELETE FROM oidc_codes WHERE code_hash = $1 AND expires_at > now() RETURNING request_id`,
+		hashValue(code)).Scan(&requestID); err != nil {
 		return nil, errors.New("postgres: authorization code is unknown or expired")
 	}
-	return s.AuthRequestByID(ctx, requestID)
+
+	var (
+		a         oidcstore.AuthRequest
+		challenge string
+		method    string
+		authTime  *time.Time
+	)
+	if err := tx.QueryRow(ctx, `
+		DELETE FROM oidc_auth_requests
+		 WHERE id = $1
+		RETURNING id, client_id, redirect_uri, response_type, response_mode, scopes, state, nonce,
+		          code_challenge, code_challenge_method, subject, done, auth_time`, requestID).Scan(
+		&a.ID, &a.ClientID, &a.RedirectURI, &a.ResponseType, &a.ResponseMode, &a.Scopes,
+		&a.State, &a.Nonce, &challenge, &method, &a.Subject, &a.IsDone, &authTime,
+	); err != nil {
+		return nil, errors.New("postgres: auth request not found")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	a.CodeChallenge = codeChallenge(challenge, method)
+	a.AuthTime = authTime
+	return &a, nil
 }
 
 func (s *OIDCStore) scanAuthRequest(ctx context.Context, query string, args ...any) (op.AuthRequest, error) {
@@ -240,7 +273,11 @@ func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenReque
 // token this store has already consumed, which is what a replayed (or stolen)
 // refresh token looks like. Returning an error rather than minting a second
 // generation is the only thing that makes reuse visible.
-var ErrRefreshTokenSpent = errors.New("postgres: refresh token was already rotated")
+//
+// It is an *oidc.Error carrying invalid_grant: the token endpoint maps a typed
+// protocol error to 400 invalid_grant, while a bare error becomes 500
+// server_error — which would tell the client to retry rather than refresh.
+var ErrRefreshTokenSpent = oidc.ErrInvalidGrant().WithDescription("refresh token was already rotated")
 
 // CreateAccessAndRefreshTokens implements op.Storage. Refresh tokens rotate:
 // presenting one consumes it and issues a new one.

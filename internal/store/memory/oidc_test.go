@@ -164,9 +164,10 @@ func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Anti-vacuous: the code is redeemable before the revocation.
-	if _, err := store.AuthRequestByCode(ctx, "code-to-redeem"); err != nil {
-		t.Fatalf("the code was not redeemable before revocation: %v", err)
+	// Anti-vacuous: the code exists before the revocation. Counts is used rather
+	// than AuthRequestByCode because that lookup now consumes the code.
+	if got := store.Counts().Codes; got != 1 {
+		t.Fatalf("codes before revocation = %d, want 1", got)
 	}
 
 	if _, err := store.RevokeTokens(ctx, oauth.TokenFilter{Subject: "usr_1"}); err != nil {
@@ -196,6 +197,37 @@ func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
 	}
 	if _, err := store.AuthRequestByCode(ctx, "code-for-client"); err == nil {
 		t.Fatal("the client-targeted Kill Switch left an authorization code redeemable")
+	}
+}
+
+// The lookup itself is the claim, so a code cannot be exchanged twice even if two
+// requests race for it. The library only deletes the request after minting, so a
+// read-then-delete would let both win.
+func TestAuthorizationCodeIsSingleUse(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+		ClientID:            "cli",
+		RedirectURI:         "https://app.example/cb",
+		ResponseType:        oidc.ResponseTypeCode,
+		Scopes:              []string{"account.id"},
+		CodeChallenge:       "challenge-1234567890",
+		CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuthCode(ctx, ar.GetID(), "single-use-code"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "single-use-code"); err != nil {
+		t.Fatalf("first exchange refused: %v", err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "single-use-code"); err == nil {
+		t.Fatal("the authorization code was accepted twice")
 	}
 }
 

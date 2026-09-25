@@ -56,7 +56,11 @@ type OIDCStore struct {
 // token this store has already consumed, which is what a replayed (or stolen)
 // refresh token looks like. Returning an error rather than minting a second
 // generation is the whole point — it is the only thing that makes reuse visible.
-var ErrRefreshTokenSpent = errors.New("memory: refresh token was already rotated")
+//
+// It is an *oidc.Error carrying invalid_grant, not a bare error: the token
+// endpoint maps a typed protocol error to 400, while an untyped one becomes a
+// 500 server_error and hides the refusal from the client.
+var ErrRefreshTokenSpent = oidc.ErrInvalidGrant().WithDescription("refresh token was already rotated")
 
 type codeRecord struct {
 	requestID string
@@ -207,11 +211,17 @@ func (s *OIDCStore) AuthRequestByID(_ context.Context, id string) (op.AuthReques
 	return cloneAuthRequest(a), nil
 }
 
-// AuthRequestByCode implements op.Storage.
+// AuthRequestByCode implements op.Storage. It consumes the code: a second
+// exchange of the same value finds nothing. The library only deletes the request
+// after it has minted tokens, so a read-then-delete left a window where two
+// concurrent exchanges both succeeded. Treating the lookup itself as the claim is
+// what makes the code single-use under concurrency; a failed exchange burns the
+// code, which is the fail-closed direction.
 func (s *OIDCStore) AuthRequestByCode(_ context.Context, code string) (op.AuthRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.codes[oauth.TokenHash(code)]
+	key := oauth.TokenHash(code)
+	c, ok := s.codes[key]
 	if !ok || !s.now().Before(c.expiresAt) {
 		return nil, errors.New("memory: authorization code is unknown or expired")
 	}
@@ -219,6 +229,9 @@ func (s *OIDCStore) AuthRequestByCode(_ context.Context, code string) (op.AuthRe
 	if !ok {
 		return nil, errors.New("memory: auth request not found")
 	}
+	delete(s.codes, key)
+	delete(s.authRequests, c.requestID)
+	delete(s.authRequestExpiry, c.requestID)
 	return cloneAuthRequest(a), nil
 }
 

@@ -521,9 +521,17 @@ func TestRefreshGrantRotatesAndSpendsTheOldToken(t *testing.T) {
 		t.Fatalf("rotation did not happen: first=%q second=%q", first, second)
 	}
 
-	// Spent, not merely superseded.
-	if _, status := refresh(first); status == http.StatusOK {
+	// Spent, not merely superseded. The refusal must be a protocol error the
+	// client can act on: 400 invalid_grant, not 500 server_error.
+	replay, status := refresh(first)
+	if status == http.StatusOK {
 		t.Fatal("the spent refresh token was accepted a second time")
+	}
+	if status != http.StatusBadRequest {
+		t.Fatalf("replay status = %d, want 400: %v", status, replay)
+	}
+	if replay["error"] != "invalid_grant" {
+		t.Fatalf("replay error = %v, want invalid_grant", replay["error"])
 	}
 	// And the replacement is the live one, so the fix did not simply refuse
 	// everything.

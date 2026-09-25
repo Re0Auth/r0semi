@@ -97,9 +97,14 @@ func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Anti-vacuous: the code is redeemable before the revocation.
-	if _, err := store.AuthRequestByCode(ctx, "code-to-redeem"); err != nil {
-		t.Fatalf("the code was not redeemable before revocation: %v", err)
+	// Anti-vacuous: the row exists before the revocation. Counted directly rather
+	// than through AuthRequestByCode, which now consumes the code.
+	var before int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM oidc_codes`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before != 1 {
+		t.Fatalf("codes before revocation = %d, want 1", before)
 	}
 
 	if _, err := store.RevokeTokens(ctx, oauth.TokenFilter{Subject: "usr_1"}); err != nil {
@@ -107,6 +112,43 @@ func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
 	}
 	if _, err := store.AuthRequestByCode(ctx, "code-to-redeem"); err == nil {
 		t.Fatal("the authorization code survived the Kill Switch and can still mint tokens")
+	}
+}
+
+// The lookup is the claim: the DELETE ... RETURNING makes the code single-use, so
+// two exchanges cannot both succeed.
+func TestAuthorizationCodeIsSingleUse(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	ar := newAuthRequest(t, ctx, store)
+	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuthCode(ctx, ar.GetID(), "single-use-code"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "single-use-code"); err != nil {
+		t.Fatalf("first exchange refused: %v", err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "single-use-code"); err == nil {
+		t.Fatal("the authorization code was accepted twice")
+	}
+}
+
+// An expired code must not be redeemable just because the periodic sweep has not
+// run yet.
+func TestExpiredAuthorizationCodeIsRefused(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	ar := newAuthRequest(t, ctx, store)
+	if err := store.SaveAuthCode(ctx, ar.GetID(), "expired-code"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx,
+		`UPDATE oidc_codes SET expires_at = now() - interval '1 minute' WHERE code_hash = $1`,
+		hashValue("expired-code")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "expired-code"); err == nil {
+		t.Fatal("an expired authorization code was accepted")
 	}
 }
 
