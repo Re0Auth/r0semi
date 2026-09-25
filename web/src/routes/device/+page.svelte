@@ -113,7 +113,12 @@
 			? pending.scopes.filter((s) => s.explicit_consent && selected[s.scope] && !acknowledged[s.scope])
 			: []
 	);
-	const canApprove = $derived(granted.length > 0 && unacknowledged.length === 0 && busy === null);
+	// The countdown is a state, not decoration: once it reaches zero the code is no
+	// longer approvable, so the button must stop offering an action that will fail.
+	const expired = $derived(remaining !== null && remaining <= 0);
+	const canApprove = $derived(
+		granted.length > 0 && unacknowledged.length === 0 && busy === null && !expired
+	);
 
 	async function decide(decision: 'approve' | 'deny') {
 		if (!pending) return;
@@ -229,7 +234,9 @@
 				<p class="mt-0.5 font-mono text-sm tracking-widest">{pending.user_code}</p>
 			</div>
 			{#if countdown}
-				<p class="text-xs tabular-nums text-ink-muted">剩余 {countdown}</p>
+				<p class="text-xs tabular-nums {expired ? 'text-danger' : 'text-ink-muted'}">
+					{expired ? '已过期' : `剩余 ${countdown}`}
+				</p>
 			{/if}
 		</div>
 		<ScopeList
@@ -240,7 +247,9 @@
 			onAcknowledge={(scope, on) => (acknowledged = { ...acknowledged, [scope]: on })}
 		/>
 		<div class="flex flex-col gap-3 border-t border-line px-4 py-3">
-			{#if actionError}
+			{#if expired}
+				<Alert tone="warn" title="代码已过期">回到你的设备上重新获取一个，再填到这里。</Alert>
+			{:else if actionError}
 				<Alert tone="danger" title="没有完成">{actionError}</Alert>
 			{:else if unacknowledged.length > 0}
 				<p class="text-xs text-danger">有权限需要单独确认后才能继续。</p>
@@ -248,9 +257,12 @@
 				<p class="text-xs text-ink-muted">你没有勾选任何权限。请至少保留一项，或拒绝这次请求。</p>
 			{/if}
 			<div class="flex flex-wrap items-center justify-end gap-2">
-				<Button variant="secondary" loading={busy === 'deny'} disabled={busy !== null} onclick={() => decide('deny')}>
-					拒绝
-				</Button>
+				<Button
+					variant="secondary"
+					loading={busy === 'deny'}
+					disabled={busy !== null || expired}
+					onclick={() => decide('deny')}>拒绝</Button
+				>
 				<Button variant="primary" loading={busy === 'approve'} disabled={!canApprove} onclick={() => decide('approve')}>
 					批准登录
 				</Button>

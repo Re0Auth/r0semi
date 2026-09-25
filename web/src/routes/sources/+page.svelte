@@ -43,14 +43,22 @@
 		const bindError = new URLSearchParams(window.location.search).get('error');
 
 		try {
-			const [session, mine, all] = await Promise.all([
+			// The sources catalogue is public and less critical than the account's own
+			// bindings: a catalogue outage must not take away the ability to manage
+			// connections the account already has.
+			const [session, mine, all] = await Promise.allSettled([
 				api.currentSession(),
 				api.listBindings(),
 				api.listAllSources()
 			]);
-			csrf = session.csrf_token;
-			bindings = mine.data;
-			available = all.data;
+			if (session.status === 'rejected') throw session.reason;
+			if (mine.status === 'rejected') throw mine.reason;
+			csrf = session.value.csrf_token;
+			bindings = mine.value.data;
+			available = all.status === 'fulfilled' ? all.value.data : [];
+			if (all.status === 'rejected') {
+				actionError = '数据源列表暂时读不到，已连接的仍可管理。';
+			}
 			phase = 'ready';
 			if (bindError) {
 				actionError = '连接没有完成，数据源可能拒绝了授权或被取消。';
@@ -66,6 +74,13 @@
 	}
 
 	const key = (s: { game: string; source: string }) => `${s.game}/${s.source}`;
+
+	// What a source exposes, looked up from the catalogue. Both cards show it, so
+	// the decision to connect (and the reminder of what was connected) is about
+	// data, not just a provider name.
+	function resourcesFor(sourceKey: string): string[] {
+		return available.find((s) => key(s) === sourceKey)?.resources.map((r) => r.name) ?? [];
+	}
 
 	// What is not connected yet. A retired source is left out: offering a button
 	// that the server will refuse is worse than not offering it.
@@ -227,9 +242,6 @@
 		{#if outcome}
 			<Alert tone={upstreamCopy[outcome.upstream].tone} title="{outcome.source}：{upstreamCopy[outcome.upstream].title}" class="lg:col-span-2">
 				{upstreamCopy[outcome.upstream].body}
-				{#if outcome.error}
-					<span class="font-mono text-xs">（{outcome.error}）</span>
-				{/if}
 			</Alert>
 		{/if}
 
@@ -272,6 +284,12 @@
 									{/if}
 								</div>
 							</div>
+
+							{#if resourcesFor(key(binding)).length > 0}
+								<p class="border-b border-line px-4 py-2 text-xs text-ink-muted">
+									可读取 {resourcesFor(key(binding)).join('、')}
+								</p>
+							{/if}
 
 							{#if !binding.configured}
 								<p class="border-b border-line px-4 py-2 text-sm text-pretty text-warn">
@@ -384,6 +402,9 @@
 								<div class="min-w-0">
 									<p class="text-base font-medium">{src.display_name}</p>
 									<p class="mt-0.5 font-mono text-xs break-all text-ink-faint">{key(src)}</p>
+									{#if src.resources.length > 0}
+										<p class="mt-1 text-xs text-ink-muted">可读取 {src.resources.map((r) => r.name).join('、')}</p>
+									{/if}
 								</div>
 								<div class="flex flex-wrap items-center gap-2">
 									{#if src.status === 'degraded'}

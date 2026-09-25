@@ -65,12 +65,15 @@ export interface Problem {
 export class ApiError extends Error {
 	readonly status: number;
 	readonly problem: Problem;
+	/** Seconds the server asked the client to wait, when it sent Retry-After. */
+	readonly retryAfter?: number;
 
-	constructor(status: number, problem: Problem) {
+	constructor(status: number, problem: Problem, retryAfter?: number) {
 		super(problem.detail ?? problem.title);
 		this.name = 'ApiError';
 		this.status = status;
 		this.problem = problem;
+		this.retryAfter = retryAfter;
 	}
 
 	get code(): ProblemCode | LocalProblemCode {
@@ -242,6 +245,26 @@ interface CallOptions {
 	csrf?: string;
 }
 
+/** Per-attempt deadline. A request that hangs forever is a dead end, not a wait. */
+const REQUEST_TIMEOUT_MS = 15_000;
+/** Total attempts for a retryable request. Only GETs are retried. */
+const MAX_ATTEMPTS = 3;
+
+/** Retry-After in seconds, from either the delta form or an HTTP date. */
+function retryAfterSeconds(res: Response): number | undefined {
+	const raw = res.headers.get('Retry-After');
+	if (!raw) return undefined;
+	const seconds = Number(raw);
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds);
+	const at = Date.parse(raw);
+	if (Number.isNaN(at)) return undefined;
+	return Math.max(0, Math.ceil((at - Date.now()) / 1000));
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function call<T>(
 	method: 'GET' | 'POST' | 'DELETE',
 	path: string,
@@ -251,17 +274,41 @@ async function call<T>(
 	if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
 	if (opts.csrf) headers['X-CSRF-Token'] = opts.csrf;
 
-	let res: Response;
-	try {
-		res = await fetch(path, {
-			method,
-			headers,
-			credentials: 'same-origin',
-			body: opts.body === undefined ? undefined : JSON.stringify(opts.body)
-		});
-	} catch (cause) {
-		throw new ApiError(0, local('network_error', cause instanceof Error ? cause.message : 'network request failed'));
+	let res: Response | undefined;
+	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+		try {
+			res = await fetch(path, {
+				method,
+				headers,
+				credentials: 'same-origin',
+				signal: controller.signal,
+				body: opts.body === undefined ? undefined : JSON.stringify(opts.body)
+			});
+		} catch (cause) {
+			clearTimeout(timer);
+			if (method === 'GET' && attempt < MAX_ATTEMPTS) {
+				await sleep(200 * attempt);
+				continue;
+			}
+			throw new ApiError(
+				0,
+				local('network_error', cause instanceof Error ? cause.message : 'network request failed')
+			);
+		}
+		clearTimeout(timer);
+
+		// Only idempotent requests are retried, and only on the statuses that mean
+		// "try again", never on a 4xx the client caused.
+		if (method === 'GET' && attempt < MAX_ATTEMPTS && [502, 503, 504].includes(res.status)) {
+			const after = retryAfterSeconds(res) ?? 0;
+			await sleep(Math.min(after * 1000, 2000) + 100 * attempt);
+			continue;
+		}
+		break;
 	}
+	if (!res) throw new ApiError(0, local('network_error', 'network request failed'));
 
 	if (res.status === 204) return undefined as T;
 
@@ -274,12 +321,19 @@ async function call<T>(
 			// A JSON content type that is not JSON means something between here and
 			// the server answered instead: a proxy, a captive portal, an error page.
 			// Saying so is more useful than a SyntaxError.
-			throw new ApiError(res.status, local('malformed_response', `expected JSON, got ${res.headers.get('content-type') ?? 'no content type'}`));
+			throw new ApiError(
+				res.status,
+				local('malformed_response', `expected JSON, got ${res.headers.get('content-type') ?? 'no content type'}`)
+			);
 		}
 	}
 
 	if (!res.ok) {
-		throw new ApiError(res.status, looksLikeProblem(body) ? body : local('malformed_response', `unexpected ${res.status} response shape`));
+		throw new ApiError(
+			res.status,
+			looksLikeProblem(body) ? body : local('malformed_response', `unexpected ${res.status} response shape`),
+			retryAfterSeconds(res)
+		);
 	}
 	return body as T;
 }

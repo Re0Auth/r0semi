@@ -33,7 +33,9 @@
 	};
 </script>
 
-<ul class="divide-y divide-line">
+<fieldset class="min-w-0">
+	<legend class="sr-only">请求的权限</legend>
+	<ul class="divide-y divide-line">
 	{#each scopes as s (s.scope)}
 		<li class="px-4 py-3">
 			<div class="flex items-start gap-3">
@@ -88,4 +90,5 @@
 			</div>
 		</li>
 	{/each}
-</ul>
+	</ul>
+</fieldset>

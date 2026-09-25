@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 
 	"github.com/Re0Auth/r0semi/internal/account"
@@ -101,7 +102,12 @@ func (s *service) revokeUpstream(ctx context.Context, src Source, binding Bindin
 		// caller, and the Kill Switch's counters, that no upstream action was needed
 		// while no revocation request had been sent at all: an incident responder
 		// read "every source was told" and every upstream token was still live.
-		return RevocationUnavailable, err.Error()
+		//
+		// The wire answer is a stable code, not err.Error(): the underlying error can
+		// name internal hosts and paths, and the user-facing copy says what they can
+		// do about it. The text goes to the log, where an operator can read it.
+		slog.Warn("upstream revocation could not open the binding secret", "source", src.Name, "err", err)
+		return RevocationUnavailable, upstreamRevocationFailed
 	}
 
 	token, hint := preferredToken(secret)
@@ -110,7 +116,13 @@ func (s *service) revokeUpstream(ctx context.Context, src Source, binding Bindin
 	}
 	form := url.Values{"token": {token}, "token_type_hint": {hint}}
 	if err := s.postRevocation(ctx, src, src.RevocationEndpoint, form); err != nil {
-		return RevocationUnavailable, err.Error()
+		slog.Warn("upstream revocation request failed", "source", src.Name, "err", err)
+		return RevocationUnavailable, upstreamRevocationFailed
 	}
 	return RevocationDone, ""
 }
+
+// upstreamRevocationFailed is the only value UpstreamError carries. It is a
+// machine token, not a message: the details are in the log, and the UI renders
+// its own copy for the `unavailable` outcome.
+const upstreamRevocationFailed = "upstream_revocation_failed"

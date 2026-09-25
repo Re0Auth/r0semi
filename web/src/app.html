@@ -23,6 +23,26 @@
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">
+		<!--
+			The app is a client-rendered SPA, so a visitor with JavaScript disabled —
+			or one whose bootstrap was blocked by a CSP mistake — sees nothing at all.
+			This is the one piece of static content in the shell, and it says what
+			happened rather than leaving a blank page.
+		-->
+		<noscript>
+			<div
+				style="max-width: 34rem; margin: 4rem auto; padding: 0 1rem; font-family: system-ui, sans-serif; line-height: 1.6"
+			>
+				<h1 style="font-size: 1.25rem">Re0Auth 需要 JavaScript</h1>
+				<p>
+					授权确认和设备登录页面是单页应用，需要 JavaScript 才能显示。请在这个浏览器中启用
+					JavaScript 后重试。
+				</p>
+				<p style="color: #6b7280">
+					如果已经启用但仍然看到这个页面，可能是脚本被扩展或网络策略拦截了。
+				</p>
+			</div>
+		</noscript>
 		<div style="display: contents">%sveltekit.body%</div>
 	</body>
 </html>

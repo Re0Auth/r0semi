@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -223,8 +224,12 @@ func (s *Server) handleCascadeRevoke(w http.ResponseWriter, r *http.Request) {
 		// Nothing was removed, so the user can try again. Reporting the source's
 		// failure as a 200 with an outcome would suggest the logout half-succeeded;
 		// it did not succeed at all.
+		//
+		// The detail is deliberately generic: err.Error() can name internal hosts,
+		// URL paths and network details. The real text is logged for the operator.
+		slog.Warn("cascade revocation failed", "game", game, "source", source, "err", err)
 		s.writeProblem(w, r, http.StatusBadGateway, "upstream_unavailable",
-			"the data source could not end the session: "+err.Error())
+			"the data source could not end the session; try again or check the source's status")
 		return
 	}
 	writeJSON(w, http.StatusOK, unbindView{Upstream: string(result.Upstream)})

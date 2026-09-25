@@ -12,6 +12,21 @@
 		{ href: `${base}/grants`, path: '/grants', label: '应用' },
 		{ href: `${base}/sources`, path: '/sources', label: '数据源' }
 	];
+
+	// A client-side navigation replaces the whole main region without moving
+	// focus, so a keyboard or screen-reader user stays where the old page was.
+	// Moving focus to the new main is the standard SPA fix; the first render is
+	// skipped so loading the app does not yank focus from the address bar.
+	let main: HTMLElement | undefined = $state();
+	let firstRender = true;
+	$effect(() => {
+		page.url.pathname;
+		if (firstRender) {
+			firstRender = false;
+			return;
+		}
+		main?.focus();
+	});
 </script>
 
 <div class="flex min-h-dvh flex-col">
@@ -59,7 +74,11 @@
 		do not. Widening the frame without that per-page work would just stretch every
 		line of text.
 	-->
-	<main class="shell-x shell-y mx-auto w-full max-w-2xl flex-1 py-8 lg:max-w-4xl">
+	<main
+		bind:this={main}
+		tabindex="-1"
+		class="shell-x shell-y mx-auto w-full max-w-2xl flex-1 py-8 outline-none lg:max-w-4xl"
+	>
 		<!--
 			The arrival replays per navigation, so the wrapper is keyed on the path:
 			the key changes and the animation runs again. Keyed on the path rather than

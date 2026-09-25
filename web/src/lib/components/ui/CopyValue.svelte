@@ -42,6 +42,7 @@
 >
 	{#if copied}
 		<span class="whitespace-nowrap">已复制</span>
+		<span class="sr-only" role="status">已复制</span>
 	{:else}
 		<svg class="size-3.5" viewBox="0 0 14 14" fill="none" aria-hidden="true">
 			<rect x="4.7" y="4.7" width="7.3" height="7.3" rx="1.6" stroke="currentColor" stroke-width="1.2" />

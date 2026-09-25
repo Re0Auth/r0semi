@@ -84,6 +84,13 @@
 			session = null;
 			phase = 'anonymous';
 		} catch (err) {
+			if (err instanceof ApiError && err.needsSignIn) {
+				// The session was already gone; that is the outcome the button asked
+				// for, so show the signed-out page rather than an error.
+				session = null;
+				phase = 'anonymous';
+				return;
+			}
 			detail = messageOf(err);
 			phase = 'failed';
 		} finally {
@@ -104,6 +111,11 @@
 			session = await api.currentSession();
 			confirmingUnlink = null;
 		} catch (err) {
+			if (err instanceof ApiError && err.needsSignIn) {
+				session = null;
+				phase = 'anonymous';
+				return;
+			}
 			authError = messageOf(err);
 		} finally {
 			unlinking = null;
@@ -188,15 +200,18 @@
 			<ul class="divide-y divide-line">
 				{#each session.identities as identity (identity.id)}
 					<li class="flex flex-wrap items-center gap-3 px-4 py-3">
-						{#if identity.avatar_url}
-							<img
-								src={identity.avatar_url}
-								alt=""
-								width="32"
-								height="32"
-								class="size-8 rounded-full border border-line"
-							/>
-						{/if}
+						<!--
+							A monogram, not the provider's avatar URL. The CSP only allows
+							same-origin images (which stops third-party tracking), so an
+							external avatar rendered as a broken box; a letter is both
+							always visible and always offline.
+						-->
+						<span
+							class="grid size-8 shrink-0 place-items-center rounded-full border border-line bg-surface-sunken text-xs font-semibold"
+							aria-hidden="true"
+						>
+							{identity.display_name.trim().charAt(0).toUpperCase() || '?'}
+						</span>
 						<div class="min-w-0 flex-1">
 							<p class="truncate text-base font-medium">{identity.display_name}</p>
 							<p class="truncate text-xs text-ink-muted">
@@ -249,7 +264,10 @@
 					</div>
 				</div>
 			{/if}
-			<div class="flex flex-col border-t border-line px-4 py-3 sm:flex-row sm:justify-end">
+			<div class="flex flex-col gap-2 border-t border-line px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+				<p class="text-xs text-ink-muted">
+					退出只结束这个浏览器的会话；已经授权的应用仍然可以访问你的数据。
+				</p>
 				<Button
 					variant="secondary"
 					class="w-full sm:w-auto"
