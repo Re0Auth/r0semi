@@ -371,17 +371,23 @@ func TestOIDCTokenLifecycle(t *testing.T) {
 		t.Fatalf("introspection scopes = %v", intro.Scope)
 	}
 
-	// Revoking the access token makes introspection fail.
+	// A revoke from the wrong client is refused while the token still exists.
+	// (After the owner revokes it below, an unknown-token revoke is RFC 7009
+	// success instead — that is tested by the whole-grant assertion after this.)
+	if oidcErr := store.RevokeToken(ctx, refresh, "usr_1", "someone-else"); oidcErr == nil {
+		t.Fatal("wrong client allowed to revoke")
+	}
+
+	// Revoking the access token makes introspection fail, and cuts the paired
+	// refresh token with it: the two are one grant.
 	if oidcErr := store.RevokeToken(ctx, accessID, "usr_1", "oidc-web"); oidcErr != nil {
 		t.Fatalf("revoke: %v", oidcErr)
 	}
 	if err := store.SetIntrospectionFromToken(ctx, &oidc.IntrospectionResponse{}, accessID, "usr_1", "oidc-web"); err == nil {
 		t.Fatal("revoked token still introspects")
 	}
-
-	// A revoke from the wrong client is refused.
-	if oidcErr := store.RevokeToken(ctx, refresh, "usr_1", "someone-else"); oidcErr == nil {
-		t.Fatal("wrong client allowed to revoke")
+	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err == nil {
+		t.Fatal("the paired refresh token survived access-token revocation")
 	}
 
 	var tokenEvents int
