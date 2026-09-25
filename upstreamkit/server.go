@@ -44,7 +44,7 @@ type ResourceHandler func(ctx context.Context, subject string) (any, error)
 
 // Hooks are the source-specific parts the kit delegates to.
 type Hooks struct {
-	// OAuth is a full OAuth 2.0 authorization server core. internal/oauth is a
+	// OAuth is a full OAuth 2.0 authorization server core. oauth is a
 	// ready-made implementation.
 	OAuth oauth.Service
 	// Scope is the scope registry the OAuth core was built with.

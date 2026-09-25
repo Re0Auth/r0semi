@@ -1,6 +1,6 @@
 // Package idp is the r0semi OAuth *client* for external identity providers.
 //
-// It is the reverse of internal/oauth: here r0semi authenticates a human
+// It is the reverse of oauth: here r0semi authenticates a human
 // against GitHub/Google/Discord/QQ/Microsoft. It owns no account state; it turns
 // a provider callback into a canonical Identity, which internal/account then
 // maps to a usr_. See docs/account-model.md.
