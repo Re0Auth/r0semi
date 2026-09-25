@@ -34,6 +34,7 @@ export type ProblemCode =
 	| 'not_acceptable'
 	| 'not_found'
 	| 'rate_limited'
+	| 'reauth_required'
 	| 'scope_not_granted'
 	| 'source_not_bound'
 	| 'source_retired'
@@ -248,6 +249,38 @@ export interface AccountDeletion {
 	result: Record<string, unknown>;
 }
 
+/** One downstream client, as the operator plane sees it. Never carries a secret. */
+export interface AdminClient {
+	client_id: string;
+	name: string;
+	type: 'public' | 'confidential';
+	status: 'active' | 'suspended';
+	redirect_uris: string[];
+	allowed_scopes: string[];
+	created_at: string;
+}
+
+export interface AdminRegistration {
+	client: AdminClient;
+	/** Present exactly once, at registration. The server cannot read it back. */
+	client_secret?: string;
+}
+
+export interface KillSwitchReport {
+	tokens_revoked: number;
+	sessions_revoked: number;
+	clients_suspended: number;
+	bindings?: {
+		total: number;
+		revoked: number;
+		cascade: number;
+		unsupported: number;
+		unavailable: number;
+		orphaned: number;
+		failed: number;
+	};
+}
+
 function local(code: LocalProblemCode, detail: string): Problem {
 	return { type: 'about:blank', title: 'Request failed', status: 0, code, detail };
 }
@@ -418,6 +451,30 @@ export const api = {
 			body: { acknowledge: 'deletes_my_account' },
 			csrf
 		}),
+
+	// Operator plane. Every write here needs a fresh authentication; a
+	// `reauth_required` code means the operator must sign in again.
+	listAdminClients: () =>
+		call<{ data: AdminClient[]; csrf_token: string }>('GET', '/v1/admin/clients'),
+
+	registerAdminClient: (
+		csrf: string,
+		body: { name: string; type: string; redirect_uris: string[]; scopes: string[] }
+	) => call<AdminRegistration>('POST', '/v1/admin/clients', { body, csrf }),
+
+	suspendAdminClient: (clientId: string, csrf: string) =>
+		call<void>('POST', `/v1/admin/clients/${encodeURIComponent(clientId)}/suspend`, { csrf }),
+
+	activateAdminClient: (clientId: string, csrf: string) =>
+		call<void>('POST', `/v1/admin/clients/${encodeURIComponent(clientId)}/activate`, { csrf }),
+
+	deleteAdminClient: (clientId: string, csrf: string) =>
+		call<void>('DELETE', `/v1/admin/clients/${encodeURIComponent(clientId)}`, { csrf }),
+
+	killSwitch: (
+		csrf: string,
+		target: { target: 'all' | 'client' | 'subject' | 'bindings'; client_id?: string; subject?: string }
+	) => call<KillSwitchReport>('POST', '/v1/admin/kill_switch', { body: target, csrf }),
 
 	// 200 with a body, not 204: whether the source was actually told is part of
 	// the answer, and a bare success would overstate what happened.

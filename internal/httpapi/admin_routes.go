@@ -69,8 +69,9 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// requireAdminWrite is requireAdmin plus the CSRF check every mutating admin
-// endpoint needs. Both conditions produce a documented problem code.
+// requireAdminWrite is requireAdmin plus the checks every mutating admin endpoint
+// needs: a valid CSRF token and a recent enough authentication. Both conditions
+// produce a documented problem code.
 func (s *Server) requireAdminWrite(w http.ResponseWriter, r *http.Request) bool {
 	if !s.requireAdmin(w, r) {
 		return false
@@ -78,6 +79,18 @@ func (s *Server) requireAdminWrite(w http.ResponseWriter, r *http.Request) bool 
 	if !s.sessions.ValidCSRF(r) {
 		s.writeProblem(w, r, http.StatusForbidden, "invalid_request", "missing or invalid CSRF token")
 		return false
+	}
+	// Step-up by re-login. There is no password or second factor to ask for, so
+	// "recently authenticated" is the strongest available bound on a stolen or
+	// long-idle operator session: suspend, delete and Kill Switch all require a
+	// fresh sign-in once the window has passed.
+	if s.adminReauth > 0 {
+		at, ok := s.sessions.AuthenticatedAt(r.Context())
+		if !ok || time.Since(at) > s.adminReauth {
+			s.writeProblem(w, r, http.StatusForbidden, "reauth_required",
+				"sign in again to continue; this action needs a recent authentication")
+			return false
+		}
 	}
 	return true
 }

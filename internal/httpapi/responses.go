@@ -45,6 +45,7 @@ var problemTitles = map[string]string{
 	"not_acceptable":            "Not acceptable",
 	"upstream_unavailable":      "Upstream unavailable",
 	"explicit_consent_required": "Explicit consent required",
+	"reauth_required":           "Re-authentication required",
 	"internal_error":            "Internal error",
 }
 

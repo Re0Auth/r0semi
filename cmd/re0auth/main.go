@@ -344,6 +344,11 @@ func main() {
 	// The operator plane. It is mounted only when a deployment names at least one
 	// admin account; `httpapi.New` rejects a service with an empty allowlist, and
 	// this skips it entirely rather than mounting a door with no lock.
+	// Operator step-up window. Set unconditionally: it is inert when the operator
+	// plane is not mounted, and a value that only applies in some deployments is
+	// easier to reason about than one wired in two places.
+	apiConfig.AdminReauthWindow = cfg.AdminReauthWindow
+
 	if len(cfg.adminSubjects) > 0 {
 		adminSvc, err := admin.New(admin.Config{
 			Clients:  store.clients,

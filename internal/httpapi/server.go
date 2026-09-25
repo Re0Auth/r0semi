@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/account"
@@ -116,6 +117,12 @@ type Config struct {
 	// with no service would be a promise that does nothing.
 	Admin  admin.Service
 	Admins []account.UserID
+	// AdminReauthWindow is how recently the operator must have authenticated for
+	// a mutating admin call to be accepted. Zero disables the check. It is
+	// step-up by re-login: there is no second factor to prompt for, and an
+	// operator session that has been idle for hours should not be able to
+	// suspend clients or erase bindings without signing in again.
+	AdminReauthWindow time.Duration
 
 	// Deleter, when set together with Sessions, enables DELETE /v1/account: the
 	// signed-in account erasing itself. It is optional because a deployment can
@@ -193,6 +200,9 @@ type Server struct {
 	adminSvc admin.Service
 	// adminAllowed is the allowlist of account subjects that may call it.
 	adminAllowed map[account.UserID]bool
+	// adminReauth is how recent the session's authentication must be for a
+	// mutating admin call. Zero disables the check.
+	adminReauth time.Duration
 	// deleter erases the signed-in account; nil when self-service erasure is off.
 	deleter AccountDeleter
 	// auditReader reads the audit log for the operator plane; nil when that plane
@@ -286,6 +296,7 @@ func New(cfg Config) (*Server, error) {
 		devices:      cfg.DeviceStore,
 		adminSvc:     cfg.Admin,
 		adminAllowed: adminAllowed,
+		adminReauth:  cfg.AdminReauthWindow,
 		deleter:      cfg.Deleter,
 		auditReader:  cfg.Audit,
 	}

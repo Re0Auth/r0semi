@@ -176,6 +176,12 @@ scopes        = ["account.id", "phigros.profile.read"]
 # Environment override: RE0AUTH_ADMIN_SUBJECTS="usr_…,usr_…"
 subjects = []
 
+# How recent an operator's login must be for a mutating call (suspend, delete,
+# Kill Switch). There is no second factor to prompt for, so re-login is the
+# step-up. "0" disables the check.
+# Environment override: RE0AUTH_ADMIN_REAUTH_WINDOW="15m"
+reauth_window = "15m"
+
 # Identity providers. Only the ones listed here are offered, so a deployment
 # exposes exactly what it configured. Known names: github, google, discord,
 # microsoft, qq. Any other name is a **custom OIDC provider**: give it an issuer,

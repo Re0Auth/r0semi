@@ -45,6 +45,10 @@ type file struct {
 type adminSection struct {
 	// Subjects are account ids (`usr_…`) allowed to use /v1/admin.
 	Subjects []string `toml:"subjects"`
+	// ReauthWindow is how long an operator's login stays fresh enough for a
+	// mutating admin call, as a Go duration string ("15m"). Empty takes the
+	// default; "0" disables the check.
+	ReauthWindow string `toml:"reauth_window"`
 }
 
 type serverSection struct {
@@ -197,6 +201,9 @@ type settings struct {
 	RateLimitBurst int
 	// MaxInFlight caps concurrent requests. Zero disables the cap.
 	MaxInFlight int
+	// AdminReauthWindow bounds how old an operator login may be for a mutating
+	// admin call. Zero disables the check.
+	AdminReauthWindow time.Duration
 	// TrustedProxies are the networks whose X-Forwarded-For is believed when
 	// resolving the client address. Empty means no proxy is trusted.
 	TrustedProxies []netip.Prefix
@@ -261,6 +268,11 @@ const (
 	// enough that a burst of slow requests cannot exhaust database connections and
 	// memory before the limiter reacts.
 	defaultMaxInFlight = 512
+
+	// defaultAdminReauthWindow is how long an operator login stays fresh enough
+	// for a mutating admin call. Long enough not to re-login mid-incident, short
+	// enough that a stolen session does not keep operator power for a working day.
+	defaultAdminReauthWindow = 15 * time.Minute
 )
 
 // loadConfig reads the TOML file at path (empty = environment only), applies the
@@ -489,6 +501,25 @@ func loadConfig(path string) (settings, error) {
 				cfg.adminSubjects = append(cfg.adminSubjects, s)
 			}
 		}
+	}
+
+	// Operator step-up window. It only matters when the operator plane is
+	// mounted, but it is resolved unconditionally so a typo is reported rather
+	// than discovered at the first suspend.
+	reauthRaw := strings.TrimSpace(f.Admin.ReauthWindow)
+	if env := strings.TrimSpace(os.Getenv("RE0AUTH_ADMIN_REAUTH_WINDOW")); env != "" {
+		reauthRaw = env
+	}
+	cfg.AdminReauthWindow = defaultAdminReauthWindow
+	if reauthRaw != "" {
+		d, err := time.ParseDuration(reauthRaw)
+		if err != nil {
+			return settings{}, fmt.Errorf("admin.reauth_window %q is not a duration (e.g. 15m)", reauthRaw)
+		}
+		if d < 0 {
+			return settings{}, errors.New("admin.reauth_window cannot be negative (use 0 to disable)")
+		}
+		cfg.AdminReauthWindow = d
 	}
 
 	if err := loadIdP(&cfg, f.IdP); err != nil {

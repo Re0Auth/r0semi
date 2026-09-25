@@ -1631,6 +1631,7 @@ components:
             - not_acceptable
             - not_found
             - rate_limited
+            - reauth_required
             - scope_not_granted
             - source_not_bound
             - source_retired

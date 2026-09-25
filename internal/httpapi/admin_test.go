@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
@@ -313,6 +314,55 @@ func TestAdminKillSwitchBindingsTarget(t *testing.T) {
 	bindings, ok := rep["bindings"].(map[string]any)
 	if !ok || bindings["total"].(float64) != 2 || bindings["revoked"].(float64) != 2 {
 		t.Fatalf("bindings report = %v", rep["bindings"])
+	}
+}
+
+// Step-up: a mutating admin call needs a recent authentication. With a
+// vanishingly small window, a just-signed-in session is already stale, which is
+// the deterministic way to exercise the branch without sleeping.
+func TestAdminWriteRequiresRecentAuthentication(t *testing.T) {
+	manager := auth.NewManager(auth.Options{Secure: false})
+	s := &Server{
+		sessions:     manager,
+		adminAllowed: map[account.UserID]bool{"usr_admin": true},
+		adminReauth:  time.Nanosecond,
+	}
+
+	var csrf string
+	first := httptest.NewRecorder()
+	manager.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := manager.SignIn(r.Context(), "usr_admin"); err != nil {
+			t.Errorf("sign in: %v", err)
+		}
+		csrf = manager.CSRFToken(r.Context())
+	})).ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	cookies := first.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("sign-in produced no session cookie")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/clients", nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	req.Header.Set("X-CSRF-Token", csrf)
+
+	rec := httptest.NewRecorder()
+	manager.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.requireAdminWrite(w, r) {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("stale authentication = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
+	var problem map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatal(err)
+	}
+	if problem["code"] != "reauth_required" {
+		t.Fatalf("code = %v, want reauth_required", problem["code"])
 	}
 }
 
