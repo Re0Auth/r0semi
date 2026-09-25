@@ -812,6 +812,9 @@ func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.M
 		CryptoKey:   tokenKey,
 		CryptoKeyID: "re0auth",
 		Scopes:      scopes,
+		// Resource servers allowed to see tokens issued to other clients. Empty
+		// means a client may introspect only its own tokens.
+		IntrospectionClients: cfg.IntrospectionClients,
 		// Taken from the issuer's scheme, which is what the OP's question is
 		// actually about: "may this issuer be plain http". It used to be derived
 		// from cookie_secure — a different setting, about a different thing — and

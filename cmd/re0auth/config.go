@@ -69,6 +69,10 @@ type serverSection struct {
 	// default, because profiling endpoints belong on a private network and never
 	// on the public one. Point it at a loopback or cluster-internal address.
 	InternalAddr string `toml:"internal_addr"`
+	// IntrospectionClients lists client ids allowed to introspect tokens issued
+	// to other clients — resource servers. A client may always introspect its own
+	// tokens; empty means nobody else's are visible.
+	IntrospectionClients []string `toml:"introspection_clients"`
 }
 
 type storageSection struct {
@@ -194,6 +198,9 @@ type settings struct {
 	// InternalAddr is the address of the operational listener that serves metrics
 	// and profiling. Empty means it is not served at all.
 	InternalAddr string
+	// IntrospectionClients are the client ids allowed to introspect other
+	// clients' tokens. Empty means only a client's own tokens are visible.
+	IntrospectionClients []string
 	// Pool bounds the Postgres connection pool. Meaningless in memory mode; it is
 	// still resolved and validated there, so a typo is reported rather than
 	// discovered the day the deployment grows a database.
@@ -320,6 +327,18 @@ func loadConfig(path string) (settings, error) {
 	if cfg.InternalAddr != "" && cfg.InternalAddr == cfg.Addr {
 		return settings{}, errors.New(
 			"server.internal_addr must differ from server.addr: the operational surface is not the public one")
+	}
+
+	// Introspection policy. The environment overrides the file, like every other
+	// setting. Empty is the safe default: a client sees only its own tokens.
+	introspectionValues := f.Server.IntrospectionClients
+	if env := strings.TrimSpace(os.Getenv("RE0AUTH_INTROSPECTION_CLIENTS")); env != "" {
+		introspectionValues = strings.Split(env, ",")
+	}
+	for _, raw := range introspectionValues {
+		if id := strings.TrimSpace(raw); id != "" {
+			cfg.IntrospectionClients = append(cfg.IntrospectionClients, id)
+		}
 	}
 
 	// Storage. An explicit driver wins; otherwise a named DSN means postgres.

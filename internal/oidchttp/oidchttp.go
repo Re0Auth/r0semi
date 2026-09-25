@@ -78,6 +78,11 @@ type Config struct {
 	// Consent completes an authorization request after the user decides. It is
 	// the postgres OIDCStore. Optional for the protocol plane alone.
 	Consent ConsentStore
+	// IntrospectionClients are client ids allowed to introspect tokens issued to
+	// other clients — the resource servers this deployment trusts. A confidential
+	// client may always introspect its own tokens; without an entry here nobody
+	// else's are visible. Empty is the safe default.
+	IntrospectionClients []string
 }
 
 // ConsentStore is what the consent screen needs beyond op.Storage: marking an
@@ -109,6 +114,9 @@ type Handler struct {
 	// to derive it from (DenyAuthorization). A dynamic-issuer deployment is a
 	// development shape; it derives `iss` per request on the HTTP paths.
 	issuer string
+	// introspectionClients is the allowlist of client ids that may see tokens
+	// issued to other clients.
+	introspectionClients map[string]bool
 }
 
 // New builds the provider.
@@ -179,12 +187,19 @@ func New(cfg Config) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowedIntrospectors := make(map[string]bool, len(cfg.IntrospectionClients))
+	for _, id := range cfg.IntrospectionClients {
+		if id != "" {
+			allowedIntrospectors[id] = true
+		}
+	}
 	return &Handler{
-		provider: provider,
-		clients:  cfg.Clients,
-		registry: cfg.Registry,
-		consent:  cfg.Consent,
-		issuer:   strings.TrimRight(cfg.Issuer, "/"),
+		provider:             provider,
+		clients:              cfg.Clients,
+		registry:             cfg.Registry,
+		consent:              cfg.Consent,
+		issuer:               strings.TrimRight(cfg.Issuer, "/"),
+		introspectionClients: allowedIntrospectors,
 	}, nil
 }
 
@@ -335,6 +350,21 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// A request that names two different clients is malformed; the library bills
+	// the Authorization header and ignores the form value, so a mismatch between
+	// what a pre-flight checked and what the library used is exactly the shape of
+	// a bypass. This mirrors the device-endpoint rule.
+	if r.Method == http.MethodPost &&
+		(r.URL.Path == "/"+pathToken || r.URL.Path == "/"+pathIntrospection || r.URL.Path == "/"+pathRevocation) {
+		form := requestParams(r)
+		if basicID, _, hasBasic := r.BasicAuth(); hasBasic {
+			if id := strings.TrimSpace(form.Get("client_id")); id != "" && id != strings.TrimSpace(basicID) {
+				writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
+					"client_id does not match the authenticated client")
+				return
+			}
+		}
+	}
 	// The authorize entrance, for either method. `/oauth/authorize/callback` is the
 	// library's own leg and is deliberately not included: it carries no client or
 	// scope parameters, and validating it as an entrance would break the flow.
@@ -389,6 +419,8 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		// cached token (or error) is a cached secret.
 		bw.header.Set("Cache-Control", "no-store")
 		bw.header.Set("Pragma", "no-cache")
+	case r.URL.Path == "/"+pathIntrospection && bw.status == http.StatusOK:
+		body = h.filterIntrospection(body, callerClientID(r))
 	case bw.status >= 400 && !isOAuthErrorBody(bw.header.Get("Content-Type"), body):
 		body = normalizeOAuthFailure(bw, r.URL.Path)
 	}
@@ -681,6 +713,46 @@ func writeOAuthJSONError(w http.ResponseWriter, status int, code, description st
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_description": description})
+}
+
+// callerClientID resolves the client the way the library will: HTTP Basic if
+// present, else the form's client_id. It is used for the introspection policy, so
+// it must not pick a different identity than the authenticated one.
+func callerClientID(r *http.Request) string {
+	if id, _, ok := r.BasicAuth(); ok {
+		return strings.TrimSpace(id)
+	}
+	return strings.TrimSpace(requestParams(r).Get("client_id"))
+}
+
+// filterIntrospection hides a token's details from a client that neither owns it
+// nor is an allowlisted resource server. The answer stays a valid introspection
+// response with active=false rather than an error: the caller learns nothing
+// about the token, and a resource server that is not allowed to see it treats it
+// as unusable, which is the fail-closed direction.
+func (h *Handler) filterIntrospection(body []byte, caller string) []byte {
+	if caller == "" {
+		return body
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	var active bool
+	if raw, ok := payload["active"]; ok {
+		_ = json.Unmarshal(raw, &active)
+	}
+	if !active {
+		return body
+	}
+	var tokenClient string
+	if raw, ok := payload["client_id"]; ok {
+		_ = json.Unmarshal(raw, &tokenClient)
+	}
+	if tokenClient == "" || tokenClient == caller || h.introspectionClients[caller] {
+		return body
+	}
+	return []byte(`{"active":false}`)
 }
 
 // validPKCEValue reports whether s is a well-formed RFC 7636 code challenge or

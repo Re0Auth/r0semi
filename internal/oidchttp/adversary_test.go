@@ -67,6 +67,15 @@ func adversaryBody(t *testing.T, resp *http.Response) []byte {
 	return b
 }
 
+func adversaryJSON(t *testing.T, resp *http.Response) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(adversaryBody(t, resp), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 func adversaryPost(t *testing.T, f fixture, path string, form url.Values) (*http.Response, error) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, f.server.URL+path, strings.NewReader(form.Encode()))
@@ -303,6 +312,47 @@ func TestAdversarialMalformedPKCEValuesAreRejected(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "code_verifier") {
 		t.Fatalf("refusal does not name the verifier: %s", body)
+	}
+}
+
+// Introspection must not be a cross-client token oracle. A client may see its
+// own tokens, but another registered client learns only active=false unless the
+// deployment allowlists it as a resource server.
+func TestAdversarialIntrospectionIsScopedToItsOwner(t *testing.T) {
+	f := newFixture(t)
+	tokens := codeFlow(t, f, []string{"account.id"})
+	access, _ := tokens["access_token"].(string)
+	if access == "" {
+		t.Fatalf("no access token: %v", tokens)
+	}
+
+	introspect := func(clientID, secret string) map[string]any {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+"/oauth/introspect",
+			strings.NewReader(url.Values{"token": {access}}.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.SetBasicAuth(clientID, secret)
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return adversaryJSON(t, resp)
+	}
+
+	own := introspect(f.webID, "s3cret")
+	if own["active"] != true {
+		t.Fatalf("the issuing client could not introspect its own token: %v", own)
+	}
+
+	other := introspect(f.narrowID, "nsecret")
+	if other["active"] != false {
+		t.Fatalf("a different client introspected another client's token: %v", other)
+	}
+	if _, leaked := other["scope"]; leaked {
+		t.Fatalf("cross-client introspection leaked scope: %v", other)
 	}
 }
 
