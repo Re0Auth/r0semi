@@ -1,0 +1,13 @@
+# Who reviews what.
+#
+# One owner means one catch-all rule is the whole file: everything falls to the
+# maintainer, and GitHub's "no owner" warning does not apply to anything. Add
+# narrower rules here when a subsystem gains a second maintainer — split by
+# directory (`/internal/store/postgres/`), not by file, or the list becomes
+# something to maintain rather than to read.
+#
+# The handle needs write access to the repository. Without it GitHub ignores the
+# rule and stops requesting the review, and says nothing about it — which is why
+# `internal/archtest` checks this file's shape: a typo here fails nothing, it just
+# quietly stops routing.
+* @Sczr0
