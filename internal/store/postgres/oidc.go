@@ -36,6 +36,14 @@ type OIDCStore struct {
 	signer   *oidcstore.Signer
 	audit    audit.Logger
 
+	// now is the clock every deadline this store writes is written with — and
+	// judged with, in SQL as well as in Go. One clock per value is the point: a
+	// deadline written by this process and compared against the database's now()
+	// (or another replica's clock) expires at a time nobody chose, and the failure
+	// is early eviction — a live session swept, a redeemable code refused. Set by
+	// NewOIDCStore and overridden by DB.OIDC with the handle's clock; never nil.
+	now func() time.Time
+
 	accessTTL  time.Duration
 	refreshTTL time.Duration
 	requestTTL time.Duration
@@ -78,6 +86,7 @@ func NewOIDCStore(pool *pgxpool.Pool, clients oauth.ClientRegistry, opts OIDCOpt
 		login:      opts.Login,
 		signer:     opts.Signer,
 		audit:      opts.Audit,
+		now:        time.Now,
 		accessTTL:  time.Hour,
 		refreshTTL: 30 * 24 * time.Hour,
 		requestTTL: requestTTL(opts.RequestTTL),
@@ -91,9 +100,16 @@ func requestTTL(configured time.Duration) time.Duration {
 	return 30 * time.Minute
 }
 
-// OIDC returns the OpenID Provider storage on the migrated database.
+// OIDC returns the OpenID Provider storage on the migrated database. The store
+// inherits the handle's clock, so every deadline it writes is judged by the same
+// clock — see OIDCStore.now.
 func (db *DB) OIDC(clients oauth.ClientRegistry, opts OIDCOptions) (*OIDCStore, error) {
-	return NewOIDCStore(db.pool, clients, opts)
+	s, err := NewOIDCStore(db.pool, clients, opts)
+	if err != nil {
+		return nil, err
+	}
+	s.now = db.now
+	return s, nil
 }
 
 func hashValue(v string) string {
@@ -127,7 +143,7 @@ func (s *OIDCStore) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest
 		challenge = req.CodeChallenge
 		method = string(req.CodeChallengeMethod)
 	}
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO oidc_auth_requests
 			(id, client_id, redirect_uri, response_type, response_mode, scopes, state, nonce,
@@ -176,8 +192,8 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 
 	var requestID string
 	if err := tx.QueryRow(ctx,
-		`DELETE FROM oidc_codes WHERE code_hash = $1 AND expires_at > now() RETURNING request_id`,
-		hashValue(code)).Scan(&requestID); err != nil {
+		`DELETE FROM oidc_codes WHERE code_hash = $1 AND expires_at > $2 RETURNING request_id`,
+		hashValue(code), s.now()).Scan(&requestID); err != nil {
 		return nil, errors.New("postgres: authorization code is unknown or expired")
 	}
 
@@ -228,7 +244,7 @@ func (s *OIDCStore) SaveAuthCode(ctx context.Context, id, code string) error {
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO oidc_codes (code_hash, request_id, expires_at) VALUES ($1,$2,$3)
 		ON CONFLICT (code_hash) DO UPDATE SET request_id = EXCLUDED.request_id`,
-		hashValue(code), id, time.Now().UTC().Add(s.requestTTL)); err != nil {
+		hashValue(code), id, s.now().UTC().Add(s.requestTTL)); err != nil {
 		return fmt.Errorf("postgres: save auth code: %w", err)
 	}
 	return nil
@@ -257,7 +273,7 @@ func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenReque
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	expires := time.Now().UTC().Add(s.accessTTL)
+	expires := s.now().UTC().Add(s.accessTTL)
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)
 		VALUES ($1,$2,$3,$4,$5)`,
@@ -317,7 +333,7 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	amr = oidcstore.NonNil(amr)
 	audience = oidcstore.NonNil(audience)
 
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	expires := now.Add(s.accessTTL)
 
 	tx, err := s.pool.Begin(ctx)
@@ -525,7 +541,7 @@ func (s *OIDCStore) SetIntrospectionFromToken(ctx context.Context, introspection
 		hashValue(tokenID)).Scan(&clientID, &scopes, &expires); err != nil {
 		return errors.New("postgres: token not found")
 	}
-	if !expires.After(time.Now()) {
+	if !expires.After(s.now()) {
 		return errors.New("postgres: token expired")
 	}
 	introspection.Active = true
@@ -732,10 +748,10 @@ func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, 
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT client_id, scopes, issued_at, expires_at, false
-		  FROM oidc_access_tokens WHERE subject = $1 AND expires_at > now()
+		  FROM oidc_access_tokens WHERE subject = $1 AND expires_at > $2
 		UNION ALL
 		SELECT client_id, scopes, issued_at, expires_at, true
-		  FROM oidc_refresh_tokens WHERE subject = $1 AND expires_at > now()`, subject)
+		  FROM oidc_refresh_tokens WHERE subject = $1 AND expires_at > $2`, subject, s.now())
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list grants: %w", err)
 	}
@@ -933,7 +949,7 @@ func (s *OIDCStore) PurgeSubject(ctx context.Context, subject string) (int, erro
 // pending device grant (OP-backed counterpart of the same oauth.Service method).
 func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error) {
 	st, err := s.DeviceByUserCode(ctx, userCode)
-	if err != nil || st.Done || st.Denied || time.Now().After(st.Expires) {
+	if err != nil || st.Done || st.Denied || s.now().After(st.Expires) {
 		return oauth.DeviceAuthorization{}, oauth.ErrDeviceNotFound
 	}
 	client, err := s.clients.Get(ctx, st.ClientID)
@@ -963,7 +979,7 @@ func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, sub
 		return &oauth.Error{Code: "access_denied", Description: "user is not authenticated"}
 	}
 	st, err := s.DeviceByUserCode(ctx, userCode)
-	if err != nil || st.Done || st.Denied || time.Now().After(st.Expires) {
+	if err != nil || st.Done || st.Denied || s.now().After(st.Expires) {
 		return oauth.ErrDeviceNotFound
 	}
 	if !approve {

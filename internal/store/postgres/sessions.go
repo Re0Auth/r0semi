@@ -17,7 +17,16 @@ import (
 //
 // Rows are keyed by sha256(cookie value): a dumped table is not a set of usable
 // session cookies.
-type Sessions struct{ pool *pgxpool.Pool }
+type Sessions struct {
+	pool *pgxpool.Pool
+	// now is the clock this store judges expiry by. scs computes the expiry it
+	// hands Commit from its own clock, so the value is a Go-clock timestamp and
+	// must be judged by one: comparing it against the database's now() (which is
+	// what SweepExpired used to do) expires sessions at a time that depends on the
+	// skew between two machines — early, when the database's clock is ahead.
+	// Never nil; set by DB.Sessions.
+	now func() time.Time
+}
 
 // Compile-time proof that the shape still matches scs's interface.
 var _ scs.Store = (*Sessions)(nil)
@@ -53,7 +62,7 @@ func (s *Sessions) Find(token string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if !time.Now().Before(expiry) {
+	if !s.now().Before(expiry) {
 		_ = s.Delete(token)
 		return nil, false, nil
 	}
@@ -75,6 +84,10 @@ func (s *Sessions) Commit(token string, data []byte, expiry time.Time) error {
 // SweepExpired deletes expired rows. Find already removes the sessions it is
 // asked about, so this is for the ones nobody comes back to.
 //
+// `expiry` is judged by this process's clock, the same one scs wrote it with (see
+// the field comment); the index rows below are judged by the database, because
+// their `created_at` is written by the database's own DEFAULT.
+//
 // The index rows it collects are aged by sessionIndexGrace. They have to be: an
 // index row is written during SignIn, but scs commits the session row only when
 // the response is written, so for the length of one request a live session has no
@@ -82,7 +95,7 @@ func (s *Sessions) Commit(token string, data []byte, expiry time.Time) error {
 // belonged to, and nothing rewrote it — a later subject Kill Switch then missed a
 // live session while the sweep looked complete.
 func (s *Sessions) SweepExpired(ctx context.Context) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE expiry < now()`)
+	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE expiry < $1`, s.now())
 	if err != nil {
 		return 0, err
 	}

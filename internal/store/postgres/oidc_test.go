@@ -18,7 +18,14 @@ import (
 
 func oidcFixture(t *testing.T) (*OIDCStore, *audit.MemoryLogger, context.Context) {
 	t.Helper()
-	db := openTestDB(t)
+	return oidcFixtureOn(t, openTestDB(t))
+}
+
+// oidcFixtureOn is oidcFixture over a caller-supplied handle, so a test that needs
+// a different option (a skewed store clock, see clock_test.go) still gets the same
+// registered clients and signer.
+func oidcFixtureOn(t *testing.T, db *DB) (*OIDCStore, *audit.MemoryLogger, context.Context) {
+	t.Helper()
 	ctx := context.Background()
 
 	web, err := oauth.NewClient("oidc-web", "Web", oauth.ClientConfidential, "s3cret",

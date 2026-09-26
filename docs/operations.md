@@ -100,6 +100,10 @@ DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backu
   - 大量 429 → 调整 `server.rate_limit` / `rate_limit_burst`，或检查是否有客户端刷接口。
   - 大量 503 → 调整 `server.max_in_flight`，或排查慢查询/上游拖慢。
   - 登录后无会话 → `cookie_secure` 与实际 scheme 不一致。
+  - 会话/授权码**提前**失效（不到 TTL 就没了）→ 查时钟偏移。过期判定用的是**写入方自己的时钟**
+    （`internal/store/postgres` 的时钟策略：Go 写的时间戳由 Go 时钟判，数据库 `DEFAULT now()` 写的
+    才由数据库判），所以这里剩下的偏移只可能来自**副本之间**——用 NTP 把副本与数据库拉齐。
+    另外 `curl -i` 看 `Date` 响应头也能快速判断本机与副本的时差。
 
 ## 审计链锚点核对
 

@@ -15,6 +15,11 @@ import (
 // sweep the tables keep every code, token and pending request the deployment ever
 // issued.
 //
+// Every deadline column here is written by this process (never by the database),
+// so every comparison is against this process's clock, passed in as a parameter.
+// Judging them with the database's now() instead is the two-clock mix that could
+// delete a row its writer still considered live; see DB.now.
+//
 // Sessions are not here. They have their own sweep (Sessions.SweepExpired), which
 // also collects the orphan session_subjects rows, so it stays the single place
 // that knows about that pair; the composition root runs both.
@@ -49,10 +54,11 @@ func (db *DB) SweepExpired(ctx context.Context) (int64, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	now := db.now()
 	var total int64
 	for _, t := range expiredTables {
 		tag, err := tx.Exec(ctx, fmt.Sprintf(
-			`DELETE FROM %s WHERE %s < now()`, t.table, t.column))
+			`DELETE FROM %s WHERE %s < $1`, t.table, t.column), now)
 		if err != nil {
 			return 0, fmt.Errorf("postgres: sweep %s: %w", t.table, err)
 		}

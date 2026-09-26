@@ -25,6 +25,14 @@ import (
 // (`go test` prints "ok" either way, so silence is not evidence.)
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
+	return openTestDBWith(t, DefaultPoolOptions())
+}
+
+// openTestDBWith is openTestDB with handle options — today, a replacement store
+// clock (WithClock), which is how the single-clock policy is asserted. Everything
+// else is shared, so a skewed-clock test cannot drift from the ordinary fixture.
+func openTestDBWith(t *testing.T, opts PoolOptions, options ...Option) *DB {
+	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		if os.Getenv("CI") != "" {
@@ -32,7 +40,7 @@ func openTestDB(t *testing.T) *DB {
 		}
 		t.Skip("TEST_DATABASE_URL is not set; skipping Postgres integration tests")
 	}
-	db, err := Open(context.Background(), dsn, DefaultPoolOptions())
+	db, err := Open(context.Background(), dsn, opts, options...)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

@@ -37,6 +37,28 @@ type DB struct {
 	// connectTimeout bounds establishing the migration connection, which is
 	// deliberately not taken from the pool. See Migrate.
 	connectTimeout time.Duration
+	// now is the clock every store handed out here writes its deadlines with — and
+	// judges them with, so a value is never compared against a different clock
+	// than the one that produced it. It is injectable (WithClock) because that
+	// policy is otherwise unassertable: a test cannot skew the database's clock,
+	// but it can skew this one and watch a deadline it wrote still be honoured.
+	now func() time.Time
+}
+
+// Option customises a DB at construction.
+type Option func(*DB)
+
+// WithClock replaces the store clock. Default: time.Now.
+//
+// Callers that do not set it get the process clock, which is the honest default:
+// the alternative — judging Go-written deadlines with the database's now() — is
+// exactly the two-clock mix this exists to remove. See OIDCStore.now.
+func WithClock(now func() time.Time) Option {
+	return func(db *DB) {
+		if now != nil {
+			db.now = now
+		}
+	}
 }
 
 // PoolOptions bounds the connection pool and the statements that run on it.
@@ -129,7 +151,10 @@ func (o PoolOptions) normalized() PoolOptions {
 // would otherwise apply are for a general-purpose program, not for one whose
 // every query is on a request's critical path. See PoolOptions for what each
 // bound buys.
-func Open(ctx context.Context, dsn string, opts PoolOptions) (*DB, error) {
+//
+// options customise the handle itself rather than the pool; today that means the
+// store clock (WithClock), which tests use to pin the single-clock policy.
+func Open(ctx context.Context, dsn string, opts PoolOptions, options ...Option) (*DB, error) {
 	opts = opts.normalized()
 	cfg, err := poolConfig(dsn, opts)
 	if err != nil {
@@ -149,7 +174,12 @@ func Open(ctx context.Context, dsn string, opts PoolOptions) (*DB, error) {
 		pool.Close()
 		return nil, fmt.Errorf("postgres: ping: %w", err)
 	}
-	db := &DB{pool: pool, dsn: dsn, connectTimeout: opts.ConnectTimeout}
+	db := &DB{pool: pool, dsn: dsn, connectTimeout: opts.ConnectTimeout, now: time.Now}
+	for _, opt := range options {
+		if opt != nil {
+			opt(db)
+		}
+	}
 	if err := db.Migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -227,7 +257,7 @@ func (db *DB) Bindings() *Bindings { return &Bindings{pool: db.pool} }
 func (db *DB) BindFlows() *BindFlows { return &BindFlows{pool: db.pool} }
 
 // Sessions returns the HTTP session store.
-func (db *DB) Sessions() *Sessions { return &Sessions{pool: db.pool} }
+func (db *DB) Sessions() *Sessions { return &Sessions{pool: db.pool, now: db.now} }
 
 // Clients returns the downstream-client registry.
 func (db *DB) Clients() *Clients { return &Clients{pool: db.pool} }
