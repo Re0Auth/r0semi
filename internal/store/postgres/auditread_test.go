@@ -224,6 +224,14 @@ func TestAuditQueryClampsThePageSize(t *testing.T) {
 	if page.Limit != maxAuditPage {
 		t.Fatalf("applied limit = %d, want the %d ceiling", page.Limit, maxAuditPage)
 	}
+	// The ceiling has to bound the allocation too, not just the number reported: the
+	// capacity must not be a function of what was asked for. Three rows came back, so
+	// a slice sized from the 11,000 requested would be plainly larger than one sized
+	// from the reader's default.
+	if got := cap(page.Entries); got > defaultAuditPage {
+		t.Fatalf("asking for %d allocated capacity %d, want no more than %d",
+			maxAuditPage+10_000, got, defaultAuditPage)
+	}
 
 	page, err = logger.Query(ctx, audit.Query{})
 	if err != nil {

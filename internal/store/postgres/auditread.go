@@ -89,7 +89,12 @@ func (l *AuditLogger) Query(ctx context.Context, q audit.Query) (audit.Page, err
 	}
 	defer rows.Close()
 
-	page := audit.Page{Entries: make([]audit.Entry, 0, limit), Limit: limit}
+	// The capacity is the reader's default, not the requested limit: sizing an
+	// allocation from a value that arrived in a request is a denial-of-service shape
+	// even when a clamp upstream makes it safe, so the capacity here does not depend
+	// on the request at all. A page larger than the default grows by append, and the
+	// SQL LIMIT is what bounds the rows in either case.
+	page := audit.Page{Entries: make([]audit.Entry, 0, defaultAuditPage), Limit: limit}
 	for rows.Next() {
 		var e audit.Entry
 		if err := rows.Scan(&e.ID, &e.Time, &e.Action, &e.Subject, &e.Provider,
