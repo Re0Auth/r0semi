@@ -23,15 +23,19 @@ import (
 // `go test ./...` works with no database running. In CI it is a hard failure:
 // a green build there must mean the SQL was executed, not that it was skipped.
 // (`go test` prints "ok" either way, so silence is not evidence.)
-func openTestDB(t *testing.T) *DB {
+func openTestDB(t testing.TB) *DB {
 	t.Helper()
 	return openTestDBWith(t, DefaultPoolOptions())
 }
 
 // openTestDBWith is openTestDB with handle options — today, a replacement store
-// clock (WithClock), which is how the single-clock policy is asserted. Everything
-// else is shared, so a skewed-clock test cannot drift from the ordinary fixture.
-func openTestDBWith(t *testing.T, opts PoolOptions, options ...Option) *DB {
+// clock (WithClock) or an audit observer, which is how those policies are asserted.
+// Everything else is shared, so a skewed-clock or instrumented test cannot drift
+// from the ordinary fixture.
+//
+// It takes testing.TB so benchmarks can use it too: the audit append benchmark is
+// the only way to see the chain's serialisation as a number.
+func openTestDBWith(t testing.TB, opts PoolOptions, options ...Option) *DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

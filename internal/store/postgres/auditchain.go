@@ -105,6 +105,17 @@ func (l *AuditLogger) sign(rowHash []byte) []byte {
 // lock is held only for the length of one insert, and audit writes are not a hot
 // path.
 func (l *AuditLogger) appendChained(ctx context.Context, r auditRow) error {
+	// The whole chained write is timed, wait for the lock included: that wait is
+	// the number that decides whether the serialisation has become the ceiling
+	// (see Metrics.ObserveAuditAppend). Timed even on failure, because a run of
+	// slow failures is exactly what an operator needs to see.
+	start := time.Now()
+	defer func() {
+		if l.observe != nil {
+			l.observe(time.Since(start))
+		}
+	}()
+
 	tx, err := l.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: audit: begin: %w", err)

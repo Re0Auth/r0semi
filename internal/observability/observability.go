@@ -72,6 +72,7 @@ type Metrics struct {
 	tokensRevoked         *prometheus.CounterVec
 	adminActions          *prometheus.CounterVec
 	auditVerify           *prometheus.CounterVec
+	auditAppend           *prometheus.HistogramVec
 	upstreamFetch         *prometheus.CounterVec
 	upstreamFetchDuration *prometheus.HistogramVec
 	upstreamRefresh       *prometheus.CounterVec
@@ -121,6 +122,8 @@ func New() *Metrics {
 			"Operator-plane mutations that succeeded, by action.", "action"),
 		auditVerify: counter("audit_verify_total",
 			"Audit-chain verification outcomes, by result.", "result"),
+		auditAppend: histogram("audit_append_duration_seconds",
+			"Time to append one chained audit record, including the wait for the chain-head lock."),
 		upstreamFetch: counter("upstream_fetches_total",
 			"Data-plane reads proxied to a configured source, by game, source and result.", "game", "source", "result"),
 		upstreamFetchDuration: histogram("upstream_fetch_duration_seconds",
@@ -137,7 +140,7 @@ func New() *Metrics {
 	reg.MustRegister(m.requests, m.duration, m.inFlight)
 	reg.MustRegister(
 		m.logins, m.tokensIssued, m.tokenErrors, m.deviceDecision,
-		m.revocations, m.tokensRevoked, m.adminActions, m.auditVerify,
+		m.revocations, m.tokensRevoked, m.adminActions, m.auditVerify, m.auditAppend,
 		m.upstreamFetch, m.upstreamFetchDuration, m.upstreamRefresh, m.circuitTransitions,
 		m.vaultOps, m.vaultLatency,
 	)
@@ -405,6 +408,23 @@ func (m *Metrics) ObserveAdminAction(action string) {
 		return
 	}
 	m.adminActions.WithLabelValues(action).Inc()
+}
+
+// ObserveAuditAppend records how long one chained audit write took, including the
+// wait for the chain-head lock.
+//
+// The chain serialises every writer on a single row. That is the design — two
+// concurrent inserts that each read the same predecessor would fork it — but it
+// also means the data plane's real ceiling can be set by something no request
+// metric shows: every vault-backed fetch writes an audit row before it hands over
+// a credential, so the append path is on the critical path of reads that look
+// unrelated to auditing. This number is what says whether that serialisation is
+// still cheap or has become the bottleneck (docs/capacity-planning.md §4).
+func (m *Metrics) ObserveAuditAppend(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.auditAppend.WithLabelValues().Observe(d.Seconds())
 }
 
 // ObserveAuditVerify records the outcome of walking the audit chain.

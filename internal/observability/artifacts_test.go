@@ -62,6 +62,7 @@ func declaredMetricNames(t *testing.T) map[string]bool {
 	m.ObserveTokensRevoked(RevocationKillSwitch, 1)
 	m.ObserveAdminAction(AdminKillSwitch)
 	m.ObserveAuditVerify(VerifyOK)
+	m.ObserveAuditAppend(time.Millisecond)
 	m.ObserveUpstreamFetch("phigros", "next-phi", UpstreamOK)
 	m.ObserveUpstreamFetchDuration("phigros", "next-phi", UpstreamOK, time.Millisecond)
 	m.ObserveUpstreamRefresh(RefreshRejected)

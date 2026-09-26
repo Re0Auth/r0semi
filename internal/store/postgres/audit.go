@@ -29,6 +29,11 @@ type AuditLogger struct {
 	// not a source of truth: losing it costs one query.
 	mu    sync.Mutex
 	cache map[string][]byte
+	// observe reports how long one chained append took, wait for the chain-head
+	// lock included. It is a function rather than a metrics handle so this package
+	// keeps no dependency on the instrumentation — the composition root injects it
+	// (WithAuditObserver), which is also what keeps metric names in one place.
+	observe func(time.Duration)
 }
 
 // Record implements audit.Logger.

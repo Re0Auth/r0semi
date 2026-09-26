@@ -292,6 +292,26 @@
           "legendFormat": "{{state}}"
         }
       ]
+    },
+    {
+      "title": "Audit append duration",
+      "description": "One chained audit write, the wait for the chain-head lock included. The chain serialises every writer on a single row by design, and that row is on the data plane's critical path — a credential use is audited before the secret is handed over. A rising p95 with a flat request rate is the serialisation becoming the ceiling, not a slow query.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(re0auth_audit_append_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(re0auth_audit_append_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
     }
   ],
   "refresh": "30s",

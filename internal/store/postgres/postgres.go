@@ -43,6 +43,8 @@ type DB struct {
 	// policy is otherwise unassertable: a test cannot skew the database's clock,
 	// but it can skew this one and watch a deadline it wrote still be honoured.
 	now func() time.Time
+	// auditObserver times one chained audit write; see WithAuditObserver.
+	auditObserver func(time.Duration)
 }
 
 // Option customises a DB at construction.
@@ -57,6 +59,22 @@ func WithClock(now func() time.Time) Option {
 	return func(db *DB) {
 		if now != nil {
 			db.now = now
+		}
+	}
+}
+
+// WithAuditObserver receives the duration of every chained audit write, the wait
+// for the chain-head lock included.
+//
+// The chain serialises every writer on one row by design, and the audit write sits
+// on the data plane's critical path (a vault use is audited before the secret is
+// handed over). Whether that is affordable is a question only measurement answers,
+// so the store reports the number and the composition root decides what to do with
+// it — the metrics package, in production.
+func WithAuditObserver(observe func(time.Duration)) Option {
+	return func(db *DB) {
+		if observe != nil {
+			db.auditObserver = observe
 		}
 	}
 }
@@ -266,7 +284,12 @@ func (db *DB) Clients() *Clients { return &Clients{pool: db.pool} }
 // chain; it is required, and must be 32 bytes, because a chain signed with no key
 // would look like tamper-evidence and not be.
 func (db *DB) Audit(key []byte) (*AuditLogger, error) {
-	return newAuditLogger(db.pool, key)
+	logger, err := newAuditLogger(db.pool, key)
+	if err != nil {
+		return nil, err
+	}
+	logger.observe = db.auditObserver
+	return logger, nil
 }
 
 // withMigrationLock runs fn against a goose provider under the migration advisory

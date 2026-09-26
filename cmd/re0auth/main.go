@@ -251,6 +251,21 @@ func main() {
 		stop()
 	}()
 
+	// The Prometheus instrumentation. It is always built: whether it is *exported*
+	// depends on an internal address being configured, but recording is cheap and
+	// a metric that only starts once someone remembers to enable it is missing
+	// from exactly the incident it was meant to explain.
+	//
+	// It is built before everything else — including the storage layer — because
+	// the vault, the login plane, the OpenID Provider, the federation service and
+	// the audit sink all record into it. The audit sink in particular is wired in
+	// at Open (WithAuditObserver), so the chain's serialisation is measured from
+	// the first write rather than from whenever someone remembers to hook it up.
+	// The HTTP golden signals are not the only thing it carries: the
+	// security-relevant domain signals are what the alerting rules fire on
+	// (ADR-0007).
+	metrics := observability.New()
+
 	// Before openStorage, because Open migrates up: a rollback issued after it
 	// would be undone by the act of opening the database.
 	if *migrateDown {
@@ -258,7 +273,7 @@ func main() {
 		return
 	}
 
-	store, err := openStorage(ctx, cfg)
+	store, err := openStorage(ctx, cfg, metrics)
 	if err != nil {
 		die("storage", err)
 	}
@@ -297,17 +312,6 @@ func main() {
 	if store.auditHead != nil {
 		loops.Go(func() { anchorLoop(loopCtx, store.auditHead, auditAnchorInterval) })
 	}
-
-	// The Prometheus instrumentation. It is always built: whether it is *exported*
-	// depends on an internal address being configured, but recording is cheap and
-	// a metric that only starts once someone remembers to enable it is missing
-	// from exactly the incident it was meant to explain.
-	//
-	// It is built here, before any component, because the vault, the login plane,
-	// the OpenID Provider and the federation service all record into it. The HTTP
-	// golden signals are not the only thing it carries: the security-relevant
-	// domain signals are what the alerting rules fire on (ADR-0007).
-	metrics := observability.New()
 
 	// The connection pool is the one dependency whose saturation /readyz reports
 	// only as a 503. Export it, so an incident has the number the runbook tells the
@@ -686,7 +690,11 @@ func readinessProbe(store storage) httpapi.ReadinessProbe {
 
 // openStorage picks the backends. A DSN turns on Postgres and applies
 // migrations; without one everything lives in memory.
-func openStorage(ctx context.Context, cfg settings) (storage, error) {
+//
+// metrics is threaded in so the durable stores can report into it at
+// construction — today the audit sink's append duration (WithAuditObserver),
+// which has to be wired before the first write to be worth anything.
+func openStorage(ctx context.Context, cfg settings, metrics *observability.Metrics) (storage, error) {
 	var store storage
 	if cfg.DatabaseURL == "" {
 		store = storage{
@@ -714,7 +722,7 @@ func openStorage(ctx context.Context, cfg settings) (storage, error) {
 		MinConns:         cfg.Pool.MinConns,
 		ConnectTimeout:   cfg.Pool.ConnectTimeout,
 		StatementTimeout: cfg.Pool.StatementTimeout,
-	})
+	}, postgres.WithAuditObserver(metrics.ObserveAuditAppend))
 	if err != nil {
 		return storage{}, err
 	}
