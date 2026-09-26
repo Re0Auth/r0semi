@@ -65,32 +65,36 @@ jobs:
           provenance: true
           sbom: true
 
+      # An OCI reference is lowercase in its repository part, and this
+      # organization's name is not. Handing `ghcr.io/Re0Auth/r0semi@sha256:…`
+      # straight to Trivy fails with "could not parse reference" — the build and
+      # push tools normalize the name on the way out, this parser does not. That is
+      # what failed the first tag run, after the DB and the image had both been
+      # fetched successfully; the same string went to the two steps below.
+      #
+      # One step computes the name, the scan and the signature read it, so the
+      # three cannot drift apart.
+      - name: image reference
+        id: image
+        run: echo "name=$(echo 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       # Trivy is pinned by digest too: a scanner that can change under its tag is
       # the same supply-chain problem the pinning below exists to avoid. The
       # runtime image is scratch, so there is no OS package surface — this scan
       # is about the Go binary's dependency graph and whatever the base stages
       # left behind.
-      #
-      # The vulnerability DB comes from the AWS public mirror rather than from
-      # Trivy's default ghcr.io/aquasecurity/trivy-db. Trivy reads the credentials
-      # mounted below, and those are scoped to this repository, so the default
-      # source is unreachable from here; measured from outside CI it answers 404
-      # anonymously as well. The mirror answers 200 anonymously, which is why it
-      # exists — and the first tag run failed on exactly this, in ten seconds,
-      # with the DB as the only thing it had not yet done.
       - name: scan the image
         run: |
           docker run --rm \
-            -e TRIVY_DB_REPOSITORY=public.ecr.aws/aquasecurity/trivy-db \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.docker/config.json":/root/.docker/config.json:ro \
             aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
             image --exit-code 1 --severity HIGH,CRITICAL --no-progress \
-            "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
+            "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
 
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: sign the image digest
-        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}"
+        run: cosign sign --yes "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
 
   release:
     needs: [ci, image]
