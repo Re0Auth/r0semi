@@ -2,6 +2,7 @@ package archtest
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -104,6 +105,11 @@ func TestKubernetesBaselineHasProbesAndLimits(t *testing.T) {
 // The image. `latest` is a floating reference: a redeploy silently picks up whatever
 // was pushed last, which is the opposite of what pinning a release means. The file
 // says "pin a released tag or, better, a digest" in a comment; this makes it a check.
+// The tag half is checked against the repository's own tags, not against the string:
+// the release workflow fires on `push: tags: v*` and publishes one image per tag, so
+// a name that is not a tag here is a name no image was ever pushed under. Checking
+// only that the field was non-empty and not `latest` — which is what this did before
+// — passed for `v0.0.0-rc.1`, a tag that existed nowhere, while the base pinned it.
 //
 // The TLS secret. The Ingress terminates TLS with a secret the base does not create,
 // so a fresh cluster applies an Ingress that can never serve. That prerequisite is
@@ -133,6 +139,15 @@ func TestKubernetesBaselinePinsItsImageAndNamesItsTLSSecret(t *testing.T) {
 	if len(kustomization.Images) == 0 {
 		t.Fatal("the base images nothing, so it deploys whatever the Deployment names")
 	}
+	// Refused rather than skipped when the checkout has no tags to compare against:
+	// a check that could not run and a check that found nothing are indistinguishable
+	// in a green job, which is the failure mode this pair exists to avoid. CI fetches
+	// them for the jobs that run this package (fetch-depth: 0 in ci.yml).
+	tags := releaseTags(t, root)
+	if len(tags) == 0 {
+		t.Fatal("this checkout carries no v* tags, so the pinned image tag cannot be checked; " +
+			"fetch them (`git fetch --tags`, or actions/checkout with fetch-depth: 0)")
+	}
 	for _, img := range kustomization.Images {
 		if img.Digest != "" {
 			continue
@@ -140,6 +155,13 @@ func TestKubernetesBaselinePinsItsImageAndNamesItsTLSSecret(t *testing.T) {
 		if img.NewTag == "" || img.NewTag == "latest" {
 			t.Errorf("%s is not pinned (newTag=%q digest=%q); pin a released tag or a digest",
 				img.Name, img.NewTag, img.Digest)
+			continue
+		}
+		if !slices.Contains(tags, img.NewTag) {
+			t.Errorf("%s is pinned to newTag %q, which is not a tag in this repository; "+
+				"the release workflow publishes an image per v* tag, so this names an image "+
+				"that was never pushed and the base cannot be pulled. Tags here: %s",
+				img.Name, img.NewTag, strings.Join(tags, ", "))
 		}
 	}
 
@@ -173,6 +195,25 @@ func TestKubernetesBaselinePinsItsImageAndNamesItsTLSSecret(t *testing.T) {
 				"a prerequisite an operator cannot find is a dangling one", entry.SecretName)
 		}
 	}
+}
+
+// releaseTags lists the v* tags this checkout can see.
+//
+// It is what makes "pinned to a released tag" checkable at all. The release
+// workflow fires on `push: tags: v*` and pushes one image per tag, so a tag in
+// this repository is the evidence that an image exists under that name — and a
+// name that is not here is one nobody pushed.
+func releaseTags(t *testing.T, root string) []string {
+	t.Helper()
+	cmd := exec.Command("git", "tag", "--list", "v*")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		// Loud, for the same reason the scan in tooling_test.go is: a check that
+		// could not run must not read as a check that found nothing.
+		t.Fatalf("git tag --list: %v", err)
+	}
+	return strings.Fields(string(out))
 }
 
 func readYAMLDocs(t *testing.T, dir string) []map[string]any {

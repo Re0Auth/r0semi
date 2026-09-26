@@ -56,6 +56,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Tags, not only history. internal/archtest checks that the image tag
+          # deploy/k8s/base pins is one this repository actually has, and a
+          # checkout without tags cannot answer that — it refuses to run rather
+          # than passing vacuously, which is what it would do for any tag.
+          fetch-depth: 0
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -264,6 +270,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Same reason as the `test` job: this runs internal/archtest too, and
+          # the image-pin check needs the tags to compare against.
+          fetch-depth: 0
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:

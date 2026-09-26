@@ -15,8 +15,13 @@ resources:
 #
 # The tag below is the most recent published release, not `latest`: a floating
 # reference means a redeploy silently picks up whatever was pushed last, which is
-# the opposite of what a baseline is for. `internal/archtest` fails if this file
-# ever goes back to a floating tag.
+# the opposite of what a baseline is for.
+#
+# `internal/archtest` holds two halves of that claim. It refuses `latest` (and an
+# empty tag), and it refuses a tag this repository does not have: the release
+# workflow publishes one image per `v*` tag, so a name that is not a tag here
+# names an image nobody pushed. Both used to be one check on the string alone,
+# which passed for a tag that had never been built.
 images:
   - name: ghcr.io/re0auth/r0semi
-    newTag: v0.0.0-rc.1
+    newTag: v0.0.0-rc.3
