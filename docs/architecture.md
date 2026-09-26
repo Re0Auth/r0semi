@@ -306,6 +306,10 @@ bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆�
 关键不变量（由 `internal/httpapi` 测试守护）：**协议平面绝不输出 problem+json，业务平面绝不输出
 `{error,error_description}`，浏览器平面两者都不输出**；三个平面各有独立子 mux、错误写出器与 panic 恢复，仅共享 request-id 中间件。
 
+**跨源：三个平面都按同源部署，不实现 CORS。** 这条此前只是"没人发 CORS 头"的事实，而实测发现
+提供方库会在自己的端点上按 `Origin` 回头（见 [cors-decision.md](./cors-decision.md)，ADR-0011）；
+现在它是一条被守卫钉住的决策，协议面的响应在 `internal/oidchttp` 的边界统一过滤。
+
 ### 4.6 前端（`web/` + `internal/webui`）
 
 SvelteKit 2 + Svelte 5 + Tailwind v4，`adapter-static` 输出到 `internal/webui/dist`，由 `//go:embed` 嵌进二进制，

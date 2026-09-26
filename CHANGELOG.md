@@ -19,6 +19,11 @@
   数据库 `DEFAULT now()` 写的仍由数据库判定。副本与数据库之间无需再对齐到亚秒——但仍建议 NTP；
   排障见 [docs/operations.md](docs/operations.md) 的「可观测与排障」。
 
+- **协议面不再返回 CORS 头**（discovery 与 `/oauth/*`）：库此前按请求 `Origin` 回
+  `Access-Control-Allow-Origin` 与 `Access-Control-Allow-Credentials: true`，与服务同源的部署无关，
+  但对任何来源都生效。现在这些头被去掉，同源客户端不受影响；跨源前端请看
+  [docs/cors-decision.md](docs/cors-decision.md)（ADR-0011，含重新评估的触发条件）。
+
 ## v0.0.0-rc.1
 
 预发布，用来把 **tag → CI → 产物** 这条链路端到端跑通一次（可下载产物的构成见 README

@@ -215,6 +215,13 @@ func New(cfg Config) (*Handler, error) {
 
 // ServeHTTP routes the protocol plane.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// ADR-0011: this service is same-origin and does not implement CORS. The
+	// provider library disagrees — it reflects the request's Origin into
+	// Access-Control-Allow-Origin with Allow-Credentials: true on the endpoints it
+	// owns. Left in place that is an undocumented, all-origins CORS policy nobody
+	// chose and nothing would notice changing, so it is filtered at this boundary:
+	// one place that covers every branch, including ones added later.
+	w = corsFreeWriter{ResponseWriter: w}
 	switch {
 	case r.URL.Path == RFC8414Path:
 		// O-1: identical content, one source. Rewrite to the OIDC document.
@@ -472,7 +479,49 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		(r.URL.Path == "/"+pathToken || r.URL.Path == "/"+pathIntrospection || r.URL.Path == "/"+pathRevocation) {
 		bw.header.Set("WWW-Authenticate", `Basic realm="oauth"`)
 	}
+
+	// ADR-0011: the provider's CORS headers are removed at the ServeHTTP boundary
+	// (corsFreeWriter), so nothing has to be done about them here.
 	bw.flush(w, body)
+}
+
+// corsFreeWriter drops the CORS response headers a dependency may set.
+//
+// Both WriteHeader and Write strip, because a handler that never calls WriteHeader
+// explicitly still commits the headers through Go's implicit 200 — filtering only
+// the explicit call would leave exactly the responses nobody looked at unstripped.
+type corsFreeWriter struct {
+	http.ResponseWriter
+}
+
+func (w corsFreeWriter) WriteHeader(status int) {
+	stripCORS(w.Header())
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w corsFreeWriter) Write(b []byte) (int, error) {
+	stripCORS(w.Header())
+	return w.ResponseWriter.Write(b)
+}
+
+// corsHeaders is the whole Access-Control- family a CORS implementation would own.
+// Partial removal would leave a half-stated policy, which is worse than either
+// answering cross-origin requests deliberately or not answering at all.
+var corsHeaders = []string{
+	"Access-Control-Allow-Origin",
+	"Access-Control-Allow-Credentials",
+	"Access-Control-Allow-Headers",
+	"Access-Control-Allow-Methods",
+	"Access-Control-Expose-Headers",
+	"Access-Control-Max-Age",
+}
+
+// stripCORS removes any CORS response header a dependency may have set. See
+// ADR-0011 for why the absence is a decision rather than an accident.
+func stripCORS(h http.Header) {
+	for _, name := range corsHeaders {
+		h.Del(name)
+	}
 }
 
 // isOAuthErrorBody reports whether a response already satisfies the protocol

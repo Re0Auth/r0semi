@@ -139,3 +139,44 @@ func TestSecurityHeadersOnCompressorRefusal(t *testing.T) {
 		t.Error("a refused response must still carry a request id")
 	}
 }
+
+// TestServerEmitsNoCORSHeaders pins ADR-0011: this service is same-origin and does
+// not implement CORS. The decision is only real if it holds on the wire — a
+// middleware added for something unrelated, or a dependency that starts answering
+// pre-flights on our behalf, would otherwise pass unnoticed and "we do not speak
+// CORS" would quietly become "we never said".
+//
+// The requests carry an Origin and hit every plane, including the OPTIONS
+// pre-flight itself (a handler that wanted to support CORS would have to answer
+// those; we must not).
+func TestServerEmitsNoCORSHeaders(t *testing.T) {
+	env := newTestEnv(t)
+	corsHeaders := []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Credentials",
+		"Access-Control-Allow-Headers",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Expose-Headers",
+		"Access-Control-Max-Age",
+	}
+	origin := map[string]string{
+		"Origin":                        "https://app.example",
+		"Access-Control-Request-Method": "POST",
+	}
+	for _, tc := range []struct{ method, target string }{
+		{http.MethodGet, "/.well-known/oauth-authorization-server"}, // protocol plane
+		{http.MethodPost, "/oauth/token"},
+		{http.MethodOptions, "/oauth/token"}, // the pre-flight
+		{http.MethodGet, "/v1/me"},           // business plane
+		{http.MethodOptions, "/v1/me"},
+		{http.MethodGet, "/"}, // browser plane
+	} {
+		rec := env.do(tc.method, tc.target, "", origin)
+		for _, name := range corsHeaders {
+			if got := rec.Header().Get(name); got != "" {
+				t.Errorf("%s %s returned %s: %q; the service does not implement CORS (ADR-0011)",
+					tc.method, tc.target, name, got)
+			}
+		}
+	}
+}
