@@ -47,6 +47,26 @@
 
 ---
 
+## Re0AuthPoolSaturated
+
+**含义**：连接池占用 > 90% 且 10 分钟内出现 > 10 次"空取"（`acquire` 时池里没有空闲连接，只能等），
+持续 10 分钟。空取**仍然是成功的**——它表现为时延，不表现为错误，所以这条告警比
+`Re0AuthHighErrorRate` 早一步。
+
+**诊断**：
+1. 面板 “DB pool connections”：`acquired_conns` 是否长期贴着 `max_conns`，`empty_acquire_count_total` 的斜率。
+2. 数据库侧：`pg_stat_activity` 找长事务/慢语句（连接被占着往往不是池小，而是语句慢）。
+3. 核对预算：`max_conns × 副本数` 与滚动发布的峰值（`maxSurge`）是否仍在 Postgres `max_connections` 之下，
+   见 [capacity-planning.md](./capacity-planning.md) §2。
+
+**处置**：先解决"为什么连接被占住"（慢语句、缺索引、上游等待期间持有连接）；确认是容量而非泄漏后，
+再单调调整 `max_conns` 与 Postgres 侧上限。**注意** `max_in_flight` 是每副本值，扩容副本会让入站并发按
+副本数放大，别忘了同步核对。
+
+**升级**：若同时出现 `Re0AuthHighErrorRate`，按可用性事件处置。
+
+---
+
 ## Re0AuthTokenEndpointErrorRate
 
 **含义**：令牌端点错误比例 > 5% 持续 10 分钟（SLI S2）。
@@ -86,6 +106,25 @@
 [operations.md](./operations.md#审计链锚点核对)），确认是不是尾部也被截断。见 [admin.md](./admin.md) §5。
 
 **升级**：立即升级为安全事件，见 [incident-response.md](./incident-response.md)；考虑一键撤销。
+
+---
+
+## Re0AuthAuditVerifyError
+
+**含义**：审计链**校验本身没跑完**（`increase(audit_verify_total{result="error"}[10m]) > 0`）。
+与 `Re0AuthAuditChainBroken` 不同：那条说"链有问题"，这条说"没人知道链有没有问题"——日志可能完好无损，
+但 S5 这个硬目标此刻是盲的。
+
+**诊断**：
+1. 先看数据库/连接池：校验是全表遍历，数据库不可达、连接拿不到、语句被取消都会走到这里。
+2. 看 `Re0AuthPoolSaturated` 是否同时在场；池打满会连带让长遍历失败。
+3. 手工跑一次 `GET /v1/admin/audit/verify`：能返回就记下 `chained`（规模）与耗时；仍 500 就把数据库侧的错误日志找出来。
+
+**处置**：若原因是遍历超出语句超时（日志已大到 45s 全扫跑不完），说明该上锚点/增量校验了——
+见 [operations.md](./operations.md#审计链锚点核对)。**不要**据此重跑或截断日志；校验失败不等于链有问题，
+但也不等于链没问题，在拿到一次成功的校验之前按"未知"对待。
+
+**升级**：持续 1 小时仍无法完成一次校验 → 视为 S5 不可观测，按事故处理并升级。
 
 ---
 

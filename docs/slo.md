@@ -17,6 +17,8 @@
 | S7 | 上游可用性 | `upstream_fetches_total{result="unavailable"}` 比例，按 source | < 5% |
 
 S5 是**硬目标**：审计链自洽是本服务对"日志被动过吗"唯一的控制，任何一次 `failed` 都是事件，不是趋势。
+`error`（校验本身没跑完）是 S5 的**盲区**：链可能完好，但没有人能证明——所以它单独告警
+（`Re0AuthAuditVerifyError`），而不是并进 `failed`。
 
 ### 1.1 错误预算与燃尽率
 
@@ -44,9 +46,11 @@ S1 的 99.9% 目标等价于 30 天滚动窗口内 **0.1% 的错误预算**。�
 | `Re0AuthErrorBudgetFastBurn` | 1h 与 5m 错误率同时 > 14.4×0.1% | critical | S1 | 按可用性事件处置并升级 |
 | `Re0AuthErrorBudgetSlowBurn` | 6h 与 30m 错误率同时 > 6×0.1% | warning | S1 | 开单排查持续的小比例 5xx |
 | `Re0AuthSlowRequests` | 业务面 p99 > 1s，持续 10m | warning | S4 | 查上游来源是否变慢、连接池是否打满 |
+| `Re0AuthPoolSaturated` | 连接池占用 > 90% 且 10m 内空取 > 10 次，持续 10m | warning | S1/S4 | 先查长语句再谈加池；核对 `max_conns × 副本数` 预算 |
 | `Re0AuthTokenEndpointErrorRate` | 令牌错误比例 > 5%，持续 10m | warning | S2 | 按 `error` 标签分组看是 `invalid_client` 还是 `invalid_grant` |
 | `Re0AuthLoginFailureRate` | 登录失败比例 > 30%，持续 15m | warning | S3 | 按 `provider` 看是否某一个 IdP 的发现/换票挂了 |
 | `Re0AuthAuditChainBroken` | `increase(audit_verify_total{result="failed"}[10m]) > 0` | critical | S5 | 按 `admin.md` §5 调查；`first_bad_id` 指向第一处不一致 |
+| `Re0AuthAuditVerifyError` | `increase(audit_verify_total{result="error"}[10m]) > 0` | warning | S5 | 校验没跑完 ≠ 链坏了：先看数据库与语句超时，再手工跑一次 verify |
 | `Re0AuthVaultOperationFailures` | 非 ok 比例 > 1%，持续 10m | critical | S6 | 看 `result`：`unconfigured_key` 意味着轮换没收尾，`decrypt_error` 意味着数据损坏 |
 | `Re0AuthUpstreamSourceUnavailable` | 某 source `unavailable` 比例 > 30%，持续 10m | warning | S7 | 确认该数据源自身是否可达；`not_bound` 不是故障，不触发 |
 | `Re0AuthUpstreamSlowSource` | 某 source `ok` 读取 p95 > 2s，持续 15m | warning | S7 | 区分网络还是源本身慢；长期慢可降级该源 |

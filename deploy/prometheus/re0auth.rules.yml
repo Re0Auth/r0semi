@@ -60,6 +60,27 @@ groups:
             Re0AuthUpstreamSlowSource.
           runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authslowrequests
 
+      - alert: Re0AuthPoolSaturated
+        # The pool is a queue, and its queue is invisible until it hurts: an
+        # acquisition that had to wait still succeeds, so it shows up as latency
+        # rather than as an error. Sustained waiting is the leading indicator of
+        # the outage Re0AuthHighErrorRate pages for one step later.
+        expr: |
+          (re0auth_db_pool_acquired_conns / re0auth_db_pool_max_conns) > 0.9
+          and
+          increase(re0auth_db_pool_empty_acquire_count_total[10m]) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The database connection pool is nearly exhausted"
+          description: >-
+            Compare max_conns against Postgres max_connections and the replica
+            count — the budget is per process, so a rolling deploy multiplies it
+            (docs/capacity-planning.md). Look for long-running statements before
+            raising the pool.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authpoolsaturated
+
       - alert: Re0AuthTokenEndpointErrorRate
         # SLI S2. The minimum-traffic guard keeps a single failed exchange on a
         # quiet deployment from flapping the alert.
@@ -119,6 +140,25 @@ groups:
             chain first disagrees. Treat as tampering or corruption until proven
             otherwise; docs/runbooks.md and docs/admin.md §5 have the contract.
           runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authauditchainbroken
+
+      - alert: Re0AuthAuditVerifyError
+        # S5's blind spot. `failed` means the chain was read and does not hold;
+        # `error` means the walk itself did not finish — a cancelled statement, an
+        # unreachable database — so the log may be perfectly intact and nobody can
+        # tell. Without this rule S5 goes silent exactly as the log grows, which is
+        # the one failure mode a hard target must not have.
+        expr: increase(re0auth_audit_verify_total{result="error"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The audit log chain could not be verified"
+          description: >-
+            Different from Re0AuthAuditChainBroken: nothing here says the chain is
+            broken, only that the walk did not complete. Check the database first,
+            then run GET /v1/admin/audit/verify by hand — a walk that outlasts the
+            statement timeout is the usual cause.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authauditverifyerror
 
       - alert: Re0AuthVaultOperationFailures
         # SLI S6. unconfigured_key means a key rotation was left unfinished;

@@ -218,3 +218,83 @@ func TestDashboardReferencesDeclaredMetrics(t *testing.T) {
 		}
 	}
 }
+
+// TestEveryRunbookLinkResolves keeps the alerts' runbook_url anchors honest.
+//
+// The structural check above proves a link exists; only this proves it lands
+// somewhere. A dead anchor is worse than no link at all: the runbook is the one
+// thing an operator reaches for at 3am, and a fragment that matches no heading
+// costs exactly the minutes the alert was supposed to buy.
+func TestEveryRunbookLinkResolves(t *testing.T) {
+	const runbooksPath = "../../docs/runbooks.md"
+
+	raw, err := os.ReadFile(rulesPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", rulesPath, err)
+	}
+	var doc struct {
+		Groups []struct {
+			Rules []struct {
+				Alert       string            `yaml:"alert"`
+				Annotations map[string]string `yaml:"annotations"`
+			} `yaml:"rules"`
+		} `yaml:"groups"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("%s does not parse: %v", rulesPath, err)
+	}
+
+	body, err := os.ReadFile(runbooksPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", runbooksPath, err)
+	}
+	headings := make(map[string]bool)
+	for _, line := range strings.Split(string(body), "\n") {
+		title, ok := strings.CutPrefix(line, "## ")
+		if !ok {
+			continue
+		}
+		headings[normalizeAnchor(title)] = true
+	}
+	// A floor, so a parse that silently stops matching fails instead of passing
+	// vacuously: every alert today has a section, and the generic ones add more.
+	if len(headings) < 10 {
+		t.Fatalf("only %d runbook headings were found in %s; the parse cannot be right",
+			len(headings), runbooksPath)
+	}
+
+	checked := 0
+	for _, g := range doc.Groups {
+		for _, r := range g.Rules {
+			if r.Alert == "" {
+				continue
+			}
+			url := r.Annotations["runbook_url"]
+			if url == "" {
+				continue // the structural test already fails on a missing one
+			}
+			_, fragment, ok := strings.Cut(url, "#")
+			if !ok || fragment == "" {
+				t.Errorf("alert %q has a runbook_url with no anchor: %q", r.Alert, url)
+				continue
+			}
+			checked++
+			if !headings[fragment] {
+				t.Errorf("alert %q points at #%s, which is not a heading in %s",
+					r.Alert, fragment, runbooksPath)
+			}
+		}
+	}
+	if checked < 8 {
+		t.Fatalf("only %d runbook links were checked; that is too few to be the whole set", checked)
+	}
+}
+
+// normalizeAnchor turns a heading into the anchor a Markdown renderer mints for
+// it: lowercased, spaces removed. It deliberately does not reimplement any
+// renderer's full rule set — it covers exactly the shape this project's headings
+// use (an ASCII alert name), so a heading it cannot normalise still has to match
+// a fragment character for character.
+func normalizeAnchor(s string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), " ", ""))
+}
