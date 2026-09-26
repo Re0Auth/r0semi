@@ -12,10 +12,12 @@
 # the backup bucket. A checksum is written alongside, as backup.sh does. Store the
 # result somewhere the database backup is not.
 #
-# What this does NOT cover: `vault.retired` KEKs live in the config file, not the
-# environment. If a rotation is in flight, archive the config's retired-key section
-# with this file — those keys are what still opens the records the current key does
-# not, and losing them mid-rotation is unrecoverable.
+# The config file declares secrets too, and those declarations are the part nothing
+# else can know: a renamed `vault.kek_env`, the idp and source client secrets, the
+# retired KEKs of a rotation in flight. The binary is asked for them
+# (`-print-secret-env`; RE0AUTH_BIN overrides the path, RE0AUTH_CONFIG the file).
+# When a config declares them and they cannot be enumerated, this refuses to write
+# a file that would look complete.
 set -euo pipefail
 
 dir="${1:-./backups}"
@@ -43,14 +45,47 @@ write_key() {
   printf '%s=%s\n' "$name" "$value" >> "$out"
 }
 
+# Config-declared secrets. The KEK's variable name is itself a config choice
+# (vault.kek_env, default RE0AUTH_KEK), so it comes from the same enumeration
+# instead of being assumed.
+bin="${RE0AUTH_BIN:-./re0auth}"
+cfg="${RE0AUTH_CONFIG:-config/re0auth.toml}"
+kek_name="RE0AUTH_KEK"
+declared=""
+if [ -e "$cfg" ]; then
+  if [ -x "$bin" ]; then
+    declared="$("$bin" -print-secret-env -config "$cfg")"
+    renamed="$(printf '%s\n' "$declared" | sed -n 's/^vault\.kek_env=//p')"
+    if [ -n "$renamed" ]; then
+      kek_name="$renamed"
+    fi
+  elif grep -Eq '(client_secret_env|kek_env)[[:space:]]*=' "$cfg"; then
+    echo "$cfg declares secret variables, but $bin is not executable;" >&2
+    echo "run this where the binary is, or point RE0AUTH_BIN at it" >&2
+    rm -f "$out"
+    exit 1
+  fi
+fi
+
 # 0600 from the start, so the plaintext never exists with wider permissions even
 # briefly before encryption.
 umask 077
 : > "$out"
-write_key RE0AUTH_KEK
-write_key RE0AUTH_OIDC_TOKEN_KEY
-write_key RE0AUTH_OIDC_SIGNING_KEY
-write_key RE0AUTH_AUDIT_KEY
+
+# Every required key, each written once. The list is deduplicated because a config
+# that declares no KEK name of its own still needs the default, and the default may
+# be the declared one.
+while IFS= read -r name; do
+  write_key "$name"
+done < <(
+  {
+    printf '%s\n' "$kek_name"
+    printf '%s\n' RE0AUTH_OIDC_TOKEN_KEY RE0AUTH_OIDC_SIGNING_KEY RE0AUTH_AUDIT_KEY
+    if [ -n "$declared" ]; then
+      printf '%s\n' "$declared" | sed -n 's/^[^=]*=//p'
+    fi
+  } | awk 'NF && !seen[$0]++'
+)
 
 # Retired keys are optional, but during a rotation they are what still opens the
 # records the current key does not. Copied through verbatim when present.

@@ -67,11 +67,20 @@ DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backu
 `RE0AUTH_AUDIT_KEY`（以及轮换进行中的 retired 集合）写成 `0600` 的 `.env`，`BACKUP_AGE_RECIPIENT`
 存在时用 age 加密，并附 sha256 校验。
 
+除这四把之外，**配置里声明的机密变量也一并归档**，且它们是必须的：`vault.kek_env`（可以改名，
+脚本通过 `re0auth -print-secret-env` 读出来，而不是假定叫 `RE0AUTH_KEK`）、
+`vault.retired[].kek_env`、`idp.*.client_secret_env`、`sources[].client_secret_env`。
+因此脚本需要两样东西：可读的配置文件（`RE0AUTH_CONFIG`，默认 `config/re0auth.toml`）与可执行的
+二进制（`RE0AUTH_BIN`，默认 `./re0auth`）。
+
+- **声明了就必须能归档**：任何一个声明的变量缺失、或拿不到二进制去枚举它们，脚本都会**中止并删掉
+  半个文件**——宁可没有备份，也不要一个看起来完整的备份。没有配置文件时脚本按旧的四个名字工作。
 - **密钥备份必须放在数据库备份够不到的地方**（另一个凭据域 / 账号），否则一次凭据泄露会同时拿走密文与钥匙。
-- `vault.retired`（配置里的旧 KEK）不在环境变量里；轮换进行中要连同配置的 retired 段一起归档，
-  否则仍被旧 key 包裹的记录会变得不可读。
+- `vault.retired`（配置里的旧 KEK）现在由脚本自动覆盖（上面那条）；若你的配置把它声明在别处
+  （非 `*_env` 形式），仍需手工归档。
 - 丢失后果：KEK 丢失 → 上游凭据永久不可恢复；审计 key 丢失 → 链无法再校验；
-  OP 两把 key 丢失 → 在途 `id_token` 全部失效、access token 不可读（等于全站登出）。
+  OP 两把 key 丢失 → 在途 `id_token` 全部失效、access token 不可读（等于全站登出）；
+  IdP / 数据源 client secret 丢失 → 需在各提供方重新签发并更新配置。
 
 ## 密钥轮换
 

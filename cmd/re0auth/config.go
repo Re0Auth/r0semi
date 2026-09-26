@@ -275,6 +275,52 @@ const (
 	defaultAdminReauthWindow = 15 * time.Minute
 )
 
+// configSecretEnvNames lists the environment variables a config file declares as
+// secret holders, one `role=NAME` line per declaration, sorted.
+//
+// It decodes the same schema loadConfig does but resolves nothing — deliberately.
+// loadConfig fails when a secret's value is missing, and "which variables does this
+// file need" is asked precisely while a deployment is still being assembled, or
+// while a backup target is being rebuilt.
+//
+// The left-hand side of each line is where the name is declared, so the output is
+// readable on its own and a script can pick out a specific role (backup-keys.sh
+// does, for a renamed vault.kek_env). What it answers is the part nothing else can
+// know: a config may rename the KEK's variable, declare idp and source client
+// secrets, and list the retired KEKs of a rotation in flight — none of which are in
+// the environment under a name anyone can guess.
+func configSecretEnvNames(path string) ([]string, error) {
+	var f file
+	if err := config.Read(path, &f); err != nil {
+		return nil, err
+	}
+	var lines []string
+	add := func(role, name string) {
+		if strings.TrimSpace(name) != "" {
+			lines = append(lines, role+"="+name)
+		}
+	}
+	add("vault.kek_env", f.Vault.KEKEnv)
+	for i, retired := range f.Vault.Retired {
+		add(fmt.Sprintf("vault.retired[%d].kek_env", i), retired.KEKEnv)
+	}
+	// Map iteration is randomised, so the provider names are sorted before use: an
+	// output whose order changes run to run is not diffable.
+	providers := make([]string, 0, len(f.IdP))
+	for name := range f.IdP {
+		providers = append(providers, name)
+	}
+	sort.Strings(providers)
+	for _, name := range providers {
+		add("idp."+name+".client_secret_env", f.IdP[name].ClientSecretEnv)
+	}
+	for i, source := range f.Sources {
+		add(fmt.Sprintf("sources[%d].client_secret_env", i), source.ClientSecretEnv)
+	}
+	sort.Strings(lines)
+	return lines, nil
+}
+
 // loadConfig reads the TOML file at path (empty = environment only), applies the
 // environment overrides, resolves every secret by name, and validates the
 // result. It fails closed: a half-configured server never starts.

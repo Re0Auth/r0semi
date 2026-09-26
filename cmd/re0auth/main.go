@@ -57,7 +57,9 @@ var (
 		"re-wrap every stored credential's DEK under the current KEK, then exit")
 	migrateDown = flag.Bool("migrate-down", false,
 		"roll back the most recently applied migration, then exit")
-	showVersion = flag.Bool("version", false, "print the build version and exit")
+	showVersion    = flag.Bool("version", false, "print the build version and exit")
+	printSecretEnv = flag.Bool("print-secret-env", false,
+		"print the environment variables the config declares as secret holders (role=NAME per line) and exit")
 )
 
 // version identifies the build. The release target stamps it at link time
@@ -183,6 +185,29 @@ func main() {
 	// already looking at a deployment that will not start.
 	if *showVersion {
 		fmt.Println("re0auth", version)
+		return
+	}
+
+	// -print-secret-env answers "which variables does this config declare as secret
+	// holders" for the backup path: a config may rename the KEK's variable and may
+	// introduce idp/source client secrets, none of which the environment reveals by
+	// itself. It resolves nothing, so it also works while a deployment is still
+	// being assembled, and it prints before logging is configured — the output is
+	// machine-read by scripts/backup-keys.sh and must not carry log lines.
+	if *printSecretEnv {
+		path, _ := config.Path(*configFlag, "RE0AUTH_CONFIG", defaultConfigPath)
+		if path == "" {
+			fmt.Fprintln(os.Stderr, "re0auth: -print-secret-env needs a config file; pass -config or RE0AUTH_CONFIG")
+			os.Exit(1)
+		}
+		names, err := configSecretEnvNames(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "re0auth:", err)
+			os.Exit(1)
+		}
+		for _, line := range names {
+			fmt.Println(line)
+		}
 		return
 	}
 
