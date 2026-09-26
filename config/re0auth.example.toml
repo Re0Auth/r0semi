@@ -61,9 +61,19 @@ trusted_proxies = []
 # differ from `addr`: a separate listener is the whole reason these endpoints are
 # not reachable through the public one.
 #
-#   internal_addr = "127.0.0.1:9090"
+# A **non-loopback** address is refused unless `expose_internal` acknowledges it.
+# A container has a real reason to want one — a Kubernetes Service can only select
+# a pod that listens on a pod IP, so the baseline binds 0.0.0.0 — but binding one
+# by accident is how a heap profile ends up on the network. The acknowledgement is
+# where the NetworkPolicy or firewall that makes the binding safe gets recorded;
+# without one, use a loopback address.
+#
+#   internal_addr   = "127.0.0.1:9090"
+#   expose_internal = false
 # Environment override: RE0AUTH_INTERNAL_ADDR="127.0.0.1:9090"
-internal_addr = ""
+#                       RE0AUTH_INTERNAL_EXPOSE=true
+internal_addr   = ""
+expose_internal = false
 
 # Client ids allowed to introspect tokens issued to OTHER clients — the resource
 # servers you trust. A client may always introspect its own tokens; empty is the

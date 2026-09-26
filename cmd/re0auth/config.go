@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"sort"
@@ -76,6 +77,13 @@ type serverSection struct {
 	// default, because profiling endpoints belong on a private network and never
 	// on the public one. Point it at a loopback or cluster-internal address.
 	InternalAddr string `toml:"internal_addr"`
+	// ExposeInternal acknowledges that InternalAddr is NOT loopback, so the
+	// operational surface is reachable from beyond this host. Required for such
+	// an address: a container has to bind 0.0.0.0 to be selected by a Service, so
+	// the address cannot be refused outright — but /debug/pprof/ dumps heap and
+	// goroutine state, and "the operator meant to write 127.0.0.1" must not be the
+	// difference between a private and a public one.
+	ExposeInternal bool `toml:"expose_internal"`
 	// IntrospectionClients lists client ids allowed to introspect tokens issued
 	// to other clients — resource servers. A client may always introspect its own
 	// tokens; empty means nobody else's are visible.
@@ -210,6 +218,9 @@ type settings struct {
 	// InternalAddr is the address of the operational listener that serves metrics
 	// and profiling. Empty means it is not served at all.
 	InternalAddr string
+	// ExposeInternal is the operator's acknowledgement that InternalAddr reaches
+	// beyond this host. False refuses a non-loopback address at startup.
+	ExposeInternal bool
 	// IntrospectionClients are the client ids allowed to introspect other
 	// clients' tokens. Empty means only a client's own tokens are visible.
 	IntrospectionClients []string
@@ -334,13 +345,18 @@ func loadConfig(path string) (settings, error) {
 	if err != nil {
 		return settings{}, err
 	}
+	exposeInternal, err := config.Bool("RE0AUTH_INTERNAL_EXPOSE", f.Server.ExposeInternal)
+	if err != nil {
+		return settings{}, err
+	}
 	cfg := settings{
-		Addr:         config.FirstNonEmpty(os.Getenv("RE0AUTH_ADDR"), f.Server.Addr, "127.0.0.1:8080"),
-		Issuer:       strings.TrimRight(config.FirstNonEmpty(os.Getenv("RE0AUTH_ISSUER"), f.Server.Issuer), "/"),
-		CookieSecure: cookieSecure,
-		KEKID:        config.FirstNonEmpty(os.Getenv("RE0AUTH_KEK_ID"), f.Vault.KEKID, "kek-1"),
-		DatabaseURL:  os.Getenv("DATABASE_URL"),
-		InternalAddr: config.FirstNonEmpty(os.Getenv("RE0AUTH_INTERNAL_ADDR"), f.Server.InternalAddr),
+		Addr:           config.FirstNonEmpty(os.Getenv("RE0AUTH_ADDR"), f.Server.Addr, "127.0.0.1:8080"),
+		Issuer:         strings.TrimRight(config.FirstNonEmpty(os.Getenv("RE0AUTH_ISSUER"), f.Server.Issuer), "/"),
+		CookieSecure:   cookieSecure,
+		KEKID:          config.FirstNonEmpty(os.Getenv("RE0AUTH_KEK_ID"), f.Vault.KEKID, "kek-1"),
+		DatabaseURL:    os.Getenv("DATABASE_URL"),
+		InternalAddr:   config.FirstNonEmpty(os.Getenv("RE0AUTH_INTERNAL_ADDR"), f.Server.InternalAddr),
+		ExposeInternal: exposeInternal,
 	}
 	if cfg.Issuer == "" {
 		return settings{}, errors.New("server.issuer is required (or RE0AUTH_ISSUER); e.g. https://re0auth.example")
@@ -427,6 +443,21 @@ func loadConfig(path string) (settings, error) {
 	if cfg.InternalAddr != "" && cfg.InternalAddr == cfg.Addr {
 		return settings{}, errors.New(
 			"server.internal_addr must differ from server.addr: the operational surface is not the public one")
+	}
+	// Being a different address is not enough on its own. `internal_addr =
+	// "0.0.0.0:9090"` is also "different", and it hands /metrics and
+	// /debug/pprof/ — heap, goroutine dumps, CPU profiles — to anything that can
+	// reach the host. A container has a real reason to want that binding (a
+	// Kubernetes Service can only select a pod that listens on a pod IP), so it is
+	// allowed, but only once the operator says so: the acknowledgement is the
+	// place the NetworkPolicy or firewall that makes it safe gets recorded.
+	if cfg.InternalAddr != "" && !internalAddrIsLocal(cfg.InternalAddr) && !cfg.ExposeInternal {
+		return settings{}, fmt.Errorf(
+			"server.internal_addr %q is reachable from beyond this host, and /metrics and /debug/pprof/ "+
+				"are served on it (pprof dumps heap and goroutine state). Bind a loopback address, or "+
+				"set server.expose_internal = true (RE0AUTH_INTERNAL_EXPOSE=true) once a network "+
+				"control in front of it — a NetworkPolicy, a firewall, a private interface — is in place",
+			cfg.InternalAddr)
 	}
 
 	// Introspection policy. The environment overrides the file, like every other
@@ -721,6 +752,38 @@ func decodeKey32(value, what string) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("%s must be 32 bytes, base64 or hex", what)
+}
+
+// internalAddrIsLocal reports whether the operational listener would be confined
+// to this host.
+//
+// It is deliberately conservative: anything it cannot prove is loopback counts as
+// reachable, because the two mistakes do not cost the same. Refusing a private
+// address costs one configuration line; accepting a public one publishes heap
+// profiles and goroutine dumps to whoever can reach the port.
+//
+// A hostname other than "localhost" is therefore not local. Resolving it here
+// would answer with DNS what the bind answers with the interface table, and the
+// two are allowed to disagree — between the check and the listen, or between this
+// process and the resolver.
+func internalAddrIsLocal(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Not host:port. Keep whatever is there as the host, so a bare "127.0.0.1"
+		// or a bare ":9090" is still classified rather than waved through.
+		host = addr
+	}
+	if host == "localhost" {
+		return true
+	}
+	// Covers the empty host (":9090", every interface, which is not local), the
+	// unspecified addresses (0.0.0.0, ::) and any routable one: IsLoopback is true
+	// only for 127.0.0.0/8 and ::1.
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // parseTrustedProxies parses CIDR prefixes, and bare addresses as single-host

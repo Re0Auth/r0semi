@@ -11,6 +11,13 @@ data:
     issuer        = "https://auth.example.com"
     addr          = "0.0.0.0:8080"
     internal_addr = "0.0.0.0:9090"
+    # The pod has to bind 0.0.0.0 for the Service to select it, so the
+    # operational surface is reachable from outside the pod — which the process
+    # refuses without this acknowledgement. What makes it safe is the
+    # NetworkPolicy beside this file: ingress to 9090 is allowed only from the
+    # `monitoring` namespace. On any other orchestrator, provide that control
+    # yourself or bind a loopback address.
+    expose_internal = true
     cookie_secure = true
     rate_limit       = 50
     rate_limit_burst = 100

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
+	"github.com/Re0Auth/r0semi/internal/observability"
 )
 
 type stubHead struct {
@@ -29,6 +31,27 @@ type stubHead struct {
 }
 
 func (s stubHead) Head(context.Context) ([]byte, error) { return s.sum, s.err }
+
+// stubVerifier answers a chain walk with a canned outcome.
+type stubVerifier struct {
+	verification audit.Verification
+	err          error
+}
+
+func (s stubVerifier) Verify(context.Context) (audit.Verification, error) {
+	return s.verification, s.err
+}
+
+// scrapeMetrics returns the Prometheus exposition text for this Metrics set.
+func scrapeMetrics(t *testing.T, m *observability.Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.InternalHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics = %d, want 200", rec.Code)
+	}
+	return rec.Body.String()
+}
 
 // captureLog swaps the process default logger for one writing into a buffer. This
 // package has no parallel tests, so the swap is safe; anchorOnce is called
@@ -70,6 +93,134 @@ func TestAnchorRecordsTheChainHead(t *testing.T) {
 				t.Fatalf("a failed read still anchored a value:\n%s", out)
 			}
 		})
+	}
+}
+
+// The verify loop exists to move `audit_verify_total`, because that series is S5:
+// `result="failed"` being identically zero is the target, and until this loop the
+// only thing that ever moved it was an operator calling the admin endpoint by hand.
+// So what each outcome records is the contract worth pinning — in particular that a
+// walk which did not finish is `error` and not `failed`. Conflating them would
+// either page someone for a busy database or hide a genuine chain failure behind
+// the value the runbooks treat as routine.
+func TestVerifyOnceRecordsTheOutcomeItFound(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stub    stubVerifier
+		want    string
+		wantLog string
+	}{
+		{
+			name:    "an intact chain",
+			stub:    stubVerifier{verification: audit.Verification{OK: true, Chained: 12, Legacy: 3}},
+			want:    `re0auth_audit_verify_total{result="ok"} 1`,
+			wantLog: "audit chain verified",
+		},
+		{
+			name: "a chain that does not hold",
+			stub: stubVerifier{verification: audit.Verification{
+				OK: false, Chained: 40, FirstBadID: 42, Reason: "prev_hash does not match",
+			}},
+			want:    `re0auth_audit_verify_total{result="failed"} 1`,
+			wantLog: "first_bad_id=42",
+		},
+		{
+			name:    "a walk that did not finish",
+			stub:    stubVerifier{err: errors.New("statement timeout")},
+			want:    `re0auth_audit_verify_total{result="error"} 1`,
+			wantLog: "could not verify the audit chain",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLog(t)
+			metrics := observability.New()
+			verifyOnce(context.Background(), tc.stub, metrics)
+
+			if body := scrapeMetrics(t, metrics); !strings.Contains(body, tc.want) {
+				t.Errorf("exposition is missing %q:\n%s", tc.want, body)
+			}
+			if out := logged(); !strings.Contains(out, tc.wantLog) {
+				t.Errorf("log does not mention %q:\n%s", tc.wantLog, out)
+			}
+		})
+	}
+}
+
+// The loop must not inherit the read API's allowlist. That gate exists because
+// reading the log exposes every account's activity to whoever calls it; the loop is
+// the service examining its own log and has no caller to authorize. Gating it the
+// same way would mean a durable deployment that names no operators — legitimate, and
+// exactly the case auditReadSide returns nil for — silently stops verifying.
+func TestAuditVerifierIsNotGatedOnAnAllowlist(t *testing.T) {
+	readable := auditReadSink{audit.NewMemoryLogger()}
+
+	if got := auditVerifier(readable); got == nil {
+		t.Fatal("the verifier was withheld from a sink that can verify")
+	}
+	if got := auditVerifier(audit.NewMemoryLogger()); got != nil {
+		t.Fatal("the verifier was offered by a sink that cannot verify")
+	}
+	// The contrast that makes the point: the allowlist withholds the read API from
+	// the same sink the loop still verifies.
+	if got := auditReadSide(nil, readable); got != nil {
+		t.Fatal("the read API was offered without an admin allowlist")
+	}
+}
+
+// countingVerifier counts the walks it was asked for.
+type countingVerifier struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (c *countingVerifier) Verify(context.Context) (audit.Verification, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n++
+	return audit.Verification{OK: true}, nil
+}
+
+func (c *countingVerifier) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// Two properties of the loop itself, neither of which the body's test can see.
+//
+// It walks once at startup rather than waiting for the first tick: a rolling deploy
+// restarts replicas far more often than six hours, so a loop that only acted on its
+// ticker would on such a deployment never walk anything at all — a control that
+// appears configured and never runs.
+//
+// And it stops when the process's context ends, like every other loop here, rather
+// than outliving the storage it reads.
+func TestAuditVerifyLoopWalksAtStartAndStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	verifier := &countingVerifier{}
+	metrics := observability.New()
+	done := make(chan struct{})
+	// An interval far longer than the test: the ticker cannot fire, so any walk at
+	// all must be the startup one. Asserting "it already happened" without this
+	// would be a race against the scheduler, not a statement about the loop.
+	go func() {
+		auditVerifyLoop(ctx, verifier, metrics, time.Hour)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for verifier.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if verifier.count() == 0 {
+		t.Fatal("the loop waited for its first tick instead of walking at startup")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the loop ignored cancellation")
 	}
 }
 
@@ -511,6 +662,70 @@ func TestInternalAddrMustDifferFromThePublicAddr(t *testing.T) {
 	}
 	if cfg.InternalAddr != "127.0.0.1:9090" {
 		t.Fatalf("internal_addr = %q, want 127.0.0.1:9090", cfg.InternalAddr)
+	}
+}
+
+// Being a *different* address is not the same as being a private one, and the old
+// check only asked the first question. `0.0.0.0:9090` — an ordinary way to write
+// "every interface", and what the k8s baseline itself needs — passed it, putting
+// /metrics and /debug/pprof/ on the network with nothing but a documentation line in
+// the way. Now it takes an acknowledgement, and the acknowledgement is where the
+// NetworkPolicy that makes it safe gets recorded.
+func TestNonLoopbackInternalAddrNeedsAcknowledgement(t *testing.T) {
+	t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+	t.Setenv("RE0AUTH_COOKIE_SECURE", "true")
+	t.Setenv("RE0AUTH_KEK", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	t.Setenv("RE0AUTH_ADDR", "0.0.0.0:8080")
+
+	t.Setenv("RE0AUTH_INTERNAL_ADDR", "0.0.0.0:9090")
+	t.Setenv("RE0AUTH_INTERNAL_EXPOSE", "")
+	if _, err := loadConfig(""); err == nil {
+		t.Fatal("a non-loopback internal_addr was accepted without acknowledgement")
+	}
+
+	t.Setenv("RE0AUTH_INTERNAL_EXPOSE", "true")
+	cfg, err := loadConfig("")
+	if err != nil {
+		t.Fatalf("an acknowledged non-loopback internal_addr was rejected: %v", err)
+	}
+	if !cfg.ExposeInternal {
+		t.Fatal("expose_internal did not reach the settings")
+	}
+
+	// A loopback address still needs no acknowledgement — and a stray
+	// acknowledgement for one is harmless rather than an error, because the binding
+	// is the thing that decides.
+	t.Setenv("RE0AUTH_INTERNAL_ADDR", "127.0.0.1:9090")
+	t.Setenv("RE0AUTH_INTERNAL_EXPOSE", "")
+	if _, err := loadConfig(""); err != nil {
+		t.Fatalf("a loopback internal_addr was rejected: %v", err)
+	}
+}
+
+// The classification is deliberately conservative, and the asymmetry is why: the
+// two mistakes do not cost the same. Refusing a private address costs one config
+// line; accepting a public one publishes heap profiles and goroutine dumps. So
+// anything not provably loopback counts as reachable — including a hostname, which
+// would need DNS to settle and could disagree with what the bind does.
+func TestInternalAddrReachabilityIsClassifiedConservatively(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:9090", true},
+		{"127.0.0.53:9090", true}, // the whole 127/8 block, not just .0.1
+		{"[::1]:9090", true},
+		{"localhost:9090", true},
+		{"0.0.0.0:9090", false},
+		{"[::]:9090", false},
+		{":9090", false},
+		{"10.1.2.3:9090", false},
+		{"re0auth.internal:9090", false},
+		{"", false},
+	} {
+		if got := internalAddrIsLocal(tc.addr); got != tc.want {
+			t.Errorf("internalAddrIsLocal(%q) = %v, want %v", tc.addr, got, tc.want)
+		}
 	}
 }
 

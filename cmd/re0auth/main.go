@@ -90,6 +90,15 @@ const (
 	// unlike a cron job calling the admin endpoint, needs no credential.
 	auditAnchorInterval = time.Hour
 
+	// auditVerifyInterval is how often the durable chain is walked end to end.
+	//
+	// Hours rather than minutes because this is a full scan of the log, unlike the
+	// anchor beside it, which reads one row. Shortening the interval therefore buys
+	// more repeats of the same read rather than more safety; the escalation for a
+	// log too large to walk inside its statement timeout is incremental checkpoints
+	// (docs/operations.md), not a smaller number here.
+	auditVerifyInterval = 6 * time.Hour
+
 	// HTTP server timeouts. ReadHeaderTimeout bounds a slow-header (Slowloris)
 	// client; IdleTimeout bounds a kept-alive connection that has gone quiet. Read
 	// and Write bound a whole exchange: the data plane proxies an upstream
@@ -115,6 +124,25 @@ const (
 type headReader interface {
 	Head(ctx context.Context) ([]byte, error)
 }
+
+// chainVerifier walks the record chain and reports the first row that does not
+// hold.
+//
+// It is narrower than httpapi.AuditReader on purpose, and for the same reason the
+// read API is gated on an allowlist: reading the log means reading about every
+// account, so *that* capability needs an operator behind it. The service checking
+// its own log has no caller to authorize, so it needs only this — and a deployment
+// with no operators still gets its chain walked.
+type chainVerifier interface {
+	Verify(ctx context.Context) (audit.Verification, error)
+}
+
+// The durable sink is the only implementation there is, and asserting it here means
+// a signature drift fails the build rather than quietly turning the loop off: an
+// assertion that stopped matching would leave verifyOnce unreached, the metric
+// unmoved, and every gate green — the exact shape of failure this loop was added to
+// remove.
+var _ chainVerifier = (*postgres.AuditLogger)(nil)
 
 // storage bundles the persistence ports so the composition root does not thread
 // five return values through every call.
@@ -167,16 +195,33 @@ func buildLimiter(cfg settings) *ratelimit.Limiter {
 	return ratelimit.New(cfg.RateLimit, cfg.RateLimitBurst)
 }
 
-// die reports why the process cannot start, and exits non-zero.
-//
-// It replaces log.Fatalf so the reason is a structured field rather than a
-// sentence, and so the stage is machine-readable: "which part refused to start"
-// is the first question anyone asks.
-func die(stage string, err error) {
-	slog.Error("cannot start", "stage", stage, "err", err)
-	os.Exit(1)
+// startFailure names the stage that refused to start. It is a value rather than an
+// exit so the reason can travel up to main, which is the only place that exits:
+// logging and exiting where the failure was found is what skipped every deferred
+// cleanup registered below it.
+type startFailure struct {
+	stage string
+	err   error
 }
 
+func (e *startFailure) Error() string { return e.err.Error() }
+func (e *startFailure) Unwrap() error { return e.err }
+
+// die reports why the process cannot start, as an error rather than an exit.
+//
+// The stage is a structured field rather than a sentence, and it is
+// machine-readable: "which part refused to start" is the first question anyone
+// asks. Returning instead of calling os.Exit is what lets run's deferred
+// store.close and loop join execute on the failure paths too — the ordering the
+// comment above them promises and an os.Exit here silently broke.
+func die(stage string, err error) error {
+	return &startFailure{stage: stage, err: err}
+}
+
+// main is the only function that exits the process, and the exits below all
+// happen before any resource is opened — so none of them has a deferred cleanup
+// to strand. Everything that opens something lives in run, whose defers therefore
+// always get to run.
 func main() {
 	flag.Parse()
 
@@ -220,20 +265,40 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := run(); err != nil {
+		var failure *startFailure
+		if errors.As(err, &failure) {
+			slog.Error("cannot start", "stage", failure.stage, "err", failure.err)
+		} else {
+			// Not die(): the process started fine, so "cannot start" would be a
+			// lie. Reaching here means serving stopped for a reason other than a
+			// clean shutdown, or the drain ran out of time.
+			slog.Error("server stopped with an error", "err", err)
+		}
+		os.Exit(1)
+	}
+}
+
+// run configures, wires and serves, and returns when serving has stopped.
+//
+// It is a function rather than the body of main because of its defers: the
+// storage handle is closed and the background loops are joined on the way out,
+// and only a return can guarantee that. When main called os.Exit on a failed
+// listener, those defers never ran.
+func run() error {
 	configPath, explicit := config.Path(*configFlag, "RE0AUTH_CONFIG", defaultConfigPath)
 	switch {
 	case configPath != "":
 		slog.Info("configuration file", "path", configPath)
 	case explicit:
-		slog.Error("cannot start", "stage", "config", "reason", "config file does not exist", "path", *configFlag)
-		os.Exit(1)
+		return die("config", fmt.Errorf("config file does not exist: %s", *configFlag))
 	default:
 		slog.Info("no configuration file; configuring from the environment only")
 	}
 
 	cfg, err := loadConfig(configPath)
 	if err != nil {
-		die("config", err)
+		return die("config", err)
 	}
 
 	// A signal context. Cancelling it on SIGTERM (what an orchestrator sends on a
@@ -269,13 +334,12 @@ func main() {
 	// Before openStorage, because Open migrates up: a rollback issued after it
 	// would be undone by the act of opening the database.
 	if *migrateDown {
-		migrateDownAndReport(ctx, cfg)
-		return
+		return migrateDownAndReport(ctx, cfg)
 	}
 
 	store, err := openStorage(ctx, cfg, metrics)
 	if err != nil {
-		die("storage", err)
+		return die("storage", err)
 	}
 	defer store.close()
 	reportDurability(store)
@@ -312,6 +376,14 @@ func main() {
 	if store.auditHead != nil {
 		loops.Go(func() { anchorLoop(loopCtx, store.auditHead, auditAnchorInterval) })
 	}
+	// The other half of the same control, and deliberately not gated on the same
+	// thing: this one is the service checking its own log, so it runs whether or not
+	// the deployment named an operator. The admin read API stays behind its
+	// allowlist — reading the log means reading about every account — but a chain
+	// nobody is allowed to *read* is still a chain that must be *sound*.
+	if verifier := auditVerifier(store.audit); verifier != nil {
+		loops.Go(func() { auditVerifyLoop(loopCtx, verifier, metrics, auditVerifyInterval) })
+	}
 
 	// The connection pool is the one dependency whose saturation /readyz reports
 	// only as a 503. Export it, so an incident has the number the runbook tells the
@@ -325,7 +397,7 @@ func main() {
 
 	vaultService, err := openVault(cfg, store.credentials, logger, metrics)
 	if err != nil {
-		die("vault", err)
+		return die("vault", err)
 	}
 	if len(cfg.RetiredKEKs) > 0 {
 		// Said loudly, because a retired key is a key that can still open something.
@@ -334,12 +406,11 @@ func main() {
 			"retired", len(cfg.RetiredKEKs))
 	}
 	if *rotateKeys {
-		rotateAndReport(ctx, vaultService)
-		return
+		return rotateAndReport(ctx, vaultService)
 	}
 
 	if err := seedClient(ctx, store.clients, cfg); err != nil {
-		die("seed client", err)
+		return die("seed client", err)
 	}
 
 	idpRegistry, err := idp.NewRegistry(idp.RegistryConfig{
@@ -348,7 +419,7 @@ func main() {
 		Credentials:  cfg.idpCredentials,
 	})
 	if err != nil {
-		die("idp", err)
+		return die("idp", err)
 	}
 	if len(cfg.idpCredentials) == 0 {
 		slog.Warn("no identity provider is configured; nobody can sign in")
@@ -362,14 +433,14 @@ func main() {
 	authHandler, err := auth.NewHandler(sessions, idpRegistry, store.accounts,
 		auth.WithMetrics(metrics), auth.WithAudit(logger))
 	if err != nil {
-		die("auth", err)
+		return die("auth", err)
 	}
 
 	// The handle must outlive the upstream binding round trip; see
 	// authorizationRequestTTL. The OP store owns it now, in both storage modes.
 	registry, err := federation.NewRegistry(cfg.sources...)
 	if err != nil {
-		die("sources", err)
+		return die("sources", err)
 	}
 	// One pooled, bounded client for every outbound call the data plane makes.
 	// The standard library's default transport keeps only two idle connections per
@@ -398,7 +469,7 @@ func main() {
 		Metrics:    metrics,
 	})
 	if err != nil {
-		die("federation", err)
+		return die("federation", err)
 	}
 
 	apiConfig := httpapi.Config{
@@ -432,7 +503,7 @@ func main() {
 	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
 	oidcHandler, oidcStore, janitor, err := openOIDC(cfg, store, sessions, logger, metrics)
 	if err != nil {
-		die("oidc", err)
+		return die("oidc", err)
 	}
 	// The in-memory OP store's janitor, started here with the other loops so every
 	// goroutine this process runs is started and joined in one place.
@@ -477,7 +548,7 @@ func main() {
 			Audit:    logger,
 		})
 		if err != nil {
-			die("admin", err)
+			return die("admin", err)
 		}
 		admins := make([]account.UserID, 0, len(cfg.adminSubjects))
 		for _, s := range cfg.adminSubjects {
@@ -529,7 +600,7 @@ func main() {
 		Audit:      logger,
 	})
 	if err != nil {
-		die("lifecycle", err)
+		return die("lifecycle", err)
 	}
 	apiConfig.Deleter = deleter
 	if store.sessionRevoker == nil {
@@ -542,7 +613,7 @@ func main() {
 
 	api, err := httpapi.New(apiConfig)
 	if err != nil {
-		die("http", err)
+		return die("http", err)
 	}
 
 	// Bind before announcing, so "listening" is only printed for an address that
@@ -550,7 +621,7 @@ func main() {
 	// what a deployment with a port of 0 needs to read.
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
-		die("listen", err)
+		return die("listen", err)
 	}
 	endpoints := []endpoint{{server: newServer(api.Handler()), listener: listener}}
 
@@ -561,7 +632,7 @@ func main() {
 	if cfg.InternalAddr != "" {
 		internalListener, err := net.Listen("tcp", cfg.InternalAddr)
 		if err != nil {
-			die("internal listen", err)
+			return die("internal listen", err)
 		}
 		endpoints = append(endpoints, endpoint{
 			server:   newServer(metrics.InternalHandler()),
@@ -574,13 +645,13 @@ func main() {
 
 	slog.Info("listening", "addr", listener.Addr().String(), "issuer", cfg.Issuer, "version", version)
 	if err := serveUntilSignal(ctx, shutdownTimeout, endpoints...); err != nil {
-		// Not die(): the process started fine, so "cannot start" would be a lie.
-		// Reaching here means serving stopped for a reason other than a clean
-		// shutdown, or the drain ran out of time.
-		slog.Error("server stopped with an error", "err", err)
-		os.Exit(1)
+		// Returned rather than logged and exited here. main owns the wording (this is
+		// not a start failure), and — the reason this is a return at all — returning
+		// is what lets this function's defers run: the loop join and the pool close.
+		return err
 	}
 	slog.Info("stopped")
+	return nil
 }
 
 // endpoint is one listener together with the server that serves it. Shutdown has
@@ -851,6 +922,62 @@ func anchorOnce(ctx context.Context, head headReader) {
 	}
 }
 
+// auditVerifyLoop walks the audit chain, once at startup and then on a ticker.
+//
+// It exists so that "the chain verifies" is something the service tests rather
+// than something a person has to remember: the admin endpoint is the only other
+// caller of Verify, and a control nobody invokes is a control nobody has. The
+// metric it records is the one the S5 alerts read, so before this loop those
+// alerts could only fire when an operator happened to run a verify by hand.
+//
+// It complements the anchor beside it rather than duplicating it. Verify catches
+// an edited row, a deletion in the middle and a forged signature by recomputing
+// the chain; a TRUNCATED TAIL it cannot catch, because what remains is a shorter
+// but perfectly valid chain — that is what the anchored head is for.
+func auditVerifyLoop(ctx context.Context, v chainVerifier, metrics *observability.Metrics, every time.Duration) {
+	verifyOnce(ctx, v, metrics)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			verifyOnce(ctx, v, metrics)
+		}
+	}
+}
+
+// verifyOnce is the loop's body, split out so a test can pin the outcome without
+// racing a ticker. It records the same metric the admin endpoint records, which is
+// the point: `audit_verify_total{result="failed"}` being identically zero is S5,
+// and before this it was a claim nothing checked.
+func verifyOnce(ctx context.Context, v chainVerifier, metrics *observability.Metrics) {
+	verification, err := v.Verify(ctx)
+	switch {
+	case err != nil:
+		// Not fatal, for the same reason the anchor's failure is not: a control that
+		// takes the process down is worse than one that reports. This is S5's blind
+		// spot rather than a chain failure — the walk did not finish, so nobody can
+		// say whether the log is intact — which is why it is a warning and its own
+		// metric value.
+		metrics.ObserveAuditVerify(observability.VerifyError)
+		slog.Warn("could not verify the audit chain", "err", err)
+	case !verification.OK:
+		metrics.ObserveAuditVerify(observability.VerifyFailed)
+		slog.Error("audit chain does not verify",
+			"first_bad_id", verification.FirstBadID,
+			"reason", verification.Reason,
+			"chained", verification.Chained,
+			"legacy", verification.Legacy)
+	default:
+		metrics.ObserveAuditVerify(observability.VerifyOK)
+		slog.Info("audit chain verified",
+			"chained", verification.Chained,
+			"legacy", verification.Legacy)
+	}
+}
+
 // sweepLoop periodically removes expired rows -- dated tokens, codes and pending
 // requests, and sessions. A lookup already refuses an expired row; this covers
 // the ones nobody comes back to, whose row would otherwise live on forever.
@@ -911,16 +1038,17 @@ func openVault(cfg settings, credentials vault.Repo, logger audit.Logger, metric
 // rollback to an arbitrary version is a decision better made deliberately, with the
 // migration files in hand. See docs/migration-decision.md (ADR-0008) for why
 // restore-from-backup, not down, is the rollback story.
-func migrateDownAndReport(ctx context.Context, cfg settings) {
+func migrateDownAndReport(ctx context.Context, cfg settings) error {
 	if cfg.DatabaseURL == "" {
-		die("migrate-down", errors.New("no DATABASE_URL is configured; there is nothing to roll back"))
+		return die("migrate-down", errors.New("no DATABASE_URL is configured; there is nothing to roll back"))
 	}
 	if err := postgres.MigrateDown(ctx, cfg.DatabaseURL, postgres.PoolOptions{
 		ConnectTimeout: cfg.Pool.ConnectTimeout,
 	}); err != nil {
-		die("migrate-down", err)
+		return die("migrate-down", err)
 	}
 	slog.Info("rolled back the most recent migration")
+	return nil
 }
 
 // rotateAndReport re-wraps the vault under the current KEK.
@@ -928,10 +1056,10 @@ func migrateDownAndReport(ctx context.Context, cfg settings) {
 // It is a startup action rather than a running one, for the same reason migrations
 // are: it needs the old key configured alongside the new one, and it decides what
 // "current" means, so it should not race a server that is already serving.
-func rotateAndReport(ctx context.Context, v vault.Service) {
+func rotateAndReport(ctx context.Context, v vault.Service) error {
 	rotation, err := v.Rotate(ctx)
 	if err != nil {
-		die("rotate keys", err)
+		return die("rotate keys", err)
 	}
 	slog.Info("key rotation complete",
 		"scanned", rotation.Scanned,
@@ -940,6 +1068,7 @@ func rotateAndReport(ctx context.Context, v vault.Service) {
 	if rotation.Scanned == 0 {
 		slog.Warn("there was nothing to rotate; is the configured storage the one holding credentials?")
 	}
+	return nil
 }
 
 // oidcBackend is the OP store surface the composition root needs. Both
@@ -1247,6 +1376,21 @@ func auditReadSide(admins []string, l audit.Logger) httpapi.AuditReader {
 	}
 	if r, ok := l.(httpapi.AuditReader); ok {
 		return r
+	}
+	return nil
+}
+
+// auditVerifier returns the sink's verification capability, or nil when the sink
+// cannot answer.
+//
+// The allowlist that gates auditReadSide is deliberately absent here. It exists
+// because reading the log exposes every account's activity to whoever calls; the
+// verify loop is the service examining its own log, with no caller to authorize.
+// Gating it the same way would mean a durable deployment without operators — a
+// legitimate configuration — silently stops checking its chain.
+func auditVerifier(l audit.Logger) chainVerifier {
+	if v, ok := l.(chainVerifier); ok {
+		return v
 	}
 	return nil
 }
