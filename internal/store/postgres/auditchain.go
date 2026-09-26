@@ -141,6 +141,18 @@ func (l *AuditLogger) appendChained(ctx context.Context, r auditRow) error {
 	return nil
 }
 
+// verifyStatementTimeout bounds the chain walk inside Verify.
+//
+// The pool's own statement_timeout (30s by default) is sized for a request. A
+// Verify walks every chained row, so inheriting that bound makes S5 — a hard
+// target — go blind as the log grows: the walk is cancelled, the endpoint answers
+// 500, and nothing was learned about the chain. This bound is deliberately still
+// bounded, and still under the HTTP server's writeTimeout (60s in cmd/re0auth):
+// the walk is served by a request, and a bound above that would be cut at the
+// socket instead, which is a worse failure because it looks like a network
+// problem.
+const verifyStatementTimeout = 45 * time.Second
+
 // AuditVerification is an alias kept for readability inside this package; the
 // type itself lives in the public audit package so the operator API can consume it
 // without importing a database adapter.
@@ -154,17 +166,36 @@ type AuditVerification = audit.Verification
 // the recomputation catches an edited field, the linkage catches a deletion or a
 // reorder, and the signature catches an attacker who rewrote the whole chain
 // (who can recompute every hash but cannot forge the MAC).
+//
+// The walk runs in a transaction of its own, so it can raise statement_timeout
+// for the length of the scan (see verifyStatementTimeout) and have the change
+// revert automatically when the transaction ends. A bare SET would leak the
+// longer bound into every later request on that pooled connection — the hazard
+// postgres.go's migration note spells out.
 func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
+	tx, err := l.pool.Begin(ctx)
+	if err != nil {
+		return audit.Verification{}, fmt.Errorf("postgres: audit: verify begin: %w", err)
+	}
+	// Read-only: rollback is the honest end, and it is what puts the session's
+	// statement_timeout back the moment this returns.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL statement_timeout = `+strconv.FormatInt(verifyStatementTimeout.Milliseconds(), 10)); err != nil {
+		return audit.Verification{}, fmt.Errorf("postgres: audit: verify timeout: %w", err)
+	}
+
 	// The chain head is read first as a witness that rows were chained at all.
 	// Without it, clearing the chain columns off every row (row_hash = NULL) makes
 	// each row look pre-chain and the walk reports the log intact while a caller
 	// with DB write access rewrote it freely.
 	var head []byte
-	if err := l.pool.QueryRow(ctx, `SELECT head_hash FROM audit_chain WHERE only_row`).Scan(&head); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT head_hash FROM audit_chain WHERE only_row`).Scan(&head); err != nil {
 		return audit.Verification{}, fmt.Errorf("postgres: audit: verify head: %w", err)
 	}
 
-	rows, err := l.pool.Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT id, occurred_at, action, subject, provider, outcome, detail,
 		       prev_hash, row_hash, signature
 		  FROM audit_events

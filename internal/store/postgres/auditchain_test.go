@@ -176,6 +176,28 @@ func TestAuditChainRecordsAndVerifies(t *testing.T) {
 	}
 }
 
+// TestVerifyTimeoutOutlivesThePoolBoundButStaysUnderTheHTTPCeiling pins both
+// directions of the bound Verify sets for itself.
+//
+// Under: it has to exceed the pool's per-request statement_timeout, or the walk
+// that exists for S5 is cancelled exactly when the log is large enough to matter.
+// Over: it has to stay under the HTTP server's writeTimeout (60s today, in
+// cmd/re0auth) or the answer is cut at the socket instead — a worse failure,
+// because it is indistinguishable from a network problem. That constant lives in
+// another package and cannot be imported, so it is a literal here on purpose:
+// raising the bound past it must fail this test rather than silently degrade.
+func TestVerifyTimeoutOutlivesThePoolBoundButStaysUnderTheHTTPCeiling(t *testing.T) {
+	if pool := DefaultPoolOptions().StatementTimeout; verifyStatementTimeout <= pool {
+		t.Fatalf("verifyStatementTimeout = %s, want it above the pool default %s",
+			verifyStatementTimeout, pool)
+	}
+	const httpWriteTimeout = 60 * time.Second
+	if verifyStatementTimeout >= httpWriteTimeout {
+		t.Fatalf("verifyStatementTimeout = %s, want it under the HTTP server's %s writeTimeout",
+			verifyStatementTimeout, httpWriteTimeout)
+	}
+}
+
 // TestAdversarialAuditChainCatchesAWholeLogMetadataStrip: clearing the chain
 // columns off every row must not verify. Without the chain-head witness every row
 // reads as pre-chain and the walk reports the log intact while a caller with DB

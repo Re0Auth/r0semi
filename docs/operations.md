@@ -125,6 +125,11 @@ psql "$DATABASE_URL" -c "SELECT count(*) FROM audit_events WHERE row_hash = '\x<
 - 锚点行只在**持久化部署**里存在：内存模式的审计是环形缓冲，没有链，也没有 `Head()`。
 - 日志系统要放在**够不到数据库的那个凭据域**，否则一次凭据泄露就能同时改表与改锚点——
   与 `scripts/backup-keys.sh` 对密钥备份的取舍相同。
+- **校验本身有超时，而且是单独放宽的**：`GET /v1/admin/audit/verify` 是全表遍历，它在一个事务里把
+  `statement_timeout` 临时抬到 45s（连接池默认是 30s，按请求量级设的），事务结束自动复原。
+  它仍然有界，且必须小于 HTTP 的 60s 写超时——所以**校验失败先分清是"链有问题"还是"遍历没跑完"**：
+  后者记的是 `result="error"`，由 `Re0AuthAuditVerifyError` 告警（见 [runbooks.md](./runbooks.md)）。
+  真到了 45s 也扫不完的规模，那是要上增量校验点，而不是继续抬超时。
 
 ## 数据删除与保留
 
