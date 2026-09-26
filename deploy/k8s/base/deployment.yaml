@@ -58,6 +58,18 @@ spec:
                 secretKeyRef: { name: re0auth-secrets, key: audit-key }
           volumeMounts:
             - { name: config, mountPath: /etc/re0auth, readOnly: true }
+          # Startup is not a request. Migrations run before the listener binds
+          # (cmd/re0auth), and a second replica waits on the migration advisory
+          # lock for as long as the first one takes — so a slow migration is a
+          # legitimate reason for /healthz to be unreachable for a while. Without
+          # this probe liveness (3 × 10s) would kill the pod mid-migration and the
+          # deployment would crash-loop; with it, startup gets 24 × 5s = 120s and
+          # liveness only begins counting once startup has succeeded.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
           livenessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10

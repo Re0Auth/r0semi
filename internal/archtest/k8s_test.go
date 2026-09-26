@@ -49,10 +49,25 @@ func TestKubernetesBaselineHasProbesAndLimits(t *testing.T) {
 		t.Fatal("Deployment has no containers")
 	}
 	container, _ := containers[0].(map[string]any)
-	for _, probe := range []string{"livenessProbe", "readinessProbe"} {
+	for _, probe := range []string{"startupProbe", "livenessProbe", "readinessProbe"} {
 		if _, ok := container[probe].(map[string]any); !ok {
 			t.Fatalf("container has no %s", probe)
 		}
+	}
+	// The startup probe's whole job is to outlast a slow start — migrations run
+	// before the listener binds, and a second replica waits on the migration
+	// advisory lock for as long as the first one takes. A presence check alone
+	// would pass for a probe that gives up in five seconds, so what is asserted
+	// here is the budget.
+	startup := container["startupProbe"].(map[string]any)
+	period, periodOK := startup["periodSeconds"].(int)
+	threshold, thresholdOK := startup["failureThreshold"].(int)
+	if !periodOK || !thresholdOK {
+		t.Fatalf("startupProbe needs a numeric periodSeconds and failureThreshold: %v", startup)
+	}
+	if budget := period * threshold; budget < 90 {
+		t.Fatalf("startupProbe budget is %ds, want at least 90s so a slow migration is not killed mid-flight",
+			budget)
 	}
 	resources, ok := container["resources"].(map[string]any)
 	if !ok {
