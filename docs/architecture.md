@@ -556,8 +556,11 @@ sweep 也会删除 OP 表中已过期的行**（`internal/store/postgres/sweep.g
 `internal/observability` 与 [observability-decision.md](./observability-decision.md)（ADR-0007）；
 再加 Go 运行时与进程采集器）与 `/debug/pprof/`。它**必须与 `addr` 不同**（配置校验强制）：单独一个监听器
 正是「这些端点无法经公网端口到达」的保证，而 pprof 会导出进程内部状态（goroutine 转储、堆、CPU profile），
-把 `internal_addr` 指向公网地址就是把它们公开。它按与主监听器同一套超时启动，并在同一个信号上优雅关闭
-（`serveUntilSignal` 现在接收一组 endpoint，两者一起排空）。
+把 `internal_addr` 指向公网地址就是把它们公开。**绑到非 loopback 地址还要 `server.expose_internal = true`
+显式承认**（`RE0AUTH_INTERNAL_EXPOSE`；见 [operations.md](./operations.md) 的「可观测与排障」）——
+容器必须绑 `0.0.0.0` 才可能被 Service 选中，所以这种绑法不能被一概拒绝，但它也不能靠一句文档拦着：
+`0.0.0.0:9090` 与 `127.0.0.1:9090` 在配置文件里只差四个字符。它按与主监听器同一套超时启动，
+并在同一个信号上优雅关闭（`serveUntilSignal` 现在接收一组 endpoint，两者一起排空）。
 
 > 本地开发：`docker run -e POSTGRES_PASSWORD=x -p 5432:5432 postgres:16`，然后
 > `TEST_DATABASE_URL=postgres://postgres:x@localhost:5432/postgres?sslmode=disable go test ./internal/store/postgres/`。

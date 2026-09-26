@@ -29,8 +29,10 @@ base 里有两件 **cluster 侧的前置**，它不替你做，因为它们都�
 - **TLS**：Ingress 用 `re0auth-tls` 这个 secret 终止 TLS，而 base **不创建**它——否则等于把
   cert-manager 变成基线的硬依赖。装了 cert-manager 就用 `ingress.yaml` 里注释掉的那个
   `Certificate`；用别的签发方式，就自己签发并创建同名 secret。
-- **镜像**：base 钉的是最近一个已发布 tag（目前只有 `v0.0.0-rc.1`）。生产按上面的
-  `kustomize edit set image` 换成 digest。
+- **镜像**：base 钉的是**最近一个真正发布过的 tag**（`v0.0.0-rc.3`，目前唯一带产物的预发布）。
+  生产按上面的 `kustomize edit set image` 换成 digest。这个 pin 有守卫：`internal/archtest`
+  会拿仓库里真实存在的 `v*` tag 比对，钉一个从未构建过的名字会直接失败——这条守卫存在的理由
+  见 [CHANGELOG](../CHANGELOG.md) 的 rc.1 一节。
 
 系统变更后：
 
@@ -118,6 +120,12 @@ kubectl apply -k deploy/k8s/backup
 
 - `/healthz` 存活、`/readyz` 依赖（Postgres ping）；两者纯文本、免限流，不属任何平面。
 - `/metrics` 与 `/debug/pprof/` 在 `server.internal_addr` 的独立内部监听器上，绝不暴露公网。
+  绑一个**非 loopback** 地址需要显式承认：`server.expose_internal = true`（或
+  `RE0AUTH_INTERNAL_EXPOSE=true`），否则拒绝启动。这条不是形式——`/debug/pprof/` 会导出堆、
+  goroutine dump 与 CPU profile，而原来的检查只有"不等于 `server.addr`"。k8s 基线里它是开着的
+  （容器必须绑 `0.0.0.0` 才可能被 Service 选中），安全性来自同目录的 NetworkPolicy：
+  只有 `monitoring` 命名空间能到 9090。**在别的编排系统上，请自己提供那个网络控制**，
+  或者直接绑 loopback。
 - `/metrics` 导出**黄金指标**（按平面的请求/错误/时延/在途）与**业务与安全信号**（登录结果、
   令牌签发与错误、撤销、上游读取与刷新、vault 操作、审计链校验、设备流、运维动作）。
   **SLO 与告警规则**见 [slo.md](./slo.md) 与 `deploy/prometheus/re0auth.rules.yml`，
@@ -165,6 +173,27 @@ psql "$DATABASE_URL" -c "SELECT count(*) FROM audit_events WHERE row_hash = '\x<
   它仍然有界，且必须小于 HTTP 的 60s 写超时——所以**校验失败先分清是"链有问题"还是"遍历没跑完"**：
   后者记的是 `result="error"`，由 `Re0AuthAuditVerifyError` 告警（见 [runbooks.md](./runbooks.md)）。
   真到了 45s 也扫不完的规模，那是要上增量校验点，而不是继续抬超时。
+- **链自己会被定期走一遍，不再等谁来点**：服务在启动时、以及之后每 6 小时，用**同一个**校验路径
+  走一遍整条链，结果计入 `re0auth_audit_verify_total{result="ok|failed|error"}`。
+  没有这一步时，S5（"`failed` 恒为 0"）只在有人手工调 `/v1/admin/audit/verify` 的那一刻才有意义——
+  一个没人跑的控制不是控制。现在 `Re0AuthAuditChainBroken` 与 `Re0AuthAuditVerifyError` 会自己响，
+  两条告警的处置步骤不变。
+  间隔是小时级而不是分钟级，因为它是全表遍历：**把间隔调短不是"更安全"，只是更多次相同的读**；
+  扫不完时的正解是增量校验点（上一条），不是更频繁的重扫。
+  锚点循环（上面的链接头）仍然单独存在：它抓的是**尾部截断**，校验抓的是**剩下的链是否自洽**，
+  两者互相补不上对方的盲区。
+
+#### 手工触发一次
+
+链有问题时，运维会想立刻再看一遍，而不是等下一个 6 小时：
+
+```sh
+# 走的是同一条校验路径，因此结果同样计入 audit_verify_total
+curl -fsS -H "Cookie: ..." https://auth.example.com/v1/admin/audit/verify
+```
+
+它需要管理员会话（读日志等于读每个账号的活动），所以**不能**从 cron 调；这也正是把定期校验做进
+服务内部而不是做成外部作业的原因。
 
 ## 数据删除与保留
 
