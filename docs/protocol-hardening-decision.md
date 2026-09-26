@@ -1,7 +1,7 @@
 # ADR-0005：协议面对抗审计后的收紧
 
 > 状态：**已接受**。
-> 背景：一轮只读对抗审计（`audit-authz` skill）在授权码、scope、方法、发现文档、
+> 背景：一轮只读对抗审计在授权码、scope、方法、发现文档、
 > 内省与密钥处理上找到若干缺口。本文记录每一项的取舍与落地，避免下次审计重新争论。
 > 相关：[oidc-decision.md](./oidc-decision.md)（ADR-0001）、[api-design.md](./api-design.md)、
 > [threat-model.md](./threat-model.md)。
