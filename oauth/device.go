@@ -94,6 +94,20 @@ type DeviceAuthorizationRecord struct {
 	LastPoll       time.Time
 }
 
+// DeviceDecision is the terminal outcome of a verification page: the status plus
+// everything that comes with it.
+//
+// It is a value of its own rather than a whole DeviceAuthorizationRecord because
+// a decision must be unable to touch the request's own fields (client, user code,
+// expiry) as a side effect — and, more importantly, because deciding is a
+// transition, not a write: see RecordDecision.
+type DeviceDecision struct {
+	Status   DeviceStatus
+	Subject  string  // set on approval
+	Scopes   []Scope // the granted set; may narrow the requested one
+	Explicit []Scope
+}
+
 // DeviceStore persists pending device authorizations, keyed by device code and
 // by user code. It is kept separate from Store so an implementation can adopt
 // the device flow without touching its token storage.
@@ -101,11 +115,25 @@ type DeviceAuthorizationRecord struct {
 // SaveDevice and GetDevice take the plaintext device code; the store keys on
 // TokenHash(deviceCode) and stores only the hash. The user code is not a secret
 // (it is displayed to the user), so it is stored as-is.
+//
+// The two writes are deliberately narrow. A poll and a decision arrive
+// concurrently by nature — the client polls every few seconds while the user is
+// looking at the page — so a store that accepted whole records would let a poll
+// that read before the decision write its stale copy back afterwards, erasing the
+// decision. That is the bug these method shapes exist to make unrepresentable.
 type DeviceStore interface {
 	SaveDevice(ctx context.Context, deviceCode string, d DeviceAuthorizationRecord) error
 	GetDevice(ctx context.Context, deviceCode string) (DeviceAuthorizationRecord, error)
 	GetDeviceByUserCode(ctx context.Context, userCode string) (DeviceAuthorizationRecord, error)
-	UpdateDevice(ctx context.Context, d DeviceAuthorizationRecord) error
+	// RecordPoll stamps the last poll, which is what the throttling check reads.
+	// It records nothing else: a poll is not a decision.
+	RecordPoll(ctx context.Context, deviceCodeHash string, at time.Time) error
+	// RecordDecision records the user's decision, and only if the request has not
+	// been decided yet: the first decision is final, so a concurrent approval
+	// cannot overwrite a denial (or the reverse). It reports whether the decision
+	// applied — false means the store refused it, because the request is unknown
+	// or has already been decided.
+	RecordDecision(ctx context.Context, deviceCodeHash string, d DeviceDecision) (bool, error)
 }
 
 // MemoryDeviceStore is a non-durable DeviceStore for development and tests.
@@ -160,13 +188,34 @@ func (s *MemoryDeviceStore) GetDeviceByUserCode(_ context.Context, userCode stri
 	return d, nil
 }
 
-// UpdateDevice implements DeviceStore.
-func (s *MemoryDeviceStore) UpdateDevice(_ context.Context, d DeviceAuthorizationRecord) error {
+// RecordPoll implements DeviceStore.
+func (s *MemoryDeviceStore) RecordPoll(_ context.Context, deviceCodeHash string, at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byDev[d.DeviceCodeHash] = d
-	s.byUser[NormalizeUserCode(d.UserCode)] = d.DeviceCodeHash
+	d, ok := s.byDev[deviceCodeHash]
+	if !ok {
+		return ErrDeviceNotFound
+	}
+	d.LastPoll = at
+	s.byDev[deviceCodeHash] = d
 	return nil
+}
+
+// RecordDecision implements DeviceStore. The status check and the write happen
+// under one lock, so exactly one of two concurrent decisions applies.
+func (s *MemoryDeviceStore) RecordDecision(_ context.Context, deviceCodeHash string, dec DeviceDecision) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.byDev[deviceCodeHash]
+	if !ok || d.Status != DevicePending {
+		return false, nil
+	}
+	d.Status = dec.Status
+	d.Subject = dec.Subject
+	d.Scopes = append([]Scope(nil), dec.Scopes...)
+	d.Explicit = append([]Scope(nil), dec.Explicit...)
+	s.byDev[deviceCodeHash] = d
+	return true, nil
 }
 
 // BeginDeviceAuthorization starts a device authorization. The scopes are
@@ -243,8 +292,10 @@ func (s *service) PollDeviceAuthorization(ctx context.Context, req DeviceCodeExc
 	if !rec.LastPoll.IsZero() && now.Before(rec.LastPoll.Add(s.pollInterval)) {
 		return TokenResponse{}, protocolError("slow_down", "polling faster than the advertised interval")
 	}
-	rec.LastPoll = now
-	if err := s.devices.UpdateDevice(ctx, rec); err != nil {
+	// Stamp the poll — and only the stamp. Writing the record read above back
+	// would erase a decision that landed in between, which is exactly what
+	// DeviceStore.RecordPoll exists to make impossible.
+	if err := s.devices.RecordPoll(ctx, rec.DeviceCodeHash, now); err != nil {
 		return TokenResponse{}, err
 	}
 
@@ -306,9 +357,14 @@ func (s *service) DecideDeviceAuthorization(ctx context.Context, userCode, subje
 	}
 
 	if !approve {
-		rec.Status = DeviceDenied
-		if err := s.devices.UpdateDevice(ctx, rec); err != nil {
+		applied, err := s.devices.RecordDecision(ctx, rec.DeviceCodeHash, DeviceDecision{
+			Status: DeviceDenied,
+		})
+		if err != nil {
 			return err
+		}
+		if !applied {
+			return protocolError("invalid_request", "the request has already been decided")
 		}
 		s.record(ctx, "oauth.device.deny", subject, rec.ClientID, audit.OutcomeDenied)
 		return nil
@@ -336,12 +392,19 @@ func (s *service) DecideDeviceAuthorization(ctx context.Context, userCode, subje
 		return err
 	}
 
-	rec.Status = DeviceApproved
-	rec.Subject = subject
-	rec.Scopes = append([]Scope(nil), granted...)
-	rec.Explicit = append([]Scope(nil), explicit...)
-	if err := s.devices.UpdateDevice(ctx, rec); err != nil {
+	// The transition decides: if another decision landed between the read above
+	// and this write, the store refuses and the first decision stands.
+	applied, err := s.devices.RecordDecision(ctx, rec.DeviceCodeHash, DeviceDecision{
+		Status:   DeviceApproved,
+		Subject:  subject,
+		Scopes:   granted,
+		Explicit: explicit,
+	})
+	if err != nil {
 		return err
+	}
+	if !applied {
+		return protocolError("invalid_request", "the request has already been decided")
 	}
 	s.record(ctx, "oauth.device.approve", subject, rec.ClientID, audit.OutcomeOK)
 	return nil

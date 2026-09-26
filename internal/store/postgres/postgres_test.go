@@ -441,11 +441,18 @@ func TestDevicesRoundTripAndUserCodeLookup(t *testing.T) {
 		}
 	}
 
-	got.Status = oauth.DeviceApproved
-	got.Subject = "usr_1"
-	got.Explicit = []oauth.Scope{"account.id"}
-	if err := devices.UpdateDevice(ctx, got); err != nil {
+	// A decision applies once and is final: the same call again must be refused
+	// rather than overwrite what is there.
+	applied, err := devices.RecordDecision(ctx, got.DeviceCodeHash, oauth.DeviceDecision{
+		Status:   oauth.DeviceApproved,
+		Subject:  "usr_1",
+		Explicit: []oauth.Scope{"account.id"},
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("a decision on a pending request was refused")
 	}
 	updated, err := devices.GetDevice(ctx, "device-secret")
 	if err != nil {
@@ -453,6 +460,28 @@ func TestDevicesRoundTripAndUserCodeLookup(t *testing.T) {
 	}
 	if updated.Status != oauth.DeviceApproved || updated.Subject != "usr_1" {
 		t.Fatalf("updated = %+v", updated)
+	}
+	again, err := devices.RecordDecision(ctx, got.DeviceCodeHash, oauth.DeviceDecision{
+		Status:  oauth.DeviceDenied,
+		Subject: "usr_2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again {
+		t.Fatal("a second decision overwrote the first")
+	}
+	if after, err := devices.GetDevice(ctx, "device-secret"); err != nil || after.Status != oauth.DeviceApproved {
+		t.Fatalf("the first decision did not stand: %+v (%v)", after, err)
+	}
+
+	// A poll moves last_poll and nothing else — the decision above must survive it.
+	if err := devices.RecordPoll(ctx, got.DeviceCodeHash, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if polled, err := devices.GetDevice(ctx, "device-secret"); err != nil ||
+		polled.Status != oauth.DeviceApproved || polled.Subject != "usr_1" {
+		t.Fatalf("a poll disturbed the decision: %+v (%v)", polled, err)
 	}
 }
 

@@ -252,13 +252,20 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
   authorize → 兑换 → userinfo → 刷新，断言**铸出来的** access/refresh/id token 与 `code_verifier`
   都不在日志里——失败路径的守卫看不到"真的发了令牌"这种情形。
 
-**仍开放**
+**已修（原「仍开放」）**
 
 - **`oauth` 遗留引擎的设备决策是丢失更新**（`oauth/device.go` 读整条记录、判定、整条写回，无谓词）：
   读代码成立，但**从 re0auth 装配不可达**（`cmd/re0auth` 只装配 `oauth.TokenAdmins`、
   `oauth.NewMemoryClientRegistry` 与 `oauth.NewClient`；`upstreamkit` 不挂设备端点）。
-  它是**公开库**，故对外部使用者是真缺陷——仍是假说，留作独立条目。
+  它是**公开库**，故对外部使用者是真缺陷。
   （原文这里写作 `internal/oauth/device.go`，该包并不在 `internal/` 下。）
+  **已修**：整条写回拆成两个字段级方法——`RecordPoll(ctx, deviceCodeHash, at)` 只动
+  `last_poll`，`RecordDecision(ctx, deviceCodeHash, DeviceDecision)` 带 `status = 'pending'` 谓词、
+  「第一个决定即最终」。守卫是 `oauth/device_race_test.go` 的两条确定性交错用例
+  （`TestAdversarialDevicePollDoesNotEraseADecision`、
+  `TestAdversarialDeviceFirstDecisionWinsInBothDirections`），Postgres 侧另有
+  `TestDeviceStore*` 覆盖同一语义。接口因此是**破坏性变更**，见 CHANGELOG。
+  这条印证了 ADR-0010 §4 的论点：公开库里的缺陷不能因为"我们自己不用"而降级处理。
 
 **两条常驻注意**
 

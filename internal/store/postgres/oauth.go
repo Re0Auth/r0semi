@@ -309,16 +309,13 @@ func (s *Devices) GetDeviceByUserCode(ctx context.Context, userCode string) (oau
 	return scanDevice(row)
 }
 
-// UpdateDevice implements oauth.DeviceStore. The record carries its own
-// DeviceCodeHash, which is the update key.
-func (s *Devices) UpdateDevice(ctx context.Context, d oauth.DeviceAuthorizationRecord) error {
+// RecordPoll implements oauth.DeviceStore. Only last_poll moves: a poll is not a
+// decision, and writing the decision columns here is what let a poll erase one.
+func (s *Devices) RecordPoll(ctx context.Context, deviceCodeHash string, at time.Time) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oauth_device_authorizations
-		   SET user_code = $2, client_id = $3, scopes = $4, status = $5,
-		       subject = $6, explicit_scopes = $7, expires_at = $8, last_poll = $9
-		 WHERE device_code_hash = $1`,
-		d.DeviceCodeHash, d.UserCode, d.ClientID, scopeArray(d.Scopes), string(d.Status),
-		d.Subject, scopeArray(d.Explicit), d.ExpiresAt, nullTime(d.LastPoll))
+		   SET last_poll = $2
+		 WHERE device_code_hash = $1`, deviceCodeHash, at)
 	if err != nil {
 		return err
 	}
@@ -326,6 +323,24 @@ func (s *Devices) UpdateDevice(ctx context.Context, d oauth.DeviceAuthorizationR
 		return oauth.ErrDeviceNotFound
 	}
 	return nil
+}
+
+// RecordDecision implements oauth.DeviceStore. The `status = 'pending'` predicate
+// is the claim: two concurrent decisions cannot both apply, so the first one is
+// final and neither can overwrite the other. The refusal is reported as
+// applied=false rather than an error — "somebody else already decided" is an
+// answer, and the caller turns it into the same invalid_request the sequential
+// case gets.
+func (s *Devices) RecordDecision(ctx context.Context, deviceCodeHash string, d oauth.DeviceDecision) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE oauth_device_authorizations
+		   SET status = $2, subject = $3, scopes = $4, explicit_scopes = $5
+		 WHERE device_code_hash = $1 AND status = 'pending'`,
+		deviceCodeHash, string(d.Status), d.Subject, scopeArray(d.Scopes), scopeArray(d.Explicit))
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 func scanDevice(row pgx.Row) (oauth.DeviceAuthorizationRecord, error) {
