@@ -29,9 +29,13 @@ import (
 func TestOIDCWiringEndToEnd(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		if os.Getenv("CI") != "" {
-			t.Fatal("TEST_DATABASE_URL is required in CI")
-		}
+		// The signal is the DSN, not CI. `CI` means "this is a CI run", and one of
+		// the CI runs is the Windows smoke job, where GitHub cannot provide a
+		// container `services:` at all — so inferring "CI has a database" made that
+		// job fail on a test that genuinely cannot run there. What keeps this from
+		// becoming a silent skip is on the other side: the Linux job runs this test
+		// by name and asserts it PASSed, so "it ran" is a fact rather than an
+		// assumption about an environment variable.
 		t.Skip("TEST_DATABASE_URL is not set; skipping Postgres-backed wiring test")
 	}
 	ctx := context.Background()

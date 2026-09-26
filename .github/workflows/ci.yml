@@ -192,6 +192,18 @@ jobs:
       - name: postgres integration tests (verbose)
         run: go test -race -v -timeout 120s ./internal/store/postgres/
 
+      # The same guarantee for the one Postgres-backed test outside that package.
+      # It skips when TEST_DATABASE_URL is unset — the Windows runner cannot have a
+      # service container, so "CI" cannot mean "a database exists" — and this step
+      # is what keeps that from turning into a silent skip: a SKIP prints in the
+      # verbose output and the grep below fails, so neither skipping here nor
+      # deleting the test can pass unnoticed.
+      - name: postgres-backed httpapi wiring test (verbose)
+        run: |
+          go test -race -v -timeout 120s -run TestOIDCWiringEndToEnd ./internal/httpapi/ > wiring.txt
+          cat wiring.txt
+          grep -q -- '--- PASS: TestOIDCWiringEndToEnd' wiring.txt
+
       - name: build
         run: go build ./...
 
@@ -232,7 +244,9 @@ jobs:
     # `services:` only on Linux, and the CI guard in openTestDB
     # (internal/store/postgres) turns a missing TEST_DATABASE_URL into a failure
     # rather than a silent skip — so a naive `go test ./...` here would fail on a
-    # package that genuinely cannot run.
+    # package that genuinely cannot run. The one Postgres-backed test outside that
+    # package (internal/httpapi's wiring test) skips on the same missing DSN for
+    # the same reason; the Linux job asserts by name that it ran.
     runs-on: windows-latest
 
     steps:
