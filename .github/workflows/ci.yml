@@ -300,11 +300,15 @@ jobs:
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.8.0
+      # No `cache: pnpm` here, deliberately: this job audits the lockfile and never
+      # installs, so the store setup-node would save is never created, and its post
+      # step fails the job when the save finds no such path — a cache *hit* skips
+      # the save, so that stays invisible until the cache is cold (a new repository,
+      # or any lockfile change that moves the key). archtest's workflow guard makes
+      # the rule a check rather than this comment.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
       - name: audit frontend dependencies
         working-directory: web
         run: pnpm audit --audit-level high
