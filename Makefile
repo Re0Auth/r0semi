@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test bench check lint load e2e play dist sbom checksums release docker clean bundle
+.PHONY: all web build test bench check lint load e2e play visual dist sbom checksums release docker clean bundle
 
 all: web build
 
@@ -66,7 +66,13 @@ load:
 # provider, so nothing else needs to be running — and there is no test-only way
 # to obtain a session, which is why the suite is worth having.
 e2e: web
-	cd web && pnpm exec playwright install chromium && pnpm exec playwright test
+	cd web && pnpm exec playwright install chromium && pnpm run test:e2e
+
+# The visual set on its own (tagged `@visual`, so the default run skips it). It
+# needs a baseline for this platform: `pnpm run test:visual:update` in web/ makes
+# one, and the `visual-baselines` workflow makes the Linux set that CI would need.
+visual: web
+	cd web && pnpm run test:visual
 
 check: lint
 	@unformatted=$$(gofmt -l .); \

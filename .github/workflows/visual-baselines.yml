@@ -1,0 +1,64 @@
+name: visual baselines
+
+# Makes the screenshot baselines Playwright compares against — one set per
+# platform, and this job is the Linux one.
+#
+# Manual, because it is a bootstrap rather than a gate: `--update-snapshots` writes
+# whatever the pages currently look like, so running it on every push would make
+# the visual tests assert that nothing has changed since *this* commit, which is
+# the same as asserting nothing. It runs when someone decides the look is right,
+# and the baselines it produces are reviewed like any other change.
+#
+# It does not commit anything. A workflow that writes to the repository needs a
+# token that can push, and a token that can push can rewrite history; the artifact
+# + a reviewed commit is the same result without that. The rest of the two-step is
+# in web/README.md.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baselines:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # pnpm before setup-node: the node step's `cache: pnpm` needs pnpm on PATH to
+      # locate the store, and the version is pinned to the one in web/package.json's
+      # packageManager field so CI and a laptop resolve the same tree.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.8.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # The e2e suite starts its own re0auth, which embeds this build.
+      - name: build the frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: install chromium
+        working-directory: web
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: generate the baselines
+        working-directory: web
+        run: pnpm run test:visual:update
+
+      # `if-no-files-found: error` because an artifact-less run would look like a
+      # successful bootstrap: whatever the tests did, no baselines means the next
+      # step (download, commit) has nothing to work with.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: visual-baselines-linux
+          path: web/e2e/**/*-snapshots/**
+          if-no-files-found: error

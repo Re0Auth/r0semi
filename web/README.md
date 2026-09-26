@@ -76,6 +76,30 @@ The e2e suite (`web/e2e/`) is where the login, consent, device and binding flows
 are covered end to end, through the real shipping code, with a fake IdP at the
 network edge rather than a test-only bypass inside re0auth.
 
+## Visual regression
+
+```sh
+pnpm run test:visual          # compare against this platform's baselines
+pnpm run test:visual:update   # make or refresh them
+```
+
+Screenshot baselines are bound to the **platform** — font rasterisation and
+scrollbar width differ between Linux, macOS and Windows — so the file name carries
+it and two sets can coexist. `pnpm run test:e2e` skips them (the `@visual` tag): a
+visual test with no baseline for the current platform fails by definition.
+
+The Linux set, which is the one CI would compare against, comes from the
+`visual-baselines` workflow (manual dispatch). It runs `test:visual:update` and
+uploads `web/e2e/*-snapshots/**` as an artifact, and it commits **nothing**: a
+token that can push can rewrite history, and "artifact plus one reviewed commit"
+reaches the same place without that. Two steps:
+
+1. Actions → *visual baselines* → Run workflow, then download
+   `visual-baselines-linux`;
+2. commit the `*-linux.png` files into each spec's `-snapshots` directory, then add
+   a `pnpm run test:visual` step to the CI job — that is what turns the comparison
+   into a gate.
+
 ## Layout
 
 | Path | What |

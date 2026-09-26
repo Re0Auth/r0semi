@@ -25,6 +25,14 @@ export default defineConfig({
 
 	projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
 
+	// Screenshots are per platform. Font rasterisation and scrollbar width differ
+	// enough between Linux, macOS and Windows that one platform's baseline is a
+	// guaranteed failure on another, so the file name carries the platform and the
+	// sets live side by side. Baselines come from the `visual-baselines` workflow
+	// (web/README.md); a visual test with no baseline fails by definition, which is
+	// why they are excluded from the default run until the Linux set lands.
+	snapshotPathTemplate: '{testDir}/{testFilePath}-snapshots/{arg}-{platform}{ext}',
+
 	webServer: {
 		command: 'node e2e/server.mjs',
 		// Ready when the discovery document answers — the same signal a real client

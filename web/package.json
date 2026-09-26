@@ -12,7 +12,9 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:bundle": "node scripts/check-bundle-size.mjs",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-		"test:e2e": "playwright test"
+		"test:e2e": "playwright test --grep-invert @visual",
+		"test:visual": "playwright test --grep @visual",
+		"test:visual:update": "playwright test --grep @visual --update-snapshots"
 	},
 	"devDependencies": {
 		"@axe-core/playwright": "^4.13.0",

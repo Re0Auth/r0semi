@@ -210,11 +210,17 @@ jobs:
         working-directory: web
         run: |
           pnpm exec playwright install --with-deps chromium
-          pnpm exec playwright test
+          pnpm run test:e2e
 
+      # The visual set is not in this run (`--grep-invert @visual`, inside the
+      # script): a visual test with no baseline for this platform fails by
+      # definition, and the Linux baselines do not exist yet. Once the
+      # `visual-baselines` workflow's artifact is committed, adding a
+      # `pnpm run test:visual` step here makes them a gate — the second of the two
+      # steps in web/README.md.
       - name: browser tests (Postgres store)
         working-directory: web
-        run: E2E_DATABASE_URL="$TEST_DATABASE_URL" pnpm exec playwright test
+        run: E2E_DATABASE_URL="$TEST_DATABASE_URL" pnpm run test:e2e
 
   windows-smoke:
     # The release ships windows/amd64 binaries, but until this job no test ever
