@@ -18,8 +18,10 @@ import (
 //
 // The two ignore files are the exception, and they are why the rule is shaped this
 // way: they have to name the directory in order to keep it out of git and out of the
-// Docker build context. The scan reads `git ls-files`, so it covers exactly what
-// ships — an ignored local directory or a build output is not the repository.
+// Docker build context. This check is the third exemption, for the same reason in
+// reverse — it cannot look for a string it does not contain. The scan reads
+// `git ls-files`, so it covers exactly what ships: an ignored local directory or a
+// build output is not the repository.
 func TestNoTrackedFileNamesPrivateTooling(t *testing.T) {
 	root, err := repoRoot()
 	if err != nil {
@@ -35,7 +37,15 @@ func TestNoTrackedFileNamesPrivateTooling(t *testing.T) {
 		t.Fatalf("git ls-files: %v", err)
 	}
 
-	allowed := map[string]bool{".gitignore": true, ".dockerignore": true}
+	allowed := map[string]bool{
+		".gitignore":    true,
+		".dockerignore": true,
+		// A check has to contain what it looks for. The cost of this exemption is that
+		// a stray paste into this file would go unnoticed; the alternative — building
+		// the needles out of pieces so the file does not literally contain them — buys
+		// that back at the price of the check no longer being readable.
+		"internal/archtest/tooling_test.go": true,
+	}
 	// The directory, the identity it commits under, and the name of the audit
 	// procedure it ships: three ways the same trace came in, and all three were
 	// present when this check was written.
