@@ -3,6 +3,7 @@ package archtest
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -229,6 +230,29 @@ func TestBackupWorkloadIsSafeToLeaveRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	docs := readYAMLDocs(t, filepath.Join(root, "deploy", "k8s", "backup"))
+
+	// The kustomization has to list both manifests: a file that exists but is not
+	// referenced is applied by nobody, and the failure looks like "the backup never
+	// ran" rather than like a missing line.
+	var kustomization struct {
+		Namespace string   `yaml:"namespace"`
+		Resources []string `yaml:"resources"`
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "deploy", "k8s", "backup", "kustomization.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(raw, &kustomization); err != nil {
+		t.Fatalf("backup kustomization does not parse: %v", err)
+	}
+	for _, want := range []string{"pvc.yaml", "cronjob.yaml"} {
+		if !slices.Contains(kustomization.Resources, want) {
+			t.Fatalf("the backup kustomization does not list %s: %v", want, kustomization.Resources)
+		}
+	}
+	if kustomization.Namespace != "re0auth" {
+		t.Fatalf("backup kustomization namespace = %q, want re0auth (the base's namespace)", kustomization.Namespace)
+	}
 
 	var cron map[string]any
 	kinds := map[string]bool{}
