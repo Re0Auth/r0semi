@@ -107,6 +107,17 @@ Go 堆之外的主要占用来自连接缓冲与并发请求的响应体；数�
 （`server.rate_limit`）同样是每副本的，N 个副本等于 N 倍限额，见
 [operations-decision.md](./operations-decision.md) 决策 5。
 
+**还有一个不显眼的串行点：审计链。** 每条审计记录都锁同一行，而这条写入在数据面的关键路径上——
+`vault.Use` 在交出凭据**之前**先落审计（不变量 I3），所以每一次带凭据的读取都要过一次这个锁。
+它是否已成为瓶颈，看两个地方：
+
+- 指标 `re0auth_audit_append_duration_seconds`（含等锁）与面板 “Audit append duration”：
+  请求量没涨而 p95 持续上升，就是串行化在限速。
+- 基准 `TEST_DATABASE_URL=… go test -run '^$' -bench BenchmarkAuditAppend -benchtime 2s ./internal/store/postgres/`：
+  **并行 ns/op 不再优于串行，即为拐点**。到那一步，加连接或加副本都不再有帮助；
+  要动的是链本身，见 [operations-decision.md](./operations-decision.md) 决策 7。
+
+
 ## 5. 算例（默认配置）
 
 - 2 副本、`max_conns=16` → Postgres 侧 `32` 个连接，滚动峰值 `48`。
