@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -245,13 +246,31 @@ func main() {
 	} else {
 		slog.Warn("audit log is in-memory; records do not survive a restart")
 	}
+
+	// Every background loop runs on this context and is joined by this group.
+	//
+	// The loops deliberately do not hang off the signal context alone: serving can
+	// also end because a listener failed, and shutdown has to be able to stop them
+	// without a signal having arrived. And they are *joined* before the storage
+	// handle closes — a sweep still mid-query when the pool closes is a race
+	// shutdown would otherwise lose quietly, logging a spurious failure.
+	loopCtx, stopLoops := context.WithCancel(ctx)
+	var loops loopGroup
+	// Deferred after store.close above, so it runs before it: stop the loops, then
+	// wait for the one in flight. Every exit path (a -rotate-keys run, a failed
+	// listener, the ordinary signal) gets the same ordering.
+	defer func() {
+		stopLoops()
+		loops.Wait()
+	}()
+
 	if store.sweep != nil {
-		go sweepLoop(ctx, store.sweep, 15*time.Minute)
+		loops.Go(func() { sweepLoop(loopCtx, store.sweep, 15*time.Minute) })
 	}
 	// Only the durable chain has a head to anchor; the in-memory logger is a ring
 	// buffer and deliberately not a chained structure.
 	if store.auditHead != nil {
-		go anchorLoop(ctx, store.auditHead, auditAnchorInterval)
+		loops.Go(func() { anchorLoop(loopCtx, store.auditHead, auditAnchorInterval) })
 	}
 
 	// The Prometheus instrumentation. It is always built: whether it is *exported*
@@ -382,9 +401,14 @@ func main() {
 	}
 	// Every deployment runs the OpenID Provider (ADR-0001 P4b). The only thing a
 	// DATABASE_URL changes is where the OP keeps its state: Postgres or memory.
-	oidcHandler, oidcStore, err := openOIDC(ctx, cfg, store, sessions, logger, metrics)
+	oidcHandler, oidcStore, janitor, err := openOIDC(cfg, store, sessions, logger, metrics)
 	if err != nil {
 		die("oidc", err)
+	}
+	// The in-memory OP store's janitor, started here with the other loops so every
+	// goroutine this process runs is started and joined in one place.
+	if janitor != nil {
+		loops.Go(func() { opJanitorLoop(loopCtx, janitor, opJanitorInterval) })
 	}
 	apiConfig.OIDC = oidcHandler
 	apiConfig.TokenIntrospector = oidcHandler
@@ -537,6 +561,28 @@ type endpoint struct {
 	server   *http.Server
 	listener net.Listener
 }
+
+// loopGroup joins the process's background loops.
+//
+// Cancelling a context asks a loop to stop; it does not mean the loop has
+// returned. Anything that the loop touches — the connection pool, above all — has
+// to stay open until Wait returns, which is the difference this type exists to
+// make explicit.
+type loopGroup struct{ wg sync.WaitGroup }
+
+// Go starts fn as a tracked loop. Like sync.WaitGroup.Go, the counter is
+// incremented before the goroutine exists, so a Wait that races the start still
+// waits for it.
+func (g *loopGroup) Go(fn func()) {
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		fn()
+	}()
+}
+
+// Wait blocks until every tracked loop has returned.
+func (g *loopGroup) Wait() { g.wg.Wait() }
 
 // newServer builds an HTTP server with the limits every listener here shares. The
 // public and internal surfaces differ only in what they serve, not in how they
@@ -880,25 +926,34 @@ type oidcBackend interface {
 	DecideDeviceAuthorization(ctx context.Context, userCode, subject string, approve bool, scopes, explicit []oauth.Scope) error
 }
 
+// oidcJanitor is the in-memory OP store's expiry sweep. Returning it lets the
+// composition root start the loop that calls it alongside every other loop,
+// instead of a goroutine starting itself somewhere inside a constructor.
+type oidcJanitor interface{ SweepExpired() int }
+
 // openOIDC builds the OpenID Provider store and HTTP handler. The store is
 // Postgres when a database is configured and in-memory otherwise (ADR-0001 P4b);
 // the handler and every policy around it are identical either way.
-func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.Manager, logger audit.Logger, metrics *observability.Metrics) (*oidchttp.Handler, oidcBackend, error) {
+//
+// The janitor of an in-memory store is returned rather than started here, so the
+// composition root owns every goroutine this process runs: started next to the
+// other loops, joined by the same group.
+func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.Logger, metrics *observability.Metrics) (*oidchttp.Handler, oidcBackend, oidcJanitor, error) {
 	tokenKey, err := oidcTokenKey()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	retiredTokens, err := oidcRetiredTokenKeys()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	key, err := oidcSigningKey()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	retiredSigning, err := oidcRetiredSigningKeys()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	registry := oauth.DefaultRegistry()
 	scopes := make([]string, 0, len(registry.Descriptors()))
@@ -907,11 +962,12 @@ func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.M
 	}
 	signer := oidcstore.NewSigner("re0auth", key).WithRetired(retiredSigning...)
 	if err := oidcstore.ValidateSigner(signer); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// Declared before the login hook so the hook can record the session's real
 	// authentication time on the pending request.
 	var oidcStore oidcBackend
+	var janitor oidcJanitor
 	login := func(ctx context.Context, id string) string {
 		// Bind the request to the browser that started it, so a relayed id cannot
 		// be approved elsewhere. GetClientByClientID hands us the request context,
@@ -943,18 +999,19 @@ func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.M
 			RequestTTL: authorizationRequestTTL,
 		})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		// The memory store never expires a record on its own — a lookup refuses an
-		// expired one, but nothing removes it. Without this loop the token and
+		// expired one, but nothing removes it. Without a janitor the token and
 		// pending-request maps grow for the life of the process, and every call
 		// that scans them under the store's single lock (grants, revocation) then
-		// gets slower as they do.
-		go opJanitorLoop(ctx, mem, opJanitorInterval)
+		// gets slower as they do. The loop itself is started by the caller, with
+		// the other loops.
 		oidcStore = mem
+		janitor = mem
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	handler, err := oidchttp.New(oidchttp.Config{
 		Issuer:      cfg.Issuer,
@@ -980,9 +1037,9 @@ func openOIDC(ctx context.Context, cfg settings, store storage, sessions *auth.M
 		Metrics:          metrics,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return handler, oidcStore, nil
+	return handler, oidcStore, janitor, nil
 }
 
 // oidcTokenKey reads the 32-byte bearer-token encryption key.

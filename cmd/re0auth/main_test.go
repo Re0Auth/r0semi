@@ -225,6 +225,49 @@ func TestOPJanitorLoopSweepsAndStopsOnCancel(t *testing.T) {
 	}
 }
 
+// TestLoopGroupWaitsForTheBodyNotTheCancellation is the shutdown-ordering
+// property: cancelling asks a loop to stop, it does not mean the loop has
+// returned. The storage handle is closed after Wait, so a Wait that returned on
+// cancellation would close the pool under a sweep that is still mid-query — the
+// race the group exists to close.
+func TestLoopGroupWaitsForTheBodyNotTheCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var loops loopGroup
+
+	// A body that models a sweep in flight: it notices the cancellation and then
+	// takes measurable time to return.
+	finished := make(chan struct{})
+	loops.Go(func() {
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond)
+		close(finished)
+	})
+
+	cancel()
+	loops.Wait()
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Wait returned before the loop body finished")
+	}
+}
+
+// A group with nothing in it must not block, so the deferred join is safe on
+// every exit path (a -rotate-keys run starts no loops at all).
+func TestLoopGroupWaitIsImmediateWhenEmpty(t *testing.T) {
+	var loops loopGroup
+	done := make(chan struct{})
+	go func() {
+		loops.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait blocked with no loops running")
+	}
+}
+
 // A shutdown signal must drain the request that is already in flight rather than
 // cut it off. On a rolling deploy the process is replaced while it is answering,
 // and an abrupt exit is a failed request the user sees.
