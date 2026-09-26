@@ -100,6 +100,12 @@ reaches the same place without that. Two steps:
    a `pnpm run test:visual` step to the CI job — that is what turns the comparison
    into a gate.
 
+**Status: step 2 is deliberately not done yet.** The comparison is not a CI gate
+until the Linux baselines are committed, and generating them needs one manual
+workflow run — so it happens with the next change that touches the frontend, not on
+its own. Until then, treat `pnpm run visual` as a local tool: it reports, it does
+not block a merge.
+
 ## Layout
 
 | Path | What |
