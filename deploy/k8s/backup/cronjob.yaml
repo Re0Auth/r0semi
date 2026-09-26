@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: re0auth-backup
+spec:
+  # The RPO target in docs/operations.md is ≤ 15 minutes, and a logical dump is the
+  # simplest way to meet it. On a database large enough that a dump outlasts the
+  # interval, switch to WAL archiving / PITR instead of tightening this: pg_dump is
+  # a full read of every table, and running it 96 times a day on a large
+  # audit_events table competes with the service for exactly the I/O it needs.
+  schedule: "*/15 * * * *"
+  # Not optional. A dump that outlasts its interval would otherwise overlap the next
+  # one, and the two would compete for connections against the same max_connections
+  # budget the service already counts on (docs/capacity-planning.md §2).
+  concurrencyPolicy: Forbid
+  # A cluster that was down for a while must not fire a burst of catch-up dumps.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            # The dump volume is provisioned root-owned; fsGroup is what makes it
+            # writable by the non-root uid above.
+            fsGroup: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: pg-dump
+              # The client must be the same major as the server: pg_dump refuses a
+              # server newer than itself. Pinned by digest like every other image
+              # here — a floating tag is a different toolchain tomorrow.
+              image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef: { name: re0auth-secrets, key: database-url }
+                # Days, not a file count: a count would discard a week of history the
+                # moment a deploy happened to trigger extra runs, and the point of the
+                # backups is the history.
+                - name: BACKUP_RETAIN_DAYS
+                  value: "7"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+                  out="/backups/re0auth-$stamp.dump"
+                  pg_dump --format=custom --no-owner --no-privileges \
+                          --dbname="$DATABASE_URL" --file="$out"
+                  sha256sum "$out" > "$out.sha256"
+                  # Retention is what keeps the volume from filling up and the backups
+                  # silently stopping: a full disk turns every later run into a failed
+                  # job, and a failed backup that nobody reads is the same as none.
+                  find /backups -name 're0auth-*.dump'        -mtime "+${BACKUP_RETAIN_DAYS}" -delete
+                  find /backups -name 're0auth-*.dump.sha256' -mtime "+${BACKUP_RETAIN_DAYS}" -delete
+                  echo "backup written: $out"
+              volumeMounts:
+                - { name: backups, mountPath: /backups }
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits: { cpu: "1", memory: 512Mi }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+          volumes:
+            - name: backups
+              persistentVolumeClaim: { claimName: re0auth-backups }

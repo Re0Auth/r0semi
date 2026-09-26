@@ -60,6 +60,28 @@ DATABASE_URL=... BACKUP_AGE_IDENTITY=~/.age/keys.txt ./scripts/restore.sh /backu
   （模板见 [incident-response.md](./incident-response.md) §6）。
 - 恢复只能进空库；`restore.sh` 会在目标已有表时拒绝执行。
 
+#### 集群内的定时备份（可选）
+
+`deploy/k8s/backup/` 是一个**独立**的 kustomize 目录，故意不进 base：没有卷、没有数据库的部署
+不该每 15 分钟失败一次。
+
+```sh
+# 基础部署起来、re0auth-secrets 里有 database-url 之后
+kubectl apply -k deploy/k8s/backup
+```
+
+- 每 15 分钟一次 `pg_dump -Fc`（对应上面的 RPO 目标）；`concurrencyPolicy: Forbid` 保证一次慢
+  转储不会与下一次重叠——重叠的两个 `pg_dump` 会去抢服务正在用的连接预算。保留 7 天
+  （`BACKUP_RETAIN_DAYS`），过期删除在同一作业里做。
+- **这个卷不是异地。** 它和数据库在同一个集群、同一个凭据域。要满足"密钥/备份放在数据库够不到的
+  地方"，还需要把卷里的内容复制到对象存储或另一个账号，或用一个已经复制的 StorageClass——
+  **复制目标是部署决策**，仓库不替你选。
+- 转储**没有加密**（age 只在 `scripts/backup.sh` 的本地流程里）。落到共享存储时，用支持 SSE 的
+  对象存储，或在复制那一步加密。
+- 数据库大到一次转储超过 15 分钟时：放宽 `schedule`，不要把 `Forbid` 改成 `Allow`——那正是它
+  拖垮服务的方式。要更小的 RPO 请走 WAL 归档 / PITR，逻辑转储不是那条路 (it is a full read of
+  every table)。
+
 ### DR 密钥恢复（整站丢失）
 
 四把密钥只在环境 / k8s Secret 里，**不在任何数据库备份里**——整站丢失时，光有数据库转储是不可恢复的。

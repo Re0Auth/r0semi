@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: re0auth-backups
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # A starting point, not a recommendation: size it from the dump size
+      # (pg_dump -Fc compresses) times the retention in the CronJob.
+      storage: 20Gi
+  # storageClassName is deliberately unset, so the cluster's default class applies.
+  # A deployment that wants a replicated class (which is how the dump leaves the
+  # node) names it here — see docs/operations.md.

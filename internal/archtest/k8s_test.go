@@ -215,3 +215,107 @@ func nestedMap(t *testing.T, doc map[string]any, path ...string) map[string]any 
 	}
 	return cur
 }
+
+// TestBackupWorkloadIsSafeToLeaveRunning guards deploy/k8s/backup, the scheduled
+// logical backup. It is a workload nobody looks at until the day they need it, and
+// every one of its failure modes is silent: an image that changed under them, dumps
+// that overlap and starve the service's connection budget, an unbounded dump
+// directory that fills the volume and stops the backups, or a container running as
+// root against a volume it also writes. Each of those is asserted rather than
+// described.
+func TestBackupWorkloadIsSafeToLeaveRunning(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := readYAMLDocs(t, filepath.Join(root, "deploy", "k8s", "backup"))
+
+	var cron map[string]any
+	kinds := map[string]bool{}
+	for _, doc := range docs {
+		kind, _ := doc["kind"].(string)
+		kinds[kind] = true
+		if kind == "CronJob" {
+			cron = doc
+		}
+	}
+	for _, want := range []string{"CronJob", "PersistentVolumeClaim"} {
+		if !kinds[want] {
+			t.Fatalf("deploy/k8s/backup has no %s", want)
+		}
+	}
+	if cron == nil {
+		t.Fatal("no CronJob document parsed")
+	}
+
+	jobSpec := nestedMap(t, cron, "spec")
+	if schedule, _ := jobSpec["schedule"].(string); strings.TrimSpace(schedule) == "" {
+		t.Fatal("the backup CronJob has no schedule")
+	}
+	// Forbid is the one setting that keeps a slow dump from racing the next one.
+	if policy, _ := jobSpec["concurrencyPolicy"].(string); policy != "Forbid" {
+		t.Fatalf("concurrencyPolicy = %q, want Forbid: overlapping dumps compete for the service's connection budget",
+			policy)
+	}
+
+	podSpec := nestedMap(t, cron, "spec", "jobTemplate", "spec", "template", "spec")
+	if podSecurity, ok := podSpec["securityContext"].(map[string]any); !ok || podSecurity["runAsNonRoot"] != true {
+		t.Fatalf("backup pod is not runAsNonRoot: %v", podSpec["securityContext"])
+	}
+	containers, _ := podSpec["containers"].([]any)
+	if len(containers) == 0 {
+		t.Fatal("the backup CronJob has no containers")
+	}
+	container, _ := containers[0].(map[string]any)
+	image, _ := container["image"].(string)
+	if !strings.Contains(image, "@sha256:") {
+		t.Fatalf("backup image %q is not pinned by digest", image)
+	}
+	resources, ok := container["resources"].(map[string]any)
+	if !ok {
+		t.Fatal("the backup container has no resources block")
+	}
+	for _, field := range []string{"requests", "limits"} {
+		if _, ok := resources[field].(map[string]any); !ok {
+			t.Fatalf("backup resources have no %s", field)
+		}
+	}
+	security, ok := container["securityContext"].(map[string]any)
+	if !ok {
+		t.Fatal("the backup container has no securityContext")
+	}
+	if security["allowPrivilegeEscalation"] != false || security["readOnlyRootFilesystem"] != true {
+		t.Fatalf("backup container securityContext = %v", security)
+	}
+
+	mounts, _ := container["volumeMounts"].([]any)
+	mounted := false
+	for _, m := range mounts {
+		if mm, ok := m.(map[string]any); ok && mm["mountPath"] == "/backups" {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Fatal("nothing is mounted at /backups; the dump would be written into the container and lost")
+	}
+
+	// The script's own load-bearing lines: a dump with no retention fills the volume
+	// and every later run fails, and a dump with no checksum cannot be told apart
+	// from a truncated one.
+	args, _ := container["args"].([]any)
+	script := ""
+	for _, a := range args {
+		if s, ok := a.(string); ok {
+			script += s
+		}
+	}
+	for _, want := range []struct{ needle, why string }{
+		{"pg_dump", "the workload must dump the database"},
+		{"sha256sum", "each dump needs its checksum beside it"},
+		{"-mtime", "an unbounded dump directory fills the volume and stops the backups"},
+	} {
+		if !strings.Contains(script, want.needle) {
+			t.Fatalf("the backup script does not contain %q: %s", want.needle, want.why)
+		}
+	}
+}
