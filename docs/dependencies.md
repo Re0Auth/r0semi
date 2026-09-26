@@ -78,6 +78,7 @@
 | `tailwindcss` 4 + `@tailwindcss/vite` | 样式 | v4 的 `@theme` 让设计 token 就是普通 CSS 变量，不用多一层配置对象。对内部实现细节（`--color-ink` 等）的审计，比对一个组件库的源码容易 |
 | `svelte-check` | `pnpm run check` | TS + a11y 静态检查。不放进 CI 的检查等于没有 |
 | `@playwright/test` | `web/e2e` | 真浏览器跑同意页与设备流。只有在浏览器里才能发现“每一层各自正确、拼起来却不能用”的那类 bug——比如一个掐死自己 bootstrap 的 CSP。它只在开发/CI 存在，不进产物 |
+| `@axe-core/playwright` | `web/e2e/a11y.spec.ts` | 渲染后的可访问性审计。`svelte-check` 只能查它静态能看出的规则；对比度、可访问名、landmark 这些要看**带数据的真实页面**。审计在 `prefers-reduced-motion: reduce` 下取样：卡片的淡入动画会让 axe 量到动画中途的透明度，得到每次都不一样的假失败。同样只在开发/CI 存在 |
 
 **刻意不用 `shadcn-svelte` 的 CLI。** 评估过：v1.7 的 `init` 要求交互式选一套 preset（`--preset` 的取值没有非交互的帮助说明），
 而它产出的是**复制进仓库、归你所有**的组件——也就是说，手写同样几个组件得到的是同一个东西，还少一层生成器。

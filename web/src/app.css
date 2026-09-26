@@ -46,7 +46,14 @@
 	--color-line-strong: oklch(0.775 0.009 200);
 	--color-ink: oklch(0.205 0.008 200);
 	--color-ink-muted: oklch(0.44 0.01 200);
-	--color-ink-faint: oklch(0.545 0.01 200);
+	/*
+	 * Faint is the smallest text the design uses (12px metadata), and it has to
+	 * clear 4.5:1 on the *tinted* surfaces too, not only on the canvas: on
+	 * `accent-soft` and `danger-soft` a lighter shade measured 4.23 and 4.36. The
+	 * figures come from rasterising the token to pixels and running the WCAG
+	 * arithmetic on that, which is also what axe does in web/e2e/a11y.spec.ts.
+	 */
+	--color-ink-faint: oklch(0.52 0.01 200);
 
 	--color-accent: oklch(0.47 0.105 200);
 	--color-accent-soft: oklch(0.945 0.03 200);
