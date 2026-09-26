@@ -1,7 +1,7 @@
 # 第二轮对抗性审计（Re0Auth）
 
 **范围**：五个不变量 —— ①令牌与 scope 签发、②账号隔离、④撤销是否真的生效、⑤凭据containment、⑥fail-closed。
-**不在范围内**：协议正确性的全面重扫（第一轮已覆盖）。
+**不在范围内**：协议正确性的全面重扫（第一轮做过，但那一轮的记录不在本仓库；本轮不重复覆盖）。
 
 **方法**：按不变量分组的对抗性探针清单——每条先问「能违反它的最小请求是什么」，再实际发出去。
 每个发现都**必须有一条会失败的测试**才算数——「我推理它是安全的」正是这套流程要取代的东西。
@@ -348,7 +348,8 @@ vault 的 `Identity` 与 `Meta` 明文落盘（threat-model §6.1）；审计链
   处置选择**失败**而不是「当作没有密钥」，理由写在 `checkSubjectKey` 的注释里：读路径把「没有行」
   当「还没有密钥」并铸一把新的，若把长度错的行也归入这一类，就会给一个已有密钥的 subject 再铸一把，
   把它的历史劈成两个假名。
-- **第三方库未审计**：**第四轮已闭环**。它把这条缝当成靶子：枚举了 `zitadel/oidc v3.51.3` 在这些路径上
+- **第三方库未审计**：**第四轮已闭环**（该轮没有独立文档，处置就写在本文件与
+  [security-audit-3.md](./security-audit-3.md) 引用它的段落里，附提交号）。它把这条缝当成靶子：枚举了 `zitadel/oidc v3.51.3` 在这些路径上
   写什么（`pkg/op/error.go` 的 `oidc_error` 带 `description` 与整条 `parent` 链；
   `pkg/oidc/authorization.go` 的 `LogValue` 记录 scopes/response_type/client_id/redirect_uri，
   **不**记录 `code_challenge` 与 `state`），并落成守卫

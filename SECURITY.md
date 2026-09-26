@@ -106,7 +106,8 @@ report: the invariants are the product.
 ## Our own audits
 
 We run an adversarial pass against our own invariants rather than waiting for
-someone else to. The rounds so far are on disk:
+someone else to. Four rounds have been run. Two of them were written up as
+documents, and those are the ones on disk:
 
 - [`docs/security-audit-2.md`](docs/security-audit-2.md) — the invariant sweep:
   token issuance, account isolation, revocation, credential containment,
@@ -115,6 +116,12 @@ someone else to. The rounds so far are on disk:
   the seam with the third-party OpenID Provider library, the audit-log read
   surface, and the device flow's concurrency and binding. Same rule: a finding is
   not a finding until a test can fail on it.
+
+Rounds 1 and 4 have **no document of their own**. They are referenced by the two
+above (round 4's dispositions carry the commit that landed them), and the guards
+those rounds added are in the suite like every other fix — but there is nothing
+to open, so treat the references as pointers to commits and tests, not to a
+report.
 
 Each finding's reproducer is now part of the ordinary suite: it failed before the
 fix and passes after, so it guards the fix the way any other test guards its
