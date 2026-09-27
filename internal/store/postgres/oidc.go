@@ -981,21 +981,17 @@ func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int,
 // commit that answer together with the token deletes.
 func revokePendingAuthorizations(ctx context.Context, db querier, f oauth.TokenFilter) (int, error) {
 	removed := 0
+	clause, args := revokePredicate(f)
 	tag, err := db.Exec(ctx, `
 		DELETE FROM oidc_codes
 		 WHERE request_id IN (
-		       SELECT id FROM oidc_auth_requests
-		        WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2))`,
-		f.ClientID, f.Subject)
+		       SELECT id FROM oidc_auth_requests`+clause+`)`, args...)
 	if err != nil {
 		return removed, err
 	}
 	removed += int(tag.RowsAffected())
 
-	tag, err = db.Exec(ctx, `
-		DELETE FROM oidc_auth_requests
-		 WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
-		f.ClientID, f.Subject)
+	tag, err = db.Exec(ctx, `DELETE FROM oidc_auth_requests`+clause, args...)
 	if err != nil {
 		return removed, err
 	}

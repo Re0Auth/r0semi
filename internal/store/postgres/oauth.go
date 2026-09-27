@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -237,9 +238,8 @@ func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, er
 	if err != nil {
 		return total, err
 	}
-	if _, err := s.pool.Exec(ctx,
-		`DELETE FROM oauth_codes WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
-		f.ClientID, f.Subject); err != nil {
+	clause, args := revokePredicate(f)
+	if _, err := s.pool.Exec(ctx, `DELETE FROM oauth_codes`+clause, args...); err != nil {
 		return total, err
 	}
 	return total, nil
@@ -283,20 +283,47 @@ func (s *Tokens) PurgeLegacySubject(ctx context.Context, subject string) (int, e
 // half of itself and reported a count is not something a retry can distinguish
 // from success.
 //
-// Table names are compile-time constants, never request input, so building the
-// statement with Sprintf does not put anything user-controlled into the SQL.
+// Table names are compile-time constants, never request input, so concatenating
+// one into the statement does not put anything user-controlled into the SQL.
 func revokeMatching(ctx context.Context, db querier, tables []string, f oauth.TokenFilter) (int, error) {
+	clause, args := revokePredicate(f)
 	total := 0
 	for _, table := range tables {
-		tag, err := db.Exec(ctx, fmt.Sprintf(
-			`DELETE FROM %s WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
-			table), f.ClientID, f.Subject)
+		tag, err := db.Exec(ctx, `DELETE FROM `+table+clause, args...)
 		if err != nil {
 			return total, err
 		}
 		total += int(tag.RowsAffected())
 	}
 	return total, nil
+}
+
+// revokePredicate builds the WHERE clause and arguments for a bulk revocation.
+//
+// The filter's empty fields drop out, so the statement is exactly as narrow as
+// the caller asked. The obvious single-statement form — `WHERE ($1 = ” OR
+// client_id = $1) AND ($2 = ” OR subject = $2)` — is never sargable: a planner
+// cannot turn an OR on a parameter into an index scan, so even a subject-scoped
+// Kill Switch, which has a (subject, client_id) index to use, read every token row
+// instead. That path runs during an incident, under the pool's statement timeout,
+// where "the cut did not finish" is a real outcome.
+//
+// Only column names and placeholder positions are built here; the table name is a
+// compile-time constant at each call site and no request value reaches the SQL.
+func revokePredicate(f oauth.TokenFilter) (clause string, args []any) {
+	var where []string
+	if f.ClientID != "" {
+		args = append(args, f.ClientID)
+		where = append(where, fmt.Sprintf("client_id = $%d", len(args)))
+	}
+	if f.Subject != "" {
+		args = append(args, f.Subject)
+		where = append(where, fmt.Sprintf("subject = $%d", len(args)))
+	}
+	if len(where) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(where, " AND "), args
 }
 
 // Devices implements oauth.DeviceStore on Postgres. The device code is hashed;
