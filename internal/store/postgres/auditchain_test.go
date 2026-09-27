@@ -4,11 +4,58 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
 )
+
+// Concurrent records are coalesced into batches (see auditbatch.go), and the chain
+// they produce must still be a chain: every row linked to the one before it, the
+// head advanced once, and the walk that verifies it clean. This is the end-to-end
+// half of the batcher tests — they prove the queue preserves order, and this
+// proves the order a batch is written in is the order the chain needs.
+func TestConcurrentRecordsKeepTheChainIntact(t *testing.T) {
+	db := openTestDB(t)
+	logger := openAudit(t, db)
+	ctx := context.Background()
+
+	const writers = 50
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := logger.Record(ctx, audit.Event{
+				Action:   "vault.use",
+				Subject:  "usr_chain",
+				Provider: "phigros.fake",
+				Outcome:  audit.OutcomeOK,
+				Detail:   map[string]string{"n": strconv.Itoa(i)},
+			}); err != nil {
+				t.Errorf("record %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	v, err := logger.Verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.OK {
+		t.Fatalf("the chain does not verify after concurrent writes: %s (first bad id %d)", v.Reason, v.FirstBadID)
+	}
+	if v.Chained < writers {
+		t.Fatalf("chained rows = %d, want at least the %d written here", v.Chained, writers)
+	}
+	head, err := logger.Head(ctx)
+	if err != nil || len(head) == 0 {
+		t.Fatalf("the chain head is empty after %d writes: %v, %v", writers, head, err)
+	}
+}
 
 // TestAuditCanonicalIsDeterministic is the load-bearing property of the whole
 // chain: the bytes a row is hashed over must not depend on anything but the row.

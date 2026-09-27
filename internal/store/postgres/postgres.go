@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io/fs"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -45,6 +46,11 @@ type DB struct {
 	now func() time.Time
 	// auditObserver times one chained audit write; see WithAuditObserver.
 	auditObserver func(time.Duration)
+	// closersMu guards closers, the audit append writers this handle handed out.
+	// Close stops them before the pool goes away, so a row that was already
+	// accepted for writing is still written.
+	closersMu sync.Mutex
+	closers   []func()
 }
 
 // Option customises a DB at construction.
@@ -241,8 +247,20 @@ func poolConfig(dsn string, opts PoolOptions) (*pgxpool.Config, error) {
 	return cfg, nil
 }
 
-// Close releases the pool.
-func (db *DB) Close() { db.pool.Close() }
+// Close releases the pool. Append writers handed out by Audit are stopped first,
+// and stopped synchronously: a queued audit row is a caller waiting for its write
+// to be confirmed, so closing the pool underneath it would turn a graceful stop
+// into a failed record.
+func (db *DB) Close() {
+	db.closersMu.Lock()
+	closers := db.closers
+	db.closers = nil
+	db.closersMu.Unlock()
+	for _, close := range closers {
+		close()
+	}
+	db.pool.Close()
+}
 
 // Ping reports whether the database is reachable. It is the readiness probe: a
 // pool that cannot acquire a connection means this instance cannot serve, and an
@@ -289,6 +307,9 @@ func (db *DB) Audit(key []byte) (*AuditLogger, error) {
 		return nil, err
 	}
 	logger.observe = db.auditObserver
+	db.closersMu.Lock()
+	db.closers = append(db.closers, logger.Close)
+	db.closersMu.Unlock()
 	return logger, nil
 }
 

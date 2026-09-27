@@ -12,10 +12,13 @@ import (
 
 // AuditLogger implements audit.Logger on Postgres.
 //
-// Records are append-only and durable. Record returns only after the INSERT is
-// acknowledged, because callers such as vault.Use rely on that contract to
-// withhold a plaintext secret until the access has been recorded (invariant I3,
-// fail-closed). It deliberately does not batch or buffer.
+// Records are append-only and durable. Record returns only after the batch
+// containing the row is committed, because callers such as vault.Use rely on that
+// contract to withhold a plaintext secret until the access has been recorded
+// (invariant I3, fail-closed). Concurrent records are coalesced into one
+// transaction by the batcher (see auditbatch.go): the row is still committed
+// before its caller is answered, but the chain-head lock and the round trips are
+// paid once per batch instead of once per row.
 //
 // Every record is also chained to the one before it and signed with a key held
 // outside the database, so a row cannot be edited, deleted or reordered without
@@ -25,6 +28,9 @@ import (
 type AuditLogger struct {
 	pool *pgxpool.Pool
 	key  []byte
+	// batch coalesces concurrent appends. It is created with the logger and
+	// stopped by Close.
+	batch *auditBatcher
 	// mu guards cache, which maps a subject to its per-subject key. It is a cache,
 	// not a source of truth: losing it costs one query.
 	mu    sync.Mutex
@@ -34,6 +40,15 @@ type AuditLogger struct {
 	// keeps no dependency on the instrumentation — the composition root injects it
 	// (WithAuditObserver), which is also what keeps metric names in one place.
 	observe func(time.Duration)
+}
+
+// Close stops the append writer once everything queued has been written. It is
+// called by DB.Close, after the background loops have been joined, so no caller
+// can still be enqueueing.
+func (l *AuditLogger) Close() {
+	if l.batch != nil {
+		l.batch.Close()
+	}
 }
 
 // Record implements audit.Logger.
@@ -60,7 +75,7 @@ func (l *AuditLogger) Record(ctx context.Context, e audit.Event) error {
 		return err
 	}
 
-	return l.appendChained(ctx, auditRow{
+	return l.batch.enqueue(ctx, auditRow{
 		OccurredAt: when,
 		Action:     e.Action,
 		Subject:    subject,

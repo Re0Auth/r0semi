@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Re0Auth/r0semi/audit"
@@ -47,8 +48,19 @@ type auditRow struct {
 //
 // The leading domain tag keeps these hashes from ever colliding with a hash
 // computed for a different purpose over the same fields.
+//
+// It is called before appendChained takes the chain-head lock, so the buffer
+// growth, the key sort and the strconv work do not sit in the one critical section
+// every audit write serialises on. Grow is set from the fields because the buffer
+// otherwise reallocates its way up on every call.
 func (r auditRow) canonical() []byte {
+	size := 64 + len(r.Action) + len(r.Subject) + len(r.Provider) + len(r.Outcome)
+	for k, v := range r.Detail {
+		size += 8 + len(k) + len(v)
+	}
 	var b bytes.Buffer
+	b.Grow(size)
+
 	writeLenPrefixed(&b, "re0auth.audit.row/1")
 	writeLenPrefixed(&b, strconv.FormatInt(r.OccurredAt.UTC().UnixMicro(), 10))
 	writeLenPrefixed(&b, r.Action)
@@ -97,14 +109,19 @@ func (l *AuditLogger) sign(rowHash []byte) []byte {
 	return l.mac(auditSignatureLabel, rowHash)
 }
 
-// appendChained writes one event and extends the chain.
+// appendBatch writes a batch of rows as one extension of the chain.
 //
-// The head row is locked for the whole transaction. That serialisation is not an
-// optimisation detail: two concurrent inserts that each read the same predecessor
-// would produce two rows claiming the same place, and the chain would fork. The
-// lock is held only for the length of one insert, and audit writes are not a hot
-// path.
-func (l *AuditLogger) appendChained(ctx context.Context, r auditRow) error {
+// The head row is locked for the whole transaction, and the batch is written in
+// one. That serialisation is not an optimisation detail: two concurrent inserts
+// that each read the same predecessor would produce two rows claiming the same
+// place, and the chain would fork. It is also why batching is worth having: the
+// lock and the round trips are paid once for a batch instead of once per row. The
+// rows are written in the order given, so each one's predecessor is the row
+// before it — see auditbatch.go for the queue that preserves that order.
+func (l *AuditLogger) appendBatch(ctx context.Context, rows []auditRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
 	// The whole chained write is timed, wait for the lock included: that wait is
 	// the number that decides whether the serialisation has become the ceiling
 	// (see Metrics.ObserveAuditAppend). Timed even on failure, because a run of
@@ -115,6 +132,15 @@ func (l *AuditLogger) appendChained(ctx context.Context, r auditRow) error {
 			l.observe(time.Since(start))
 		}
 	}()
+
+	// Encoded before the transaction: the buffer, the sort and the strconv work are
+	// a function of these rows alone, and they used to run between taking the
+	// chain-head lock and releasing it — inside the one critical section every audit
+	// write in the process serialises on.
+	canonicals := make([][]byte, len(rows))
+	for i, r := range rows {
+		canonicals[i] = r.canonical()
+	}
 
 	tx, err := l.pool.Begin(ctx)
 	if err != nil {
@@ -131,19 +157,27 @@ func (l *AuditLogger) appendChained(ctx context.Context, r auditRow) error {
 		prev = auditGenesis
 	}
 
-	rowHash := chainHash(prev, r.canonical())
-	sig := l.sign(rowHash)
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO audit_events
-			(occurred_at, action, subject, provider, outcome, detail, prev_hash, row_hash, signature)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		r.OccurredAt, r.Action, r.Subject, r.Provider, r.Outcome, r.Detail,
-		prev, rowHash, sig); err != nil {
+	batch := &pgx.Batch{}
+	for i, r := range rows {
+		rowHash := chainHash(prev, canonicals[i])
+		sig := l.sign(rowHash)
+		batch.Queue(`
+			INSERT INTO audit_events
+				(occurred_at, action, subject, provider, outcome, detail, prev_hash, row_hash, signature)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			r.OccurredAt, r.Action, r.Subject, r.Provider, r.Outcome, r.Detail,
+			prev, rowHash, sig)
+		prev = rowHash
+	}
+	// One round trip for the inserts, and the first statement's error is the
+	// batch's: a failure here aborts the transaction and the rollback below
+	// discards the whole batch, so no caller is told a row is durable unless every
+	// row in it is.
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return fmt.Errorf("postgres: audit: insert: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE audit_chain SET head_hash = $1 WHERE only_row`, rowHash); err != nil {
+		`UPDATE audit_chain SET head_hash = $1 WHERE only_row`, prev); err != nil {
 		return fmt.Errorf("postgres: audit: advance chain head: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -309,6 +343,10 @@ func (l *AuditLogger) Head(ctx context.Context) ([]byte, error) {
 }
 
 // newAuditLogger validates the key and returns the sink.
+//
+// The append writer starts here and runs until Close. observe is deliberately not
+// captured: DB.Audit sets it after construction, and appendBatch reads it at each
+// call, so a logger built before the observer is wired still reports.
 func newAuditLogger(pool *pgxpool.Pool, key []byte) (*AuditLogger, error) {
 	switch {
 	case pool == nil:
@@ -317,9 +355,11 @@ func newAuditLogger(pool *pgxpool.Pool, key []byte) (*AuditLogger, error) {
 		return nil, fmt.Errorf("postgres: audit: the chain key must be %d bytes, got %d",
 			auditChainKeySize, len(key))
 	}
-	return &AuditLogger{
+	l := &AuditLogger{
 		pool:  pool,
 		key:   append([]byte(nil), key...),
 		cache: make(map[string][]byte, 64),
-	}, nil
+	}
+	l.batch = newAuditBatcher(l.appendBatch)
+	return l, nil
 }
