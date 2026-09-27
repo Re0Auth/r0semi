@@ -3,13 +3,75 @@ package idp
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/oauth2"
 )
+
+// recordingTransport answers from the test and remembers that it was asked, so a
+// client that is used can be told apart from one that is not.
+type recordingTransport struct {
+	calls atomic.Int64
+}
+
+func (t *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"access_token":"at-1","token_type":"Bearer","expires_in":3600}`)),
+		Request: req,
+	}, nil
+}
+
+// The registry's client must be used by Exchange without the caller putting it in
+// the context.
+//
+// x/oauth2 reads the client from the context and falls back to http.DefaultClient
+// when it finds none — no timeout, the default transport, and the standard
+// library's redirect policy on a request whose body is the authorization code and
+// the client secret. The siblings of this test inject the client themselves, which
+// is exactly why the gap survived: the production caller passes the request
+// context, so the fallback was the only path it ever took. The token endpoint here
+// is a host that cannot resolve, so a fallback to the default client fails rather
+// than silently passing.
+func TestExchangeUsesTheConfiguredClient(t *testing.T) {
+	rt := &recordingTransport{}
+	reg, err := NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		HTTPClient:   &http.Client{Transport: rt},
+		Credentials: []Credentials{{
+			Provider: GitHub, ClientID: "cid", ClientSecret: "sec",
+			AuthURL: "https://idp.invalid/auth", TokenURL: "https://idp.invalid/token",
+			UserInfoURL: "https://idp.invalid/user",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := reg.Get(GitHub)
+	if !ok {
+		t.Fatal("provider not registered")
+	}
+
+	token, err := c.Exchange(context.Background(), "code-1", "verifier-1")
+	if err != nil {
+		t.Fatalf("Exchange did not use the configured client: %v", err)
+	}
+	if token.AccessToken != "at-1" {
+		t.Fatalf("access token = %q", token.AccessToken)
+	}
+	if got := rt.calls.Load(); got != 1 {
+		t.Fatalf("the configured transport saw %d requests, want 1", got)
+	}
+}
 
 func TestNewRegistryValidation(t *testing.T) {
 	if _, err := NewRegistry(RegistryConfig{}); err == nil {

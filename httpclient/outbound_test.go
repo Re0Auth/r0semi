@@ -2,8 +2,12 @@ package httpclient
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -199,4 +203,169 @@ func TestBulkheadHoldsSlotUntilBodyClosed(t *testing.T) {
 	}
 	close(release)
 	_ = second.Body.Close()
+}
+
+// A redirect off the origin host is refused, and nothing of the request reaches
+// the host it pointed at.
+//
+// The guard for a real leak: the client followed redirects by default, Go strips
+// Authorization only when the destination is outside the same domain, and it never
+// strips the body on 307/308. Every request through this client carries something
+// that must not be deflected — a bearer token on the data plane, a refresh token
+// and the client secret on the token exchange — so "go somewhere else" has to be
+// an error, not a hop.
+func TestOutboundRefusesRedirectToAnotherHost(t *testing.T) {
+	var reached atomic.Bool
+	var gotBody atomic.Value
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody.Store(string(b))
+		reached.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer evil.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evil.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	c := NewOutboundClient(OutboundConfig{})
+	req, err := http.NewRequest(http.MethodPost, source.URL+"/oauth/token",
+		strings.NewReader("grant_type=refresh_token&refresh_token=SECRET-REFRESH&client_secret=SECRET-CLIENT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer SECRET-BEARER")
+
+	resp, err := c.Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("the outbound client followed a redirect to another host")
+	}
+	if reached.Load() {
+		t.Fatalf("the request was delivered to the redirect target with body %q", gotBody.Load())
+	}
+}
+
+// The refusal is about who receives the request, not about redirects as such: a
+// same-host redirect still resolves, so the policy cannot be mistaken for "turn
+// redirects off everywhere".
+func TestOutboundAllowsASameHostRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/moved", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/target", http.StatusFound)
+	})
+	mux.HandleFunc("/target", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewOutboundClient(OutboundConfig{})
+	resp, err := c.Get(srv.URL + "/moved")
+	if err != nil {
+		t.Fatalf("a same-host redirect was refused: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want the redirect followed to 200", resp.StatusCode)
+	}
+}
+
+// A scheme change is a host change in the sense that matters: the request would
+// leave for somewhere the operator did not configure, and an https -> http hop is
+// a downgrade on top of it.
+func TestNoCrossHostRedirectsRefusesASchemeChange(t *testing.T) {
+	origin, err := url.Parse("https://api.example/oauth/token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	via := []*http.Request{{URL: origin}}
+
+	downgrade, err := http.NewRequest(http.MethodGet, "http://api.example/moved", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NoCrossHostRedirects(downgrade, via); err == nil {
+		t.Fatal("an https -> http redirect was allowed")
+	}
+
+	sameHost, err := http.NewRequest(http.MethodGet, "https://api.example/moved", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NoCrossHostRedirects(sameHost, via); err != nil {
+		t.Fatalf("a same-scheme, same-host redirect was refused: %v", err)
+	}
+
+	otherHost, err := http.NewRequest(http.MethodGet, "https://elsewhere.example/moved", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NoCrossHostRedirects(otherHost, via); err == nil {
+		t.Fatal("a redirect to another host was allowed")
+	}
+}
+
+// The guard that keeps a configured source or IdP from being aimed at the cloud
+// metadata address or another internal listener.
+//
+// The check runs on the resolved address at dial time, which is what a URL-level
+// check cannot do: a name that answered publicly when the source was registered
+// can answer 169.254.169.254 later. Loopback is where every test server lives, so
+// the difference is directly observable — and the refusal has to name the setting
+// that permits it, or an operator with a self-hosted source sees only "connection
+// refused".
+func TestTransportRefusesPrivateAddressesWhenAsked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+
+	open := NewOutboundClient(OutboundConfig{})
+	resp, err := open.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("loopback was refused without the flag: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	guarded := NewOutboundClient(OutboundConfig{
+		Transport: TransportConfig{DenyPrivateAddresses: true},
+	})
+	if _, err := guarded.Get(srv.URL); err == nil {
+		t.Fatal("a loopback address was dialed with DenyPrivateAddresses set")
+	} else if !strings.Contains(err.Error(), "allow_private_addresses") {
+		t.Fatalf("the refusal does not name the setting that permits it: %v", err)
+	}
+}
+
+// The predicate behind the hook, tested on the addresses an attacker reaches for
+// rather than only on the one a test server happens to use.
+func TestIsPublicAddress(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"127.0.0.1":       false,
+		"::1":             false,
+		"10.0.0.5":        false,
+		"172.16.3.4":      false,
+		"192.168.1.1":     false,
+		"169.254.169.254": false, // the cloud metadata address
+		"fd00::1":         false, // IPv6 unique-local
+		"fe80::1":         false,
+		"100.64.0.1":      false, // carrier-grade NAT
+		"0.0.0.0":         false,
+		"2002:7f00:1::":   false, // 6to4 wrapping 127.0.0.1
+		"64:ff9b::7f00:1": false, // NAT64 wrapping 127.0.0.1
+		"8.8.8.8":         true,
+		"1.1.1.1":         true,
+		"2606:4700::1111": true,
+	} {
+		addr, err := netip.ParseAddr(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		if got := IsPublicAddress(addr); got != want {
+			t.Errorf("IsPublicAddress(%s) = %v, want %v", raw, got, want)
+		}
+	}
 }

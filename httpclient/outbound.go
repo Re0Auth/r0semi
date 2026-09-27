@@ -1,10 +1,14 @@
 package httpclient
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/failsafe-go/failsafe-go/bulkhead"
@@ -35,6 +39,13 @@ type TransportConfig struct {
 	ResponseHeaderTimeout time.Duration
 	// ExpectContinueTimeout bounds the wait for a 100-continue.
 	ExpectContinueTimeout time.Duration
+	// DenyPrivateAddresses refuses a connection whose resolved address is not
+	// public. It is checked at dial time, on the address the kernel is about to be
+	// given, so it holds after DNS resolution — the point being that a name which
+	// resolved to a public address at configuration time and to 169.254.169.254 at
+	// request time is refused. Off by default because self-hosted data sources on a
+	// private network are a supported shape; a public deployment turns it on.
+	DenyPrivateAddresses bool
 }
 
 // DefaultTransportConfig is the pool sizing for a client that talks to a small
@@ -78,8 +89,17 @@ func NewTransport(cfg TransportConfig) *http.Transport {
 	}
 
 	return &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}
+			if cfg.DenyPrivateAddresses {
+				// Control rather than a check on the URL: this runs on the resolved
+				// address, so it also covers a hostname the peer's DNS has been made
+				// to answer differently than it did when the source was registered.
+				dialer.Control = denyPrivateAddress
+			}
+			return dialer.DialContext(ctx, network, address)
+		},
 		MaxIdleConns:          cfg.MaxIdleConns,
 		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:       cfg.IdleConnTimeout,
@@ -88,6 +108,70 @@ func NewTransport(cfg TransportConfig) *http.Transport {
 		ExpectContinueTimeout: cfg.ExpectContinueTimeout,
 		ForceAttemptHTTP2:     true,
 	}
+}
+
+// nonPublicPrefixes are address blocks that are not public but that
+// IsPrivate/IsLoopback/IsLinkLocalUnicast do not already report: carrier-grade
+// NAT, IETF protocol assignments, the documentation ranges, benchmarking, the
+// reserved block, and the two IPv6 forms that embed an IPv4 address.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),   // RFC 6598 carrier-grade NAT
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),    // documentation
+	netip.MustParsePrefix("198.18.0.0/15"),   // benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"), // documentation
+	netip.MustParsePrefix("203.0.113.0/24"),  // documentation
+	netip.MustParsePrefix("240.0.0.0/4"),     // reserved
+	netip.MustParsePrefix("64:ff9b::/96"),    // NAT64: the low 32 bits are an IPv4 address
+	netip.MustParsePrefix("2001:db8::/32"),   // documentation
+	netip.MustParsePrefix("2002::/16"),       // 6to4: same embedding
+}
+
+// IsPublicAddress reports whether addr is one an outbound client may connect to
+// when private addresses are refused.
+//
+// It is deliberately an allow-list of what is left after the special ranges are
+// removed, rather than a deny-list of "interesting" addresses: the ranges an
+// attacker reaches for are the ones that mean something locally (loopback, the
+// link-local metadata address, the private networks), and a deny-list would have
+// to keep up with them.
+func IsPublicAddress(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() {
+		return false
+	}
+	if addr.IsPrivate() || addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() {
+		return false
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+// denyPrivateAddress is a net.Dialer.Control hook: it is handed the address about
+// to be dialed, after resolution, and refuses it when it is not public.
+func denyPrivateAddress(network, address string, _ syscall.RawConn) error {
+	if network == "unix" || network == "unixgram" || network == "unixpacket" {
+		// Not reachable through this transport, and there is no IP address to judge.
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("httpclient: cannot read the dial address %q: %w", address, err)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("httpclient: cannot read the dial address %q: %w", host, err)
+	}
+	if !IsPublicAddress(addr) {
+		return fmt.Errorf("httpclient: refusing to connect to %s: %s is not a public address "+
+			"(set upstream.allow_private_addresses to permit one)", address, addr)
+	}
+	return nil
 }
 
 // bulkheadTransport bounds the number of requests in flight at once.
@@ -176,10 +260,47 @@ type OutboundConfig struct {
 
 const defaultOutboundTimeout = 20 * time.Second
 
+// NoCrossHostRedirects is the redirect policy for every outbound client: a hop
+// that changes the scheme or the host is refused, and the refusal is an error
+// rather than a response the caller might mistake for the peer's answer.
+//
+// These calls carry material a redirect target has no business receiving — a
+// bearer token in the Authorization header, and on the token exchange a refresh
+// token and the client secret in the form body. Redirects were being followed by
+// default, and the standard library only strips Authorization when the
+// destination is outside the same domain (net/http's shouldCopyHeaderOnRedirect),
+// so a sibling host keeps the header; the body is not stripped for any host on
+// 307/308, because bodies are replayed verbatim. A source that is compromised,
+// merely misconfigured, or reachable through a hijacked DNS answer could
+// therefore point a credential at a host of its choosing — and on the raw
+// passthrough the response would come back to the caller, making the service an
+// SSRF pivot as well.
+//
+// The only safe answer to "go somewhere else" from an API endpoint is to stop:
+// the operator configured the endpoint, and a redirect is not something that
+// config said. Same-host redirects are allowed because they cannot change who
+// receives the request.
+func NoCrossHostRedirects(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	origin := via[0].URL
+	if req.URL.Scheme != origin.Scheme || req.URL.Host != origin.Host {
+		// Hosts only, no paths or queries: this error is logged, and a URL on the
+		// wire here can carry a code or a token.
+		return fmt.Errorf("httpclient: refused a redirect from %s://%s to %s://%s",
+			origin.Scheme, origin.Host, req.URL.Scheme, req.URL.Host)
+	}
+	return nil
+}
+
 // NewOutboundClient builds the hardened client the data plane uses: a pooled
 // transport, a per-request deadline, and a global in-flight cap. It is a plain
 // *http.Client, so it satisfies Doer and can also be handed to code that wants a
 // concrete client (the OAuth token exchange, say) — one client, one pool.
+//
+// Redirects that leave the origin host are refused (NoCrossHostRedirects); see
+// that function for what following them used to cost.
 func NewOutboundClient(cfg OutboundConfig) *http.Client {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultOutboundTimeout
@@ -192,7 +313,11 @@ func NewOutboundClient(cfg OutboundConfig) *http.Client {
 		// Outside the bulkhead: an open breaker must reject before a slot is taken.
 		rt = CircuitBreaker(rt, *cfg.Breaker)
 	}
-	return &http.Client{Timeout: cfg.Timeout, Transport: rt}
+	return &http.Client{
+		Timeout:       cfg.Timeout,
+		Transport:     rt,
+		CheckRedirect: NoCrossHostRedirects,
+	}
 }
 
 var _ Doer = (*http.Client)(nil)

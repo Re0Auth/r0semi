@@ -22,6 +22,8 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
+
+	"github.com/Re0Auth/r0semi/httpclient"
 )
 
 // Provider identifies an external identity provider.
@@ -239,7 +241,11 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 	}
 	hc := cfg.HTTPClient
 	if hc == nil {
-		hc = &http.Client{Timeout: 10 * time.Second}
+		// The library's own default is hardened too, not just the composition
+		// root's: a caller that forgets to pass one should not silently get the
+		// unhardened default client. The redirect policy matters most on the token
+		// exchange, which posts the authorization code and the client secret.
+		hc = &http.Client{Timeout: 10 * time.Second, CheckRedirect: httpclient.NoCrossHostRedirects}
 	}
 	base := strings.TrimRight(cfg.RedirectBase, "/")
 	callbackPath := cfg.CallbackPath
@@ -386,10 +392,21 @@ func (c *Client) AuthCodeURL(ctx context.Context, state, verifier, nonce string)
 }
 
 // Exchange redeems an authorization code, proving possession of the verifier.
+//
+// The configured client travels in the context, because that is where
+// golang.org/x/oauth2 looks for one — and when it finds none it posts with
+// http.DefaultClient: no timeout (the server's write timeout becomes the only
+// bound), the default transport, and the standard library's redirect policy on a
+// request whose body is the authorization code and the client secret. Federation
+// makes the same bridge for the upstream exchange; this was the one place that
+// did not.
 func (c *Client) Exchange(ctx context.Context, code, verifier string) (*oauth2.Token, error) {
 	cfg, err := c.oauthConfig(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if c.http != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, c.http)
 	}
 	return cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 }
