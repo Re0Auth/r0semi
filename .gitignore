@@ -60,3 +60,11 @@ docs/*.pdf
 
 # IDE CLI
 .commandcode
+
+# The audit workspace. Audits run here — throwaway probes, generated binaries,
+# machine-local notes and the shared brief the area agents read. What belongs in
+# the repository is archived next to the report it backs: the fifth round's raw
+# records are under docs/audit-5/, and the tests that fail on its findings are
+# under internal/zzprobe/. Anchored so it cannot shadow a deeper directory of the
+# same name.
+/scratchpad/
