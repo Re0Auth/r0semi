@@ -192,7 +192,11 @@ func (l *Limiter) Check(key string) Verdict {
 	}
 	if reservation := b.limiter.ReserveN(now, 1); reservation.OK() {
 		v.Reset = reservation.DelayFrom(now)
-		reservation.Cancel()
+		// CancelAt(now), not Cancel: Cancel cancels at a fresh time.Now(), and
+		// when the bucket still had a token the reservation's timeToAct is `now`
+		// itself — already in the past by then, so CancelAt refuses to run and
+		// the reserved token silently leaks out of the bucket.
+		reservation.CancelAt(now)
 	}
 	return v
 }
