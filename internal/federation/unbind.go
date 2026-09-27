@@ -25,16 +25,18 @@ func (s *service) Bindings(ctx context.Context, user account.UserID) ([]Binding,
 // It is idempotent: unbinding something that is not bound reports nothing to do
 // rather than failing, so a retry after a dropped response is harmless.
 //
+// A binding whose source is no longer in the configuration is still removable.
+// The list view reports such a binding with configured:false and tells the user
+// it can be disconnected, so this call must keep that promise: there is no source
+// left to ask, but the local half — shredding the secret and deleting the row —
+// happens exactly as it does for a configured source.
+//
 // Known and bounded gap: a refresh token the source has already rotated away from
 // is not revoked, because only the current one is in the vault. That follows from
 // rotation rather than from this call, and is recorded rather than papered over.
 func (s *service) Unbind(ctx context.Context, user account.UserID, game, source string) (RevocationResult, error) {
 	if user == "" || game == "" || source == "" {
 		return RevocationResult{}, errors.New("federation: user, game and source are required")
-	}
-	src, ok := s.registry.Get(game, source)
-	if !ok {
-		return RevocationResult{}, ErrUnknownSource
 	}
 	// The same per-binding lock a refresh takes, for the whole call.
 	//
@@ -50,20 +52,33 @@ func (s *service) Unbind(ctx context.Context, user account.UserID, game, source 
 
 	binding, err := s.bindings.Get(ctx, user, game, source)
 	if errors.Is(err, ErrNotBound) {
+		// Nothing is bound. An unknown source is "no such thing" only when there is
+		// also nothing to remove — otherwise it is the idempotent no-op, because the
+		// desired state (not bound) already holds.
+		if _, ok := s.registry.Get(game, source); !ok {
+			return RevocationResult{}, ErrUnknownSource
+		}
 		return RevocationResult{Upstream: RevocationNothingToDo}, nil
 	}
 	if err != nil {
 		return RevocationResult{}, err
 	}
 
+	// The registry lookup happens after the binding is found, not before: a source
+	// can be dropped from the configuration while bindings to it remain, and those
+	// bindings must still be removable. When the source is gone there is nothing to
+	// ask upstream, so only the local cut runs — which is the half that has to
+	// happen anyway.
 	result := RevocationResult{Upstream: RevocationNothingToDo}
-	if src.TokenClass == tokenClassLongLived {
-		// The source declared up front that it cannot revoke per client. Saying so
-		// out loud is the entire reason token_class exists; quietly reporting
-		// success would defeat it.
-		result.Upstream = RevocationUnsupported
-	} else {
-		result.Upstream, result.UpstreamError = s.revokeUpstream(ctx, src, binding)
+	if src, ok := s.registry.Get(game, source); ok {
+		if src.TokenClass == tokenClassLongLived {
+			// The source declared up front that it cannot revoke per client. Saying so
+			// out loud is the entire reason token_class exists; quietly reporting
+			// success would defeat it.
+			result.Upstream = RevocationUnsupported
+		} else {
+			result.Upstream, result.UpstreamError = s.revokeUpstream(ctx, src, binding)
+		}
 	}
 
 	// The local removal happens whatever the source said. A user must always be

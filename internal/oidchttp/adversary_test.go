@@ -154,6 +154,97 @@ func TestAdversarialDeviceAuthorizationRejectsGET(t *testing.T) {
 	}
 }
 
+// /oauth/keys was the one protocol endpoint left with neither a method
+// constraint nor a pre-flight, so it answered 200 to every verb. The response is
+// public key material and nothing mutates, so nothing leaked — but "a check
+// attached to one method is not a check" is exactly the lesson the authorize,
+// token and device endpoints paid for, and keys is where the same laxity would
+// otherwise be inherited by whatever is mounted there next.
+func TestAdversarialKeysEndpointIsGetOnly(t *testing.T) {
+	f := newFixture(t)
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req, err := http.NewRequest(method, f.server.URL+"/oauth/keys", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body := adversaryBody(t, resp); resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s /oauth/keys = %d, want 200: %s", method, resp.StatusCode, body)
+		}
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		req, err := http.NewRequest(method, f.server.URL+"/oauth/keys", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := adversaryBody(t, resp)
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("%s /oauth/keys = %d, want 405: %s", method, resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), `"error"`) {
+			t.Fatalf("%s /oauth/keys refusal is not an OAuth error body: %s", method, body)
+		}
+	}
+}
+
+// The verb matrix for the protocol plane, derived from the same endpointMethods
+// table the handler enforces, so a new endpoint or a changed policy is covered
+// without editing the test. Every endpoint is asked with every verb; only the
+// declared ones may avoid a 405, and every refusal must be an OAuth error body.
+//
+// HEAD is omitted on purpose: net/http serves it from the GET handler and the
+// provider library's answer to it is not part of the contract this table states.
+func TestEveryProtocolEndpointRefusesUnlistedMethods(t *testing.T) {
+	f := newFixture(t)
+	verbs := []string{
+		http.MethodGet, http.MethodPost, http.MethodPut,
+		http.MethodDelete, http.MethodPatch, http.MethodOptions,
+	}
+
+	refused := 0
+	for path, allowed := range endpointMethods {
+		for _, verb := range verbs {
+			t.Run(verb+" "+path, func(t *testing.T) {
+				req, err := http.NewRequest(verb, f.server.URL+path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := adversaryBody(t, resp)
+				if allowed[verb] {
+					if resp.StatusCode == http.StatusMethodNotAllowed {
+						t.Fatalf("%s %s is declared allowed but answered 405: %s", verb, path, body)
+					}
+					return
+				}
+				if resp.StatusCode != http.StatusMethodNotAllowed {
+					t.Fatalf("%s %s = %d, want 405: %s", verb, path, resp.StatusCode, body)
+				}
+				if !strings.Contains(string(body), `"error"`) {
+					t.Fatalf("%s %s refusal is not an OAuth error body: %s", verb, path, body)
+				}
+				refused++
+			})
+		}
+	}
+	// Anti-vacuous: the table must have produced refusals, not skipped every path.
+	if refused < 10 {
+		t.Fatalf("only %d wrong-method refusals asserted", refused)
+	}
+}
+
 // A GET to the token endpoint must not exchange a code at all. Before this
 // guard the library accepted it and the code ended up in the URL/logs.
 func TestAdversarialTokenEndpointRejectsGET(t *testing.T) {

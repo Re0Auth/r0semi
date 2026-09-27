@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/oidchttp"
 	"github.com/Re0Auth/r0semi/internal/store/memory"
 	"github.com/Re0Auth/r0semi/oauth"
 	"github.com/Re0Auth/r0semi/vault"
@@ -100,12 +102,37 @@ func newFakeUpstream(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// bindEnvParts is newBindEnv's wiring kept addressable. A test can rebuild the
+// HTTP surface against a different federation registry (handlerWithRegistry),
+// which is the only way to reach "the binding outlived its source" end to end:
+// the session, account and vault stay the ones that produced the binding, and
+// only the source entry disappears.
+type bindEnvParts struct {
+	base     string
+	client   *http.Client
+	accounts *account.MemoryStore
+	bindings *federation.MemoryBindingStore
+	store    *memory.OIDCStore
+	vault    vault.Service
+	upstream *httptest.Server
+	manager  *auth.Manager
+	auth     *auth.Handler
+	op       *oidchttp.Handler
+	api      *Server
+	handler  http.Handler
+}
+
 // newBindEnv wires the IdP login plane, the OpenID Provider, and the federation
 // plane against a fake IdP and a fake upstream source. It returns the run
 // handler and OP store so a test can mint a token through the real code flow.
 func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *federation.MemoryBindingStore, http.Handler, *memory.OIDCStore, vault.Service) {
 	t.Helper()
-	ctx := context.Background()
+	p := newBindEnvParts(t)
+	return p.base, p.client, p.accounts, p.bindings, p.handler, p.store, p.vault
+}
+
+func newBindEnvParts(t *testing.T) *bindEnvParts {
+	t.Helper()
 
 	idpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -121,13 +148,16 @@ func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *fede
 	}))
 	t.Cleanup(idpSrv.Close)
 
-	upstream := newFakeUpstream(t)
+	p := &bindEnvParts{upstream: newFakeUpstream(t)}
 
-	var handler http.Handler
+	// The server dispatches through p.handler on every request, so a test can swap
+	// the surface (see handlerWithRegistry) without a second port, which would
+	// break the port-agnostic session cookie.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handler.ServeHTTP(w, r)
+		p.handler.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
+	p.base = srv.URL
 
 	idpRegistry, err := idp.NewRegistry(idp.RegistryConfig{
 		RedirectBase: srv.URL,
@@ -141,9 +171,9 @@ func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *fede
 		t.Fatal(err)
 	}
 
-	accounts := account.NewMemoryStore()
-	manager := auth.NewManager(auth.Options{Secure: false})
-	authHandler, err := auth.NewHandler(manager, idpRegistry, accounts)
+	p.accounts = account.NewMemoryStore()
+	p.manager = auth.NewManager(auth.Options{Secure: false})
+	p.auth, err = auth.NewHandler(p.manager, idpRegistry, p.accounts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,59 +184,76 @@ func newBindEnv(t *testing.T) (string, *http.Client, *account.MemoryStore, *fede
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := clients.Create(ctx, apiClient); err != nil {
+	if err := clients.Create(context.Background(), apiClient); err != nil {
 		t.Fatal(err)
 	}
 
-	registry, err := federation.NewRegistry(federation.Source{
-		Game: "phigros", Name: "fake", DisplayName: "Fake", Issuer: upstream.URL,
-		ClientID: "cid", ClientSecret: "sec", TokenClass: "revocable",
-		// Declared, as this deployment would declare it after reading the source's
-		// discovery document. The fake source serves the endpoint.
-		CascadeRevocationEndpoint: upstream.URL + "/oauth/cascade_revocation",
-		Resources:                 []federation.Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindings := federation.NewMemoryBindingStore()
-	v := newTestVault(t)
-	fed, err := federation.NewService(federation.Config{
-		Registry: registry, Bindings: bindings, Vault: v, Doer: upstream.Client(), BaseURL: srv.URL,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	p.bindings = federation.NewMemoryBindingStore()
+	p.vault = newTestVault(t)
+	p.op, p.store = newOPBackend(t, srv.URL, clients, p.manager)
 
-	opHandler, store := newOPBackend(t, srv.URL, clients, manager)
-	api, err := New(Config{
-		Issuer:            srv.URL,
-		OIDC:              opHandler,
-		TokenIntrospector: opHandler,
-		GrantStore:        store,
-		DeviceStore:       store,
-		Authorization:     opHandler,
-		Sessions:          manager,
-		Accounts:          accounts,
-		Auth:              authHandler,
-		Federation:        fed,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler = api.Handler()
+	p.api = p.handlerWithRegistry(t, bindSourceRegistry(t, p.upstream.URL))
+	p.handler = p.api.Handler()
 
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := &http.Client{
+	p.client = &http.Client{
 		Jar: jar,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	return srv.URL, client, accounts, bindings, handler, store, v
+	return p
+}
+
+// bindSourceRegistry is the deployment's source list, with the fake upstream
+// described exactly as a deployment would describe it after reading its discovery
+// document.
+func bindSourceRegistry(t *testing.T, issuer string) *federation.Registry {
+	t.Helper()
+	registry, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "fake", DisplayName: "Fake", Issuer: issuer,
+		ClientID: "cid", ClientSecret: "sec", TokenClass: "revocable",
+		CascadeRevocationEndpoint: issuer + "/oauth/cascade_revocation",
+		Resources:                 []federation.Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}
+
+// handlerWithRegistry rebuilds the HTTP surface against a federation service whose
+// registry is `registry`, sharing every other store with p — same session, same
+// account, same vault. It is how a test removes a source from the configuration
+// while the binding it describes stays on disk.
+func (p *bindEnvParts) handlerWithRegistry(t *testing.T, registry *federation.Registry) *Server {
+	t.Helper()
+	fed, err := federation.NewService(federation.Config{
+		Registry: registry, Bindings: p.bindings, Vault: p.vault,
+		Doer: p.upstream.Client(), BaseURL: p.base,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := New(Config{
+		Issuer:            p.base,
+		OIDC:              p.op,
+		TokenIntrospector: p.op,
+		GrantStore:        p.store,
+		DeviceStore:       p.store,
+		Authorization:     p.op,
+		Sessions:          p.manager,
+		Accounts:          p.accounts,
+		Auth:              p.auth,
+		Federation:        fed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return api
 }
 
 // The full bind journey: sign in -> /bind -> upstream authorizes -> callback ->
@@ -289,5 +336,85 @@ func TestBindCallbackRejectsUnknownState(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// The HTTP half of the orphaned-binding fix. A binding can outlive its source's
+// entry in the configuration; GET /v1/bindings reports that with configured:false
+// and promises it can still be disconnected. Before the fix the endpoint answered
+// 404 (ErrUnknownSource was returned before the binding was ever read), so the
+// upstream token and its vault secret could only be cleared by an operator.
+func TestUnbindOrphanedBindingEndToEnd(t *testing.T) {
+	p := newBindEnvParts(t)
+	signIn(t, p.client, p.base)
+	ctx := context.Background()
+
+	uid, err := p.accounts.FindByIdentity(ctx, idp.GitHub, "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Bind through the shipped flow, so the row and its secret are the ones the
+	// real code produces.
+	resp := getURL(t, p.client, p.base+"/bind?game=phigros&source=fake&return_to=/dashboard")
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("bind start = %d", resp.StatusCode)
+	}
+	authorizeURL := resp.Header.Get("Location")
+	resp.Body.Close()
+	resp = getURL(t, p.client, authorizeURL)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("upstream authorize = %d", resp.StatusCode)
+	}
+	callbackURL := resp.Header.Get("Location")
+	resp.Body.Close()
+	resp = getURL(t, p.client, callbackURL)
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("callback = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	binding, err := p.bindings.Get(ctx, uid, "phigros", "fake")
+	if err != nil {
+		t.Fatalf("the binding was not stored: %v", err)
+	}
+
+	// Reconfigure without the source. The row and the vault secret stay; only the
+	// description of the source is gone.
+	other, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "other", DisplayName: "Other", Issuer: p.upstream.URL,
+		TokenClass: "revocable",
+		Resources:  []federation.Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.api = p.handlerWithRegistry(t, other)
+	p.handler = p.api.Handler()
+
+	csrf, _ := decodeResp(t, getURL(t, p.client, p.base+"/v1/sessions/current"))["csrf_token"].(string)
+	if csrf == "" {
+		t.Fatal("no CSRF token on the session view")
+	}
+	req, err := http.NewRequest(http.MethodDelete, p.base+"/v1/bindings/phigros/fake", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp = doReq(t, p.client, req)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("DELETE an orphaned binding = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if body := decodeResp(t, resp); body["upstream"] != "nothing" {
+		t.Fatalf("upstream = %v, want nothing (there is no source left to ask)", body["upstream"])
+	}
+
+	if _, err := p.bindings.Get(ctx, uid, "phigros", "fake"); err == nil {
+		t.Error("the orphaned binding row survived")
+	}
+	if exists, _ := p.vault.Exists(ctx, federation.BindingIdentity(binding)); exists {
+		t.Error("the orphaned binding secret survived")
 	}
 }

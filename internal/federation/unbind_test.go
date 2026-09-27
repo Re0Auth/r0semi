@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -247,6 +248,56 @@ func TestUnbindRemovesLocallyWhenTheSourceRefuses(t *testing.T) {
 	}
 	if exists, _ := v.Exists(ctx, BindingIdentity(binding)); exists {
 		t.Error("the binding secret survived a refused upstream revocation")
+	}
+}
+
+// A binding can outlive its source's entry in the configuration: GET /v1/bindings
+// reports it with configured:false and says it can still be disconnected. Unbind
+// used to answer ErrUnknownSource *before* it ever read the binding, so the row
+// and its vault secret survived and the owner had no way to remove them — only an
+// operator Kill Switch or account erasure could.
+func TestUnbindCutsABindingWhoseSourceIsGone(t *testing.T) {
+	rec := &releasingSource{}
+	up := newReleasingSource(t, rec)
+	svc, bindings, v := unbindService(t, unbindSource(up.URL, "revocable"))
+	ctx := context.Background()
+
+	binding := connect(t, svc, "usr_1")
+
+	// The deployment is reconfigured without this source, but the row and its
+	// secret remain.
+	reg, err := NewRegistry(Source{Game: game, Name: "other", DisplayName: "Other", Issuer: up.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphaned, err := NewService(Config{
+		Registry: reg, Bindings: bindings, Vault: v,
+		Doer: up.Client(), HTTPClient: up.Client(), BaseURL: "https://re0auth.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := orphaned.Unbind(ctx, "usr_1", game, sourceName)
+	if err != nil {
+		t.Fatalf("an orphaned binding could not be disconnected: %v", err)
+	}
+	if result.Upstream != RevocationNothingToDo {
+		t.Fatalf("upstream = %q, want nothing: there is no source left to ask", result.Upstream)
+	}
+	if calls := rec.calls(); len(calls) != 0 {
+		t.Fatalf("a source that is no longer configured was asked to revoke: %v", calls)
+	}
+	if _, err := bindings.Get(ctx, "usr_1", game, sourceName); err == nil {
+		t.Error("the orphaned binding row survived")
+	}
+	if exists, _ := v.Exists(ctx, BindingIdentity(binding)); exists {
+		t.Error("the orphaned binding secret survived")
+	}
+	// An unknown source with nothing bound is still "no such thing" — the HTTP
+	// layer answers 404 for that, and it must stay that way.
+	if _, err := orphaned.Unbind(ctx, "usr_1", game, sourceName); !errors.Is(err, ErrUnknownSource) {
+		t.Fatalf("unbind after removal = %v, want ErrUnknownSource", err)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -609,10 +610,50 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) businessPlane() http.Handler {
 	mux := http.NewServeMux()
+	// Routes are grouped by bare pattern and dispatched by method inside the
+	// handler, rather than registered as "METHOD pattern" pairs. The reason is the
+	// wrong verb: the /v1/ catch-all below matches every method, so net/http's own
+	// 405 is shadowed and a PUT to a GET-only route fell through to its 404. With
+	// the dispatch here, a method the route does not declare is a plane-shaped 405
+	// carrying Allow — the honest answer, and the one the protocol plane gives too.
+	byPattern := make(map[string]map[string]http.HandlerFunc)
+	var patterns []string
 	for _, rt := range s.specRoutes() {
-		if strings.HasPrefix(rt.Pattern, "/v1/") {
-			mux.HandleFunc(rt.Method+" "+rt.Pattern, rt.Handler)
+		if !strings.HasPrefix(rt.Pattern, "/v1/") {
+			continue
 		}
+		if byPattern[rt.Pattern] == nil {
+			byPattern[rt.Pattern] = make(map[string]http.HandlerFunc)
+			patterns = append(patterns, rt.Pattern)
+		}
+		byPattern[rt.Pattern][rt.Method] = rt.Handler
+	}
+	for _, pattern := range patterns {
+		handlers := byPattern[pattern]
+		allow := make([]string, 0, len(handlers)+1)
+		for method := range handlers {
+			allow = append(allow, method)
+			if method == http.MethodGet {
+				allow = append(allow, http.MethodHead)
+			}
+		}
+		sort.Strings(allow)
+		allowHeader := strings.Join(allow, ", ")
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			// net/http serves a HEAD request from a GET handler; do the same, so the
+			// dispatch does not turn a legal HEAD into a 405.
+			method := r.Method
+			if method == http.MethodHead {
+				method = http.MethodGet
+			}
+			if h, ok := handlers[method]; ok {
+				h(w, r)
+				return
+			}
+			w.Header().Set("Allow", allowHeader)
+			s.writeProblem(w, r, http.StatusMethodNotAllowed, "invalid_request",
+				"this endpoint does not accept "+r.Method)
+		})
 	}
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown resource")

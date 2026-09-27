@@ -234,7 +234,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/oauth/"):
 		h.serveOAuth(w, r)
 	default:
-		http.NotFound(w, r)
+		// Everything reaching here is under /.well-known/ but is not one of the two
+		// documents: an unknown URL, or a trailing-slash spelling of a real one.
+		// http.NotFound is text/plain, which is no plane's contract, while planeOf,
+		// the limiter and the metric label all call this path the protocol plane.
+		// Answer in that plane's shape, as serveOAuth does for an unknown /oauth
+		// path.
+		writeOAuthJSONError(w, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
 	}
 }
 
@@ -413,15 +419,17 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		writeOAuthJSONError(w, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
 		return
 	}
-	// RFC 6749 §3.2/§5.1, RFC 7662 §2.1, RFC 7009 §2.1 and RFC 8628 §3.1 all
-	// require POST for these endpoints. The library registers them without a
-	// method constraint and reads r.Form, so before this guard a GET was a working
-	// exchange — which put authorization codes, refresh tokens and introspection
-	// tokens into URLs and access logs. Refusing the method is the fix at the
-	// source; the response contract still applies to whatever POST fails.
-	if endpointRequiresPOST(r.URL.Path) && r.Method != http.MethodPost {
+	// One table decides the allowed method for every endpoint (knownOAuthPath is
+	// derived from it), so a wrong verb is refused with 405 before any pre-flight
+	// or handler runs. The failure this prevents is a check attached to one verb:
+	// RFC 6749 §3.2/§5.1, RFC 7662 §2.1, RFC 7009 §2.1 and RFC 8628 §3.1 require
+	// POST on the token endpoints and the library registers them without a method
+	// constraint, so before this guard a GET exchanged codes and put refresh and
+	// introspection tokens into URLs and logs; the mirror image was a PUT reaching
+	// an endpoint that had no method policy at all.
+	if !endpointMethods[r.URL.Path][r.Method] {
 		writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
-			"this endpoint requires POST")
+			"this endpoint does not accept "+r.Method)
 		return
 	}
 	// RFC 6749 §3.1: request parameters must not be repeated. The library's
@@ -1001,35 +1009,33 @@ func duplicatedParam(values url.Values) string {
 	return ""
 }
 
-// endpointRequiresPOST names the protocol endpoints that must only ever accept
-// POST. authorize (and its callback), userinfo and keys are absent on purpose:
-// they are GET endpoints by specification.
-func endpointRequiresPOST(path string) bool {
-	switch path {
-	case "/" + pathToken, "/" + pathIntrospection, "/" + pathRevocation, "/" + pathDeviceAuthz:
-		return true
-	default:
-		return false
-	}
+// endpointMethods is the one place each protocol endpoint's allowed HTTP methods
+// are declared. A method absent from its set is refused with 405 before any
+// pre-flight or handler runs, so the constraint is method-complete: the failure
+// mode this table exists to prevent is a check attached to one verb (a GET that
+// exchanged a code, a POST that skipped PKCE) letting every other verb through.
+//
+// HEAD is listed wherever GET is, because HTTP requires it and net/http serves it
+// from the same handler. authorize, its callback and userinfo accept GET and POST
+// per their RFCs; keys is GET-only (RFC 7517 §5); the rest are POST-only.
+var endpointMethods = map[string]map[string]bool{
+	"/" + pathAuthorize:               {http.MethodGet: true, http.MethodPost: true, http.MethodHead: true},
+	"/" + pathAuthorize + "/callback": {http.MethodGet: true, http.MethodHead: true},
+	"/" + pathToken:                   {http.MethodPost: true},
+	"/" + pathIntrospection:           {http.MethodPost: true},
+	"/" + pathRevocation:              {http.MethodPost: true},
+	"/" + pathUserinfo:                {http.MethodGet: true, http.MethodPost: true, http.MethodHead: true},
+	"/" + pathKeys:                    {http.MethodGet: true, http.MethodHead: true},
+	"/" + pathDeviceAuthz:             {http.MethodPost: true},
 }
 
-// knownOAuthPath reports whether path is an endpoint this provider serves. It
-// exists so an unknown /oauth/ path is an OAuth error rather than the library's
-// plain-text 404, keeping the protocol plane's error format uniform.
+// knownOAuthPath reports whether path is an endpoint this provider serves — and
+// therefore whether it has a method policy at all. Deriving it from
+// endpointMethods keeps "known" and "has allowed methods" from drifting apart:
+// a path in the map is both.
 func knownOAuthPath(path string) bool {
-	switch path {
-	case "/" + pathAuthorize,
-		"/" + pathAuthorize + "/callback",
-		"/" + pathToken,
-		"/" + pathIntrospection,
-		"/" + pathRevocation,
-		"/" + pathUserinfo,
-		"/" + pathKeys,
-		"/" + pathDeviceAuthz:
-		return true
-	default:
-		return false
-	}
+	_, ok := endpointMethods[path]
+	return ok
 }
 
 // sanitizeTokenResponse enforces two contract points the library does not:

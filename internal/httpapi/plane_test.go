@@ -44,6 +44,12 @@ var protocolPaths = []string{
 	"/.well-known/openid-configuration",
 	"/.well-known/oauth-protected-resource",
 	"/.well-known",
+	// An unknown URL under /.well-known/ and a trailing-slash spelling of a real
+	// document are both handed to the provider, whose own 404 used to be the
+	// standard library's text/plain — no plane's shape, on a path planeOf calls
+	// protocol. These two spellings pin that the whole subtree answers as OAuth.
+	"/.well-known/not-a-real-endpoint",
+	"/.well-known/oauth-authorization-server/",
 }
 
 // protocolAnyMethod names the endpoints that legitimately accept both GET and
@@ -376,4 +382,70 @@ func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 		return nil
 	}
 	return body
+}
+
+// TestEveryBusinessRouteRefusesUnlistedMethods is the verb matrix for the
+// business plane, derived from specRoutes so a new endpoint is covered the moment
+// it is declared. A method the route does not declare must be a plane-shaped 405
+// with Allow — not the catch-all's 404, which is what a PUT or an OPTIONS used to
+// get before the plane dispatched on the method itself.
+func TestEveryBusinessRouteRefusesUnlistedMethods(t *testing.T) {
+	srv := newFullEnv(t)
+	handler := srv.Handler()
+
+	subst := strings.NewReplacer(
+		"{game}", "phigros",
+		"{resource}", "profile",
+		"{source}", "fake",
+		"{client_id}", "cli",
+		"{path}", "x",
+		"{id}", "req_1",
+	)
+	verbs := []string{
+		http.MethodGet, http.MethodPost, http.MethodPut,
+		http.MethodDelete, http.MethodPatch, http.MethodOptions, http.MethodHead,
+	}
+
+	refused := 0
+	// Grouped by pattern, because a pattern can declare more than one method
+	// (GET+POST /v1/admin/clients); the policy is per route, and iterating the
+	// entries one by one would call the sibling method unlisted.
+	allowed := make(map[string]map[string]bool)
+	var patterns []string
+	for _, rt := range srv.specRoutes() {
+		if allowed[rt.Pattern] == nil {
+			allowed[rt.Pattern] = make(map[string]bool)
+			patterns = append(patterns, rt.Pattern)
+		}
+		allowed[rt.Pattern][rt.Method] = true
+	}
+	for _, pattern := range patterns {
+		for _, verb := range verbs {
+			t.Run(verb+" "+pattern, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(verb, subst.Replace(pattern), nil))
+
+				methods := allowed[pattern]
+				// A GET handler serves HEAD, as net/http does; anything else is refused.
+				if methods[verb] || (verb == http.MethodHead && methods[http.MethodGet]) {
+					if rec.Code == http.StatusMethodNotAllowed {
+						t.Fatalf("%s is declared for %s but answered 405", verb, pattern)
+					}
+					return
+				}
+				if rec.Code != http.StatusMethodNotAllowed {
+					t.Fatalf("%s %s = %d, want 405", verb, pattern, rec.Code)
+				}
+				if rec.Header().Get("Allow") == "" {
+					t.Errorf("405 for %s %s carries no Allow header", verb, pattern)
+				}
+				assertProblemPlane(t, rec)
+				refused++
+			})
+		}
+	}
+	// Anti-vacuous: the walk must have produced refusals, not skipped every route.
+	if refused < 20 {
+		t.Fatalf("only %d wrong-method refusals asserted; the walk is not reaching the plane", refused)
+	}
 }

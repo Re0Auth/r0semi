@@ -8,6 +8,25 @@
 
 ## Unreleased
 
+- **源从配置移除后，名下绑定现在可以被用户断开**：`Unbind` 此前在读取绑定**之前**就对未知源返回
+  `ErrUnknownSource`，于是 `DELETE /v1/bindings/{game}/{source}` 回 404，而 `GET /v1/bindings`
+  仍带着 `configured:false` 列出这条绑定并声称「仍可断开」——那条上游令牌与其 vault 密文只能靠运维
+  Kill Switch 或整账号抹除清除。现在注册表查找挪到读取绑定之后：绑定存在即执行本地那一半（撕密文、
+  删行），上游记为 `nothing`（已无源可问）；只有「未知源且无绑定」才继续是 404。
+
+- **协议面 `/.well-known/*` 的未知路径改为 OAuth JSON 404**：此前落在提供方 handler 的
+  `http.NotFound` 分支，回的是标准库的 `text/plain` 404，而日志、指标与限流器都把该请求记为
+  `plane=protocol`。未知路径与真实文档的尾斜杠拼写（如 `/.well-known/oauth-authorization-server/`）
+  现在与 `/oauth/*` 的未知端点为同一形状。
+
+- **每个端点声明自己的动词，未列出的动词一律 `405`**：协议面新增一张 `endpointMethods` 表
+  （「已知端点」也由它派生），`authorize`/它的回调与 `userinfo` 收 `GET`/`POST`，`keys` 收
+  `GET`/`HEAD`，其余收 `POST`；`PUT`/`DELETE`/`PATCH`/`OPTIONS` 等一律回 `405` 的 OAuth 错误体，
+  不再落到库或某个没有方法策略的分支。`/oauth/keys` 此前对任意方法都回 200（响应只是公钥，未泄露
+  任何东西，但它是唯一没有方法约束的端点）。业务面同样改为按方法分派：已注册路径上未声明的动词现在回
+  `405` problem+json 并带 `Allow` 头，而不再被 `/v1/` 兜底吞成 `404`。两面的动词矩阵都从
+  `specRoutes` / `endpointMethods` 自动派生，各有一条逐一断言的守卫测试。
+
 - **撤销令牌的索引（迁移 `0018`）**：`oidc_refresh_tokens.id_hash` 此前没有索引，而 RFC 7009 撤销路径
   （`RevokeToken` 的查找与两条 DELETE）都按它查/删，每次撤销都退化成全表扫描。新迁移在启动时自动执行；
   影响面是撤销与应急响应端点，不是签发热路径。
