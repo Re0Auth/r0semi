@@ -350,3 +350,74 @@ func TestFlushStartsCompressing(t *testing.T) {
 		t.Fatalf("body = %q", out)
 	}
 }
+
+// A first write that is already past the threshold goes straight to the encoder
+// instead of being copied into the threshold buffer, so the two arrival shapes
+// have to produce the same response.
+//
+// This is the guard for that fast path: the raw passthrough hands the middleware a
+// single 4MiB slice, and a full-body copy per compressed response is exactly the
+// cost this avoids. Byte-for-byte equality is what proves the fast path did not
+// also change the output — the threshold decision still has to be made, and the
+// flusher still has to work.
+func TestSingleLargeWriteMatchesChunkedWrites(t *testing.T) {
+	c := newTestCompressor(t, Config{})
+
+	body := []byte("[" + strings.Repeat(`{"score":123456,"song":"x"},`, 500) + `{}]`)
+	if len(body) < DefaultMinSize*4 {
+		t.Fatalf("the fixture is only %d bytes; it does not exercise the fast path", len(body))
+	}
+
+	for _, coding := range []string{"gzip", "zstd"} {
+		one := serve(c, http.MethodGet, "/v1/thing", coding, "application/json", nil, body)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+		req.Header.Set("Accept-Encoding", coding)
+		c.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			// Smaller than minSize each time, so the buffer decides when to commit.
+			for i := 0; i < len(body); i += DefaultMinSize / 4 {
+				end := min(i+DefaultMinSize/4, len(body))
+				if _, err := w.Write(body[i:end]); err != nil {
+					t.Errorf("chunked write: %v", err)
+					return
+				}
+			}
+		})).ServeHTTP(rec, req)
+
+		if got := one.Header().Get("Content-Encoding"); got != coding {
+			t.Fatalf("%s: single-write Content-Encoding = %q", coding, got)
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != coding {
+			t.Fatalf("%s: chunked Content-Encoding = %q", coding, got)
+		}
+		if !bytes.Equal(one.Body.Bytes(), rec.Body.Bytes()) {
+			t.Fatalf("%s: a single large write and chunked writes produced different bytes (%d vs %d)",
+				coding, one.Body.Len(), rec.Body.Len())
+		}
+		if out := decode(t, coding, one.Body.Bytes()); !bytes.Equal(out, body) {
+			t.Fatalf("%s: round trip differs", coding)
+		}
+	}
+}
+
+// The allocation profile of a single large write, which is the shape the raw
+// passthrough produces. It reports bytes allocated, so the copy this fast path
+// removed shows up as a number rather than as a latency change.
+func BenchmarkSingleLargeWrite(b *testing.B) {
+	c, err := New(Config{Encodings: Default()})
+	if err != nil {
+		b.Fatal(err)
+	}
+	body := bytes.Repeat([]byte(`{"score":123456,"song":"abcdef"},`), 4096)
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rec := serve(c, http.MethodGet, "/v1/thing", "zstd", "application/json", nil, body)
+		if rec.Code != http.StatusOK {
+			b.Fatalf("status = %d", rec.Code)
+		}
+	}
+}

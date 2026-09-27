@@ -172,6 +172,30 @@ func negotiate(header string, serverPref []string) (string, bool) {
 		// client that would not understand a coding. Send identity.
 		return "", true
 	}
+	// Fast path: the common header is a bare list of codings — "gzip, deflate,
+	// br" — with no parameters and no wildcard, so every listed coding has q=1 and
+	// the answer is simply the first server-preferred one that appears. Anything
+	// with a `;` or a `*` takes the general path below, which is where the map and
+	// the q-value arithmetic belong.
+	if !strings.ContainsAny(header, ";*") {
+		offered := func(name string) bool {
+			for _, part := range strings.Split(header, ",") {
+				if strings.EqualFold(strings.TrimSpace(part), name) {
+					return true
+				}
+			}
+			return false
+		}
+		for _, name := range serverPref {
+			if offered(name) {
+				return name, true
+			}
+		}
+		// No coding matched; the spec's default for identity is q=1, so it is
+		// acceptable.
+		return "", true
+	}
+
 	q, star, hasStar := parseAcceptEncoding(header)
 
 	// A coding's quality: an explicit entry, else the wildcard, else not offered.
@@ -332,6 +356,16 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 	}
 	if w.compressing {
 		return w.enc.Write(p)
+	}
+	// The threshold decision needs the bytes only until they reach minSize, so a
+	// first write that is already past it goes straight to the encoder. Copying it
+	// into the buffer first cost a full-body allocation and copy on exactly the
+	// responses worth compressing — the raw passthrough calls Write once with up to
+	// 4MiB.
+	if len(w.buf) == 0 && len(p) >= w.c.minSize {
+		w.startCompress()
+		_, err := w.enc.Write(p)
+		return len(p), err
 	}
 	w.buf = append(w.buf, p...)
 	if len(w.buf) < w.c.minSize {
