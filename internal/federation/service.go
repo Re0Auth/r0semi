@@ -118,7 +118,11 @@ type Config struct {
 	BaseURL string
 	// BindTTL is how long a pending bind stays valid. Defaults to 10 minutes.
 	BindTTL time.Duration
-	Now     func() time.Time
+	// KillSwitchPageSize is how many bindings one page of the deployment-wide
+	// sweep holds. Defaults to killSwitchPageSize; a test sets it small to
+	// exercise the paging loop.
+	KillSwitchPageSize int
+	Now                func() time.Time
 	// Metrics, when set, records upstream reads and token refreshes. Nil records
 	// nothing; the *observability.Metrics methods are nil-safe.
 	Metrics *observability.Metrics
@@ -142,11 +146,18 @@ func NewService(cfg Config) (Service, error) {
 	if cfg.BindTTL <= 0 {
 		cfg.BindTTL = 10 * time.Minute
 	}
+	if cfg.KillSwitchPageSize <= 0 {
+		cfg.KillSwitchPageSize = killSwitchPageSize
+	}
 	if cfg.HTTPClient == nil {
 		if hc, ok := cfg.Doer.(*http.Client); ok {
 			cfg.HTTPClient = hc
 		} else {
-			cfg.HTTPClient = http.DefaultClient
+			// Not http.DefaultClient: that is the one client in the process with no
+			// timeout and no redirect policy, and this one posts the authorization
+			// code and the client secret. A caller that supplies only a Doer still
+			// gets a bounded client for the exchange.
+			cfg.HTTPClient = httpclient.NewOutboundClient(httpclient.OutboundConfig{})
 		}
 	}
 	if cfg.Now == nil {
@@ -161,6 +172,7 @@ func NewService(cfg Config) (Service, error) {
 		httpClient: cfg.HTTPClient,
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		bindTTL:    cfg.BindTTL,
+		sweepPage:  cfg.KillSwitchPageSize,
 		locks:      &keyedMutex{},
 		now:        cfg.Now,
 		metrics:    cfg.Metrics,
@@ -176,8 +188,11 @@ type service struct {
 	httpClient *http.Client
 	baseURL    string
 	bindTTL    time.Duration
-	locks      *keyedMutex
-	now        func() time.Time
+	// sweepPage is how many bindings one page of the deployment-wide sweep holds;
+	// see Config.KillSwitchPageSize.
+	sweepPage int
+	locks     *keyedMutex
+	now       func() time.Time
 	// metrics observes upstream reads and refreshes. Optional; a nil
 	// *observability.Metrics records nothing.
 	metrics *observability.Metrics

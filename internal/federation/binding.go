@@ -137,6 +137,21 @@ type BindingStore interface {
 	ListAll(ctx context.Context) ([]Binding, error)
 }
 
+// BindingPager is implemented by a store that can enumerate the deployment's
+// bindings a page at a time, in (user, game, source) order.
+//
+// The Kill Switch sweeps every binding in the deployment, and loading all of them
+// into memory to do it does not scale with the number of accounts — worse, each
+// one it holds is a row it is about to make an upstream call about. A store that
+// can page is asked for pages instead; one that cannot keeps using ListAll, which
+// is why this is a separate interface rather than a seventh method on
+// BindingStore.
+//
+// An empty cursor is the start of the list.
+type BindingPager interface {
+	ListAllPage(ctx context.Context, afterUser, afterGame, afterSource string, limit int) ([]Binding, error)
+}
+
 // MemoryBindingStore is a non-durable BindingStore for development and tests.
 type MemoryBindingStore struct {
 	mu sync.RWMutex
@@ -227,6 +242,58 @@ func (s *MemoryBindingStore) ListAll(_ context.Context) ([]Binding, error) {
 	for _, b := range s.m {
 		out = append(out, b)
 	}
+	sortBindings(out)
+	return out, nil
+}
+
+// ListAllPage implements BindingPager: the bindings after the cursor, in the same
+// order ListAll returns them.
+func (s *MemoryBindingStore) ListAllPage(_ context.Context, afterUser, afterGame, afterSource string, limit int) ([]Binding, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	all := make([]Binding, 0, len(s.m))
+	for _, b := range s.m {
+		all = append(all, b)
+	}
+	sortBindings(all)
+
+	out := make([]Binding, 0, limit)
+	for _, b := range all {
+		if !bindingAfter(b, afterUser, afterGame, afterSource) {
+			continue
+		}
+		out = append(out, b)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// bindingAfter reports whether b sorts after the (user, game, source) cursor. An
+// empty cursor is the start of the list, which is safe because a real account id
+// is never empty.
+func bindingAfter(b Binding, user, game, source string) bool {
+	if user == "" && game == "" && source == "" {
+		return true
+	}
+	switch {
+	case b.User != account.UserID(user):
+		return b.User > account.UserID(user)
+	case b.Game != game:
+		return b.Game > game
+	default:
+		return b.Source > source
+	}
+}
+
+// sortBindings orders bindings the one way every listing does, so a page boundary
+// means the same thing to the store and to its caller.
+func sortBindings(out []Binding) {
 	sort.Slice(out, func(i, j int) bool {
 		switch {
 		case out[i].User != out[j].User:
@@ -237,5 +304,4 @@ func (s *MemoryBindingStore) ListAll(_ context.Context) ([]Binding, error) {
 			return out[i].Source < out[j].Source
 		}
 	})
-	return out, nil
 }

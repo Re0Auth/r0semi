@@ -99,6 +99,32 @@ func (s *Bindings) ListAll(ctx context.Context) ([]federation.Binding, error) {
 		 ORDER BY user_id, game, source`)
 }
 
+// ListAllPage implements federation.BindingPager: the same order as ListAll, one
+// page at a time, keyed on the primary key.
+//
+// The keyset predicate is what keeps the sweep's memory flat and its queries
+// index-backed. It also tolerates the sweep deleting rows as it goes: the cursor
+// is the last row *read*, so removing rows behind it cannot make the next page
+// skip anything.
+func (s *Bindings) ListAllPage(ctx context.Context, afterUser, afterGame, afterSource string, limit int) ([]federation.Binding, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	if afterUser == "" && afterGame == "" && afterSource == "" {
+		return s.queryBindings(ctx, `
+			SELECT user_id, game, source, token_type, expiry, has_refresh, version
+			  FROM federation_bindings
+			 ORDER BY user_id, game, source
+			 LIMIT $1`, limit)
+	}
+	return s.queryBindings(ctx, `
+		SELECT user_id, game, source, token_type, expiry, has_refresh, version
+		  FROM federation_bindings
+		 WHERE (user_id, game, source) > ($1, $2, $3)
+		 ORDER BY user_id, game, source
+		 LIMIT $4`, afterUser, afterGame, afterSource, limit)
+}
+
 func (s *Bindings) queryBindings(ctx context.Context, query string, args ...any) ([]federation.Binding, error) {
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
