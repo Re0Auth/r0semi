@@ -243,9 +243,17 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 	if hc == nil {
 		// The library's own default is hardened too, not just the composition
 		// root's: a caller that forgets to pass one should not silently get the
-		// unhardened default client. The redirect policy matters most on the token
-		// exchange, which posts the authorization code and the client secret.
-		hc = &http.Client{Timeout: 10 * time.Second, CheckRedirect: httpclient.NoCrossHostRedirects}
+		// unhardened default client. It carries the same address guard the
+		// composition root installs, so a provider whose discovery or token
+		// endpoint resolves to loopback, link-local or a private address is
+		// refused at dial time rather than reached. A deployment whose identity
+		// provider really lives on a private address injects its own client
+		// through RegistryConfig.HTTPClient — failing closed by default is the
+		// point, and that injection is the one escape hatch.
+		hc = httpclient.NewOutboundClient(httpclient.OutboundConfig{
+			Timeout:   10 * time.Second,
+			Transport: httpclient.TransportConfig{DenyPrivateAddresses: true},
+		})
 	}
 	base := strings.TrimRight(cfg.RedirectBase, "/")
 	callbackPath := cfg.CallbackPath

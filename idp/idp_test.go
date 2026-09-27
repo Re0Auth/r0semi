@@ -241,3 +241,46 @@ func TestIdentityValidate(t *testing.T) {
 		t.Fatal("accepted an identity without a provider")
 	}
 }
+
+// The fallback client, used when a caller does not inject one, must carry the
+// same address guard as the composition root: a provider whose endpoint resolves
+// to a private address is refused at dial time rather than reached. The
+// composition root always injects a hardened client, so this path is only
+// reachable from a direct library consumer — which is exactly why the default
+// has to be safe on its own.
+func TestFallbackClientRefusesPrivateAddresses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "token_type": "Bearer"})
+	}))
+	defer srv.Close()
+
+	newReg := func(hc *http.Client) *Registry {
+		t.Helper()
+		r, err := NewRegistry(RegistryConfig{
+			RedirectBase: "https://re0auth.test",
+			HTTPClient:   hc, // nil exercises the fallback
+			Credentials: []Credentials{{
+				Provider: GitHub, ClientID: "cid", ClientSecret: "sec",
+				AuthURL: srv.URL + "/auth", TokenURL: srv.URL + "/token", UserInfoURL: srv.URL + "/me",
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+
+	// Anti-vacuous: with an injected client the loopback fixture is reachable, so
+	// the refusal below is the guard and not a broken fixture.
+	okClient, _ := newReg(srv.Client()).Get(GitHub)
+	if _, err := okClient.Exchange(context.Background(), "c", "v"); err != nil {
+		t.Fatalf("the loopback fixture was unreachable with an injected client: %v", err)
+	}
+
+	c, _ := newReg(nil).Get(GitHub)
+	if _, err := c.Exchange(context.Background(), "c", "v"); err == nil ||
+		!strings.Contains(err.Error(), "not a public address") {
+		t.Fatalf("the fallback client did not refuse a private address: %v", err)
+	}
+}
