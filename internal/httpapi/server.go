@@ -645,8 +645,27 @@ func withNoStore(next http.Handler) http.Handler {
 // outside it is an API, so a mistyped URL in a browser should read like a 404 page
 // rather than like an API error. The /v1 subtree has its own catch-all that
 // answers problem+json, which is where an API client's typo actually lands.
+//
+// But "on no plane" is not the same as planeBrowser. Go's mux matches on the
+// escaped path, so a percent-encoded slash matches no route under /v1/ or /oauth/
+// while the decoded r.URL.Path every plane decision reads — planeOf, the limiter,
+// the metric label, this function — calls it business or protocol. `/v1%2F..%2Fme`
+// and `/oauth%2Ftoken` reach here that way, and answering text/plain is the plane
+// contract leaking in the one place a client assembles the URL by hand. So the
+// catch-all answers in the plane planeOf assigns, and only a genuine browser path
+// gets text.
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not found", http.StatusNotFound)
+	switch planeOf(r.URL.Path) {
+	case planeBusiness:
+		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown resource")
+	case planeProtocol:
+		// The same shape the provider answers an unknown /oauth path with
+		// (internal/oidchttp's serveOAuth); an encoded path must not be the one
+		// spelling that gets a different format.
+		writeOAuthError(w, r, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
 }
 
 // bindEnabled reports whether the source-binding flow can be served.

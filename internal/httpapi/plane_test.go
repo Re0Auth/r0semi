@@ -148,6 +148,36 @@ func TestErrorFormatNeverCrossesPlanes(t *testing.T) {
 	}
 }
 
+// TestEncodedPathStillAnswersInItsPlane guards handleNotFound's plane dispatch.
+//
+// Go's mux matches on the *escaped* path, so a percent-encoded slash makes a URL
+// that planeOf (and the limiter, and the metric label) calls business or protocol
+// match no route and fall to the catch-all. It answered text/plain there — the one
+// place the plane contract leaked — and the walk above could not see it because it
+// visits registered patterns and unencoded paths only.
+func TestEncodedPathStillAnswersInItsPlane(t *testing.T) {
+	handler := newFullEnv(t).Handler()
+	slash := "%2F"
+
+	cases := []struct {
+		target string
+		assert func(*testing.T, *httptest.ResponseRecorder)
+	}{
+		{"/v1" + slash + ".." + slash + "me", assertProblemPlane},
+		{"/oauth" + slash + "token", assertOAuthPlane},
+	}
+	for _, c := range cases {
+		t.Run(c.target, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, c.target, nil))
+			if rec.Code < 400 {
+				t.Fatalf("encoded path answered %d; want a 4xx so the failure shape is asserted", rec.Code)
+			}
+			c.assert(t, rec)
+		})
+	}
+}
+
 // Compression can refuse a request without ever calling the handler, and it picks
 // its error writer with the same predicate the plane split uses. A client that
 // refuses every coding must not be handed the wrong plane's shape — and on the
