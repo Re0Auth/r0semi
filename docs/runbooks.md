@@ -128,6 +128,31 @@
 
 ---
 
+## Re0AuthAuditAppendSlow
+
+**含义**：带链审计写入的 p99 超过 250ms 持续 10 分钟
+（`histogram_quantile(0.99, rate(re0auth_audit_append_duration_seconds_bucket[10m])) > 0.25`）。
+
+**为什么它不是"慢一点而已"**：链头只有一行，每次追加都要 `SELECT … FOR UPDATE` 把它锁住直到 COMMIT，
+所以这个数字是**审计吞吐的上限**；而 `vault.Use` 在交出明文凭据**之前**先写审计（I3），
+于是所有"凭据支撑的读取"都排在这条串行队列后面。链从"够快"变成"瓶颈"没有别的征兆，
+只有这条曲线。
+
+**诊断**：
+1. 看面板 “Audit append duration (p95/p99)”，确认是持续抬升还是尖峰；结合 `Re0AuthPoolSaturated`
+   判断是否只是池被占满（那是另一条告警的处置）。
+2. 看数据库侧：`audit_events` 的行数、`audit_chain` 的锁等待（`pg_locks` / `pg_stat_activity`），
+   以及是否有长事务压在同一个库上。
+3. 确认没有正在进行的密钥轮换或大批量抹除——两者都会短时间内写入密集的审计。
+
+**处置**：先按上面的顺序排除掉数据库侧的原因；若确认是链头串行本身成为上限，
+按 [capacity-planning.md](./capacity-planning.md) §4 的方案处理（分片链 / 单写入者 append）。
+**不要**为了让曲线好看而降低审计粒度：这条曲线变高说明系统在该处确实串行，而不是指标太敏感。
+
+**升级**：若同时出现 `Re0AuthSlowRequests` 或凭据读取的用户可见失败，按事故处理。
+
+---
+
 ## Re0AuthVaultOperationFailures
 
 **含义**：凭据库非 ok 操作比例 > 1% 持续 10 分钟（SLI S6）。

@@ -56,6 +56,7 @@ S1 的 99.9% 目标等价于 30 天滚动窗口内 **0.1% 的错误预算**。�
 | `Re0AuthLoginFailureRate` | 登录失败比例 > 30%，持续 15m | warning | S3 | 按 `provider` 看是否某一个 IdP 的发现/换票挂了 |
 | `Re0AuthAuditChainBroken` | `increase(audit_verify_total{result="failed"}[10m]) > 0` | critical | S5 | 按 `admin.md` §5 调查；`first_bad_id` 指向第一处不一致 |
 | `Re0AuthAuditVerifyError` | `increase(audit_verify_total{result="error"}[10m]) > 0` | warning | S5 | 校验没跑完 ≠ 链坏了：先看数据库与语句超时，再手工跑一次 verify |
+| `Re0AuthAuditAppendSlow` | 带链追加 p99 > 250ms，持续 10m | warning | — | 链头是一行锁，这个数字是审计与「先审计后交付」路径的串行上限；先排数据库再谈分片 |
 | `Re0AuthVaultOperationFailures` | 非 ok 比例 > 1%，持续 10m | critical | S6 | 看 `result`：`unconfigured_key` 意味着轮换没收尾，`decrypt_error` 意味着数据损坏 |
 | `Re0AuthUpstreamSourceUnavailable` | 某 source `unavailable` 比例 > 30%，持续 10m | warning | S7 | 确认该数据源自身是否可达；`not_bound` 不是故障，不触发 |
 | `Re0AuthUpstreamSlowSource` | 某 source `ok` 读取 p95 > 2s，持续 15m | warning | S7 | 区分网络还是源本身慢；长期慢可降级该源 |

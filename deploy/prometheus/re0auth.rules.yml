@@ -160,6 +160,39 @@ groups:
             statement timeout is the usual cause.
           runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authauditverifyerror
 
+      - alert: Re0AuthAuditAppendSlow
+        # The chain head is a single row lock, so a chained append is the one
+        # serialised step in the durable path — and vault.Use writes one *before*
+        # it hands over a plaintext credential (invariant I3), which puts that
+        # serialisation in front of every credential-backed read. There has been a
+        # dashboard panel for this since the metric was added and no rule, so "the
+        # chain has become the ceiling" was something an operator had to notice
+        # rather than be told. See docs/capacity-planning.md §4.
+        expr: |
+          (
+            histogram_quantile(
+              0.99,
+              sum by (le) (rate(re0auth_audit_append_duration_seconds_bucket[10m]))
+            ) > 0.25
+          )
+          and
+          (
+            sum(rate(re0auth_audit_append_duration_seconds_count[10m])) > 0
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chained audit appends are slow (p99 > 250ms)"
+          description: >-
+            An append is a handful of round trips and should be single-digit
+            milliseconds; 250ms means the chain-head lock is setting the rate.
+            BenchmarkAuditAppend and BenchmarkAuditAppendParallel are the pair to
+            read: when the parallel run stops improving on the serial one, the
+            lock — not the pool — is the ceiling. Unfinished key rotations and a
+            saturated database are the two ordinary causes.
+          runbook_url: https://github.com/Re0Auth/r0semi/blob/main/docs/runbooks.md#re0authauditappendslow
+
       - alert: Re0AuthVaultOperationFailures
         # SLI S6. unconfigured_key means a key rotation was left unfinished;
         # decrypt_error means ciphertext that no longer opens.
