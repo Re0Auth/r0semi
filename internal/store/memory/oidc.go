@@ -45,10 +45,157 @@ type OIDCStore struct {
 	devices           map[string]deviceRecord // by TokenHash(device code)
 	userCodes         map[string]string       // normalized user code -> TokenHash(device code)
 
+	// Subject indexes. The token maps are keyed by token hash, so every lookup by
+	// subject — and every revocation by subject, which is what a Kill Switch sweep
+	// and an account erasure do — used to scan the whole map under the store's
+	// single lock. That made Grants and RevokeTokens slower as the deployment grew,
+	// on the paths that exist to be fast during an incident.
+	//
+	// The indexes are maintained in the same critical section as the maps they
+	// describe, through the put/delete helpers below rather than by hand, so the two
+	// cannot drift; checkIndexes in the tests asserts that over a randomised
+	// sequence of operations.
+	accessBySubject  subjectIndex
+	refreshBySubject subjectIndex
+	requestBySubject subjectIndex
+
 	accessTTL  time.Duration
 	refreshTTL time.Duration
 	requestTTL time.Duration
 	now        func() time.Time
+}
+
+// subjectIndex maps a subject to the keys of the records belonging to it.
+//
+// A record with no subject (a token minted for an anonymous request) is not
+// indexed: it can only be found by a full scan, which is what an unfiltered
+// revocation does anyway.
+type subjectIndex map[string]map[string]struct{}
+
+func newSubjectIndex() subjectIndex { return make(subjectIndex) }
+
+func (ix subjectIndex) add(subject, key string) {
+	if subject == "" {
+		return
+	}
+	keys, ok := ix[subject]
+	if !ok {
+		keys = make(map[string]struct{}, 4)
+		ix[subject] = keys
+	}
+	keys[key] = struct{}{}
+}
+
+func (ix subjectIndex) remove(subject, key string) {
+	keys, ok := ix[subject]
+	if !ok {
+		return
+	}
+	delete(keys, key)
+	if len(keys) == 0 {
+		delete(ix, subject)
+	}
+}
+
+// keys returns the record keys indexed for a subject, or nil. The caller must not
+// mutate the result.
+func (ix subjectIndex) keys(subject string) map[string]struct{} { return ix[subject] }
+
+// --- indexed writes. Every mutation of a token or auth-request map goes through
+// one of these, so the index cannot be forgotten. The caller holds the lock.
+
+func (s *OIDCStore) putAccessLocked(key string, t accessToken) {
+	s.accessTokens[key] = t
+	s.accessBySubject.add(t.subject, key)
+}
+
+func (s *OIDCStore) deleteAccessLocked(key string) bool {
+	t, ok := s.accessTokens[key]
+	if !ok {
+		return false
+	}
+	delete(s.accessTokens, key)
+	s.accessBySubject.remove(t.subject, key)
+	return true
+}
+
+func (s *OIDCStore) putRefreshLocked(key string, t refreshToken) {
+	s.refreshTokens[key] = t
+	s.refreshBySubject.add(t.subject, key)
+}
+
+func (s *OIDCStore) deleteRefreshLocked(key string) bool {
+	t, ok := s.refreshTokens[key]
+	if !ok {
+		return false
+	}
+	delete(s.refreshTokens, key)
+	s.refreshBySubject.remove(t.subject, key)
+	return true
+}
+
+func (s *OIDCStore) deleteRequestLocked(id string) bool {
+	a, ok := s.authRequests[id]
+	if !ok {
+		return false
+	}
+	delete(s.authRequests, id)
+	delete(s.authRequestExpiry, id)
+	s.requestBySubject.remove(a.Subject, id)
+	return true
+}
+
+// --- candidate sets for a filtered revocation. Each returns the keys to examine:
+// the subject's indexed records when a subject is given, every key otherwise. The
+// caller holds the lock and must not delete while ranging the result, which is why
+// these copy.
+
+func (s *OIDCStore) accessKeysLocked(subject string) []string {
+	if subject == "" {
+		out := make([]string, 0, len(s.accessTokens))
+		for k := range s.accessTokens {
+			out = append(out, k)
+		}
+		return out
+	}
+	indexed := s.accessBySubject.keys(subject)
+	out := make([]string, 0, len(indexed))
+	for k := range indexed {
+		out = append(out, k)
+	}
+	return out
+}
+
+func (s *OIDCStore) refreshKeysLocked(subject string) []string {
+	if subject == "" {
+		out := make([]string, 0, len(s.refreshTokens))
+		for k := range s.refreshTokens {
+			out = append(out, k)
+		}
+		return out
+	}
+	indexed := s.refreshBySubject.keys(subject)
+	out := make([]string, 0, len(indexed))
+	for k := range indexed {
+		out = append(out, k)
+	}
+	return out
+}
+
+func (s *OIDCStore) requestKeysLocked(subject string) []string {
+	if subject == "" {
+		out := make([]string, 0, len(s.authRequests))
+		for k := range s.authRequests {
+			out = append(out, k)
+		}
+		return out
+	}
+	indexed := s.requestBySubject.keys(subject)
+	out := make([]string, 0, len(indexed))
+	for k := range indexed {
+		out = append(out, k)
+	}
+	return out
 }
 
 // ErrRefreshTokenSpent reports a refresh token presented after it had already
@@ -153,6 +300,9 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		refreshTokens:     make(map[string]refreshToken),
 		devices:           make(map[string]deviceRecord),
 		userCodes:         make(map[string]string),
+		accessBySubject:   newSubjectIndex(),
+		refreshBySubject:  newSubjectIndex(),
+		requestBySubject:  newSubjectIndex(),
 		accessTTL:         time.Hour,
 		refreshTTL:        30 * 24 * time.Hour,
 		requestTTL:        ttl,
@@ -202,6 +352,7 @@ func (s *OIDCStore) CreateAuthRequest(_ context.Context, req *oidc.AuthRequest, 
 	}
 	s.authRequests[id] = a
 	s.authRequestExpiry[id] = s.now().Add(s.requestTTL)
+	s.requestBySubject.add(a.Subject, id)
 	return a, nil
 }
 
@@ -235,8 +386,7 @@ func (s *OIDCStore) AuthRequestByCode(_ context.Context, code string) (op.AuthRe
 		return nil, errors.New("memory: auth request not found")
 	}
 	delete(s.codes, key)
-	delete(s.authRequests, c.requestID)
-	delete(s.authRequestExpiry, c.requestID)
+	s.deleteRequestLocked(c.requestID)
 	return cloneAuthRequest(a), nil
 }
 
@@ -258,8 +408,7 @@ func (s *OIDCStore) SaveAuthCode(_ context.Context, id, code string) error {
 func (s *OIDCStore) DeleteAuthRequest(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.authRequests, id)
-	delete(s.authRequestExpiry, id)
+	s.deleteRequestLocked(id)
 	for k, c := range s.codes {
 		if c.requestID == id {
 			delete(s.codes, k)
@@ -282,7 +431,7 @@ func (s *OIDCStore) CreateAccessToken(_ context.Context, request op.TokenRequest
 		issuedAt: now, expiresAt: expires,
 	}
 	s.mu.Lock()
-	s.accessTokens[oauth.TokenHash(id)] = t
+	s.putAccessLocked(oauth.TokenHash(id), t)
 	s.mu.Unlock()
 	s.record(context.Background(), "oidc.token", request.GetSubject(), t.clientID, audit.OutcomeOK)
 	return id, expires, nil
@@ -356,10 +505,10 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 			s.mu.Unlock()
 			return "", "", time.Time{}, ErrRefreshTokenSpent
 		}
-		delete(s.refreshTokens, spent)
+		s.deleteRefreshLocked(spent)
 	}
-	s.accessTokens[oauth.TokenHash(accessID)] = access
-	s.refreshTokens[oauth.TokenHash(value)] = refresh
+	s.putAccessLocked(oauth.TokenHash(accessID), access)
+	s.putRefreshLocked(oauth.TokenHash(value), refresh)
 	s.mu.Unlock()
 
 	s.record(ctx, "oidc.token", request.GetSubject(), access.clientID, audit.OutcomeOK)
@@ -384,14 +533,16 @@ func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) 
 func (s *OIDCStore) TerminateSession(_ context.Context, userID, clientID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for k, t := range s.accessTokens {
-		if t.subject == userID && t.clientID == clientID {
-			delete(s.accessTokens, k)
+	// Only this subject's records are examined: the index is what keeps a session
+	// termination from walking every token in the deployment.
+	for key := range s.accessBySubject.keys(userID) {
+		if t, ok := s.accessTokens[key]; ok && t.clientID == clientID {
+			s.deleteAccessLocked(key)
 		}
 	}
-	for k, t := range s.refreshTokens {
-		if t.subject == userID && t.clientID == clientID {
-			delete(s.refreshTokens, k)
+	for key := range s.refreshBySubject.keys(userID) {
+		if t, ok := s.refreshTokens[key]; ok && t.clientID == clientID {
+			s.deleteRefreshLocked(key)
 		}
 	}
 	return nil
@@ -408,14 +559,38 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 			s.mu.Unlock()
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
-		delete(s.accessTokens, h)
+		s.deleteAccessLocked(h)
 		// RFC 7009 §2.1: revoking a token should revoke the whole grant. The
 		// refresh token minted alongside this access token shares its id hash.
+		//
+		// This one lookup is by id hash rather than by subject, so it is a scan —
+		// and it is left as one deliberately. A revocation is an operator or user
+		// action, not a hot path, and a fourth index would have to be maintained on
+		// every refresh rotation for it.
 		for k, rt := range s.refreshTokens {
 			if rt.idHash == h {
-				delete(s.refreshTokens, k)
+				s.deleteRefreshLocked(k)
 			}
 		}
+		s.mu.Unlock()
+		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
+		return nil
+	}
+	// The access row can already be gone while its refresh half is not: the access
+	// token expires after an hour, the refresh token after thirty days, and the
+	// sweep removes each on its own. Without this lookup the presented access token
+	// matches nothing, the call answers RFC 7009's "unknown token is success", and
+	// the refresh token — the half that mints replacements — stays live.
+	for k, rt := range s.refreshTokens {
+		if rt.idHash != h {
+			continue
+		}
+		if rt.clientID != clientID {
+			s.mu.Unlock()
+			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+		}
+		s.deleteRefreshLocked(k)
+		s.deleteAccessLocked(h)
 		s.mu.Unlock()
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
@@ -425,9 +600,9 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 			s.mu.Unlock()
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
-		delete(s.refreshTokens, h)
+		s.deleteRefreshLocked(h)
 		// The paired access token is keyed by the same id hash.
-		delete(s.accessTokens, t.idHash)
+		s.deleteAccessLocked(t.idHash)
 		s.mu.Unlock()
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
@@ -519,18 +694,34 @@ func (s *OIDCStore) SetUserinfoFromToken(_ context.Context, userinfo *oidc.UserI
 }
 
 // SetIntrospectionFromToken implements op.Storage.
+//
+// The hash, the clock read and the scope copy happen before the store's lock, not
+// under it. They are pure functions of the arguments and of data the lock does not
+// own, and holding the lock through them made this the store's slowest operation
+// per unit of real work: the parallel benchmark ran at 227ns/op against 168ns/op
+// serial, on twenty cores, for a lookup that is a map read.
 func (s *OIDCStore) SetIntrospectionFromToken(_ context.Context, introspection *oidc.IntrospectionResponse, tokenID, subject, _ string) error {
+	key := oauth.TokenHash(tokenID)
+	now := s.now()
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.accessTokens[oauth.TokenHash(tokenID)]
-	if !ok || !s.now().Before(t.expiresAt) {
+	t, ok := s.accessTokens[key]
+	if !ok {
+		s.mu.Unlock()
+		return errors.New("memory: token not found")
+	}
+	scopes := append([]string(nil), t.scopes...)
+	clientID, expiresAt := t.clientID, t.expiresAt
+	s.mu.Unlock()
+
+	if !now.Before(expiresAt) {
 		return errors.New("memory: token not found")
 	}
 	introspection.Active = true
 	introspection.Subject = subject
-	introspection.ClientID = t.clientID
-	introspection.Scope = append([]string(nil), t.scopes...)
-	introspection.Expiration = oidc.FromTime(t.expiresAt)
+	introspection.ClientID = clientID
+	introspection.Scope = scopes
+	introspection.Expiration = oidc.FromTime(expiresAt)
 	return nil
 }
 
@@ -657,8 +848,7 @@ func (s *OIDCStore) SweepExpired() int {
 	removed := 0
 	for id, expires := range s.authRequestExpiry {
 		if now.After(expires) {
-			delete(s.authRequestExpiry, id)
-			delete(s.authRequests, id)
+			s.deleteRequestLocked(id)
 			removed++
 		}
 	}
@@ -668,15 +858,18 @@ func (s *OIDCStore) SweepExpired() int {
 			removed++
 		}
 	}
+	// The two token sweeps are scans by design: expiry is a property of the record,
+	// not of its subject, so no index can narrow them. They run on a ticker, not on
+	// a request.
 	for k, t := range s.accessTokens {
 		if !now.Before(t.expiresAt) {
-			delete(s.accessTokens, k)
+			s.deleteAccessLocked(k)
 			removed++
 		}
 	}
 	for k, t := range s.refreshTokens {
 		if !now.Before(t.expiresAt) {
-			delete(s.refreshTokens, k)
+			s.deleteRefreshLocked(k)
 			removed++
 		}
 	}
@@ -730,6 +923,12 @@ func (s *OIDCStore) SetAuthTime(_ context.Context, id string, at time.Time) erro
 
 // CompleteLogin attaches the subject and the approved (possibly narrowed)
 // scopes to a pending authorization request.
+//
+// An authorization request is created before anyone has signed in, so its subject
+// is empty until this call — which means this is also where the subject index
+// learns about it. Without the move, a revocation filtered by subject would look
+// at the old (empty) set and miss the request and its code entirely, and a code
+// that survives a Kill Switch is a live credential.
 func (s *OIDCStore) CompleteLogin(_ context.Context, id, subject string, scopes []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -737,9 +936,14 @@ func (s *OIDCStore) CompleteLogin(_ context.Context, id, subject string, scopes 
 	if !ok {
 		return errors.New("memory: auth request not found")
 	}
+	previous := a.Subject
 	a.Subject = subject
 	a.Scopes = append([]string(nil), scopes...)
 	a.IsDone = true
+	if previous != subject {
+		s.requestBySubject.remove(previous, id)
+		s.requestBySubject.add(subject, id)
+	}
 	// Preserve the session's real authentication time when the login hook set it;
 	// only fall back to the decision time when it did not.
 	if a.AuthTime == nil {
@@ -766,14 +970,22 @@ func (s *OIDCStore) DeviceByUserCode(_ context.Context, userCode string) (*op.De
 
 // ApproveDevice marks a device authorization approved. A nil scopes slice keeps
 // the requested scopes; an explicit slice narrows them.
+//
+// The state conditions are checked here, under the same lock the write takes, so
+// a decision cannot land on a code that is already decided or expired — the
+// postgres store carries the same predicate in its UPDATE (see C3-3 in
+// docs/security-audit-3.md).
 func (s *OIDCStore) ApproveDevice(_ context.Context, userCode, subject string, scopes []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h, ok := s.userCodes[normalizeUserCode(userCode)]
 	if !ok {
-		return errors.New("memory: device authorization not found")
+		return oauth.ErrDeviceNotFound
 	}
 	d := s.devices[h]
+	if d.done || d.denied || !s.now().Before(d.expiresAt) {
+		return oauth.ErrDeviceNotFound
+	}
 	d.done = true
 	d.subject = subject
 	d.authTime = s.now()
@@ -786,14 +998,20 @@ func (s *OIDCStore) ApproveDevice(_ context.Context, userCode, subject string, s
 }
 
 // DenyDevice marks a device authorization denied.
+//
+// A denial only requires that none is recorded yet: `done` is deliberately not
+// consulted, so denying still outranks an approval whichever write lands second.
 func (s *OIDCStore) DenyDevice(_ context.Context, userCode string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h, ok := s.userCodes[normalizeUserCode(userCode)]
 	if !ok {
-		return errors.New("memory: device authorization not found")
+		return oauth.ErrDeviceNotFound
 	}
 	d := s.devices[h]
+	if d.denied {
+		return oauth.ErrDeviceNotFound
+	}
 	d.denied = true
 	s.devices[h] = d
 	s.record(context.Background(), "oidc.device.deny", "", d.clientID, audit.OutcomeDenied)
@@ -835,23 +1053,29 @@ func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, 
 			g.HasRefresh = true
 		}
 	}
-	for _, t := range s.accessTokens {
-		if t.subject == subject {
+	for key := range s.accessBySubject.keys(subject) {
+		if t, ok := s.accessTokens[key]; ok {
 			collect(t.clientID, t.scopes, t.issuedAt, t.expiresAt, false)
 		}
 	}
-	for _, t := range s.refreshTokens {
-		if t.subject == subject {
+	for key := range s.refreshBySubject.keys(subject) {
+		if t, ok := s.refreshTokens[key]; ok {
 			collect(t.clientID, t.scopes, t.issuedAt, t.expiresAt, true)
 		}
 	}
 	s.mu.Unlock()
 
+	// Names resolved in one lookup for the whole page rather than one Get per
+	// client from inside the scan above.
+	ids := make([]string, 0, len(byClient))
+	for id := range byClient {
+		ids = append(ids, id)
+	}
+	names := oauth.LookupClientNames(ctx, s.clients, ids)
+
 	out := make([]oauth.Grant, 0, len(byClient))
 	for _, g := range byClient {
-		if c, err := s.clients.Get(ctx, g.ClientID); err == nil {
-			g.ClientName = c.Name
-		}
+		g.ClientName = names[g.ClientID]
 		sortScopes(g.Scopes)
 		out = append(out, *g)
 	}
@@ -860,19 +1084,43 @@ func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, 
 }
 
 // RevokeGrant removes every token a client holds for a subject.
+//
+// It also removes what the client could still redeem: an authorization code
+// minted but not yet exchanged, and an approved device authorization. Both are
+// capabilities rather than tokens, so neither is counted, but leaving either
+// alive let a client that withheld it obtain a fresh access/refresh pair after
+// the user revoked the grant — revocation reported success while the access
+// came back, and the refresh token made it indefinite. RevokeTokens and
+// PurgeSubject clear the same state for the same reason.
 func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) error {
 	if subject == "" || clientID == "" {
 		return errors.New("memory: subject and client id are required")
 	}
 	s.mu.Lock()
-	for k, t := range s.accessTokens {
-		if t.subject == subject && t.clientID == clientID {
-			delete(s.accessTokens, k)
+	for key := range s.accessBySubject.keys(subject) {
+		if t, ok := s.accessTokens[key]; ok && t.clientID == clientID {
+			s.deleteAccessLocked(key)
 		}
 	}
-	for k, t := range s.refreshTokens {
-		if t.subject == subject && t.clientID == clientID {
-			delete(s.refreshTokens, k)
+	for key := range s.refreshBySubject.keys(subject) {
+		if t, ok := s.refreshTokens[key]; ok && t.clientID == clientID {
+			s.deleteRefreshLocked(key)
+		}
+	}
+	purged := make(map[string]bool)
+	for id := range s.requestBySubject.keys(subject) {
+		req, ok := s.authRequests[id]
+		if !ok || req.ClientID != clientID {
+			continue
+		}
+		s.deleteRequestLocked(id)
+		purged[id] = true
+	}
+	// Codes hang off their request, so they go with it rather than waiting for
+	// the sweep to expire them.
+	for k, c := range s.codes {
+		if purged[c.requestID] {
+			delete(s.codes, k)
 		}
 	}
 	// A device authorization for this client and subject is a capability that
@@ -902,25 +1150,30 @@ func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	removed := 0
-	for k, t := range s.accessTokens {
-		if f.Matches(t.clientID, t.subject) {
-			delete(s.accessTokens, k)
+	// A revocation filtered by subject only has to look at that subject's records;
+	// the unfiltered one is the Kill Switch's "everything", and it must look at all
+	// of them. The keys are copied out before anything is deleted, because the
+	// delete helpers mutate the index being ranged.
+	for _, k := range s.accessKeysLocked(f.Subject) {
+		if t, ok := s.accessTokens[k]; ok && f.Matches(t.clientID, t.subject) {
+			s.deleteAccessLocked(k)
 			removed++
 		}
 	}
-	for k, t := range s.refreshTokens {
-		if f.Matches(t.clientID, t.subject) {
-			delete(s.refreshTokens, k)
+	for _, k := range s.refreshKeysLocked(f.Subject) {
+		if t, ok := s.refreshTokens[k]; ok && f.Matches(t.clientID, t.subject) {
+			s.deleteRefreshLocked(k)
 			removed++
 		}
 	}
 	purged := make(map[string]bool)
-	for id, req := range s.authRequests {
-		if f.Matches(req.ClientID, req.Subject) {
-			delete(s.authRequests, id)
-			delete(s.authRequestExpiry, id)
-			purged[id] = true
+	for _, id := range s.requestKeysLocked(f.Subject) {
+		req, ok := s.authRequests[id]
+		if !ok || !f.Matches(req.ClientID, req.Subject) {
+			continue
 		}
+		s.deleteRequestLocked(id)
+		purged[id] = true
 	}
 	for k, c := range s.codes {
 		if purged[c.requestID] {
@@ -952,13 +1205,14 @@ func (s *OIDCStore) PurgeSubject(_ context.Context, subject string) (int, error)
 	defer s.mu.Unlock()
 	removed := 0
 	purged := make(map[string]bool)
-	for id, req := range s.authRequests {
-		if req.Subject == subject {
-			delete(s.authRequests, id)
-			delete(s.authRequestExpiry, id)
-			purged[id] = true
-			removed++
+	for _, id := range s.requestKeysLocked(subject) {
+		req, ok := s.authRequests[id]
+		if !ok || req.Subject != subject {
+			continue
 		}
+		s.deleteRequestLocked(id)
+		purged[id] = true
+		removed++
 	}
 	// Codes hang off their request, so they go with it rather than waiting for the
 	// sweep to expire them. Leaving them behind would keep a usable authorization

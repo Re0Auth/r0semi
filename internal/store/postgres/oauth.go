@@ -168,17 +168,36 @@ func (s *Tokens) ListBySubject(ctx context.Context, subject string) ([]oauth.Gra
 
 // DeleteBySubjectClient implements oauth.Store.
 //
-// Both statements run even if the first removes nothing, and neither asks how
-// many rows went away: revoking is idempotent, so the count is not information
-// anyone acts on.
+// All three statements run even if an earlier one removes nothing, and none asks
+// how many rows went away: revoking is idempotent, so the count is not
+// information anyone acts on.
+//
+// They run in one transaction because "every token this client holds" is the
+// claim the endpoint answers for: a half-applied revocation that errored still
+// reports a failure the caller may retry, but the retry has no way to know which
+// half landed. Unspent authorization codes are deleted with the tokens for the
+// reason oauth.Store documents: an unspent code is a redeemable capability, and
+// redeeming it after the revocation returns a fresh access *and* refresh token.
 func (s *Tokens) DeleteBySubjectClient(ctx context.Context, subject, clientID string) error {
-	if _, err := s.pool.Exec(ctx,
-		`DELETE FROM oauth_access_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM oauth_refresh_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID)
-	return err
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, q := range []string{
+		`DELETE FROM oauth_access_tokens WHERE subject = $1 AND client_id = $2`,
+		`DELETE FROM oauth_refresh_tokens WHERE subject = $1 AND client_id = $2`,
+	} {
+		if _, err := tx.Exec(ctx, q, subject, clientID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM oauth_codes WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // TokenOwner implements oauth.Store: which client a presented value belongs to,
@@ -259,12 +278,17 @@ func (s *Tokens) PurgeLegacySubject(ctx context.Context, subject string) (int, e
 // returns the total. Empty filter fields match everything, so the same statement
 // serves "all", "this client" and "this subject".
 //
+// It takes the shared handle rather than the pool so a caller can run it inside
+// its own transaction — RevokeTokens does, because a bulk revocation that applied
+// half of itself and reported a count is not something a retry can distinguish
+// from success.
+//
 // Table names are compile-time constants, never request input, so building the
 // statement with Sprintf does not put anything user-controlled into the SQL.
-func revokeMatching(ctx context.Context, pool *pgxpool.Pool, tables []string, f oauth.TokenFilter) (int, error) {
+func revokeMatching(ctx context.Context, db querier, tables []string, f oauth.TokenFilter) (int, error) {
 	total := 0
 	for _, table := range tables {
-		tag, err := pool.Exec(ctx, fmt.Sprintf(
+		tag, err := db.Exec(ctx, fmt.Sprintf(
 			`DELETE FROM %s WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
 			table), f.ClientID, f.Subject)
 		if err != nil {
@@ -413,6 +437,33 @@ func (s *Clients) List(ctx context.Context) ([]oauth.Client, error) {
 			return nil, err
 		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ClientNames implements oauth.ClientNameLookup: every name for a grants page in
+// one query, instead of one Get per client from inside the page's row loop.
+//
+// Suspended clients are included, unlike Get. The page this feeds lists tokens
+// that were issued to somebody: suspension stops a client acting, it does not
+// make the user's grant disappear, and an unnamed row would be the one the user
+// most needs to recognise before revoking it.
+func (s *Clients) ClientNames(ctx context.Context, ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id, name FROM oauth_clients WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: client names: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		out[id] = name
 	}
 	return out, rows.Err()
 }

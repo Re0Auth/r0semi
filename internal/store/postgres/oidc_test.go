@@ -188,6 +188,40 @@ func TestRevokeTokenCutsTheWholeGrant(t *testing.T) {
 	}
 }
 
+// A retry has to be able to finish a revocation that a partial failure left half
+// applied.
+//
+// The residue is built the way the two-statement version produced it: the access
+// row is gone and the refresh row — the half that mints replacements — is still
+// there. Looking only in the access table, the presented access token then matched
+// nothing, fell through to RFC 7009's "unknown token is success", and answered 200
+// while the refresh token stayed live. Deleting the pair in one transaction stops
+// new residue; finding it by the refresh row's id_hash is what repairs the old.
+func TestRevokeTokenRepairsAStrandedRefreshHalf(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	req := &oidcstore.AuthRequest{ClientID: "oidc-web", Subject: "usr_1", Scopes: []string{"account.id"}}
+	accessID, refreshValue, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Precondition: the pair is live, so a pass cannot come from nothing working.
+	if _, err := store.TokenRequestByRefreshToken(ctx, refreshValue); err != nil {
+		t.Fatalf("precondition: the refresh token was not usable: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx,
+		`DELETE FROM oidc_access_tokens WHERE id_hash = $1`, hashValue(accessID)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RevokeToken(ctx, accessID, "usr_1", "oidc-web"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, refreshValue); err == nil {
+		t.Fatal("the stranded refresh token survived the retry that reported success")
+	}
+}
+
 // Mirrors memory.TestCompleteLoginPreservesRecordedAuthTime.
 func TestCompleteLoginPreservesRecordedAuthTime(t *testing.T) {
 	store, _, ctx := oidcFixture(t)
@@ -317,6 +351,59 @@ func TestRevokingAGrantDeletesItsDeviceAuthorization(t *testing.T) {
 	// And the path the library actually takes agrees with the direct read.
 	if st, err := store.GetDeviceAuthorizatonState(ctx, "oidc-device", "device-revoked"); err == nil && st.Done {
 		t.Fatalf("the device code still hands out tokens after revocation: %+v", st)
+	}
+}
+
+// Mirrors memory.TestRevokeGrantAlsoDropsPendingAuthorizationCode and the
+// httpapi guard: the user-facing revoke must reach an unspent authorization code,
+// not only the tokens and the device rows. Redeeming a withheld code returns a
+// refresh token, so leaving it behind made the revocation reversible.
+//
+// The predicate is (client_id, subject) and the code row it must not touch is
+// asserted too: a revocation that reached another account's code would be a
+// different defect wearing the fix's clothes.
+func TestRevokingAGrantDeletesItsPendingCode(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	revoked := newAuthRequest(t, ctx, store)
+	survivor := newAuthRequest(t, ctx, store)
+	if err := store.CompleteLogin(ctx, revoked.GetID(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteLogin(ctx, survivor.GetID(), "usr_2", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuthCode(ctx, revoked.GetID(), "grant-code"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAuthCode(ctx, survivor.GetID(), "other-account-code"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Anti-vacuous: both rows exist before the revocation. Counted directly rather
+	// than through AuthRequestByCode, which consumes the code.
+	var before int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM oidc_codes`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before != 2 {
+		t.Fatalf("codes before revocation = %d, want 2", before)
+	}
+
+	if err := store.RevokeGrant(ctx, "usr_1", "oidc-web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "grant-code"); err == nil {
+		t.Fatal("an unspent authorization code survived the grant revocation")
+	}
+	var after int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM oidc_codes`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != 1 {
+		t.Fatalf("codes after revocation = %d, want only the other account's", after)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "other-account-code"); err != nil {
+		t.Fatalf("another account's code was revoked: %v", err)
 	}
 }
 
@@ -608,6 +695,84 @@ func TestOIDCDeviceDescribeAndDecide(t *testing.T) {
 	if _, err := store.DescribeDeviceAuthorization(ctx, "GHJK-BCDF"); !errors.Is(err, oauth.ErrDeviceNotFound) {
 		t.Fatalf("describe after decision = %v, want ErrDeviceNotFound", err)
 	}
+}
+
+// A device decision is a state transition rather than an assignment: the UPDATE
+// carries its own conditions, so a decision that lands on a code somebody else
+// already decided is refused instead of overwriting it. Round 3's C3-3 recorded
+// the unconditional write; its in-memory twin is
+// internal/store/memory/device_decision_test.go, which runs everywhere.
+func TestDeviceDecisionIsRefusedOnceTheCodeIsDecided(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+
+	newCode := func(t *testing.T, code string, ttl time.Duration) {
+		t.Helper()
+		if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "dc-"+code, code,
+			time.Now().Add(ttl), []string{"account.id"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("a second approval is refused", func(t *testing.T) {
+		newCode(t, "SPNT-0001", 5*time.Minute)
+		if err := store.ApproveDevice(ctx, "SPNT-0001", "usr_1", nil); err != nil {
+			t.Fatalf("first approval: %v", err)
+		}
+		if err := store.ApproveDevice(ctx, "SPNT-0001", "usr_2", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+			t.Fatalf("second approval = %v, want ErrDeviceNotFound", err)
+		}
+		st, err := store.DeviceByUserCode(ctx, "SPNT-0001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Subject != "usr_1" {
+			t.Fatalf("subject = %q, want the first approver", st.Subject)
+		}
+	})
+
+	t.Run("approving a denied code is refused", func(t *testing.T) {
+		newCode(t, "DENY-0001", 5*time.Minute)
+		if err := store.DenyDevice(ctx, "DENY-0001"); err != nil {
+			t.Fatalf("deny: %v", err)
+		}
+		if err := store.ApproveDevice(ctx, "DENY-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+			t.Fatalf("approving a denied code = %v, want ErrDeviceNotFound", err)
+		}
+	})
+
+	t.Run("approving an expired code is refused", func(t *testing.T) {
+		newCode(t, "EXPR-0001", -time.Minute)
+		if err := store.ApproveDevice(ctx, "EXPR-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+			t.Fatalf("approving an expired code = %v, want ErrDeviceNotFound", err)
+		}
+	})
+
+	t.Run("a second denial is refused", func(t *testing.T) {
+		newCode(t, "TWIC-0001", 5*time.Minute)
+		if err := store.DenyDevice(ctx, "TWIC-0001"); err != nil {
+			t.Fatalf("first denial: %v", err)
+		}
+		if err := store.DenyDevice(ctx, "TWIC-0001"); !errors.Is(err, oauth.ErrDeviceNotFound) {
+			t.Fatalf("second denial = %v, want ErrDeviceNotFound", err)
+		}
+	})
+
+	t.Run("a denial still overrides an approval", func(t *testing.T) {
+		newCode(t, "OVER-0001", 5*time.Minute)
+		if err := store.ApproveDevice(ctx, "OVER-0001", "usr_1", nil); err != nil {
+			t.Fatalf("approve: %v", err)
+		}
+		if err := store.DenyDevice(ctx, "OVER-0001"); err != nil {
+			t.Fatalf("deny after approve: %v", err)
+		}
+		st, err := store.DeviceByUserCode(ctx, "OVER-0001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !st.Denied {
+			t.Fatal("the denial did not take effect")
+		}
+	})
 }
 
 // The login hook is what binds an OP auth request to the browser session before

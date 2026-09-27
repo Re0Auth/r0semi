@@ -267,6 +267,60 @@ func TestRevokeTokensAlsoDropsPendingAuthorizationCode(t *testing.T) {
 	}
 }
 
+// The same capability rule, through the door a user actually has: revoking a
+// client's grant from the account page. A code the client withheld must not
+// outlive the revocation — redeeming it returns an access *and* a refresh token,
+// so the client the user just cut off comes back for good.
+//
+// It must also stay scoped: another client's code, and another account's code for
+// the same client, are not this revocation's to delete.
+func TestRevokeGrantAlsoDropsPendingAuthorizationCode(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	newCode := func(clientID, subject, code string) {
+		t.Helper()
+		ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+			ClientID:            clientID,
+			RedirectURI:         "https://app.example/cb",
+			ResponseType:        oidc.ResponseTypeCode,
+			Scopes:              []string{"account.id"},
+			CodeChallenge:       "challenge-1234567890",
+			CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CompleteLogin(ctx, ar.GetID(), subject, []string{"account.id"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveAuthCode(ctx, ar.GetID(), code); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newCode("cli", "usr_1", "grant-code")
+	newCode("cli", "usr_2", "other-account-code")
+	newCode("other-cli", "usr_1", "other-client-code")
+
+	// Anti-vacuous: all three codes exist before the revocation.
+	if got := store.Counts().Codes; got != 3 {
+		t.Fatalf("codes before revocation = %d, want 3", got)
+	}
+
+	if err := store.RevokeGrant(ctx, "usr_1", "cli"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "grant-code"); err == nil {
+		t.Fatal("an unspent authorization code survived the grant revocation")
+	}
+	// The two that are not this (subject, client) pair are untouched and usable.
+	if _, err := store.AuthRequestByCode(ctx, "other-account-code"); err != nil {
+		t.Fatalf("another account's code was revoked: %v", err)
+	}
+	if _, err := store.AuthRequestByCode(ctx, "other-client-code"); err != nil {
+		t.Fatalf("another client's code was revoked: %v", err)
+	}
+}
+
 // RFC 7009 §2.1: revoking either token should cut the whole grant, not just the
 // presented one.
 func TestRevokeTokenCutsTheWholeGrant(t *testing.T) {
@@ -295,6 +349,42 @@ func TestRevokeTokenCutsTheWholeGrant(t *testing.T) {
 	var introspect oidc.IntrospectionResponse
 	if err := store.SetIntrospectionFromToken(ctx, &introspect, accessID2, "usr_1", "cli"); err == nil {
 		t.Fatal("the paired access token survived refresh-token revocation")
+	}
+}
+
+// A revocation that presents an access token whose row is already gone must still
+// cut the half that can mint replacements.
+//
+// The two lifetimes make this reachable without any failure: the access token
+// expires after an hour and the refresh token after thirty days, and the sweep
+// removes each on its own. Looking only in the access table, the presented value
+// matched nothing and the call answered RFC 7009's "unknown token is success"
+// while the refresh token stayed live. Mirrors the Postgres store's
+// TestRevokeTokenRepairsAStrandedRefreshHalf.
+func TestRevokeTokenCutsARefreshHalfWhoseAccessRowIsGone(t *testing.T) {
+	store, client := testStore(t)
+	ctx := context.Background()
+	req := &oidcstore.AuthRequest{ClientID: client.ID, Subject: "usr_1", Scopes: []string{"account.id"}}
+
+	accessID, refresh, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Precondition: the pair is live, so a pass cannot come from nothing working.
+	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err != nil {
+		t.Fatalf("precondition: the refresh token was not usable: %v", err)
+	}
+
+	// The access row disappears the way the sweep removes it: on its own.
+	store.mu.Lock()
+	delete(store.accessTokens, oauth.TokenHash(accessID))
+	store.mu.Unlock()
+
+	if err := store.RevokeToken(ctx, accessID, "usr_1", client.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err == nil {
+		t.Fatal("the stranded refresh token survived a revocation that reported success")
 	}
 }
 

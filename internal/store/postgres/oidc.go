@@ -395,18 +395,38 @@ func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string
 }
 
 // TerminateSession implements op.Storage.
+//
+// One transaction for both tables: the caller is told the session is over, and a
+// partial delete that errored would leave the refresh half alive — which for the
+// caller is not a failure it can see, because a refresh token only shows itself
+// later.
 func (s *OIDCStore) TerminateSession(ctx context.Context, userID, clientID string) error {
-	if _, err := s.pool.Exec(ctx,
-		`DELETE FROM oidc_access_tokens WHERE subject = $1 AND client_id = $2`, userID, clientID); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM oidc_refresh_tokens WHERE subject = $1 AND client_id = $2`, userID, clientID)
-	return err
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, q := range []string{
+		`DELETE FROM oidc_access_tokens WHERE subject = $1 AND client_id = $2`,
+		`DELETE FROM oidc_refresh_tokens WHERE subject = $1 AND client_id = $2`,
+	} {
+		if _, err := tx.Exec(ctx, q, userID, clientID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // RevokeToken implements op.Storage. Access tokens arrive as the plaintext ID,
 // refresh tokens as the plaintext value; both are hashed before lookup.
+//
+// Each branch deletes a pair in one transaction. Two separate statements were the
+// problem: if the second failed, the caller got an error, and the retry could not
+// repair it — the presented value's row was already gone, so the lookup fell
+// through to RFC 7009's "unknown token is success" and answered 200 while the
+// other half was still live. A refresh token in that state mints replacements
+// indefinitely, and the revocation that "succeeded" is how it survives.
 func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, clientID string) *oidc.Error {
 	h := hashValue(tokenOrTokenID)
 
@@ -417,10 +437,30 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 		}
 		// RFC 7009 §2.1: revoke the whole grant, not just the presented token. The
 		// refresh token minted with this access token carries the same id_hash.
-		if _, err := s.pool.Exec(ctx, `DELETE FROM oidc_access_tokens WHERE id_hash = $1`, h); err != nil {
+		if err := s.revokeInOneTx(ctx, []string{
+			`DELETE FROM oidc_access_tokens WHERE id_hash = $1`,
+			`DELETE FROM oidc_refresh_tokens WHERE id_hash = $1`,
+		}, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)
 		}
-		if _, err := s.pool.Exec(ctx, `DELETE FROM oidc_refresh_tokens WHERE id_hash = $1`, h); err != nil {
+		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
+		return nil
+	}
+
+	// The access row is gone but its refresh half may not be: exactly the residue
+	// a partial failure used to leave when the pair was deleted in two statements.
+	// Without this the retry finds nothing, answers RFC 7009's "unknown token is
+	// success", and the refresh token keeps minting — which is how a revocation
+	// that errored once became a revocation that never happened.
+	if err := s.pool.QueryRow(ctx,
+		`SELECT client_id FROM oidc_refresh_tokens WHERE id_hash = $1`, h).Scan(&owner); err == nil {
+		if owner != clientID {
+			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+		}
+		if err := s.revokeInOneTx(ctx, []string{
+			`DELETE FROM oidc_refresh_tokens WHERE id_hash = $1`,
+			`DELETE FROM oidc_access_tokens WHERE id_hash = $1`,
+		}, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)
 		}
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
@@ -431,14 +471,12 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 		if owner != clientID {
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
-		// Delete the paired access token first; the refresh row is the only place
-		// that names it.
-		if _, err := s.pool.Exec(ctx, `
+		// The access token goes first; the refresh row is the only place that names it.
+		if err := s.revokeInOneTx(ctx, []string{`
 			DELETE FROM oidc_access_tokens
-			 WHERE id_hash IN (SELECT id_hash FROM oidc_refresh_tokens WHERE token_hash = $1)`, h); err != nil {
-			return oidc.ErrServerError().WithParent(err)
-		}
-		if _, err := s.pool.Exec(ctx, `DELETE FROM oidc_refresh_tokens WHERE token_hash = $1`, h); err != nil {
+			 WHERE id_hash IN (SELECT id_hash FROM oidc_refresh_tokens WHERE token_hash = $1)`,
+			`DELETE FROM oidc_refresh_tokens WHERE token_hash = $1`,
+		}, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)
 		}
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
@@ -446,6 +484,24 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	}
 	// RFC 7009: revoking an unknown token is success.
 	return nil
+}
+
+// revokeInOneTx runs each statement with the same argument inside one
+// transaction, in the order given. The revocation branches need exactly that
+// shape: one value, two deletes that must land together.
+func (s *OIDCStore) revokeInOneTx(ctx context.Context, statements []string, arg string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, q := range statements {
+		if _, err := tx.Exec(ctx, q, arg); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // GetRefreshTokenInfo implements op.Storage.
@@ -703,13 +759,22 @@ func (s *OIDCStore) DeviceByUserCode(ctx context.Context, userCode string) (*op.
 
 // ApproveDevice marks a device authorization approved. A nil scopes slice keeps
 // the requested scopes; an explicit slice narrows them.
+//
+// The write carries the conditions the read does — still pending, still
+// unexpired, not denied — so approving is a state transition rather than an
+// assignment. Callers read the state first and refuse a spent code, but that read
+// and this write are two statements: round 3 (C3-3) recorded that the write was
+// unconditional, with two racing deciders both succeeding. The race was shown to
+// have no payoff, and it is closed here anyway, because a decision that lands on
+// a code somebody else already decided should be refused where it lands.
 func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string, scopes []string) error {
+	const pending = `done = false AND denied = false AND expires_at > now()`
 	q := `UPDATE oidc_devices SET done = true, subject = $2, auth_time = now()
-	       WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', ''))`
+	       WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending
 	args := []any{userCode, subject}
 	if scopes != nil {
 		q = `UPDATE oidc_devices SET done = true, subject = $2, auth_time = now(), scopes = $3
-		      WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', ''))`
+		      WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending
 		args = append(args, scopes)
 	}
 	tag, err := s.pool.Exec(ctx, q, args...)
@@ -717,22 +782,30 @@ func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string,
 		return fmt.Errorf("postgres: approve device: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return errors.New("postgres: device authorization not found")
+		// An unknown code and one that is no longer pending are the same answer:
+		// this is not a code the caller may decide.
+		return fmt.Errorf("postgres: device authorization is not pending: %w", oauth.ErrDeviceNotFound)
 	}
 	s.record(ctx, "oidc.device.approve", subject, "", audit.OutcomeOK)
 	return nil
 }
 
 // DenyDevice marks a device authorization denied.
+//
+// Its condition is deliberately not the same as ApproveDevice's: `done = false` is
+// absent, so a denial still outranks an approval whichever write lands second.
+// That invariant is round 3's C3-3 conclusion and the tests pin it; what this
+// adds is that a second denial is refused rather than recorded twice.
 func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oidc_devices SET denied = true
-		 WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', ''))`, userCode)
+		 WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', ''))
+		   AND denied = false`, userCode)
 	if err != nil {
 		return fmt.Errorf("postgres: deny device: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return errors.New("postgres: device authorization not found")
+		return fmt.Errorf("postgres: device authorization is not pending: %w", oauth.ErrDeviceNotFound)
 	}
 	s.record(ctx, "oidc.device.deny", "", "", audit.OutcomeDenied)
 	return nil
@@ -772,9 +845,6 @@ func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, 
 		g, ok := byClient[clientID]
 		if !ok {
 			g = &oauth.Grant{ClientID: clientID, IssuedAt: issued, ExpiresAt: expires}
-			if c, err := s.clients.Get(ctx, clientID); err == nil {
-				g.ClientName = c.Name
-			}
 			byClient[clientID] = g
 		}
 		for _, sc := range scopes {
@@ -796,8 +866,17 @@ func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// Names come from one lookup for the page. They used to come from a Get
+	// inside the loop above — one extra round trip per distinct client, on a query
+	// that is already two unions.
+	ids := make([]string, 0, len(byClient))
+	for id := range byClient {
+		ids = append(ids, id)
+	}
+	names := oauth.LookupClientNames(ctx, s.clients, ids)
 	out := make([]oauth.Grant, 0, len(byClient))
 	for _, g := range byClient {
+		g.ClientName = names[g.ClientID]
 		sort.Slice(g.Scopes, func(i, j int) bool { return g.Scopes[i] < g.Scopes[j] })
 		out = append(out, *g)
 	}
@@ -828,6 +907,23 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_devices WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
 		return err
 	}
+	// So does an authorization code minted but not yet exchanged. Codes are
+	// deleted through their request because request_id is their only link to the
+	// subject; the same shape as revokePendingAuthorizations below, which the
+	// Kill Switch uses. Leaving them behind let a client that withheld its code
+	// redeem it after the user revoked the grant — and the exchange returns a
+	// refresh token, so the access did not merely survive a moment, it became
+	// indefinite.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM oidc_codes
+		 WHERE request_id IN (
+		       SELECT id FROM oidc_auth_requests
+		        WHERE client_id = $1 AND subject = $2)`, clientID, subject); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM oidc_auth_requests WHERE client_id = $1 AND subject = $2`, clientID, subject); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
@@ -843,20 +939,35 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 // in the result — that number is tokens — but they must go: a held device_code
 // would otherwise re-mint what was just revoked, defeating the Kill Switch for
 // the life of the code.
+//
+// All of it happens in one transaction, and the returned count is zero when it
+// fails. The number is an operator's evidence that the account is contained; a
+// partial application that reported "some" would be worse than none, because the
+// retry is what makes it complete and a count in between is indistinguishable
+// from success.
 func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
-	total, err := revokeMatching(ctx, s.pool, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return total, err
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	total, err := revokeMatching(ctx, tx, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
+	if err != nil {
+		return 0, err
 	}
 	// A pending authorization request whose code has not been redeemed is a
 	// redeemable capability, not a token. Leaving it alive let a code issued
 	// before the Kill Switch mint a fresh access/refresh pair after the switch
 	// reported success.
-	if _, err := revokePendingAuthorizations(ctx, s.pool, f); err != nil {
-		return total, err
+	if _, err := revokePendingAuthorizations(ctx, tx, f); err != nil {
+		return 0, err
 	}
-	if _, err := revokeMatching(ctx, s.pool, []string{"oidc_devices"}, f); err != nil {
-		return total, err
+	if _, err := revokeMatching(ctx, tx, []string{"oidc_devices"}, f); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
 	}
 	return total, nil
 }
@@ -864,15 +975,13 @@ func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int,
 // revokePendingAuthorizations deletes auth requests selected by the filter and
 // the codes minted from them. Codes are deleted first because their only link to
 // the subject is request_id.
-func revokePendingAuthorizations(ctx context.Context, pool *pgxpool.Pool, f oauth.TokenFilter) (int, error) {
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
+//
+// It runs on the caller's handle rather than opening its own transaction: the
+// caller is the one that can say what "revoked" means, and it has to be able to
+// commit that answer together with the token deletes.
+func revokePendingAuthorizations(ctx context.Context, db querier, f oauth.TokenFilter) (int, error) {
 	removed := 0
-	tag, err := tx.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		DELETE FROM oidc_codes
 		 WHERE request_id IN (
 		       SELECT id FROM oidc_auth_requests
@@ -883,7 +992,7 @@ func revokePendingAuthorizations(ctx context.Context, pool *pgxpool.Pool, f oaut
 	}
 	removed += int(tag.RowsAffected())
 
-	tag, err = tx.Exec(ctx, `
+	tag, err = db.Exec(ctx, `
 		DELETE FROM oidc_auth_requests
 		 WHERE ($1 = '' OR client_id = $1) AND ($2 = '' OR subject = $2)`,
 		f.ClientID, f.Subject)
@@ -891,10 +1000,6 @@ func revokePendingAuthorizations(ctx context.Context, pool *pgxpool.Pool, f oaut
 		return removed, err
 	}
 	removed += int(tag.RowsAffected())
-
-	if err := tx.Commit(ctx); err != nil {
-		return removed, err
-	}
 	return removed, nil
 }
 

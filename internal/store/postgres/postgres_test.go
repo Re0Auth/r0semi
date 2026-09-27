@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alexedwards/scs/v2"
+
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
@@ -935,6 +937,55 @@ func TestSessionsCommitFindDelete(t *testing.T) {
 	}
 }
 
+// scs's LoadAndSave hands the request context to a store that implements
+// scs.CtxStore, and this store has to be one: a session read happens on every
+// browser request that carries a cookie, and on context.Background it waits for a
+// pooled connection with no deadline at all (the pool's statement_timeout bounds a
+// statement, not the wait for a connection).
+//
+// The policy per method is pinned here, cancellation included: reads and deletes
+// honour it, and the commit deliberately does not — scs writes the session after
+// the handler returns, so a browser that navigates away in that window would
+// otherwise lose the session of a user who had just signed in.
+func TestSessionsHonourTheCallersContext(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("TEST_DATABASE_URL is required in CI: this test must not silently skip")
+		}
+		t.Skip("TEST_DATABASE_URL is not set; skipping Postgres integration test")
+	}
+	ctx := context.Background()
+	db, err := Open(ctx, dsn, PoolOptions{MaxConns: 1, MinConns: 0})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(db.Close)
+
+	sessions := db.Sessions()
+	// The interface scs type-asserts for, checked on the value scs is given.
+	if _, ok := any(sessions).(scs.CtxStore); !ok {
+		t.Fatal("the session store does not implement scs.CtxStore, so scs never passes it a context")
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := sessions.FindCtx(cancelled, "tok-ctx"); err == nil {
+		t.Fatal("FindCtx ran a query with a cancelled context")
+	}
+	if err := sessions.DeleteCtx(cancelled, "tok-ctx"); err == nil {
+		t.Fatal("DeleteCtx ran a query with a cancelled context")
+	}
+
+	// The exception, and the assertion that matters most: the write lands anyway.
+	if err := sessions.CommitCtx(cancelled, "tok-ctx", []byte("payload"), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("a commit whose client had already gone was lost: %v", err)
+	}
+	if data, found, err := sessions.FindCtx(ctx, "tok-ctx"); err != nil || !found || string(data) != "payload" {
+		t.Fatalf("the committed session = %q, %v, %v; the commit did not land", data, found, err)
+	}
+}
+
 // scs defines an expired session as "not found", and the row should not linger.
 func TestSessionsExpiredIsNotFoundAndRemoved(t *testing.T) {
 	db := openTestDB(t)
@@ -1057,6 +1108,49 @@ func TestClientsRoundTripKeepsSecretHashOnly(t *testing.T) {
 
 	if _, err := clients.Get(ctx, "ghost"); !errors.Is(err, oauth.ErrClientNotFound) {
 		t.Fatalf("unknown client = %v, want ErrClientNotFound", err)
+	}
+}
+
+// The grants page resolves every client name in one query. The names have to come
+// back for the ids asked about, and a suspended client must still be named: the
+// page lists tokens that were issued, and suspension does not un-issue them.
+func TestClientsResolveNamesForAPageInOneQuery(t *testing.T) {
+	db := openTestDB(t)
+	clients := db.Clients()
+	ctx := context.Background()
+
+	for _, spec := range []struct{ id, name string }{{"cli", "CLI"}, {"spa", "SPA"}, {"gone", "Gone"}} {
+		c, err := oauth.NewClient(spec.id, spec.name, oauth.ClientPublic, "",
+			[]string{"https://app.example/cb"}, []oauth.Scope{oauth.ScopeAccountID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := clients.Create(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := clients.SetStatus(ctx, "gone", oauth.ClientSuspended); err != nil {
+		t.Fatal(err)
+	}
+
+	names, err := clients.ClientNames(ctx, []string{"cli", "spa", "gone", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names["cli"] != "CLI" || names["spa"] != "SPA" {
+		t.Fatalf("names = %v", names)
+	}
+	if names["gone"] != "Gone" {
+		t.Errorf("a suspended client lost its name: %v", names)
+	}
+	if _, ok := names["missing"]; ok {
+		t.Errorf("an unregistered id was answered: %v", names)
+	}
+
+	// An empty page is not a query, and not an error.
+	empty, err := clients.ClientNames(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("ClientNames(nil) = %v, %v", empty, err)
 	}
 }
 

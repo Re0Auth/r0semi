@@ -779,3 +779,82 @@ func TestAdversarialSuccessfulExchangesDoNotLogTokens(t *testing.T) {
 		}
 	}
 }
+
+// A revocation must reach what the client has not spent yet.
+//
+// RevokeGrant deleted the tokens and a device authorization, but not an
+// authorization code that had been minted and not yet exchanged — so a client
+// that withheld its code could redeem it after the user revoked the grant. The
+// client is fully untrusted (threat model B2), and because every consent approval
+// carries offline_access the exchange returns a refresh token: the grant that
+// had already disappeared from the account page came back, indefinitely.
+//
+// Guard for the memory store; internal/store/postgres and internal/store/memory
+// pin the same property on the rows themselves.
+func TestAdversarialRevokedGrantDoesNotRedeemAPendingCode(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	verifier := strings.Repeat("a", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	authz := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {f.webID},
+		"redirect_uri":          {"https://client.example/cb"},
+		"scope":                 {"openid account.id"},
+		"state":                 {"state-1234567890"},
+		"nonce":                 {"nonce-1234567890"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	resp := get(t, noRedirect, f.server.URL+"/oauth/authorize?"+authz.Encode())
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("authorize status = %d: %s", resp.StatusCode, adversaryBody(t, resp))
+	}
+	login, _ := url.Parse(resp.Header.Get("Location"))
+	id := login.Query().Get("authRequestID")
+	if id == "" {
+		t.Fatalf("no authRequestID in %s", resp.Header.Get("Location"))
+	}
+
+	// Exactly what the real consent approval stores: httpapi adds offline_access,
+	// which is what makes an unspent code worth a refresh token.
+	if err := f.store.CompleteLogin(ctx, id, "usr_1", []string{"openid", "account.id", "offline_access"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp = get(t, noRedirect, f.server.URL+"/oauth/authorize/callback?id="+url.QueryEscape(id))
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("callback status = %d: %s", resp.StatusCode, adversaryBody(t, resp))
+	}
+	cb, _ := url.Parse(resp.Header.Get("Location"))
+	code := cb.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in %s", cb)
+	}
+
+	// The user revokes the client while the code is still unspent.
+	if err := f.store.RevokeGrant(ctx, "usr_1", f.webID); err != nil {
+		t.Fatal(err)
+	}
+
+	tokens, status := postToken(t, f.server.URL, f.webID, "s3cret", url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"redirect_uri":  {"https://client.example/cb"},
+		"code_verifier": {verifier},
+	})
+	if status == http.StatusOK {
+		t.Fatalf("a code issued before RevokeGrant was redeemed after it: %v", tokens)
+	}
+	if _, ok := tokens["refresh_token"]; ok {
+		t.Fatal("the revoked grant produced a refresh token")
+	}
+	// A refusal, not an outage: the code is gone, so the protocol answer is
+	// invalid_grant (400), not a 500 from a store that failed.
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 invalid_grant: %v", status, tokens)
+	}
+}
