@@ -10,13 +10,23 @@ import (
 	"cmp"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
 
 // Read decodes a TOML file into out. An empty path is not an error: it means the
 // process is running from the environment alone.
+//
+// A key the schema does not know is an error rather than a shrug. Silently
+// ignoring one produces a deployment that starts with a setting the operator
+// believes they typed: `dsn` instead of `dsn_env` leaves the driver empty, and the
+// driver's default is memory — a durable deployment comes up ephemeral and says so
+// only in a warning. The same applies to `trusted_proxies`, `expose_internal` and
+// the admin allowlist. Every other configuration decision in this process fails
+// closed; this one now does too.
 func Read(path string, out any) error {
 	if path == "" {
 		return nil
@@ -26,8 +36,18 @@ func Read(path string, out any) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
-	if err := toml.Unmarshal(raw, out); err != nil {
+	md, err := toml.Decode(string(raw), out)
+	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
+	}
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		for _, k := range undecoded {
+			keys = append(keys, k.String())
+		}
+		sort.Strings(keys)
+		return fmt.Errorf("%s: unknown keys (a typo here is a setting that never takes effect): %s",
+			path, strings.Join(keys, ", "))
 	}
 	return nil
 }
