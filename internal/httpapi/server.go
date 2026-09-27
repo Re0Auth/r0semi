@@ -522,6 +522,18 @@ func (s *Server) Handler() http.Handler {
 		// HTML. See webui.Handler.
 		root.Handle(webui.BasePath+"/", webui.Handler(s.frontend))
 
+		// The app's robots.txt belongs at the root of the origin. A crawler asks
+		// for /robots.txt and nothing else; the copy adapter-static puts under the
+		// app's prefix is never fetched, so its "Disallow: /app/" — the whole point
+		// of the file — had no effect at all.
+		if robots, ok := webui.Robots(s.frontend); ok {
+			root.HandleFunc("GET /robots.txt", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Header().Set("Cache-Control", "public, max-age=3600")
+				_, _ = w.Write(robots)
+			})
+		}
+
 		// The exact root, so the catch-all below is not shadowed.
 		//
 		// This is not decoration. The login plane's return_to defaults to "/", so

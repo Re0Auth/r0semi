@@ -66,6 +66,21 @@ func Built(fsys fs.FS) bool {
 	return err == nil
 }
 
+// Robots returns the robots.txt that ships with the build, if there is one.
+//
+// The file is written for the root of the origin, and adapter-static copies it
+// under the app's prefix — where no crawler looks, so its Disallow is never read.
+// Serving it is a routing decision and belongs to the composition root; carrying
+// the bytes is this package's, so there is one copy of the file rather than a
+// second one written in Go that can drift.
+func Robots(fsys fs.FS) ([]byte, bool) {
+	b, err := fs.ReadFile(fsys, "robots.txt")
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
 // Handler serves the app from fsys under BasePath.
 //
 // The routing rule, in full: a path naming an existing file is served that file;

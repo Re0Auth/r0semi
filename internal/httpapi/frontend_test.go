@@ -3,6 +3,8 @@ package httpapi
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -53,6 +55,44 @@ func TestRootRedirectsToFrontend(t *testing.T) {
 	}
 	if got := rec.Header().Get("Location"); got != webui.BasePath+"/" {
 		t.Fatalf("Location = %q, want %q", got, webui.BasePath+"/")
+	}
+}
+
+// The app's robots.txt has to be served where a crawler asks for it.
+//
+// adapter-static copies it under the app's prefix, and the only mount for that
+// directory is /app/, so /robots.txt was an ordinary 404: the file's own
+// "Disallow: /app/" was written for a location nothing served. The fixture is the
+// real file, so this also fails if the file is renamed or emptied.
+func TestRobotsTxtIsServedAtTheRoot(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "web", "static", "robots.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Disallow: /app/") {
+		t.Fatalf("web/static/robots.txt no longer disallows the app: %q", body)
+	}
+
+	fsys := testFrontend()
+	fsys["robots.txt"] = &fstest.MapFile{Data: body}
+	srv := withFrontend(t, fsys)
+
+	rec := status(t, srv.Handler(), "/robots.txt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /robots.txt = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain", got)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "Disallow: /app/") {
+		t.Fatalf("served robots.txt = %q, want the app disallowed", got)
+	}
+
+	// A build without the file has no route rather than an empty one: the request
+	// falls through to the ordinary 404.
+	rec = status(t, withFrontend(t, testFrontend()).Handler(), "/robots.txt")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /robots.txt without the file = %d, want 404", rec.Code)
 	}
 }
 
