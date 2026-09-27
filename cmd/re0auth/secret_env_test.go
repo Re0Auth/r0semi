@@ -105,3 +105,18 @@ func TestConfigSecretEnvNamesRefusesAMissingFile(t *testing.T) {
 		t.Fatal("a missing config file was reported as an empty list")
 	}
 }
+
+// The example shipped in every release archive has to decode under the real
+// schema. It is the file operators copy to config/re0auth.toml, and since unknown
+// keys are now refused, drift between it and the settings struct is a startup
+// failure for the first person who follows the README — which is exactly the
+// person who cannot debug it.
+//
+// configSecretEnvNames is the loader to test with: it decodes the whole `file`
+// schema and resolves no secrets, so no environment is needed.
+func TestShippedExampleConfigDecodes(t *testing.T) {
+	path := filepath.Join("..", "..", "config", "re0auth.example.toml")
+	if _, err := configSecretEnvNames(path); err != nil {
+		t.Fatalf("the shipped example config does not match the schema: %v", err)
+	}
+}

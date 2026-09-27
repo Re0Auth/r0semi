@@ -702,6 +702,54 @@ func TestNonLoopbackInternalAddrNeedsAcknowledgement(t *testing.T) {
 	}
 }
 
+// Outbound calls to private addresses are refused unless the deployment says its
+// sources live there — the same shape as expose_internal, for the same reason. The
+// endpoints come from configuration, so without the guard a mistaken or malicious
+// registration aims this process at an internal service or the cloud metadata
+// address, and the raw passthrough hands the answer back to the caller.
+//
+// The default is the guard being ON, and both the file and the environment are
+// checked here because the environment has to win.
+func TestPrivateUpstreamsNeedAcknowledgement(t *testing.T) {
+	t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+	t.Setenv("RE0AUTH_COOKIE_SECURE", "true")
+	t.Setenv("RE0AUTH_KEK", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	t.Setenv("RE0AUTH_ALLOW_PRIVATE_UPSTREAMS", "")
+
+	cfg, err := loadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AllowPrivateUpstreams {
+		t.Fatal("private upstream addresses were allowed without any acknowledgement")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "re0auth.toml")
+	if err := os.WriteFile(path,
+		[]byte("[upstream]\nallow_private_addresses = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AllowPrivateUpstreams {
+		t.Fatal("allow_private_addresses = true in the file did not reach the settings")
+	}
+
+	// The environment overrides the file, like every other setting — including in
+	// the direction that turns the acknowledgement back off.
+	t.Setenv("RE0AUTH_ALLOW_PRIVATE_UPSTREAMS", "false")
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AllowPrivateUpstreams {
+		t.Fatal("the environment did not override the file")
+	}
+}
+
 // The classification is deliberately conservative, and the asymmetry is why: the
 // two mistakes do not cost the same. Refusing a private address costs one config
 // line; accepting a public one publishes heap profiles and goroutine dumps. So

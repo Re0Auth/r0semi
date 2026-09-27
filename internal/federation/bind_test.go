@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Re0Auth/r0semi/vault"
 )
@@ -252,5 +253,43 @@ func TestCompleteBindDenied(t *testing.T) {
 	}
 	if flow.ReturnTo != "/dashboard" {
 		t.Fatalf("flow = %+v", flow)
+	}
+}
+
+// A bind flow is written by BeginBind and read only if the browser comes back, so
+// an abandoned one — a closed tab, a scan the user never finished — has to be
+// removable. Consume already refuses an expired flow; without a sweep the entry
+// itself stayed in the map, which in memory mode is the only bound that exists.
+func TestMemoryBindFlowStoreSweepsExpiredFlows(t *testing.T) {
+	store := NewMemoryBindFlowStore()
+	ctx := context.Background()
+	now := time.Now()
+
+	expired := BindFlow{
+		ID: "bnd_expired", State: "bnd_expired", User: "usr_1", Game: game, Source: sourceName,
+		Verifier: "verifier", ReturnTo: "/dashboard", ExpiresAt: now.Add(-time.Minute),
+	}
+	live := BindFlow{
+		ID: "bnd_live", State: "bnd_live", User: "usr_1", Game: game, Source: sourceName,
+		Verifier: "verifier", ReturnTo: "/dashboard", ExpiresAt: now.Add(time.Minute),
+	}
+	for _, f := range []BindFlow{expired, live} {
+		if err := store.Put(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if removed := store.SweepExpired(); removed != 1 {
+		t.Fatalf("SweepExpired removed %d, want only the expired flow", removed)
+	}
+	if _, err := store.Consume(ctx, expired.State); !errors.Is(err, ErrUnknownBind) {
+		t.Fatalf("the expired flow survived the sweep: %v", err)
+	}
+	// The live one is untouched: a sweep is not allowed to break a flow in flight.
+	if _, err := store.Consume(ctx, live.State); err != nil {
+		t.Fatalf("the sweep removed a live flow: %v", err)
+	}
+	if removed := store.SweepExpired(); removed != 0 {
+		t.Fatalf("a second sweep removed %d, want 0", removed)
 	}
 }

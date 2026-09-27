@@ -415,8 +415,17 @@ func run() error {
 
 	idpRegistry, err := idp.NewRegistry(idp.RegistryConfig{
 		RedirectBase: cfg.Issuer,
-		HTTPClient:   &http.Client{Timeout: 10 * time.Second},
-		Credentials:  cfg.idpCredentials,
+		// The same hardened client shape as the data plane, with a shorter
+		// deadline: a pooled transport instead of the standard library's two idle
+		// connections per host, the outbound redirect policy (so a provider cannot
+		// deflect the token exchange — which carries the authorization code and the
+		// client secret — at another host), and the address guard, so discovery
+		// cannot send this process to an internal one.
+		HTTPClient: httpclient.NewOutboundClient(httpclient.OutboundConfig{
+			Timeout:   10 * time.Second,
+			Transport: httpclient.TransportConfig{DenyPrivateAddresses: !cfg.AllowPrivateUpstreams},
+		}),
+		Credentials: cfg.idpCredentials,
 	})
 	if err != nil {
 		return die("idp", err)
@@ -457,6 +466,12 @@ func run() error {
 		// data plane's own signals cannot show: the requests it refuses never
 		// reach the network.
 		Breaker: &httpclient.BreakerOptions{Metrics: metrics},
+		// Private, loopback and link-local addresses are refused unless the
+		// deployment says its sources live there. This is what stops a source
+		// registration — or a source's DNS — from aiming the data plane at the
+		// metadata service or another internal listener, which the raw passthrough
+		// would then hand back to the caller.
+		Transport: httpclient.TransportConfig{DenyPrivateAddresses: !cfg.AllowPrivateUpstreams},
 	})
 	federationService, err := federation.NewService(federation.Config{
 		Registry:   registry,
@@ -768,18 +783,27 @@ func readinessProbe(store storage) httpapi.ReadinessProbe {
 func openStorage(ctx context.Context, cfg settings, metrics *observability.Metrics) (storage, error) {
 	var store storage
 	if cfg.DatabaseURL == "" {
+		bindFlows := federation.NewMemoryBindFlowStore()
 		store = storage{
 			accounts:    account.NewMemoryStore(),
 			clients:     oauth.NewMemoryClientRegistry(),
 			credentials: vault.NewMemoryRepo(),
 			bindings:    federation.NewMemoryBindingStore(),
-			bindFlows:   federation.NewMemoryBindFlowStore(),
+			bindFlows:   bindFlows,
 			audit:       audit.NewMemoryLogger(),
 			// A nil session store makes auth.NewManager fall back to its
 			// in-memory one.
 			sessions: nil,
-			durable:  false,
-			close:    func() {},
+			// There is no database to sweep, but there is still state with a
+			// deadline. A bind flow that is started and never finished was written
+			// once and read never, so without this it lives until the process ends:
+			// the durable store is covered by the Postgres sweep, and the OP store
+			// has its own janitor, but this one had nothing.
+			sweep: func(context.Context) (int64, error) {
+				return int64(bindFlows.SweepExpired()), nil
+			},
+			durable: false,
+			close:   func() {},
 		}
 		return store, nil
 	}

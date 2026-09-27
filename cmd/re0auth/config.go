@@ -32,13 +32,32 @@ import (
 
 // file is the on-disk schema.
 type file struct {
-	Server  serverSection         `toml:"server"`
-	Storage storageSection        `toml:"storage"`
-	Vault   vaultSection          `toml:"vault"`
-	Client  clientSection         `toml:"client"`
-	Admin   adminSection          `toml:"admin"`
-	IdP     map[string]idpSection `toml:"idp"`
-	Sources []sourceSection       `toml:"sources"`
+	Server   serverSection         `toml:"server"`
+	Storage  storageSection        `toml:"storage"`
+	Upstream upstreamSection       `toml:"upstream"`
+	Vault    vaultSection          `toml:"vault"`
+	Client   clientSection         `toml:"client"`
+	Admin    adminSection          `toml:"admin"`
+	IdP      map[string]idpSection `toml:"idp"`
+	Sources  []sourceSection       `toml:"sources"`
+}
+
+// upstreamSection governs the outbound clients — the data plane's source calls
+// and the identity providers' token, userinfo and discovery calls.
+type upstreamSection struct {
+	// AllowPrivateAddresses permits outbound connections to loopback, link-local
+	// and private addresses. It is a boolean rather than a list because the
+	// question is "may this process reach my internal network", and the useful
+	// answers are yes and no.
+	//
+	// Off by default, and it must be turned on deliberately: the endpoints come
+	// from configuration, so a compromised or mistaken source registration is
+	// enough to point a request at the cloud metadata address or an internal
+	// service, and on the raw passthrough the answer comes back to the caller.
+	// Self-hosted data sources on a private network are a supported shape, so this
+	// is an acknowledgement rather than a prohibition — like expose_internal, and
+	// for the same reason.
+	AllowPrivateAddresses bool `toml:"allow_private_addresses"`
 }
 
 // adminSection is the operator allowlist. There is no role table: an account is
@@ -215,6 +234,11 @@ type settings struct {
 	// TrustedProxies are the networks whose X-Forwarded-For is believed when
 	// resolving the client address. Empty means no proxy is trusted.
 	TrustedProxies []netip.Prefix
+	// AllowPrivateUpstreams permits outbound calls to loopback, link-local and
+	// private addresses. False (the default) refuses them at dial time, so a
+	// source registration or a discovery document cannot aim this process at an
+	// internal service or the cloud metadata address.
+	AllowPrivateUpstreams bool
 	// InternalAddr is the address of the operational listener that serves metrics
 	// and profiling. Empty means it is not served at all.
 	InternalAddr string
@@ -275,16 +299,43 @@ const authorizationRequestTTL = 30 * time.Minute
 const (
 	defaultRateLimit      = 50.0
 	defaultRateLimitBurst = 100
-	// defaultMaxInFlight is high enough not to shape ordinary traffic and low
-	// enough that a burst of slow requests cannot exhaust database connections and
-	// memory before the limiter reacts.
-	defaultMaxInFlight = 512
+	// defaultMaxInFlightMemory is the cap when there is no connection pool to size
+	// it against: high enough not to shape ordinary traffic, low enough that a
+	// burst of slow requests cannot exhaust memory before the limiter reacts.
+	defaultMaxInFlightMemory = 512
+	// In a durable deployment the cap is derived from the pool instead, because
+	// that is where concurrency actually queues: requests beyond the pool wait on
+	// pgx for a connection, and the only bound there is the client hanging up. 8×
+	// leaves room for the requests that never reach the database, and the floor
+	// keeps a small pool from shaping ordinary traffic.
+	maxInFlightPerConn = 8
+	minMaxInFlight     = 64
 
 	// defaultAdminReauthWindow is how long an operator login stays fresh enough
 	// for a mutating admin call. Long enough not to re-login mid-incident, short
 	// enough that a stolen session does not keep operator power for a working day.
 	defaultAdminReauthWindow = 15 * time.Minute
 )
+
+// defaultMaxInFlightFor returns the concurrency cap a deployment gets when it has
+// not chosen one.
+//
+// It is a function of the pool rather than a constant because the number's job is
+// to bound work in progress, and in a durable deployment work in progress means
+// requests waiting on the database. A cap set far above the pool does not bound
+// anything: it converts a fast refusal into a slow wait for a connection the
+// process does not have. An in-memory deployment has no pool, so it keeps the flat
+// default.
+func defaultMaxInFlightFor(durable bool, maxConns int32) int {
+	if !durable {
+		return defaultMaxInFlightMemory
+	}
+	inFlight := int(maxConns) * maxInFlightPerConn
+	if inFlight < minMaxInFlight {
+		inFlight = minMaxInFlight
+	}
+	return inFlight
+}
 
 // configSecretEnvNames lists the environment variables a config file declares as
 // secret holders, one `role=NAME` line per declaration, sorted.
@@ -412,15 +463,18 @@ func loadConfig(path string) (settings, error) {
 		return settings{}, errors.New("server.rate_limit_burst must be at least 1 when rate_limit is set")
 	}
 
-	maxInFlight := defaultMaxInFlight
+	// The concurrency cap is resolved *after* the pool, because an unchosen cap is
+	// derived from it — see defaultMaxInFlightFor. -1 is "not chosen": the parser
+	// below rejects every other negative value, so it cannot collide with one.
+	maxInFlight := -1
 	if f.Server.MaxInFlight != nil {
 		maxInFlight = *f.Server.MaxInFlight
 	}
-	cfg.MaxInFlight, err = config.Int("RE0AUTH_MAX_IN_FLIGHT", maxInFlight)
+	maxInFlight, err = config.Int("RE0AUTH_MAX_IN_FLIGHT", maxInFlight)
 	if err != nil {
 		return settings{}, err
 	}
-	if cfg.MaxInFlight < 0 {
+	if maxInFlight < -1 {
 		return settings{}, errors.New("server.max_in_flight cannot be negative (use 0 to disable the cap)")
 	}
 
@@ -435,6 +489,20 @@ func loadConfig(path string) (settings, error) {
 	cfg.TrustedProxies, err = parseTrustedProxies(proxyValues)
 	if err != nil {
 		return settings{}, err
+	}
+
+	// Outbound address policy. The environment overrides the file, like every
+	// other setting, and the default is to refuse: this is the switch that turns
+	// a configured endpoint into a route into the deployment's own network, so
+	// turning it on is an acknowledgement rather than a default.
+	if raw := strings.TrimSpace(os.Getenv("RE0AUTH_ALLOW_PRIVATE_UPSTREAMS")); raw != "" {
+		allow, err := config.Bool("RE0AUTH_ALLOW_PRIVATE_UPSTREAMS", false)
+		if err != nil {
+			return settings{}, err
+		}
+		cfg.AllowPrivateUpstreams = allow
+	} else {
+		cfg.AllowPrivateUpstreams = f.Upstream.AllowPrivateAddresses
 	}
 
 	// The operational surface must not be the public one. They are separate
@@ -502,6 +570,14 @@ func loadConfig(path string) (settings, error) {
 	if err != nil {
 		return settings{}, err
 	}
+
+	// The concurrency cap, now that both the pool and the driver are known: a
+	// deployment that chose one gets it, and one that did not gets a number sized
+	// to what it can actually serve concurrently.
+	if maxInFlight < 0 {
+		maxInFlight = defaultMaxInFlightFor(cfg.DatabaseURL != "", cfg.Pool.MaxConns)
+	}
+	cfg.MaxInFlight = maxInFlight
 
 	// Vault: the KEK is required, and its length is checked here so a bad key
 	// fails before anything else is wired.

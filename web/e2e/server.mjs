@@ -321,6 +321,14 @@ rate_limit = 0
 # Postgres, and with it the OpenID Provider engine.
 driver = "${dbUrl ? 'postgres' : 'memory'}"
 
+[upstream]
+# The fake identity providers below live on 127.0.0.1, which the outbound clients
+# refuse by default: on a real deployment a loopback endpoint for a source or an
+# IdP is a misconfiguration, and refusing it is what keeps a registered URL from
+# becoming a route into the deployment's own network. A test harness is the case
+# the acknowledgement exists for.
+allow_private_addresses = true
+
 [vault]
 kek_env = "RE0AUTH_KEK"
 

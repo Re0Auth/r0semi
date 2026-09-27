@@ -99,6 +99,29 @@ func (s *MemoryBindFlowStore) PurgeUserFlows(_ context.Context, user account.Use
 	return n, nil
 }
 
+// SweepExpired drops flows whose deadline has passed and reports how many it
+// removed.
+//
+// Expiry is enforced on Consume, so this is not what makes an expired flow
+// unusable — it is what keeps the map from holding every flow the process ever
+// started. A flow is written by BeginBind and read only if the browser comes back;
+// an abandoned one (a closed tab, a QR scan the user never finished) has no other
+// bound, and in memory mode there is no durable sweep behind it. The composition
+// root runs this on the same ticker as the other sweeps.
+func (s *MemoryBindFlowStore) SweepExpired() int {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for state, f := range s.m {
+		if !now.Before(f.ExpiresAt) {
+			delete(s.m, state)
+			removed++
+		}
+	}
+	return removed
+}
+
 // BeginBind starts binding a source for a user and returns the upstream
 // authorization URL to redirect the browser to.
 func (s *service) BeginBind(ctx context.Context, user account.UserID, game, source, returnTo string) (BindChallenge, error) {

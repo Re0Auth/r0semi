@@ -36,6 +36,12 @@ rate_limit_burst = 100
 # disables it. A request arriving while the cap is full gets a plane-shaped 503
 # with Retry-After: 1.
 #
+# Leave this out and a durable deployment gets max(64, max_conns × 8) instead
+# (128 with the default pool of 16), because that is where concurrency actually
+# queues: past the pool size a request waits on pgx for a connection, and the only
+# bound there is the client hanging up. An in-memory deployment has no pool to size
+# it against and keeps 512. A value set here or in the environment is used as-is.
+#
 # Environment override: RE0AUTH_MAX_IN_FLIGHT="512"
 max_in_flight = 512
 
@@ -194,6 +200,25 @@ subjects = []
 # step-up. "0" disables the check.
 # Environment override: RE0AUTH_ADMIN_REAUTH_WINDOW="15m"
 reauth_window = "15m"
+
+[upstream]
+# Whether outbound calls may reach loopback, link-local and private addresses.
+#
+# Off, and it must be turned on deliberately. The endpoints below are operator
+# configuration, so a mistaken or malicious registration is enough to aim this
+# process at something that is not a data source at all — the cloud metadata
+# address, an admin panel on the internal network — and on the raw passthrough
+# (GET /v1/games/{game}/sources/{source}/raw/…) the answer comes straight back to
+# the caller. The check runs on the resolved address at dial time, so a hostname
+# that answered publicly when it was registered and privately at request time is
+# refused too.
+#
+# Set it to true when your sources or identity providers really are on a private
+# network: a self-hosted data source on 10.x, a Keycloak on the LAN, a fake IdP in
+# a test harness. It is one acknowledgement for the whole process, the same shape
+# as expose_internal and for the same reason.
+# allow_private_addresses = false
+# Environment override: RE0AUTH_ALLOW_PRIVATE_UPSTREAMS=true
 
 # Identity providers. Only the ones listed here are offered, so a deployment
 # exposes exactly what it configured. Known names: github, google, discord,
