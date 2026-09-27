@@ -46,6 +46,14 @@ introspection 默认只允许 client 查询自己的 token，资源服务器需�
 `server.introspection_clients` / `RE0AUTH_INTROSPECTION_CLIENTS` 中显式列出；撤销任一令牌会同时撤销
 同一授权链的配对令牌（RFC 7009 §2.1）。取舍记录在 [protocol-hardening-decision.md](./protocol-hardening-decision.md)（ADR-0005）。
 
+**introspection 只认机密客户端。** 该端点的授权判据就是客户端认证本身，而公开客户端没有可用来
+认证的秘密（它的 id 就印在客户端二进制与每一条授权请求 URL 里）。注册表对「非机密客户端」的
+`AuthorizeClientIDSecret` 返回 nil（=已认证），这在 token 端点是必需的——公开客户端自报 id 且本就不
+持有秘密——但在这里会让 `Authorization: Basic base64("<公开client_id>:")`（空 secret 也行）变成
+「已认证」。因此**白名单条目只会对机密客户端生效**，调用方不是机密客户端时一律 401 `invalid_client`
+（`refuseIntrospectionByANonConfidentialClient`），与白名单里有没有它无关。相应地，
+`introspection_endpoint_auth_methods_supported` 里没有 `none`。
+
 **业务平面全部 `no-store`。** 这张表的「按资源语义」曾经落空——业务面一个 `Cache-Control` 都没有。
 但这里每个响应都是**认证后的按人数据**：会话引导与 admin 客户端列表下发 CSRF token，账号导出是某个人
 账号的全部内容。既没有 `Vary`，中间缓存也就没有任何键能区分两个账号。
@@ -172,7 +180,7 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 | `GET` | `/oauth/authorize` | RFC 6749 §4.1 | 浏览器跳转；仅 `response_type=code`；强制 PKCE S256 |
 | `POST` | `/oauth/token` | RFC 6749 §4.1.3 / §6 / RFC 8628 §3.4 | `authorization_code` + `refresh_token` + `device_code`；`Cache-Control: no-store` |
 | `POST` | `/oauth/revoke` | RFC 7009 | 永远返回 `200`（幂等） |
-| `POST` | `/oauth/introspect` | RFC 7662 | 资源服务器使用 |
+| `POST` | `/oauth/introspect` | RFC 7662 | 资源服务器使用；**必须是机密客户端**，公开客户端一律 401 |
 | `POST` | `/oauth/device_authorization` | RFC 8628 §3.1 | CLI/桌面设备码（**已实现**） |
 | `GET` | `/v1/device/verification` | RFC 8628 §3.3 | 设备流验证页：需登录，且把 user code 绑到当前浏览器会话 |
 | `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 | 授权服务器元数据 |

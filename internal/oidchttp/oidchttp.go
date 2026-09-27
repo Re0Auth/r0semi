@@ -85,6 +85,13 @@ type Config struct {
 	// other clients — the resource servers this deployment trusts. A confidential
 	// client may always introspect its own tokens; without an entry here nobody
 	// else's are visible. Empty is the safe default.
+	//
+	// Every entry must name a CONFIDENTIAL client. Introspection is authorized by
+	// client authentication alone, and a public client keeps no secret to
+	// authenticate with (its id is printed in the client binary and in every
+	// authorization URL), so an entry naming one would make the endpoint an
+	// anonymous cross-client token reader. Such a caller is refused with 401
+	// rather than trusted; see refuseIntrospectionByANonConfidentialClient.
 	IntrospectionClients []string
 	// Metrics, when set, records token issuance and token-endpoint failures. Nil
 	// records nothing; the *observability.Metrics methods are nil-safe, so a
@@ -483,6 +490,25 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 					"client_id does not match the authenticated client")
 				return
 			}
+		}
+	}
+	// RFC 7662 §2.1: introspection is called by a PROTECTED RESOURCE with its own
+	// credentials. A public client has none — and the storage's client
+	// authentication cannot say so: `AuthorizeClientIDSecret` verifies a secret only
+	// for a confidential client and answers nil ("authenticated") for every other
+	// type. That is required at the token endpoint, where a public client names
+	// itself and keeps no secret, but here the authentication IS the authorization
+	// decision, so it is made real: a caller whose client is not confidential is
+	// refused, allowlisted or not.
+	//
+	// The escalation this closes: a public client's id is not a credential — it is
+	// printed in the client binary and in every authorization URL — so an allowlist
+	// entry naming one (nothing in the config, the docs or Config said it must not)
+	// turned the endpoint into an anonymous reader of ANY token's
+	// `active/scope/sub/client_id/exp`, with an empty secret.
+	if r.URL.Path == "/"+pathIntrospection {
+		if h.refuseIntrospectionByANonConfidentialClient(w, r, form) {
+			return
 		}
 	}
 	// The authorize entrance, for either method. `/oauth/authorize/callback` is the
@@ -960,6 +986,31 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 		return true
 	}
 	return false
+}
+
+// refuseIntrospectionByANonConfidentialClient refuses an introspection caller whose
+// client has no secret to authenticate with.
+//
+// It answers on its own only when it can prove the caller cannot authenticate: an
+// absent or unknown id is left to the library, which already answers 401 for both.
+// What it corrects is the single case the library decides in the unsafe direction,
+// because the check it makes — "return nil, i.e. authenticated, for a client that
+// keeps no secret" — is right for the token endpoint and wrong here.
+func (h *Handler) refuseIntrospectionByANonConfidentialClient(w http.ResponseWriter, r *http.Request, form url.Values) bool {
+	id, _, _ := r.BasicAuth()
+	if strings.TrimSpace(id) == "" {
+		id = strings.TrimSpace(form.Get("client_id"))
+	}
+	if id == "" {
+		return false
+	}
+	c, err := h.clients.Get(r.Context(), id)
+	if err != nil || c.Type == oauth.ClientConfidential {
+		return false
+	}
+	writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
+		"introspection requires a confidential client")
+	return true
 }
 
 // bearerOf resolves the bearer credential a request carries the way the library's

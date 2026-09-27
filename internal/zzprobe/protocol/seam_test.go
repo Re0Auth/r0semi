@@ -10,8 +10,9 @@ import (
 	"testing"
 )
 
-// PROBE 1 — the introspection allowlist is checked against a client id, but a
-// PUBLIC client authenticates with no secret at all.
+// PROBE 1 — the introspection allowlist is checked against a client id, and a
+// PUBLIC client authenticates with no secret at all. This probe now asserts the
+// refusal, because that is the property that must hold.
 //
 // internal/store/memory/oidc.go AuthorizeClientIDSecret returns nil for any
 // secret when the client is not confidential (`c.Type == ClientConfidential &&`
@@ -20,15 +21,18 @@ import (
 // pkg/op/token_intospection.go ParseTokenIntrospectionRequest requires
 // `authenticated`). So if the deployment's resource-server allowlist names a
 // public client — and nothing in the config, the docs or the wrapper's Config
-// says it must not — then anyone on the network can send
+// said it must not — then anyone on the network can send
 //
-//	Authorization: Basic base64(<public-client-id>:garbage)
+//	Authorization: Basic base64(<public-client-id>:)
 //
 // and receive the full introspection record of ANY token in the deployment.
 //
-// The control cases below are what make this non-vacuous: the same request
-// without the allowlist answers active=false, and a non-existent client id is
-// refused with 401.
+// The refusal has to be made at this layer: the lax `return nil` is required at the
+// token endpoint, where a public client names itself and keeps no secret, so the
+// endpoint that authorizes by authentication alone cannot borrow that rule
+// (internal/oidchttp refuseIntrospectionByANonConfidentialClient). The control
+// cases keep this non-vacuous: a confidential allowlist entry still works with its
+// secret, and an unknown client id is still 401.
 func TestProbeIntrospectionAllowlistWithAPublicClientIsAnonymousRead(t *testing.T) {
 	// One deployment shape, two mounts: the victim's token is minted once, on the
 	// mount WITHOUT the allowlist, and then introspected through both.
@@ -40,47 +44,50 @@ func TestProbeIntrospectionAllowlistWithAPublicClientIsAnonymousRead(t *testing.
 		t.Fatal("no access token minted, so the probe would be vacuous")
 	}
 
-	introspect := func(e env, basicID, basicSecret string) (int, map[string]any) {
+	introspect := func(e env, basicID, basicSecret string) (int, string, map[string]any) {
 		t.Helper()
 		resp, raw := e.postForm(t, "/oauth/introspect",
 			url.Values{"token": {tokens.AccessToken}}, basicID, basicSecret)
-		return resp.StatusCode, decodeJSON(t, raw)
+		var payload map[string]any
+		_ = json.Unmarshal(raw, &payload)
+		return resp.StatusCode, string(raw), payload
 	}
 
-	// The escalation: the PUBLIC client's id with a secret it does not have.
-	status, payload := introspect(allowed, allowed.deviceID, "not-the-secret")
-	if status != http.StatusOK {
-		t.Fatalf("introspect as the public client = %d: %v", status, payload)
+	// The escalation that must no longer happen: the PUBLIC client's id, with a
+	// secret it does not have, and with none at all.
+	for _, secret := range []string{"not-the-secret", ""} {
+		status, raw, payload := introspect(allowed, allowed.deviceID, secret)
+		if status == http.StatusOK && payload["active"] == true {
+			t.Errorf("the public client introspected another client's token (secret %q): %s", secret, raw)
+		}
+		if status != http.StatusUnauthorized {
+			t.Errorf("the public client's introspection answered %d (secret %q), want 401: %s", status, secret, raw)
+		}
+		if strings.Contains(raw, "phigros.score.read") || strings.Contains(raw, "usr_probe") {
+			t.Errorf("the refusal leaked the token's facts: %s", raw)
+		}
 	}
-	if payload["active"] != true {
-		t.Fatalf("the public client could not introspect; finding not reproduced: %v", payload)
-	}
-	if got, _ := payload["scope"].(string); !strings.Contains(got, "phigros.score.read") {
-		t.Fatalf("cross-client introspection did not leak the scope: %v", payload)
-	}
-	if got, _ := payload["sub"].(string); got == "" {
-		t.Fatalf("cross-client introspection did not leak the subject: %v", payload)
-	}
-	t.Logf("public client %q read another client's token: active=%v scope=%v sub=%v",
-		allowed.deviceID, payload["active"], payload["scope"], payload["sub"])
+	t.Logf("a public client on the allowlist is refused at /oauth/introspect")
 
-	// An empty secret is enough, which is what "no credential at all" looks like.
-	status, payload = introspect(allowed, allowed.deviceID, "")
-	if status != http.StatusOK || payload["active"] != true {
-		t.Fatalf("an empty secret was not enough: %d %v", status, payload)
-	}
-
-	// Control 1: with no allowlist the same request sees nothing.
-	status, payload = introspect(denied, denied.deviceID, "not-the-secret")
-	if status != http.StatusOK || payload["active"] != false {
-		t.Fatalf("control failed: without the allowlist the public client got %d %v", status, payload)
-	}
-
-	// Control 2: a client id that does not exist is refused outright, so the
-	// anonymous read above is the allowlist, not a missing authentication step.
-	status, payload = introspect(allowed, "no-such-client-id", "x")
+	// Control 1: the rule is about the caller, not the list — with no allowlist the
+	// same public caller is refused the same way.
+	status, raw, _ := introspect(denied, denied.deviceID, "not-the-secret")
 	if status != http.StatusUnauthorized {
-		t.Fatalf("control failed: an unknown client id got %d %v, want 401", status, payload)
+		t.Fatalf("control failed: without the allowlist the public client got %d %s", status, raw)
+	}
+
+	// Control 2: the honest path still works, so the endpoint is not simply closed
+	// — a CONFIDENTIAL client introspects its own token.
+	status, raw, payload := introspect(denied, denied.webID, denied.webSec)
+	if status != http.StatusOK || payload["active"] != true {
+		t.Fatalf("control failed: the issuing confidential client got %d %s", status, raw)
+	}
+
+	// Control 3: a client id that does not exist is refused outright, so the
+	// refusals above are about the client type rather than a missing auth step.
+	status, raw, _ = introspect(allowed, "no-such-client-id", "x")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("control failed: an unknown client id got %d %s, want 401", status, raw)
 	}
 }
 

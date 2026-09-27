@@ -106,6 +106,12 @@ type serverSection struct {
 	// IntrospectionClients lists client ids allowed to introspect tokens issued
 	// to other clients — resource servers. A client may always introspect its own
 	// tokens; empty means nobody else's are visible.
+	//
+	// Every id must name a CONFIDENTIAL client. Introspection is authorized by
+	// client authentication alone, and a public client keeps no secret to
+	// authenticate with, so an entry naming one would make the endpoint readable
+	// by anyone; such a caller is refused with 401 rather than trusted. The
+	// variable is RE0AUTH_INTROSPECTION_CLIENTS (comma-separated).
 	IntrospectionClients []string `toml:"introspection_clients"`
 }
 

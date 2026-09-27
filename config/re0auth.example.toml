@@ -85,6 +85,12 @@ expose_internal = false
 # servers you trust. A client may always introspect its own tokens; empty is the
 # safe default. See ADR-0005.
 #
+# Every id must be a CONFIDENTIAL client (one with a secret). Introspection is
+# authorized by client authentication alone, and a public client keeps no secret to
+# authenticate with — its id is printed in the client binary and in every
+# authorization URL — so an entry naming one would make the endpoint readable by
+# anyone. Such a caller is refused with 401, never trusted.
+#
 #   introspection_clients = ["cli_resource_server"]
 # Environment override: RE0AUTH_INTROSPECTION_CLIENTS="cli_a,cli_b"
 introspection_clients = []
