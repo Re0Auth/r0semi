@@ -201,3 +201,31 @@ func TestMACAuthorizationUsesPort(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+// The upstream reply is untrusted and can be as large as maxBody. Its text must
+// not be echoed into an error (and so into a log line) unbounded, and a newline
+// in it must not be able to forge a log entry.
+func TestUpstreamErrorTextIsBounded(t *testing.T) {
+	huge := strings.Repeat("A", 1<<16) + "\nforged log line"
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": false,
+			"data":    map[string]string{"error": "invalid_client", "error_description": huge},
+		})
+	}))
+
+	_, err := c.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := err.Error(); len(got) > 400 {
+		t.Fatalf("the error carries %d bytes of upstream text", len(got))
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Fatal("an upstream newline was echoed into the error")
+	}
+	// Anti-vacuous: bounding must not drop the machine-readable code.
+	if !strings.Contains(err.Error(), "invalid_client") {
+		t.Fatalf("the upstream error code was dropped: %q", err.Error())
+	}
+}

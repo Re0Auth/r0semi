@@ -313,7 +313,7 @@ func parseTapError(data json.RawMessage) (code, message string) {
 
 func businessError(stage string, data json.RawMessage) error {
 	code, message := parseTapError(data)
-	return fmt.Errorf("taptapoauth: %s failed: %s %s", stage, code, message)
+	return fmt.Errorf("taptapoauth: %s failed: %s %s", stage, boundDetail(code), boundDetail(message))
 }
 
 func tokenBusinessError(data json.RawMessage) error {
@@ -324,7 +324,22 @@ func tokenBusinessError(data json.RawMessage) error {
 		strings.Contains(classifier, "slow_down") {
 		return ErrAuthorizationPending
 	}
-	return fmt.Errorf("taptapoauth: token failed: %s %s", code, message)
+	return fmt.Errorf("taptapoauth: token failed: %s %s", boundDetail(code), boundDetail(message))
+}
+
+// maxErrorDetail bounds how much upstream-supplied text can reach an error, and
+// therefore a log line. The reply is untrusted and may be as large as maxBody
+// (1 MiB), and a raw newline in it would forge a log entry. The value is
+// flattened and capped for display only; classification runs on the unbounded
+// value before this, so a recognized error code is unaffected.
+const maxErrorDetail = 200
+
+func boundDetail(s string) string {
+	s = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(s))
+	if r := []rune(s); len(r) > maxErrorDetail {
+		s = string(r[:maxErrorDetail]) + "…"
+	}
+	return s
 }
 
 func scanURL(verificationURL, qrcodeURL, userCode string) string {
