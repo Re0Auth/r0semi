@@ -823,9 +823,16 @@ func callerClientID(r *http.Request) string {
 // response with active=false rather than an error: the caller learns nothing
 // about the token, and a resource server that is not allowed to see it treats it
 // as unusable, which is the fail-closed direction.
+//
+// A token whose response names no client cannot be attributed to anybody, and an
+// unattributable token is not one to describe: both cases answer inactive. The
+// caller that reaches here with an empty client id is the library's own
+// authentication failing to resolve a client, which cannot return 200 today —
+// "cannot happen" is not the same as "cannot leak" when the branch that would
+// leak is one `if` away from being reachable.
 func (h *Handler) filterIntrospection(body []byte, caller string) []byte {
 	if caller == "" {
-		return body
+		return []byte(`{"active":false}`)
 	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -842,7 +849,10 @@ func (h *Handler) filterIntrospection(body []byte, caller string) []byte {
 	if raw, ok := payload["client_id"]; ok {
 		_ = json.Unmarshal(raw, &tokenClient)
 	}
-	if tokenClient == "" || tokenClient == caller || h.introspectionClients[caller] {
+	if tokenClient == "" {
+		return []byte(`{"active":false}`)
+	}
+	if tokenClient == caller || h.introspectionClients[caller] {
 		return body
 	}
 	return []byte(`{"active":false}`)
