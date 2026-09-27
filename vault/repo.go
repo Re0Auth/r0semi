@@ -92,6 +92,20 @@ type Repo interface {
 	DeleteSubject(ctx context.Context, subject string) (int, error)
 }
 
+// RecordPager is implemented by a Repo that can enumerate records a page at a
+// time, in ascending (subject, provider) order.
+//
+// Rotate visits every credential, and loading the whole vault into memory to do it
+// does not scale with the number of accounts. A repo that can page is asked for
+// pages; one that cannot keeps using List — which is why this is a separate
+// interface rather than another method on Repo, whose implementations include
+// third-party ones.
+//
+// An empty cursor is the start of the list.
+type RecordPager interface {
+	ListPage(ctx context.Context, afterSubject, afterProvider string, limit int) ([]Record, error)
+}
+
 // MemoryRepo is a non-durable Repo for development and tests.
 type MemoryRepo struct {
 	mu      sync.RWMutex
@@ -133,7 +147,12 @@ func (r *MemoryRepo) Delete(_ context.Context, id Identity) error {
 	return nil
 }
 
-// List implements Repo, ordered by identity so two runs agree.
+// List implements Repo, ordered by (subject, provider) so two runs agree — and so
+// the order matches the Postgres adapter's `ORDER BY subject, provider` and the
+// cursor ListPage compares against. Identity.String() renders it the other way
+// round (provider:subject), and ordering by that was a real bug: the pager's
+// cursor then disagreed with the listing's order, so a rotation walked some
+// records twice and others not at all.
 func (r *MemoryRepo) List(_ context.Context) ([]Record, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -142,13 +161,57 @@ func (r *MemoryRepo) List(_ context.Context) ([]Record, error) {
 	for id := range r.records {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+	sort.Slice(ids, func(i, j int) bool { return identityLess(ids[i], ids[j]) })
 
 	out := make([]Record, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, cloneRecord(r.records[id]))
 	}
 	return out, nil
+}
+
+// identityLess orders identities the way every listing and cursor does.
+func identityLess(a, b Identity) bool {
+	if a.Subject != b.Subject {
+		return a.Subject < b.Subject
+	}
+	return a.Provider < b.Provider
+}
+
+// ListPage implements RecordPager: the records after the cursor, in the same order
+// List returns them.
+func (r *MemoryRepo) ListPage(_ context.Context, afterSubject, afterProvider string, limit int) ([]Record, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	all, err := r.List(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Record, 0, limit)
+	for _, rec := range all {
+		if !recordAfter(rec.Identity, afterSubject, afterProvider) {
+			continue
+		}
+		out = append(out, rec)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// recordAfter reports whether id sorts after the (subject, provider) cursor. An
+// empty cursor is the start of the list, which is safe because a stored identity
+// always has both fields set.
+func recordAfter(id Identity, subject, provider string) bool {
+	if subject == "" && provider == "" {
+		return true
+	}
+	if id.Subject != subject {
+		return id.Subject > subject
+	}
+	return id.Provider > provider
 }
 
 // DeleteSubject implements Repo.

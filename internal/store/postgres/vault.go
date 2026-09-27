@@ -21,10 +21,32 @@ const vaultCols = `subject, provider, version, wrapped_dek, kek_id, nonce, ciphe
 //
 // One scan of the table, ordered so the same rotation run twice agrees with
 // itself. It exists for key rotation; nothing on the read path enumerates
-// credentials, and the set of identities is itself personal data.
+// credentials, and the set of identities is itself personal data. Rotation prefers
+// ListPage, which is the same order without the whole vault in memory.
 func (s *Vault) List(ctx context.Context) ([]vault.Record, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT `+vaultCols+` FROM vault_credentials ORDER BY subject, provider`)
+	return s.queryRecords(ctx, `SELECT `+vaultCols+` FROM vault_credentials ORDER BY subject, provider`)
+}
+
+// ListPage implements vault.RecordPager: the same order as List, one page at a
+// time, keyed on the primary key. Rotation walks the vault with it rather than
+// holding every credential in memory.
+func (s *Vault) ListPage(ctx context.Context, afterSubject, afterProvider string, limit int) ([]vault.Record, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	if afterSubject == "" && afterProvider == "" {
+		return s.queryRecords(ctx,
+			`SELECT `+vaultCols+` FROM vault_credentials ORDER BY subject, provider LIMIT $1`, limit)
+	}
+	return s.queryRecords(ctx,
+		`SELECT `+vaultCols+` FROM vault_credentials
+		  WHERE (subject, provider) > ($1, $2)
+		  ORDER BY subject, provider
+		  LIMIT $3`, afterSubject, afterProvider, limit)
+}
+
+func (s *Vault) queryRecords(ctx context.Context, query string, args ...any) ([]vault.Record, error) {
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -32,13 +32,64 @@ import (
 //     the source, which is why §6.0 of the threat model says so rather than
 //     offering a command that looks like a fix.
 func (s *service) Rotate(ctx context.Context) (Rotation, error) {
-	records, err := s.repo.List(ctx)
-	if err != nil {
-		return Rotation{}, fmt.Errorf("vault: rotate: list: %w", err)
+	var out Rotation
+
+	// A repo that can page is walked a page at a time: rotation visits every
+	// credential in the deployment, and holding all of them at once does not scale
+	// with the number of accounts. The cursor is the last record read, and rotation
+	// never changes a record's identity, so paging is stable under the writes it
+	// makes.
+	if pager, ok := s.repo.(RecordPager); ok {
+		var afterSubject, afterProvider string
+		for {
+			page, err := pager.ListPage(ctx, afterSubject, afterProvider, rotatePageSize)
+			if err != nil {
+				return out, fmt.Errorf("vault: rotate: list: %w", err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			if err := s.rotateRecords(ctx, page, &out); err != nil {
+				return out, err
+			}
+			if len(page) < rotatePageSize {
+				break
+			}
+			last := page[len(page)-1]
+			afterSubject, afterProvider = last.Identity.Subject, last.Identity.Provider
+		}
+	} else {
+		records, err := s.repo.List(ctx)
+		if err != nil {
+			return out, fmt.Errorf("vault: rotate: list: %w", err)
+		}
+		if err := s.rotateRecords(ctx, records, &out); err != nil {
+			return out, err
+		}
 	}
 
+	// One event for the operation rather than one per record: the counts are the
+	// part anyone reads, and a rotation over a large vault should not flood the log
+	// it is meant to be auditable in.
+	_ = s.record(ctx, audit.Event{
+		Action:  "vault.rotate_keys",
+		Outcome: audit.OutcomeOK,
+		Detail: map[string]string{
+			"to_key":    s.current.KeyID(),
+			"scanned":   strconv.Itoa(out.Scanned),
+			"rewrapped": strconv.Itoa(out.Rewrapped),
+		},
+	})
+	return out, nil
+}
+
+// rotatePageSize is how many records one page of a rotation holds.
+const rotatePageSize = 200
+
+// rotateRecords re-wraps the DEK of every record that is not on the current key,
+// accumulating what it examined into out.
+func (s *service) rotateRecords(ctx context.Context, records []Record, out *Rotation) error {
 	current := s.current.KeyID()
-	var out Rotation
 	for _, rec := range records {
 		out.Scanned++
 		aad := bindingAAD(rec.Version, rec.Identity.Subject, rec.Identity.Provider)
@@ -50,7 +101,7 @@ func (s *service) Rotate(ctx context.Context) (Rotation, error) {
 			// user unable to reach their own data.
 			dek, err := s.current.Unwrap(ctx, rec.WrappedDEK, aad)
 			if err != nil {
-				return out, fmt.Errorf(
+				return fmt.Errorf(
 					"vault: rotate: %s is tagged %q but the current key cannot unwrap it: "+
 						"the key material changed without changing kek_id: %w",
 					rec.Identity, current, err)
@@ -62,40 +113,27 @@ func (s *service) Rotate(ctx context.Context) (Rotation, error) {
 
 		old, ok := s.keys[rec.KEKID]
 		if !ok {
-			return out, fmt.Errorf(
+			return fmt.Errorf(
 				"vault: rotate: %s was wrapped by key %q, which is not configured; "+
 					"declare it as a retired key and run again", rec.Identity, rec.KEKID)
 		}
 		dek, err := old.Unwrap(ctx, rec.WrappedDEK, aad)
 		if err != nil {
-			return out, fmt.Errorf("vault: rotate: unwrap %s: %w", rec.Identity, err)
+			return fmt.Errorf("vault: rotate: unwrap %s: %w", rec.Identity, err)
 		}
 		wrapped, err := s.current.Wrap(ctx, dek, aad)
 		Scrub(dek)
 		if err != nil {
-			return out, fmt.Errorf("vault: rotate: re-wrap %s: %w", rec.Identity, err)
+			return fmt.Errorf("vault: rotate: re-wrap %s: %w", rec.Identity, err)
 		}
 
 		rec.WrappedDEK = wrapped
 		rec.KEKID = current
 		rec.UpdatedAt = time.Now().UTC()
 		if err := s.repo.Put(ctx, rec); err != nil {
-			return out, fmt.Errorf("vault: rotate: persist %s: %w", rec.Identity, err)
+			return fmt.Errorf("vault: rotate: persist %s: %w", rec.Identity, err)
 		}
 		out.Rewrapped++
 	}
-
-	// One event for the operation rather than one per record: the counts are the
-	// part anyone reads, and a rotation over a large vault should not flood the log
-	// it is meant to be auditable in.
-	_ = s.record(ctx, audit.Event{
-		Action:  "vault.rotate_keys",
-		Outcome: audit.OutcomeOK,
-		Detail: map[string]string{
-			"to_key":    current,
-			"scanned":   strconv.Itoa(out.Scanned),
-			"rewrapped": strconv.Itoa(out.Rewrapped),
-		},
-	})
-	return out, nil
+	return nil
 }
