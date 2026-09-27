@@ -1,0 +1,288 @@
+# 前端（SvelteKit SPA + 内嵌服务路径 + CSP）审计报告
+
+> 区域：`web/**`、`internal/webui/**`、浏览器平面的 CSP。
+> 方法遵循 `docs/audit-5/BRIEF.md` §3：每条发现要么有一条**真的跑过的测试**，要么**读代码到行**。
+
+## 范围与方法
+
+**读过（全部逐行）**：`web/src/**`（6 个路由页面 + `+layout.svelte`/`+error.svelte`/`+layout.ts`、`lib/api.ts`、`lib/errors.ts`、`lib/a11y.ts`、`lib/index.ts`、8 个 `lib/components/**.svelte`、`app.html`、`app.css`）、`web/vite.config.ts`、`web/package.json`、`web/.npmrc`、`web/pnpm-lock.yaml`（importers 段）、`web/scripts/*.mjs`、`web/static/*`、`web/e2e/*.spec.ts`（12 个既有 spec）、`web/playwright.config.ts`、`internal/webui/webui.go` 与 `webui_test.go`、`internal/httpapi/{server.go,middleware.go,authorization_routes.go,device_routes.go,session_routes.go,idp_routes.go,frontend_test.go,security_headers_test.go}`、`internal/oidchttp/oidchttp.go` 的 consent 段（`DescribeAuthorization`/`ApproveAuthorization`）、`internal/oidcstore/oidcstore.go` 的 scope 策略段、`internal/auth/auth.go`、`internal/safeurl/safeurl.go`、`internal/federation/missing.go`、`internal/webui/dist/index.html`。
+
+**跑过的命令与结果**（本机 Windows 11，Node 24.17，pnpm 11.8）：
+
+```sh
+cd web && pnpm run check
+#   svelte-check found 0 errors and 0 warnings                     （exit 0）
+cd web && pnpm run build          # 见下方「构建说明」
+#   ✔ 165 modules / 181 modules transformed，Wrote site to "../internal/webui/dist"，exit 0
+cd web && node scripts/check-bundle-size.mjs
+#   js 20 files 156.8 KiB (63.3 KiB gzipped) / css 1 file 19.5 KiB / budget js 200 KiB css 24 KiB → 通过
+go test ./internal/zzprobe/frontendaudit/ -v      # 7 条探针，全绿（输出见各条证据）
+cd web && pnpm exec playwright test --grep-invert @visual --reporter=list
+#   64 passed（含我新加的 18 条对抗用例）
+cd web && pnpm audit --registry=https://registry.npmjs.org --audit-level low
+#   1 vulnerabilities found — Severity: 1 low（cookie <0.7.0，GHSA-pxg6-pf52-xh8x）
+cd web && pnpm audit --registry=https://registry.npmjs.org --audit-level high   # exit 0（CI 用的就是这个门）
+```
+
+**构建说明（BRIEF 要求显式声明）**：我**跑了 4 次** `cd web && pnpm run build`（第 1 次为审计早期，后 3 次为可复现性对照）。**`!` 更正与确认**：`internal/webui/dist/.gitignore` 的内容是 `*` + `!.gitignore` + `!.gitkeep`，被忽略的只有构建产物 —— `git check-ignore -v internal/webui/dist/index.html` 输出 `internal/webui/dist/.gitignore:1:*	internal/webui/dist/index.html`，且 `git status --porcelain internal/webui/dist` **始终为空**（每次构建后都复核过）。所以：**构建不会污染被跟踪的树**，而被跟踪的只有那两个占位文件（`git ls-files internal/webui/dist`）。
+
+**审计开始时磁盘上就已经有真实构建**：`index.html` 存在（`webui.Built` 为真），审计开始时它的 CSP meta 与其他产物**已先按原样读取**（见 A-FE-9 的证据），随后第 1 次构建产出的 `index.html` 与它**逐字节一致**（`sha256` 相同，`script-src` 的哈希同为 `sha256-hmKSyb9MK624S0VCmGl2StNqMGwjfW+uQ2nREdu5Se8=`），其余 26 个文件也逐字节一致 —— 即那份产物本来就来自同一份源码，`pnpm run build` 在这台机器上是**可复现**的（这一点后来成为 A-FE-9 的对照）。报告里关于 CSP 的每一条结论都同时来自「原地读产物」与「构建后读产物」两个状态。
+
+**没有跑成的**：`pnpm run lint` —— `web/package.json` 里**没有** `lint` 脚本（只有 `check`/`check:bundle`/`test:e2e`/`test:visual`）。`svelte-check` 是仓库声明的前端静态分析（`.github/workflows/ci.yml:106-108`），我跑了它。
+`pnpm audit --prod` 在本机**无法完成**：默认 registry 是 `registry.npmmirror.com`，该镜像没有实现 audit 端点，报 `ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS`。改用 `--registry=https://registry.npmjs.org` 后成功（结果见 A-FE-8）。**顺带一个事实**：`pnpm audit --prod` 在本项目语义上是空操作 —— 前端**没有任何 `dependencies`**，全部依赖都在 `devDependencies`（`web/package.json:19-31`），所以「生产依赖无告警」这句话本身不承载信息。
+
+**探针文件**（BRIEF §4；只新建，未改动任何已跟踪文件）：
+
+| 路径 | 内容 |
+|---|---|
+| `internal/zzprobe/frontendaudit/probe_test.go` | 7 条 Go 探针：CSP 头不重述、缓存指令、条件请求/Range、穿越不逃出 dist、**构建产物里内联脚本的 sha256 与 meta 声明一致**、产物里没有 `.map`/源码/绝对外链、robots 字节、HEAD 契约 |
+| `web/e2e/zzadversary-frontend.spec.ts` | 11 条浏览器对抗用例：CSP 真被浏览器执行、策略形状、哈希生效、显示/授予 scope 不背离、`user_code`/`id` 反射不成为标记、**每个非 GET 都带 `X-CSRF-Token`**、`return_to` 不离开源、`javascript:` 不作跳转、令牌不进 URL/存储/DOM、勾选不会凭空扩权 |
+| `web/e2e/zzadversary-headers.spec.ts` | 4 条：文档头、shell 无验证器、Range 实况、无 opener/top/子框架 |
+| `web/e2e/zzadversary-responses.spec.ts` | 3 条：API 返回 3xx 不变成跳转、畸形 problem 不进标记、越界 `risk` 不白屏 |
+| `docs/audit-5/probes/web/scope-narrowing.mjs` | 端到端脚本：`displayed`（同意页拿到什么）/ `sent`（页面发回什么）/ `granted`（令牌真拿到什么）三集对比 |
+| `docs/audit-5/probes/web/bundle-hygiene.mjs` | 扫构建产物：dev-only 标记（localhost/debugger/console/sourcemap/dev 分支）、密钥形状（私钥/云凭据/JWT/长 base64）、shell 引用是否都存在、是否引用站外、长度预算与最大文件 |
+| `docs/audit-5/probes/web/bundle-hygiene2.mjs` | 第二遍（第一遍的孤立块判定是假阳性，已修正）：从 shell 出发的可达性、`console.*` 精确清点、`svelte.dev` 警告串的语境、产物内所有绝对 URL 与请求路径 |
+
+---
+
+## 发现
+
+### A-FE-1 SPA shell 没有缓存验证器，只剩 `Cache-Control: no-cache` 一层
+- 严重度: **中**
+- 类别: 安全 / 可用性
+- 不变量: **被部署的 HTML 与它所声明的 CSP 哈希必须是同一份构建**；发行产物必须能自证新鲜度
+- 证据:
+  - `internal/webui/webui.go:143-150` 的 `setCacheHeaders` 只写 `Cache-Control`；`webui.go:129` 用 `http.ServeFileFS` 落盘。`embed.FS` 里 `fs.FileInfo.ModTime()` 是零值，所以标准库**不会**生成 `Last-Modified`；代码也没有装 `ETag`。
+  - 实测（`zzadversary-headers.spec.ts:36`，chromium）：
+    ```
+    [probe] shell validators: etag=undefined last-modified=undefined bytes=3154
+    ```
+    同一条用例里 `If-None-Match` / `If-Modified-Since` 分支因为验证器不存在而**根本没有执行** —— 即条件请求这条路在实现上不存在。
+  - `internal/zzprobe/frontendaudit/probe_test.go:TestProbeConditionalRequestsAndRange` 输出 `/app/ validators: ETag="" Last-Modified=""`，随后断言被跳过（探针保留这个事实）。
+  - 守卫现状：`internal/webui/webui_test.go:52-85` 只断言 `Cache-Control` 的值；`internal/httpapi/frontend_test.go:149-164` 只断言头里没有 `script-src` 等。**没有任何测试要求这个响应可被条件验证**。
+- 状态: **CONFIRMED**（浏览器实测 + 行级）
+- 影响: 直接浏览器路径上 `no-cache` 语义是正确的（每次都向源站校验）。风险在**边缘**：源站是唯一说「不要缓存」的一方，任何按自身启发式（RFC 9111 §4.2.2 允许对没有显式新鲜度信号的响应猜测新鲜度）处理的中介/企业代理/被包装的 CDN，都可以把 3 KiB 的 shell 缓存住。而 shell 是**唯一携带 `script-src 'sha256-…'` 的文档**（`internal/webui/dist/index.html:23`）：旧 shell + 新构建的资产名 = 白屏，或反过来旧 shell + 新哈希 = 启动脚本被 CSP 拦下、同样白屏。这正是第三个审计已经找到过的那一类故障（见 `docs/architecture.md` §4.7 末尾），只是触发条件从「Go 头重述策略」换成了「陈旧 shell」。第二个后果更小但确定：每次导航都重新下载完整 shell（明文 3304 B，gzip 后 1743 B，实测响应头 `content-length: 1743`），因为没有任何东西能让它拿到 304。
+- 修法建议: 在 `webui.Handler` 首次调用时对 `index.html` 的字节算一次强 `ETag`（例如 sha256 前缀）并缓存，对 shell 走 `Set("ETag", …)`；`http.ServeFileFS` 会在带 `If-None-Match` 时回 304。这同时把「shell 变了」变成一次可观测的字节级事实，而不再依赖部署方记得清缓存。**不是**裁定，是纵深防御。
+- 复现/守卫: `internal/zzprobe/frontendaudit/probe_test.go` 的 `TestProbeConditionalRequestsAndRange`（今天只记录、不断言，修好后应改为断言 304）；浏览器侧 `web/e2e/zzadversary-headers.spec.ts` 的 *the shell has no validator…*
+
+### A-FE-2 对 HTML 文档响应 `Range`，源站回 206 与半截 shell
+- 严重度: **中**
+- 类别: 安全 / 可用性
+- 不变量: 一个 HTML 文档要么整份送达，要么明确拒绝；不得把「文档的一部分」当作该 URL 的合法实体
+- 证据:
+  - `internal/webui/webui.go:129` 直接交给 `http.ServeFileFS`，没有对 shell 关掉 Range。
+  - Go 探针实测（`TestProbeConditionalRequestsAndRange`）：
+    ```
+    Range bytes=0-3 on the shell: 206 "<!do" (Content-Range="bytes 0-3/35")
+    ```
+  - 浏览器/真实产物实测（`zzadversary-headers.spec.ts:61`）：
+    ```
+    [probe] Range: bytes=0-9 on the shell -> 206 content-range="bytes 0-9/3304" body="<!doctype "
+    ```
+- 状态: **CONFIRMED**（两条独立实测）
+- 影响: 一个 `Range: bytes=10-` 的请求（下载管理器、断点续传工具、或任何把 206 当作可缓存实体的中介）可以让缓存里出现一份**截断到一半的 shell**。截断的 shell 里 `script-src` 的 meta 可能缺失：那份文档于是只剩 Go 头里的 `frame-ancestors 'none'`，**完全没有 `script-src` 约束**；如果它是被中介缓存下来再分发给别人的那份，那么别人拿到的是一份没有脚本策略的同意页文档。这不是「攻击者能注入」，而是「一个文档可能以它不被允许的半截形态流通」。就浏览器导航本身而言风险低（浏览器不会对导航发 Range）。
+- 修法建议: 对 `name == "index.html"` 的响应先 `del r.Header["Range"]; del r.Header["If-Range"]`（或自己写 `w.Write`），把 shell 变成 200-only；`_app/immutable/*` 保持可 Range（那里按字节续传是正常需求）。
+- 复现/守卫: `internal/zzprobe/frontendaudit/probe_test.go` 的 `TestProbeConditionalRequestsAndRange`；浏览器侧 `web/e2e/zzadversary-headers.spec.ts` 的 *a Range request against the shell…*
+
+### A-FE-3 同意页显示的 scope 集合 ≠ 服务器授予的 scope 集合（OIDC claim scope 静默补授）
+- 严重度: **低**
+- 类别: 合规/隐私（知情同意的完整性）
+- 不变量: 用户在同意页上看到的权限集合，必须等于这次授权最终生效的权限集合（至少要有一次显式说明，而不是静默）
+- 证据（端到端实跑，`docs/audit-5/probes/web/scope-narrowing.mjs`，请求 `openid profile email account.id`）：
+  ```
+  requested: openid profile email account.id
+  displayed: account.id
+  sent     : account.id
+  granted  : account.id openid profile email
+  granted but never displayed: openid profile email
+  ```
+  链路到行：
+  - 同意页只渲染目录能描述的 scope：`internal/httpapi/authorization_routes.go:185-201`（`scopeViews` 里 `if !ok { continue }` —— 目录里没有的 scope **被静默丢弃**）。
+  - 页面把「显示出来的那些」原样发回：`web/src/routes/consent/+page.svelte:99-108`（`scopes: granted`，而 `granted` 由 `request.scopes` 推出）。
+  - 服务端在批准时**把协议 scope 重新贴回**：`internal/oidchttp/oidchttp.go:1251-1262` 的注释自己写明「同意页渲染目录，所以它无法把协议 scope 回显 —— 重新贴上客户端要过的协议 scope」；验收它们的是 `internal/oidcstore/oidcstore.go:274-283` 的 `StandardOIDCScope`，把那 6 个名字当成「不需要问目录」。
+  - 这不是「会话里多了一串字符串」而已：`sanitizeTokenResponse` 只剥 `offline_access`，所以 `profile`/`email` **出现在令牌响应的 `scope` 字段里**（上面实测），即客户端拿到的是「已授予 `profile email`」的书面事实，而用户从未在屏幕上见过它们。
+- 状态: **CONFIRMED**（机制与后果均实跑）；**可利用性：本轮未构出**。今天被补授的三个名字都是 claim scope，而本部署的 userinfo 只返回 `sub`（`oidcstore.go:255-262` 的注释与 O-3 决定），所以它们对应不上任何真实数据能力 —— 收益是「令牌宣称了一个用户没同意的声明权限」，不是「读到了别人的数据」。
+- 影响: 同意页「该应用将获得以下权限」这一句在最上面（`consent/+page.svelte:202`）**严格来说是假的**：它列的是数据权限，而令牌同时带着用户没见过的 claim 权限。危险形状是同一条通道的推广：只要将来有任何一个**数据** scope 落进 `StandardOIDCScope` 这一类（或目录 `Resolve` 失败而调用方忽略错误），同一段代码就会**静默授予一个用户从未看到的权限**，因为批准是基于 `requested` 而不是 `displayed` 收窄的（`oidchttp.go:1235-1250`）。
+- 修法建议（三选一，都需要裁定，不是顺手改）：①把「本应用还会请求 OIDC 标准声明（openid/profile/email），本服务目前不返回任何声明」写成同意页上的一行常驻说明 —— 最小、最诚实；②让 `scopeViews` 对**拿不到描述符但不属于协议白名单**的 scope 回一个显式的「未描述」占位而不是 `continue`；③不改 UI，改为给 `NarrowScopes` 加一条不变量：批准集合必须覆盖 `displayed`（把「显示 = 授予」变成服务端性质）。
+- 复现/守卫: `docs/audit-5/probes/web/scope-narrowing.mjs`（退出码 2 = 出现了非协议 scope 的静默授予，正是给将来那条通道准备的守卫）；浏览器侧 `web/e2e/zzadversary-frontend.spec.ts` 的 *displayed scopes and granted scopes cannot diverge*（今天把这个背离**显式允许**，注释里写明是架构决定）。
+
+### A-FE-4 `web/svelte.config.js` 不存在 —— 构建配置只活在 `vite.config.ts` 里
+- 严重度: 低
+- 类别: 可维护性
+- 不变量: 一个仓库声明的构建契约，必须能被另一名维护者读到
+- 证据: `web/` 下没有 `svelte.config.*`（`Get-ChildItem -Recurse -Filter svelte.config.*` 无结果）；全仓库（docs/web/scripts/.github/Makefile）搜 `svelte\.config` **零命中**。实际的 kit 配置内联在 `web/vite.config.ts:46-110` 的 `sveltekit({…})` 里（`adapter`/`paths.base`/`csp` 都在那）。
+- 状态: **CONFIRMED**（行级 + 全仓库搜索）
+- 影响: `docs/architecture.md` §4.6 与 §4.7 都写「See `web/vite.config.ts` (`kit.csp`)」，所以**现有文档是对的**；但这与「SvelteKit 的标准布局」以及本次审计任务书里的路径假设都不一致。风险是下一个人按惯例去开 `svelte.config.js`、发现没有、于是**新建**一个 —— 而 SvelteKit 会把两份配置合并/覆盖，`base` 与 `csp` 就在两处各有一个答案，正是 `internal/webui/webui_test.go:22-35` 那条「base 必须与 Go 的挂载点一致」守卫**看不到**的那种漂移（它读的是 `vite.config.ts`）。
+- 修法建议: 要么在 `web/README.md` 里写明「本仓库刻意不使用 `svelte.config.js`，配置在 `vite.config.ts` 的 `sveltekit()` 里」，要么就把配置搬回标准位置并让 `webui_test.go` 改读它。
+- 复现/守卫: 无（纯文档/布局事实）；建议加一条 archtest 风格守卫：`web/` 下若同时存在两份 kit 配置即失败。
+
+### A-FE-5 CI 的依赖审计门是 `--audit-level high`，图中唯一的告警恰好在门槛之下
+- 严重度: 低
+- 类别: 安全（供应链）
+- 不变量: 依赖图中已知告警要么被处置，要么被**显式**接受，而不是落在阈值下面无人知晓
+- 证据:
+  ```
+  cd web && pnpm audit --registry=https://registry.npmjs.org --audit-level low
+  cookie  <0.7.0  low  "cookie accepts cookie name, path, and domain with out of bounds characters"
+     Paths: .>@sveltejs/adapter-static>@sveltejs/kit>cookie | .>@sveltejs/kit>cookie
+     Patched: >=0.7.0        Advisory: GHSA-pxg6-pf52-xh8x
+  → 1 vulnerabilities found / Severity: 1 low / exit 1
+
+  cd web && pnpm audit --registry=https://registry.npmjs.org --audit-level high
+  → 1 vulnerabilities found / Severity: 1 low / exit 0        # CI 用的就是这条（.github/workflows/ci.yml:335-337）
+  ```
+  实装版本：`node_modules/cookie/package.json` = `0.6.0`，锁文件里只有一条 `cookie: 0.6.0`，由 `@sveltejs/kit@2.70.3` 直接依赖（同时安装了 `@types/cookie@0.6.0`）。
+- 状态: **CONFIRMED**（命令 + 输出），影响面为 **HYPOTHESIS**（未复现）
+- 影响: 本部署用 `adapter-static`、`ssr=false`，构建产物里**没有**任何服务端运行时代码，`cookie` 只出现在 SvelteKit 的服务端/开发服务器路径上，所以这条告警在**发行产物**里不可达，我不把它当作漏洞报。真正的问题是流程性的：这条告警永远不会让 CI 变红，因此永远不会出现在任何人的视野里，也就不会被显式接受。`docs/dependencies.md` 的立场是「不进 CI 的检查不算检查」 —— 这一条恰好落在那个立场之外。
+- 修法建议: 要么把门收到 `--audit-level low` 并在告警出现时显式处置（加 allowlist + 理由），要么在 `docs/dependencies.md` 里写下「low 阈值以下不阻断，理由是 X」。
+- 复现/守卫: 无自动化守卫；建议加一条 CI 步骤把 `pnpm audit --audit-level low --json` 的**结果条数**落进 job summary，让「未处置但已知」与「未知」分开。
+
+### A-FE-6 `internal/webui` 只对 shell 设文档策略，非 HTML 资源不带 CSP
+- 严重度: 低
+- 类别: 安全（纵深防御）
+- 不变量: 交付到浏览器的东西，其内容类型与策略来源必须是同一个决定
+- 证据: `internal/webui/webui.go:123-127` 只在 `name == "index.html"` 时 `Set("Content-Security-Policy", shellCSP)`。实测（`TestProbeShellHeaderNeverRestatesABuildDirective`）：shell 三条路由都带 `frame-ancestors 'none'`，而 `/app/_app/immutable/entry/start.js` 与 `/app/favicon.svg` 的 `Content-Security-Policy` 为**空**。
+- 状态: **CONFIRMED**（行级 + 实测）。**但这不是可达漏洞**：真实组合里 `webui.Handler` 永远被 `internal/httpapi` 的 `withSecurityHeaders`（`middleware.go:80-95`，`h.Set("Content-Security-Policy", cspFrameAncestorsNone)`）包着，我用真实二进制实测 `/app/consent` 拿到了完整的三个头（`zzadversary-headers.spec.ts` 输出）。
+- 影响: 只有在有人把 `webui.Handler` 单独挂出去（或把它挪到 `withSecurityHeaders` 之外）时，这个包才会**独自交付一份不带 `frame-ancestors` 的 HTML**，而 `frontend_test.go:149-164` 那条守卫只检查「头里没有 script-src」，不检查「头里有没有 frame-ancestors」。另外 `writeNotBuilt`（`webui.go:154-166`）返回 503 的 HTML 内含内联 `style=`，如果哪天真把这个包的策略扩到非 HTML 响应上，它会立刻自伤。
+- 修法建议: 把 `shellCSP` 扩成「任何 `text/html` 响应」而不是「任何名为 index.html 的响应」，并在 `webui_test.go` 里断言 `frame-ancestors` 在 shell 上**存在**（现在只断言在 API 侧存在）。
+- 复现/守卫: `internal/zzprobe/frontendaudit/probe_test.go` 的 `TestProbeShellHeaderNeverRestatesABuildDirective`（同时钉住「不重述其它指令」，防止修法过头变回白屏 bug）。
+
+### A-FE-7 同意页与设备页处在同一个带主导航的布局里，没有任何「你正在做一次授权决定」的框架
+- 严重度: 低
+- 类别: 安全（同意页可信度 / 可用性）
+- 不变量: 用户在同意页上做出的安全决定，应当是这一屏幕上唯一显眼的事情
+- 证据: `web/src/routes/+layout.svelte:52-64` 的 `<nav>` 与 header 对**所有**路由生效，`/app/consent` 与 `/app/device` 也在内 —— 浏览器实测（`zzadversary-responses.spec.ts` 打印的可见文本）在同意页顶部渲染出 `r0 Re0Auth 账号 应用 数据源 授权请求 …`，与账号页一模一样。设计意图写在 `app.html:14-19`：「同意与设备页是攻击者最想仿冒的页面，所以应用不假装自己是通用登录页」，而布局并没有把这两个页面与普通页面区分开。
+- 状态: **CONFIRMED**（行级 + 渲染文本）
+- 影响: 同意页缺少视觉上的「这是一次授权决定」的框架，导航链接还提供了离开这个决定的出口（用户点「账号」就等于放弃这次待决请求，且没有任何提示）。这一条是**可用性/可信度**问题，不是注入问题。
+- 修法建议: 让 `+layout.svelte` 在 `page.url.pathname` 命中 `/consent` `/device` 时收起主导航（或在同意页顶部加一条常驻横幅说明这是 Re0Auth 自己的域名与页面）。属于设计裁定。
+- 复现/守卫: `web/e2e/zzadversary-responses.spec.ts` 的第三条用例会把这个页面的可见文本打进日志，可作回归观察点。
+
+### A-FE-8 未使用的 `web/src/lib/assets/favicon.svg` 是 Svelte 官方 logo
+- 严重度: 提示
+- 类别: 合规/隐私（品牌）
+- 不变量: 「应用无法自行更改的名字/标识」不应包含别人的商标
+- 证据: `web/src/lib/assets/favicon.svg:1` 仍是上游模板的 `<title>svelte-logo</title>` 与 `#ff3e00`。实际被服务的是 `web/static/favicon.svg`（正确的 r0 标记，`internal/webui/dist/favicon.svg`，`app.html:20` 引用它），所以**用户看不到这个文件**。
+- 状态: **CONFIRMED**（行级）
+- 影响: 无运行时影响。风险是有人沿 `$lib/assets` 这条惯例把它接进页面 —— 那会把一枚 Svelte 商标放到「用户做安全决定」的页面上。另外项目自己有一条产物卫生守卫（我写的 `TestProbeBuiltAssetsCarryNoBuildOnlyArtifacts` 已纳入"无源码/无 map/无 manifest"），但这条守卫只看 `dist`，看不见源码树里的未使用资源。
+- 修法建议: 删掉该文件，或换成真正的品牌标记。
+
+### A-FE-9 构建不可复现：一个毫秒级时间戳进入客户端包，把 12/20 个 JS 分块的内容与文件名一起改写
+- 严重度: **中**
+- 类别: 安全（发布产物可复现性 / 供应链证据）
+- 不变量: 同一份源码应当产出同一份产物；按**内容**命名的缓存键必须真的按内容命名
+- 证据（同一份源码、同一条命令，连续构建两次，逐文件 sha256 对照）：
+  ```
+  run1 files: 27   run2 files: 27
+  文件名集合完全不同的 12 个（全部在 _app/immutable 下的 js）：
+    chunks/CEtvxRdi.js      → chunks/BGyvQZmW.js
+    chunks/D7I62jMR.js      → chunks/B019G4f9.js
+    entry/app.BOZfHjUl.js   → entry/app.fzCfP_LJ.js
+    entry/start.DOHMHvWH.js → entry/start.CKNzYS7A.js
+    nodes/0.B-xYEnzw.js … nodes/7.CgkxoW9A.js → nodes/0.BIFLhlcw.js … nodes/7.BbzFHjxS.js
+  另外 8 个名称与字节都不变：B-QHV2o-.js Bjy-W4x2.js BL9iZmFo.js C4-MImpy.js
+                              CMjOogQM.js De2DKpGU.js DRAqnp8I.js xihTtKlq.js
+  index.html / version.json 内容随之改变（引用的文件名不同 / 版本号不同）
+  ```
+- 根因（逐层追到行）：
+  1. `_app/version.json` 装的是**构建时刻的毫秒时间戳**：`{"version":"1790525540052"}` vs `{"version":"1790525552590"}`（`DateTimeOffset.FromUnixTimeMilliseconds` → 2026-09-27 16:12:20 / 16:12:32 UTC —— 正是两次构建的时间）。它是 SvelteKit 的默认版本号（源码里没有设 `version.name`，`web/vite.config.ts:46-110` 的 `sveltekit({…})` 里也没有这一项）。
+  2. 那个时间戳被**内联进客户端**：唯一含 13 位时间戳的分块是 `chunks/BGyvQZmW.js`（第二遍扫描逐文件 grep `\b1\d{12}\b`，20 个分块里命中 1 个）；同一分块里还有 `fetch(`${de}/_app/version.json`, {headers:{pragma:'no-cache','cache-control':'no-cache'}})` —— 这就是客户端的版本检查（部署后提示重载）。
+  3. 该分块的内容变了 ⇒ 它的**内容哈希变了** ⇒ 指向它的 import 说明符变了 ⇒ **所有传递依赖它的分块内容也变了、哈希跟着变**。对照证实了这个级联的方向：只有 8 个不依赖它的分块字节不变，而变化的 12 个正好是「引用了那个分块 / 引用链经过它」的那批（`index.html`、`start.*.js`、`app.*.js`、`nodes/0..2`、`nodes/7` 里都能找到它的旧名字）。
+  4. `internal/webui/webui.go:145-146` 对 `_app/immutable/` 无条件发 `Cache-Control: public, max-age=31536000, immutable`。
+  5. **shell 自己的 CSP 哈希也随构建变**（同一机制的下游）：`script-src` 里的 `'sha256-…'` 是那段内联启动脚本的 SHA-256，而脚本体内含构建期值。三次构建实测依次是 `sha256-hmKSyb9MK624S0VCmGl2StNqMGwjfW+uQ2nREdu5Se8=`（审计开始时的原地产物）→ `sha256-hmKSy…`（第 1 次构建，与前者逐字节相同）→ `sha256-xJ1Vxb1JWIjPM8ldPFZN3OJtllvPOXwKeV6qEzkF/nQ=`（后续构建）。这一条**恰好证明**了「哈希由构建方计算、Go 侧只发 `frame-ancestors`」这个设计是对的（两者不会漂移，见 `internal/zzprobe/frontendaudit` 的哈希守卫，在每次构建后都重跑通过），但它同时说明：任何把 shell 与它的资产名分开缓存的部署，都会有两份各自会变的量。
+- 状态: **CONFIRMED**（两次构建逐文件哈希对照 + 时间戳与版本分块定位到行）
+- 影响:
+  - **给发布产物做完整性证据（SBOM、SHA256SUMS、`make release` 的 checksums、镜像 digest 复算）的人，无法用「源码相同 ⇒ 产物相同」来核对**：`internal/webui/dist` 每次构建都变。`docs/dependencies.md` / `Dockerfile` 把基础镜像按 digest 钉住的立场（「同一个 Dockerfile 产出同一个工具链」）正是这一条的反面 —— 工具链被钉住了，但**产物本身没有被钉住**。
+  - `immutable` 这个承诺与资产的真实生命周期不一致：文件名里的哈希不是内容摘要，上一版部署与新一版部署里**两个不同的字节序列会拿到同一个 URL**（`chunks/BGyvQZmW.js` 今天是这份内容，下次部署是另一份）。对**原子部署**（每次新容器、新旧并存）这不会错发内容 —— 这层保险是部署方式给的，不是 `immutable` 给的；它只是让「缓存一个 `immutable` URL」变成「缓存一个可能指向别的字节的 URL」。
+  - 与 A-FE-1 连起来是完整的故障链：旧 `index.html`（A-FE-1 的中介缓存）+ 新构建删掉了旧资产名 ⇒ 旧文档请求的资产在新部署里**不存在**（`http.ServeFileFS` 回 404，SPA 回落不会替脚本文件兜底），页面白屏；SvelteKit 的 `version.json` 轮询**恰好会在这种情况下失效**，因为它依赖的是**那份旧文档里已经加载的**那个分块，而那个分块已经没了。
+- 修法建议: 用 SvelteKit 自己的开关把版本改成**由源码决定**：在 `web/vite.config.ts` 的 `sveltekit({…})` 里加 `version: { name: process.env.RE0AUTH_BUILD ? process.env.RE0AUTH_BUILD : <git rev> }`（或由 `Makefile web` / `Dockerfile` 传一个 `RE0AUTH_BUILD`，与 `-ldflags -X main.version=` 复用同一个值）。这会把时间戳从产物里拿掉，同时让 12 个分块重新变成「按内容命名」、连续构建逐字节一致。**顺带**：`version.json` 目前无认证可读（`/app/_app/version.json` 经 `webui.Handler` 正常文件路径发出），因此**任何人只要知道部署地址就能读到构建时间戳** —— 修掉版本号即同时消掉这一比特信息。这属于裁定（是否愿意让构建产物带上可复现的构建标识），所以我把它写成发现 + 修法，而不是顺手改。
+- 复现/守卫: `docs/audit-5/probes/web/bundle-hygiene2.mjs`（打印版本分块与所有 `console.*`）；**建议加守卫**：一条命令连续构建两次并逐文件比对 sha256，不一致即失败 —— 这条守卫正是我今天用来证实它的方法，而 `.github/workflows/ci.yml` 里目前没有任何等价检查。
+
+### A-FE-10 发布产物里有 6 处 `console.warn`，带 `svelte.dev/e/…` 文档链接
+- 严重度: 提示
+- 类别: 安全（最小暴露面） / 可维护性
+- 不变量: 生产包不应包含开发态诊断；面向用户的页面不应往控制台写内部状态
+- 证据（`docs/audit-5/probes/web/bundle-hygiene2.mjs`，逐文件清点）：
+  ```
+  console.* call sites in shipped js: 7
+      6  _app/immutable/chunks/B-QHV2o-.js  [console.warn(]
+      1  _app/immutable/entry/app.DToPh9gB.js  [console.error(]
+  svelte.dev 出现 25 次，全部在该 vendor 分块里：
+    function Ce(){console.warn(`https://svelte.dev/e/derived_inert`)}
+    function we(e){console.warn(`https://svelte.dev/e/hydratable_missing_but_expected`)}
+    …（derived_inert / hydration_mismatch / lifecycle_outside_component / missing_context /
+       each_key_duplicate / effect_in_teardown / async_derived_orphan / 等）
+  请求路径清点（相对 /v1 的绝对路径共 13 个）：全部是 /v1/**；没有任何 console.log / console.debug / debugger /
+    sourceMappingURL / @vite/@fs/import.meta.env.DEV / NODE_ENV 分支
+  密钥形状扫描：0 命中（无私钥块、无云凭据、无 JWT、无 Bearer 字面量、无长 base64、无 usr_/cli_ 标识）
+  可达性：20 个 JS 分块**全部**从 shell 的 `start.*.js` / `app.*.js` 出发可达（0 个孤立块）
+  ```
+- 状态: **CONFIRMED**（行级 + 计数）。**未证实**：这些警告在运行时是否真的会触发（Svelte 5 生产构建会把 dev 块编译掉，而我没有构造出能触发 `derived_inert` / `missing_context` 的应用状态）。
+- 影响: 若这些警告在线上真的可触发，它们会把内部状态与文档链接写进**每一个用户的**控制台 —— 对同意页这种「用户正在做安全决定」的页面，控制台出现 Svelte 内部警告是不必要的暴露面，也是钓鱼者可以模仿的素材。价值主要不在这一条，而在于**没有任何检查在看着它**：`check-bundle-size.mjs` 只看体积，`pnpm run check` 只看类型/a11y，CI 也没有 grep 产物。唯一那处 `console.error` 在 `entry/app.*.js` 里，是 SvelteKit 的 hydration 失败路径（有意义的错误报告，不是调试噪音）。
+- 修法建议: 在 `web/scripts/` 下加一条产物 grep 守卫（与 `check-bundle-size.mjs` 同一位置、同一风格）：产物 js 里不允许出现 `console.log`/`console.debug`/`debugger`/`sourceMappingURL`/`localhost`；`console.warn` 出现即失败并打印所在文件与串。若确认 Svelte 的 dev 警告在产物里不可达，就在守卫里显式豁免并写清理由（这正是「把结论落成守卫」而不是写散文）。
+- 复现/守卫: `docs/audit-5/probes/web/bundle-hygiene2.mjs`。
+
+### A-FE-11 仓库根有一个名为 `%SC%` 的空目录
+- 严重度: 提示
+- 类别: 可维护性（脚本卫生）
+- 证据: `Get-Item -LiteralPath '%SC%'` → 目录，`LastWriteTime = 2026-09-26 12:30:11`，递归内容 **0 项**；`git status --porcelain -- '%SC%'` 与 `git ls-files -- '%SC%'` 均为空（未被跟踪、也不空转）。
+- 状态: **CONFIRMED**（观察）
+- 影响: 无运行时影响。它是一次**未被展开的 Windows 变量**（`%SC%` 是 `cmd.exe` 语法，而项目脚本用的是 PowerShell/bash —— 那种混用会把字面量当路径）。真实风险是同类笔误落在**有内容**的路径上：一条 `> %OUT%` 或 `mkdir %FOO%` 会静默写到字面量目录，而没有任何东西会报错。
+- 修法建议: 直接删掉这个空目录即可（未被跟踪）。**我没有删** —— 它属于部署/运维脚本的范围（`deploy/`、`Makefile`、CI），而那一片由 deploy-ops 子代理负责；在 `scripts/`、`web/scripts/`、`deploy/`、`config/`、`.github/`、`Makefile` 里搜 `%SC%` **零命中**，所以制造它的那条命令不在这些树里（更可能是某次一次性 shell 调用）。
+- 复现/守卫: 无（一次性清理）。
+
+### 判断（不是发现）：`form-action 'none'` 是被断言过的设计，不是漏配
+- 严重度: 提示 / 类别: 安全
+- 证据: `web/vite.config.ts:103-104` 的注释「No page here submits a native form; every action is a fetch」，以及构建产物 `internal/webui/dist/index.html:23` 的 `form-action 'none'`。
+- 我核对了两侧：设备页的表单是 `<form onsubmit={e => { e.preventDefault(); void submit(); }}>`（`web/src/routes/device/+page.svelte:188-194`），同意页根本没有 `<form>`（两个决策是 `Button onclick={() => decide(...)}`，`consent/+page.svelte:228-245`），全应用搜索 `fetch(` 只出现在 `lib/api.ts:336` 的 `call()` 里，`credentials: 'same-origin'`，相对路径。所以 `form-action 'none'` 关掉的是「页面自己提交表单」这条路，而校验 token 的表单提交正是被这条指令**阻止**的东西 —— 对同意/设备页这是净收益。
+- 附带事实（不是发现）：因为页面是纯 CSR，禁用 JS 的用户本来只会看到 `app.html:41-54` 的 `<noscript>` 说明，所以「`form-action 'none'` 挡住了 noscript 表单」没有额外损失。若将来要做 noscript 降级，这条指令必须先放开，且要连带放开的是 `script-src` 而不是它 —— 两者是不同的问题。
+
+---
+
+## 探过但没破的（这些也应变成守卫）
+
+- **没有任何 `{@html}`、`innerHTML`、`outerHTML`、`document.write`、`eval(`、`new Function(`、`insertAdjacentHTML`、`{@debug}`、`setTimeout('…')`、`localStorage`、`sessionStorage`、`document.cookie`、`window.name`**：对 `web/**/*.{ts,svelte,js,html,mjs}` 全量 grep 只有 1 处命中，而且是 `lib/api.ts:17` 的注释。⇒ 必须变成守卫：把这份 grep 写成 CI 的静态检查（或在 `svelte-check` 之外单加一条 `no-html-injection` 规则）。
+- **同意页面对「客户端名 + scope 标题/描述」是数据驱动的，但全部走 Svelte 默认转义**。`request.client.name` 来自 `internal/oidchttp/oidchttp.go:1216-1221`（`client.Name` 是运营商注册值），`ScopeList.svelte:65` 渲染 `s.description`。实测：伪造 problem body 里的 `<img src=x onerror=…>` 与 `<script>` 都以**文本**出现在页面上（`zzadversary-responses.spec.ts`），`img[src="x"]` 计数为 0、`window.__probe` 为 null。
+- **`s.scope` 被用作 `id`/`for` 属性值**（`ScopeList.svelte:45,56`），而 scope 名最终可溯到客户端请求：实测注入 `<script>`/`"` 的 `user_code` 与 `id` 都不产生标记、不执行（`zzadversary-frontend.spec.ts` 第 5、6 条）。Svelte 5 对动态属性做转义，且该 URL 只会落在一个 404 提示上（`consent/+page.svelte:67-71`）。
+- **每个非 GET 调用都带 `X-CSRF-Token`，且这个头是承重的**：枚举 `lib/api.ts` 的 10 个写端点 —— `signOut`、`decideAuthorizationRequest`、`decideDevice`、`unlinkIdentity`、`revokeGrant`、`deleteAccount`、`registerAdminClient`、`suspendAdminClient`、`activateAdminClient`、`deleteAdminClient`、`killSwitch`、`unbindSource`、`cascadeRevoke` —— 每一个都经由 `call(method, path, {csrf})`（`api.ts:322-329`）。实测（`zzadversary-frontend.spec.ts` 第 7 条）：设备审批全程捕获到的写请求 100% 带该头；**同一条请求去掉头后 403**（反空转对照，证明头不是装饰）。
+- **令牌/授权码不进任何可读位置**：完整走一次同意流程后，对 `localStorage`、`sessionStorage`、`document.cookie`、`document.documentElement.outerHTML` 逐个断言 `access_token`/`refresh_token`/CSRF token 不存在（`zzadversary-frontend.spec.ts` 第 10 条，全部通过；唯一允许出现授权码的地方是浏览器地址栏，那是协议本身）。
+- **开放重定向面全部有源站侧钳制**：`consent/+page.svelte:113` 的 `window.location.assign(result.redirect_to)` 用的是服务端返回值（服务端按已注册 redirect_uri 构造，`oidchttp.go:1291`）；`consent/+page.svelte:192` 的 `m.bind_url` 由 `internal/httpapi/authorization_routes.go:40-48` 构造成恒为 `{consent}?id=…` 的同源路径；`SignIn.svelte:49-54` 的 `provider.start_url` 由 `idp_routes.go:36` 用 issuer 拼出，且 `+page.svelte:143` 先 `new URL(start_url, location.origin)` 归一化；`sources/+page.svelte:97-102` 用的是写死的 `/bind?...`。实测：地址栏塞 `?return_to=https://evil.example/` 后点登录，导航仍落在 `127.0.0.1`，`return_to` 也没有变成绝对 URL；`?redirect_uri=javascript:…` 不执行任何脚本（服务端按已注册值处理，浏览器停在 `/oauth/authorize`）。服务端侧还有 `internal/safeurl/safeurl.go`（含 tab/CR/LF/反斜杠/`//host` 的成套单测）与 `auth_test.go:254-265`。
+- **会话 cookie 与 CSRF 的配对是稳的**：`internal/auth/auth.go:107-112` 是 `HttpOnly` + `SameSite=Lax` + `Path=/`（`Secure` 由部署开关）；`SignIn`（`auth.go:153-182`）在登录时 `RenewToken`，而 `scs` 的 renew **保留 session 值**，所以 `keyCSRF` 不轮转 —— 即「页面在登录前抓到的 token 登录后失效」这个功能 bug 不存在；反过来也不存在「登录后旧 token 仍可用」的提权面（token 是同一个，且 `ValidCSRF` 用常数时间比较，`auth.go:235-242`）。UI 侧的缓存策略（`grants/+page.svelte:35-37` 只在 mount 时取一次）因此安全。
+- **`/app/*` 不会吞掉 API 的 404**：组合根把 `webui.Handler` 钉死在 `webui.BasePath+"/"`（`server.go:520-524`），`/v1/` 与 `/oauth/` 各有自己的 catch-all。实测 `frontend_test.go:115-140` 的 `TestFrontendMountDoesNotSwallowAPIRoutes` 在真实二进制上仍成立（`zzadversary-frontend.spec.ts` 全程没有把 API 响应变成 HTML）。
+- **穿越不逃出 `dist`**：Go 探针用一份「dist 之外有 `outside.txt`」的 FS 打 10 条路径，`OUTSIDE-SECRET` 一次都没出现：`/app/../outside.txt`、`/app/..%2f…`、`/app/%2e%2e/…`、`/app/.%2e/…`、`/app/..%5c…`、`/app/_app/../../../outside.txt` 全是 `400 invalid URL path`（net/http 的 `http.ServeFileFS` 在打开之前就拒了），双编码 `%252e%252e` 因为解码后是 `%2e%2e` 这种字面名而回落到 shell。三层独立防住（ServeMux 先 clean、`webui.go:113` 再 clean、`ServeFileFS` 再看），并且探针先断言对照组能拿到 shell，不是「没跑到」。
+- **HEAD 契约**：探针确认 `HEAD /app/` 与 `HEAD /app/_app/immutable/entry/start.js` 都回 200、`Content-Length` 存在、**响应体长度 0**。
+- **产物卫生**：`dist` 共 27 个文件（js 20 / css 1），没有 `.map`、没有 `.ts/.tsx/.svelte/.md`、没有 `package.json`/`pnpm-lock.yaml`；`index.html` 里没有任何绝对 URL（无第三方字体/CDN/分析脚本 —— 配合 `default-src 'self'` + `Referrer-Policy: no-referrer`，同意页的 URL 不会流向第三方）。
+- **产物里没有密钥形状的东西，也没有 dev-only 代码**：`bundle-hygiene.mjs` 对全部 27 个文本产物跑 12 组密钥正则（私钥块 / `AKIA…` / `ghp_…` / `xox…` / JWT 三段 / 证书 / `Bearer <长串>` / `password|secret|api_key|access_token|refresh_token = "长串"` / `usr_…` / `cli_…` / 200+ 字符 base64 串）—— **0 命中**。`bundle-hygiene2.mjs` 逐文件清点：`console.log`/`console.debug`/`debugger`/`sourceMappingURL`/`localhost`/`127.0.0.1`/`@vite`/`@fs`/`import.meta.env.DEV`/`NODE_ENV !== 'production'` 分支 **全部 0 命中**；产物内绝对 URL 只有 `http://www.w3.org/1999/xhtml`（命名空间常量）与 `https://svelte.dev/e/…`（A-FE-10）；绝对请求路径 13 个全部是 `/v1/**`。**注意**：`webui.Robots` 之外没有任何东西把 `web/static` 里的其它文件带进来，所以这份扫描覆盖的就是全部交付字节。
+- **产物 JS 全图可达，没有孤立分块**：从 shell 的 `start.*.js` / `app.*.js` 出发沿 import 图遍历，20 个分块**全部**可达（第一遍扫描报的「20 个孤立块」是探针自身的假阳性 —— Windows 路径分隔符与 `relative()` 输出混用导致匹配失败；修正后为 0。按 BRIEF §3 的反空转要求，我把它记在这里而不是悄悄改掉）。
+- **`robots.txt`、`favicon.svg`、CSS 在两次构建之间逐字节不变**，而 JS 分块变 —— 这个对照把 A-FE-9 的原因收敛到「版本时间戳 → 一个分块 → 其传递依赖」这条链上，而不是笼统的「构建不确定」。
+- **构建产物里内联脚本的哈希确实被策略覆盖**：`TestProbeBuiltShellHashMatchesItsInlineScript` 自己算 `<script>` 内容的 sha256 与 meta 里声明的 `sha256-hmKSyb9MK624S0VCmGl2StNqMGwjfW+uQ2nREdu5Se8=` 比对，命中 1/1；并解析指令确认 `script-src` 不含 `unsafe-inline`/`unsafe-eval`，`object-src`/`base-uri`/`form-action` 都是 `'none'`，`connect-src`/`default-src` 是 `'self'`。
+- **CSP 在真实浏览器里真的生效**：注入内联脚本被拦，Chrome 报 `script-src 'self' 'sha256-hmKS…'`（并给出本次内容应有的 `sha256-ofKzr…`），同时**对照组**（`bypassCSP: true` 的上下文）里同一个载荷**执行成功**，所以「被拦」不是「没跑」；应用自己加载时 CSP 违规数为 0。既证明了策略是 hash-locked，也证明它不白屏。`Zzadversary-headers` 还确认同意页 `window.opener === null`、`window.top === window`、`frames.length === 0`。
+- **同意页的合法跳转没有被 CSP 挡住**：完整 `consent → 客户端 callback → 换码` 全程通过（`exchangeCode` 拿到 `access_token`），说明 `form-action 'none'` 关掉的确实只是 native form 提交。
+- **勾选不能凭空扩权**：往 DOM 里塞一个 `id="scope-phigros.b30.read"` 的复选框再点同意，令牌里仍然没有该 scope（`zzadversary-frontend.spec.ts` 第 11 条）；服务端 `NarrowScopes`（`oidcstore.go:298-313`）与 `ApproveAuthorization`（`oidchttp.go:1244-1250`）各自独立做子集检查。
+- **API 返回 3xx 不会变成客户端跳转**：`page.route` 伪造 `302 + Location: https://evil.example/harvest` 后，浏览器仍在 `127.0.0.1`（SvelteKit 把非 `redirect()` 的 3xx 当加载失败）。
+- **服务端多给的字段不会白屏**：把 `risk` 改成 `extremely-bad`、`explicit_consent` 改成 `'yes'`、`description` 改成 `undefined` 后，同意页仍然渲染出 scope 列表与「需单独确认」标记（类型断言只看 `id`/`scopes`，`api.ts:414-426`；`tones[unknown]` 只会让 class 少一个 tone，不会抛）。
+- **`robots.txt` 现在说的是实话**：`web/static/robots.txt:4` 的「device code is single use」在第三轮 C3-2 修好之后成立；`internal/httpapi/frontend_test.go:67-97` 的 `TestRobotsTxtIsServedAtTheRoot` 用**真实文件**做夹具并断言根路径服务、无文件时 404，所以「装在 `/app/robots.txt`（爬虫不看）而根路径 404」这个第三轮注意到的问题已经闭环。
+- **`check` 与 `bundle` 都在 CI 里**：`.github/workflows/ci.yml:106-108` 跑 `pnpm run check`，`:115-117` 跑 `pnpm run check:bundle`，两者我本机都跑过（0 errors / 156.8 KiB vs 200 KiB 预算）。
+- **`pnpm install --frozen-lockfile` 与树一致**：锁文件 importers 段解析出的版本（`svelte 5.57.1`、`@sveltejs/kit 2.70.3`、`vite 8.3.0`、`typescript 6.0.3`、`svelte-check 4.7.6`、`@playwright/test 1.63.0`、`tailwindcss 4.3.3`、`@sveltejs/adapter-static 3.0.10`）与 `node_modules` 里实装的**逐条一致**；`package.json` 全用 `^`，但锁文件把实际版本钉死，而 Docker 与 CI 都走 `--frozen-lockfile`。**没有 `postinstall`**，唯一的生命周期脚本是 `prepare: svelte-kit sync || echo ''`（`web/package.json:11`），不会拉网络。
+- **e2e 套件的假设是诚实的**：`web/e2e/server.mjs` 在**网络边界**伪造 IdP/数据源（`__identity/`、`__error/`、`__revocations`、`__cascades` 都是假服务的控制通道），re0auth 侧没有任何测试后门；CLIENT_ID 是公开客户端且只注册 `account.id`+`phigros.b30.read`。我确认了它**不覆盖**的状态：没有 `explicit_consent` scope（`consent.spec.ts:19-25` 自己写明了这个缺口），也没有「目录未描述的 scope」这一类 —— 而 A-FE-3 恰好落在后者上，所以既有套件看不见它。
+
+---
+
+## 未能到达（残余盲区）
+
+- **只在一个引擎里验证过 CSP**：全部浏览器结论来自 Playwright 1.63 自带的 **Chromium**（`chromium-1243`）。Firefox/Safari 对 `frame-ancestors`、meta 里的 CSP、`form-action 'none'` 的实现细节不同（尤其 Safari 对 meta `form-action` 的历史行为），我**没有**在这些引擎上跑过任何一条断言。
+- **A-FE-9 的「产物不可复现」只在 Windows + 这一套 pnpm/vite 版本上量过**：逐文件对照做了两次连续构建（外加审计早期的一次对照），三次都出现同样的 12 个分块改写。我没有在 Linux（CI 的构建平台）或 Docker 的 `node:24-alpine` 阶段里复现过，因此「CI 产物与发布产物也会这样变」是**推断**，不是实测。要证实它需要在 CI 或容器里连跑两次 `pnpm run build` 并比对。
+- **A-FE-10 的运行时可达性未证**：我证明了 6 个 `console.warn` 的**字节**在产物里，没有证明它们在线上会被调用（需要构造出触发 `derived_inert` / `missing_context` 等内部状态的应用路径）。
+- **没有部署在反向代理/CDN 后面验证过**：A-FE-1 与 A-FE-9 的联合故障链（旧 shell + 已删除的旧资产名）我只证明了**两个端点各自成立**，没有在真实代理上观察到一次白屏（本机无 Docker、无 nginx）。
+- **CSP 的 `style-src 'unsafe-inline'` 我只证明了它今天用在哪**（`app.html:32-54` 的 noscript 块与 `<div style="display: contents">`），没有证明「去掉它之后所有浏览器的 Svelte transition 都还工作」。这一条我没有把它写成发现，因为要证实需要跨引擎测试，而当前唯一已知的注入面（`style=` 属性）在启用了 JS 的页面上不存在。
+- **Postgres 侧与本次区域无关**：本区域不落地到数据库，所以「无 DB 执行」这个限制不影响上述任何一条结论；反过来说，我也没有用 Postgres 跑过任何东西。
+- **`pnpm audit` 只在大约一次调用里成功**：本机默认镜像（npmmirror）不支持 audit 端点，我改用 `registry.npmjs.org` 才拿到结果。如果 CI 或部署环境的默认 registry 也是镜像，那么 A-FE-5 里的门在那边**同样不会真正生效**（镜像连端点都没有）。
+- **视觉基线未复核**：`test:visual` 因为平台基线策略默认排除（`playwright.config.ts:28-34`），我跑了 `--grep-invert @visual`，所以 A-FE-7 这类布局判断没有截图基线背书，只有渲染文本与源码。
+- **`re0auth.exe` 级别的真实部署没跑**：我用的是 `web/e2e/server.mjs` 起的真实 Go 二进制（内存后端、`rate_limit = 0`、`allow_private_addresses = true`、`cookie_secure = false`）。**限流开启**时的浏览器平面表现（429 会不会落在 `/app/*` 上、页面对 429 的呈现）我没有实测。
+
+## 判断（文档化决定，不是缺陷）
+
+- **「协议平面不压、前端可压」**：`internal/httpapi/server.go:316-350` 用 `planeOf` 一份判定式决定压缩资格，前端资源因此走 gzip（实测 `content-length: 1743` vs 明文 3304）。这与 ADR-0003 §2 第三点一致，我不质疑。**但请注意它给 A-FE-1 加了一层**：shell 是压缩交付的，所以「不同中介各自缓存压缩前/后的字节」这件事有两份表示，而没有验证器把它们绑在一起。
+- **同意页不列 OIDC 协议/claim scope**：这是 O-3/O-6 的文档化决定（`oidcstore.go:255-262` 的注释、「userinfo 只返回 sub」）。A-FE-3 报的**不是**这个决定本身，而是它的**表述**：令牌响应的 `scope` 字段会让客户端看到 `profile email`，而页面上那句「该应用将获得以下权限」是在同一屏幕上否认它们的。是否改 UI、改令牌字段、还是改那句话，属于裁定。
+- **同意页与设备页共用带导航的布局**：可能是有意的（统一外壳、品牌一致）；A-FE-7 只指出它与 `app.html` 里写下的「同意页必须不像通用登录页」这一目标存在张力。
+- **`/v1` 未认证返回 401、`/v1/admin/*` 未认证返回 401 而非 404**：已在第三轮文档化，我复核了前端与它一致（`admin/+page.svelte:82-84` 把 404/403 都当「你不是运维」，`anonymous` 相位由 401 决定），没有新发现。
+- **`scopeViews` 静默丢弃目录外的 scope**（`authorization_routes.go:189`）：这是 A-FE-3 的机制所在。它在**今天**不可达（目录恰好覆盖全部数据 scope），但它是那类「显示少于授予」的唯一入口，因此我把它写进 A-FE-3 的修法而不是单开一条假说。
