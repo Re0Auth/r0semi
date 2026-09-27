@@ -75,9 +75,6 @@ func (s *service) Grants(ctx context.Context, subject string) ([]Grant, error) {
 		g, ok := byClient[r.ClientID]
 		if !ok {
 			g = &Grant{ClientID: r.ClientID, IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt}
-			if client, err := s.clients.Get(ctx, r.ClientID); err == nil {
-				g.ClientName = client.Name
-			}
 			byClient[r.ClientID] = g
 		}
 		g.Scopes = unionScopes(g.Scopes, r.Scopes)
@@ -92,8 +89,17 @@ func (s *service) Grants(ctx context.Context, subject string) ([]Grant, error) {
 		}
 	}
 
+	// Names resolved in one lookup for the whole page rather than one Get per
+	// client from inside the loop above.
+	ids := make([]string, 0, len(byClient))
+	for id := range byClient {
+		ids = append(ids, id)
+	}
+	names := LookupClientNames(ctx, s.clients, ids)
+
 	out := make([]Grant, 0, len(byClient))
 	for _, g := range byClient {
+		g.ClientName = names[g.ClientID]
 		out = append(out, *g)
 	}
 	// Sorted, because a map is not. A list that reorders itself between two loads
@@ -112,12 +118,13 @@ func (s *service) Grants(ctx context.Context, subject string) ([]Grant, error) {
 // It is idempotent: revoking a client that holds nothing is a no-op, which is
 // what lets the endpoint answer 204 either way.
 //
-// Known and bounded gap: an authorization code issued before the revocation and
-// not yet exchanged is left alone, so it can still be exchanged. Codes are
-// single-use, PKCE-bound, bound to the client that requested them, and expire in
-// minutes; closing the window would mean enumerating and deleting codes too, for
-// a case where the client already has its tokens. Recorded rather than papered
-// over.
+// It also removes an authorization code issued but not yet exchanged. Who holds
+// that code decides how much it is worth: a client is untrusted, and it can
+// withhold the code precisely to spend it after the user revokes — the exchange
+// returns an access *and* a refresh token, so the revocation would be undone for
+// as long as the client keeps refreshing. (An earlier note here called the gap
+// bounded because "the client already has its tokens"; the refresh token is what
+// made that wrong.)
 func (s *service) RevokeGrant(ctx context.Context, subject, clientID string) error {
 	if subject == "" || clientID == "" {
 		return errors.New("oauth: subject and client id are required")
@@ -174,6 +181,13 @@ func (s *MemoryStore) ListBySubject(_ context.Context, subject string) ([]GrantR
 
 // DeleteBySubjectClient implements Store. It reports nothing about what it
 // removed: revoking is idempotent, so "there was nothing there" is success.
+//
+// Unspent authorization codes go with the tokens. A code is a redeemable
+// capability, not a record of something already handed over: a client that asked
+// for authorization and withheld the code could exchange it after the subject
+// revoked the grant, and the exchange returns a refresh token, so the revocation
+// it just reported came undone for good. RevokeTokens clears codes for the same
+// reason; this is the per-client path.
 func (s *MemoryStore) DeleteBySubjectClient(_ context.Context, subject, clientID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,6 +200,11 @@ func (s *MemoryStore) DeleteBySubjectClient(_ context.Context, subject, clientID
 	for key, t := range s.refresh {
 		if t.Subject == subject && t.ClientID == clientID {
 			delete(s.refresh, key)
+		}
+	}
+	for key, c := range s.codes {
+		if c.Subject == subject && c.ClientID == clientID {
+			delete(s.codes, key)
 		}
 	}
 	return nil

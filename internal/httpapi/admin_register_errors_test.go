@@ -42,6 +42,31 @@ func TestAdminRegisterRejectsInvalidInput(t *testing.T) {
 	assertNoInternalLeak(t, body["detail"])
 }
 
+// A redirect URI the authorize endpoint must never send a code to is the
+// caller's fault and stays a 400. `http://` off loopback and a javascript: target
+// both used to pass, because registration only asked url.Parse for a scheme.
+func TestAdminRegisterRejectsUnsafeRedirectURIs(t *testing.T) {
+	for _, uri := range []string{"http://insecure.example/cb", "javascript:alert(1)", "https://app.example/cb#frag"} {
+		t.Run(uri, func(t *testing.T) {
+			env := newAdminEnv(t, true)
+			browser := newBrowser(t)
+			signIn(t, browser, env.base)
+			csrf := sessionCSRF(t, env.base, browser)
+
+			resp := adminJSON(t, browser, http.MethodPost, env.base+"/v1/admin/clients", csrf, map[string]any{
+				"name":          "Bad",
+				"type":          "public",
+				"redirect_uris": []string{uri},
+				"scopes":        []string{"openid"},
+			})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("registration with %q = %d, want 400", uri, resp.StatusCode)
+			}
+			assertNoInternalLeak(t, decodeResp(t, resp)["detail"])
+		})
+	}
+}
+
 // A storage failure is not the caller's fault: it must be a 500, and the wire
 // must not carry the database's words.
 func TestAdminRegisterStoreFailureIsInternal(t *testing.T) {

@@ -6,8 +6,10 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -74,9 +76,8 @@ func NewClient(id, name string, typ ClientType, secret string, redirects []strin
 		return Client{}, errors.New("oauth: at least one redirect URI is required")
 	}
 	for _, r := range redirects {
-		u, err := url.Parse(r)
-		if err != nil || u.Scheme == "" {
-			return Client{}, fmt.Errorf("oauth: invalid redirect URI %q", r)
+		if err := validRedirectURI(r); err != nil {
+			return Client{}, fmt.Errorf("oauth: invalid redirect URI %q: %w", r, err)
 		}
 	}
 
@@ -164,6 +165,85 @@ func (c Client) AllowsRedirect(uri string) bool {
 	return false
 }
 
+// forbiddenRedirectSchemes are schemes a redirect must never target. Each one
+// either carries a document a browser interprets (javascript:, data:, vbscript:)
+// or addresses the local machine rather than a client (file:, blob:, about:).
+var forbiddenRedirectSchemes = map[string]bool{
+	"javascript": true,
+	"data":       true,
+	"vbscript":   true,
+	"file":       true,
+	"blob":       true,
+	"about":      true,
+}
+
+// validRedirectURI validates a redirect URI at registration time.
+//
+// Registration is where this belongs, and it is deliberately *not* applied by
+// RestoreClient: a URI already in the registry was accepted under whatever policy
+// was in force when it was written, and refusing to load it would turn a
+// tightened rule into a deployment that cannot start.
+//
+// The rules are RFC 6749 §3.1.2 (no fragment) plus RFC 8252: https anywhere, http
+// only for a loopback host (§7.3 — a native client's local listener), and any
+// reverse-DNS private-use scheme (§7.1 — com.example.app:/cb, how a desktop or
+// mobile app receives a code). Everything else is refused. Without this the check
+// was "does url.Parse find a scheme", which accepts http:// for a host nobody can
+// protect and never rejects javascript:.
+func validRedirectURI(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("it does not parse as a URL")
+	}
+	if u.Scheme == "" {
+		return errors.New("it has no scheme")
+	}
+	if u.Fragment != "" {
+		return errors.New("RFC 6749 §3.1.2 forbids a fragment")
+	}
+	if u.User != nil {
+		return errors.New("it carries userinfo, which no client needs and a phisher does")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if forbiddenRedirectSchemes[scheme] {
+		return fmt.Errorf("the %s: scheme is never a redirect target", scheme)
+	}
+	switch scheme {
+	case "https":
+		if u.Host == "" {
+			return errors.New("an https redirect URI needs a host")
+		}
+		return nil
+	case "http":
+		if !loopbackHost(strings.ToLower(u.Hostname())) {
+			return errors.New("http is allowed only for a loopback host (RFC 8252 §7.3); use https")
+		}
+		return nil
+	default:
+		// A private-use URI scheme in reverse-DNS notation (RFC 8252 §7.1). The
+		// dot is required: `app:` alone is what a device might already have
+		// registered for something else.
+		if !strings.Contains(scheme, ".") {
+			return errors.New("a custom scheme must be in reverse-DNS notation (RFC 8252 §7.1), e.g. com.example.app")
+		}
+		if u.Opaque == "" && u.Path == "" && u.Host == "" {
+			return errors.New("it names no target")
+		}
+		return nil
+	}
+}
+
+// loopbackHost reports whether host is the local machine, the one place RFC 8252
+// §7.3 allows a plain http redirect.
+func loopbackHost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // AllowsScope reports whether the client was registered for the scope.
 func (c Client) AllowsScope(s Scope) bool {
 	for _, a := range c.AllowedScopes {
@@ -178,6 +258,48 @@ func (c Client) AllowsScope(s Scope) bool {
 type ClientRegistry interface {
 	Create(ctx context.Context, c Client) error
 	Get(ctx context.Context, id string) (Client, error)
+}
+
+// ClientNameLookup is implemented by a registry that can resolve many display
+// names at once. It exists because the grants view asked for one client at a time
+// from inside a loop over its rows: N round trips for a page whose whole content
+// is N names.
+//
+// Callers type-assert rather than require it: a registry that does not implement
+// it keeps working, one Get per id, which is what every caller did before.
+type ClientNameLookup interface {
+	ClientNames(ctx context.Context, ids []string) (map[string]string, error)
+}
+
+// LookupClientNames resolves display names for ids: in one call when the registry
+// can, one id at a time when it cannot.
+//
+// Names are cosmetic, so nothing here is fatal. A bulk lookup that fails does not
+// take the view down with it, and an id it did not answer is filled in
+// individually — which is also the whole path for a registry without the bulk
+// method. An id that resolves to nothing keeps an empty name, exactly as the
+// per-id code left it.
+func LookupClientNames(ctx context.Context, reg ClientRegistry, ids []string) map[string]string {
+	out := make(map[string]string, len(ids))
+	if reg == nil || len(ids) == 0 {
+		return out
+	}
+	if bulk, ok := reg.(ClientNameLookup); ok {
+		if names, err := bulk.ClientNames(ctx, ids); err == nil {
+			for id, name := range names {
+				out[id] = name
+			}
+		}
+	}
+	for _, id := range ids {
+		if _, resolved := out[id]; resolved {
+			continue
+		}
+		if c, err := reg.Get(ctx, id); err == nil {
+			out[id] = c.Name
+		}
+	}
+	return out
 }
 
 // ClientAdmin is the management side of a registry: the operations an operator
@@ -230,6 +352,25 @@ func (r *MemoryClientRegistry) Get(_ context.Context, id string) (Client, error)
 		return Client{}, ErrClientNotFound
 	}
 	return c, nil
+}
+
+// ClientNames implements ClientNameLookup: one read lock for the whole page.
+//
+// Unlike Get it does not hide a suspended client. What a name is asked for here
+// is a view of tokens that were issued to somebody, and an operator suspending a
+// client does not make the user's grant stop existing — the list would show an
+// unnamed client for exactly the entry the user most needs to recognise and
+// revoke.
+func (r *MemoryClientRegistry) ClientNames(_ context.Context, ids []string) (map[string]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]string, len(ids))
+	for _, id := range ids {
+		if c, ok := r.byID[id]; ok {
+			out[id] = c.Name
+		}
+	}
+	return out, nil
 }
 
 // List implements ClientAdmin.

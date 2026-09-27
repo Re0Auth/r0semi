@@ -76,7 +76,10 @@ type Store interface {
 	// ListBySubject returns every token record for a subject, expired ones
 	// included: the store has no clock, so the service decides what is still live.
 	ListBySubject(ctx context.Context, subject string) ([]GrantRecord, error)
-	// DeleteBySubjectClient removes every token one client holds for one subject.
+	// DeleteBySubjectClient removes every token one client holds for one subject,
+	// plus any authorization code it was issued and has not spent. Codes go with
+	// the tokens because an unspent code is a redeemable capability: withholding
+	// it and redeeming after the revocation hands the client a fresh token pair.
 	DeleteBySubjectClient(ctx context.Context, subject, clientID string) error
 
 	// TokenOwner returns the client a presented token value was issued to, or
@@ -151,6 +154,40 @@ func NewMemoryStore() *MemoryStore {
 		access:  make(map[string]AccessToken),
 		refresh: make(map[string]RefreshToken),
 	}
+}
+
+// SweepExpired drops every record whose deadline has passed and reports how many.
+//
+// Expiry is already enforced on read, so this is not what makes an expired token
+// unusable — it is what keeps the maps from holding every token the process ever
+// issued, which is a leak with no other bound in a store that has no database
+// behind it. Nothing calls it on a timer from inside this package: a deployment
+// that runs this store either calls it from its own loop or accepts the growth,
+// and saying so here is better than starting a goroutine a caller cannot stop.
+func (s *MemoryStore) SweepExpired(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for k, c := range s.codes {
+		if !now.Before(c.ExpiresAt) {
+			delete(s.codes, k)
+			removed++
+		}
+	}
+	for k, t := range s.access {
+		if !now.Before(t.ExpiresAt) {
+			delete(s.access, k)
+			removed++
+		}
+	}
+	for k, t := range s.refresh {
+		if !now.Before(t.ExpiresAt) {
+			delete(s.refresh, k)
+			removed++
+		}
+	}
+	return removed
 }
 
 // SaveCode implements Store.

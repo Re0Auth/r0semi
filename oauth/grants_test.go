@@ -154,6 +154,58 @@ func TestRevokeGrantMakesTheTokensStopWorking(t *testing.T) {
 	}
 }
 
+// A revocation must also reach a code the client has not spent yet.
+//
+// A client is untrusted, so it can request authorization, hold the code, and wait
+// for the user to revoke before redeeming it. The exchange issues an access *and*
+// a refresh token, so without this the grant the user just revoked comes back and
+// stays — which is what made the old "bounded gap" note on RevokeGrant wrong.
+//
+// Scoped like the token half: another client's unspent code, and the same
+// client's code for another subject, are still redeemable.
+func TestRevokeGrantStopsAnUnspentCode(t *testing.T) {
+	svc, clients, _, _, _ := newTestAS(t)
+	registerClient(t, clients, "cli", ClientPublic, "", []Scope{ScopeAccountID})
+	registerClient(t, clients, "other", ClientPublic, "", []Scope{ScopeAccountID})
+
+	ctx := context.Background()
+	authorize := func(clientID, subject string) string {
+		t.Helper()
+		resp, err := svc.Authorize(ctx, AuthorizationRequest{
+			ClientID: clientID, RedirectURI: grantRedirect, Subject: subject,
+			Scopes:        []Scope{ScopeAccountID},
+			CodeChallenge: pkceChallenge(grantVerifier), CodeChallengeMethod: "S256",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Code
+	}
+	revoked := authorize("cli", "usr_1")
+	sibling := authorize("other", "usr_1")
+	elsewhere := authorize("cli", "usr_2")
+
+	if err := svc.RevokeGrant(ctx, "usr_1", "cli"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "cli", Code: revoked, RedirectURI: grantRedirect, CodeVerifier: grantVerifier,
+	}); err == nil {
+		t.Fatal("an unspent authorization code survived the revocation of its grant")
+	}
+	if _, err := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "other", Code: sibling, RedirectURI: grantRedirect, CodeVerifier: grantVerifier,
+	}); err != nil {
+		t.Fatalf("revoking one client revoked another client's unspent code: %v", err)
+	}
+	if _, err := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "cli", Code: elsewhere, RedirectURI: grantRedirect, CodeVerifier: grantVerifier,
+	}); err != nil {
+		t.Fatalf("revoking for one subject revoked the same client's code elsewhere: %v", err)
+	}
+}
+
 // Revoking one client must not reach across to another client, or to the same
 // client acting for somebody else.
 func TestRevokeGrantIsScoped(t *testing.T) {
