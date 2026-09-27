@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,26 +17,24 @@ import (
 
 // testClock is a settable clock, so a test can age records past their deadline
 // instead of sleeping through it.
+//
+// Atomic rather than mutex-guarded, and that is not a micro-optimisation: the
+// clock is read on every store call, so a mutex here serialises the parallel
+// benchmarks on the fixture. BenchmarkIntrospect then measures the fixture's lock
+// instead of the store's, which is the one quantity it exists to report.
 type testClock struct {
-	mu  sync.Mutex
-	now time.Time
+	now atomic.Int64 // UnixNano
 }
 
 func newTestClock() *testClock {
-	return &testClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	c := new(testClock)
+	c.now.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano())
+	return c
 }
 
-func (c *testClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
+func (c *testClock) Now() time.Time { return time.Unix(0, c.now.Load()).UTC() }
 
-func (c *testClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(d)
-}
+func (c *testClock) Advance(d time.Duration) { c.now.Add(int64(d)) }
 
 var (
 	sharedSignerOnce sync.Once

@@ -28,32 +28,56 @@ type Sessions struct {
 	now func() time.Time
 }
 
-// Compile-time proof that the shape still matches scs's interface.
-var _ scs.Store = (*Sessions)(nil)
+// Compile-time proof that the shape still matches scs's interfaces.
+//
+// CtxStore is the one that matters: scs's LoadAndSave prefers FindCtx/CommitCtx/
+// DeleteCtx when the store implements them (data.go's doStoreFind and friends),
+// and it hands them the request context. Implementing only Store meant every
+// session read ran on context.Background() — no deadline, and no cancellation when
+// the client hangs up. The plain methods stay for callers that know only Store;
+// scs is not one of them.
+var (
+	_ scs.Store    = (*Sessions)(nil)
+	_ scs.CtxStore = (*Sessions)(nil)
+)
 
 // sessionTokenHash reuses the OAuth hashing deliberately: the input has the same
 // shape (32 bytes of crypto/rand) and the same reasoning applies, so a second
 // implementation would only be a chance to drift.
 func sessionTokenHash(token string) string { return oauth.TokenHash(token) }
 
-// Delete implements scs.Store. Deleting an absent session is not an error.
-func (s *Sessions) Delete(token string) error {
-	_, err := s.pool.Exec(context.Background(),
+// Delete implements scs.Store.
+func (s *Sessions) Delete(token string) error { return s.DeleteCtx(context.Background(), token) }
+
+// DeleteCtx implements scs.CtxStore. Deleting an absent session is not an error.
+func (s *Sessions) DeleteCtx(ctx context.Context, token string) error {
+	_, err := s.pool.Exec(ctx,
 		`DELETE FROM sessions WHERE token_hash = $1`, sessionTokenHash(token))
 	return err
 }
 
 // Find implements scs.Store.
+func (s *Sessions) Find(token string) ([]byte, bool, error) {
+	return s.FindCtx(context.Background(), token)
+}
+
+// FindCtx implements scs.CtxStore.
 //
 // scs defines an expired session as "not found", so an expired row is removed
-// here rather than returned. Note the interface carries no context: scs does not
-// pass one, so these calls use context.Background.
-func (s *Sessions) Find(token string) ([]byte, bool, error) {
+// here rather than returned.
+//
+// The context is the request's, and that is the point of this method existing:
+// this query runs on every browser request that carries a session cookie, and
+// without a deadline it waits for a pooled connection for as long as the pool is
+// saturated. The pool's statement_timeout bounds a statement, not the wait for a
+// connection, so the request would park until the server's write timeout cut the
+// socket — with the goroutine and the connection still held.
+func (s *Sessions) FindCtx(ctx context.Context, token string) ([]byte, bool, error) {
 	var (
 		data   []byte
 		expiry time.Time
 	)
-	err := s.pool.QueryRow(context.Background(),
+	err := s.pool.QueryRow(ctx,
 		`SELECT data, expiry FROM sessions WHERE token_hash = $1`, sessionTokenHash(token)).
 		Scan(&data, &expiry)
 	if noRows(err) {
@@ -63,15 +87,37 @@ func (s *Sessions) Find(token string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	if !s.now().Before(expiry) {
-		_ = s.Delete(token)
+		_ = s.DeleteCtx(ctx, token)
 		return nil, false, nil
 	}
 	return data, true, nil
 }
 
-// Commit implements scs.Store. An existing token is overwritten.
+// Commit implements scs.Store.
 func (s *Sessions) Commit(token string, data []byte, expiry time.Time) error {
-	_, err := s.pool.Exec(context.Background(), `
+	return s.CommitCtx(context.Background(), token, data, expiry)
+}
+
+// sessionCommitTimeout bounds a commit that outlives its request.
+//
+// The request context is deliberately detached below, and this is what keeps that
+// from meaning "wait for a pooled connection forever".
+const sessionCommitTimeout = 5 * time.Second
+
+// CommitCtx implements scs.CtxStore. An existing token is overwritten.
+//
+// The client's cancellation is dropped here, and that is the one place in this
+// store where it is. scs commits the session after the handler returns: a browser
+// that navigates away in that window cancels the request context, and failing the
+// write because of it would lose the session of a user who had just signed in —
+// the exact case the write exists for. What is not dropped is the bound: this runs
+// on its own deadline rather than the request's, so a saturated pool still fails
+// fast instead of parking a goroutine with a connection it does not have.
+func (s *Sessions) CommitCtx(ctx context.Context, token string, data []byte, expiry time.Time) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionCommitTimeout)
+	defer cancel()
+
+	_, err := s.pool.Exec(ctx, `
 		INSERT INTO sessions (token_hash, data, expiry)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (token_hash) DO UPDATE SET

@@ -2,9 +2,75 @@ package postgres
 
 import (
 	"context"
+	"io/fs"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
+
+// createIndexRE captures an index's target table and its column list from a
+// CREATE INDEX. Column lists here are simple (names, or one expression), and the
+// expression forms do not contain a top-level `)`, so a non-greedy match is
+// enough to answer "is there an index on this column".
+var createIndexRE = regexp.MustCompile(`(?is)CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF NOT EXISTS\s+)?\w+\s+ON\s+(\w+)\s*\(([^)]*)\)`)
+
+// TestEverySweptTableHasADeadlineIndex is the database-free half of the sweep's
+// own guard.
+//
+// TestSweepExpiredRemovesDatedRows proves the deletes work; it cannot see that one
+// of them is a sequential scan. This parses the migrations and asserts the schema
+// carries an index on the deadline column of every table in expiredTables — which
+// is how oidc_devices.expires_at stayed missing: a table added to the sweep
+// without an index is invisible to a test that only counts rows.
+func TestEverySweptTableHasADeadlineIndex(t *testing.T) {
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatalf("read migrations dir: %v", err)
+	}
+
+	// table -> the column lists of its indexes.
+	indexed := make(map[string][]string)
+	total := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		body, err := fs.ReadFile(migrationsFS, "migrations/"+e.Name())
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		for _, m := range createIndexRE.FindAllStringSubmatch(string(body), -1) {
+			indexed[m[1]] = append(indexed[m[1]], m[2])
+			total++
+		}
+	}
+	// Anti-vacuous: a broken parser would find nothing and pass every check below.
+	if total < 15 {
+		t.Fatalf("parsed only %d index definitions; the parser is broken", total)
+	}
+
+	for _, t2 := range expiredTables {
+		lists := indexed[t2.table]
+		if len(lists) == 0 {
+			t.Errorf("swept table %q has no index at all: the sweep scans it every run", t2.table)
+			continue
+		}
+		found := false
+		for _, cols := range lists {
+			for _, col := range strings.Split(cols, ",") {
+				if strings.TrimSpace(col) == t2.column {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Errorf("swept table %q has no index on %q: DELETE ... WHERE %s < $1 scans the whole table "+
+				"every sweep (add a migration like 0017_oidc_devices_expires_idx.sql)",
+				t2.table, t2.column, t2.column)
+		}
+	}
+}
 
 // TestSweepExpiredRemovesDatedRows plants one live and one expired row in every
 // dated table, sweeps, and checks that exactly the expired ones went. It is the
