@@ -61,6 +61,12 @@ subjects = ["usr_01J...", "usr_01K..."]
 
 - 机密客户端：服务端生成 secret，**只在 `201` 响应里返回一次**；库里只存 `sha256`，之后任何读取（包括管理员）都拿不回来。丢了就重新注册。
 - 公开客户端：无 secret，响应里没有该字段。
+- **`redirect_uris` 有策略**（`oauth.validRedirectURI`，注册时强制）：必须是 `https`（host 非空）；`http`
+  只允许 loopback（`localhost`/`127.0.0.0/8`/`::1`，RFC 8252 §7.3）；自定义 scheme 必须是反域名写法
+  且带点（`com.example.app:`，RFC 8252 §7.1）。无 fragment（RFC 6749 §3.1.2）、无 userinfo，
+  并显式拒绝 `javascript:`/`data:`/`vbscript:`/`file:`/`blob:`/`about:`。
+  只要求"能解析出 scheme"是不够的：那会放行 `http://` 到任何人都保护不了的 host，且从不拒绝 `javascript:`。
+  **该策略只作用于注册**——`RestoreClient` 不重新校验，库里已有的行照常加载（收紧规则不该让部署起不来）。
 
 ## 4. 吊销：粒度与边界
 
@@ -85,6 +91,11 @@ subjects = ["usr_01J...", "usr_01K..."]
 - 否则普通解绑：调源的 revocation endpoint（`token_class: long_lived` 的源报告为 `unsupported`，不假装成功）。
 - 源已不在配置里的**孤儿绑定**：没有源可通知，但仍会被本地清除，计为 `orphaned`。
 - 一个源失败**不会**中止其它绑定；每条绑定的结局计入 `bindings` 对象（`total`/`revoked`/`cascade`/`unsupported`/`unavailable`/`orphaned`/`failed`）。
+
+**扫描形态**（`bypass` 一个请求做完，所以它必须是有界的）：绑定**分页枚举**（keyset，键是 `(user, game, source)`，
+页大小 `KillSwitchPageSize`，默认 500），页内最多 `killSwitchWorkers`（8）条并发处理——每条都是一次 vault
+操作加一次上游 HTTP，串行会让请求时长正比于绑定数，并把出站 bulkhead 一次性打满。枚举失败时**返回已完成的
+摘要与错误**，绝不把部分清扫说成完整；每步幂等，可重跑。
 
 **它仍做不到什么，必须说清楚：**
 

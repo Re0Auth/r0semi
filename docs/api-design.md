@@ -223,7 +223,14 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 | `GET` | `/v1/sources` | — （公开） | 本部署提供的全部数据源（供「可连接」列表用） |
 | `GET` | `/v1/games/{game}/sources` | — （公开） | 该游戏的数据源、能力与 `token_class` |
 | `GET` | `/v1/games/{game}/{resource}` | 资源对应 scope | 归一化数据；`?source=` 可 pin（已实现，见 architecture.md §4.11） |
-| `GET` | `/v1/games/{game}/sources/{source}/raw/{path...}` | 该源任一资源 scope（粗粒度） | 逐字透传源的原始 API；状态码/Content-Type/body 不改 |
+| `GET` | `/v1/games/{game}/sources/{source}/raw/{path...}` | 该源任一资源 scope（粗粒度） | 逐字透传源的原始 API；状态码/Content-Type/body 不改，另加路由级 CSP 与 `Content-Disposition: attachment`（浏览器不渲染、不执行脚本，见下） |
+
+> **raw 响应为什么多两个头。** 媒体类型是源的，而响应落在**本服务的源**上——同一个持有会话 cookie、
+> 并在 `/v1/sessions/current` 发放 CSRF token 的源。全局 CSP 只有 `frame-ancestors`（SPA 的 `script-src`
+> 在自己的 `<meta>` 里，不覆盖这条响应），所以源一旦返回 `text/html`，那就是一段在本源上执行的脚本。
+> 因此 raw 响应带 `default-src 'none'; frame-ancestors 'none'; sandbox`，并强制 `attachment`：API 消费方
+> 读 body 与媒体类型，浏览器既不能渲染也不能执行。文件名由 game/source/path 生成并只保留
+> `[A-Za-z0-9._-]`，防止引号或换行注入头。
 
 > 具体游戏的资源名与 scope 由 `/v1/games/{game}/sources` 公布，无需在下游硬编码。
 

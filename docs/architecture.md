@@ -296,12 +296,20 @@ RFC 8628 的 `verification_uri` 指向**人类页面** `/app/device`（`oauth.Co
 **限流**（`internal/ratelimit`，基于 `golang.org/x/time/rate`）：可选的 `Config.Limiter` 在会话中间件之外
 先拦住超预算的调用方；按客户端地址分桶、空闲驱逐。**三个平面各自的错误形态**：`/oauth/*` 与 `/.well-known/*`
 返回 OAuth 错误，`/v1/*` 返回 `problem+json` 的 `rate_limited`，浏览器路径是纯文本。
+每个请求只取一次限流器的锁（`Check` 同时给出判定与三个 `RateLimit-*` 头），容量满时按固定样本驱逐——
+旧写法在每次新键插入时遍历整张表两遍，实测在 10k 桶时为 102µs/次且全程持锁；现在与桶数无关（`BenchmarkCheckAtCapacity`）。
 
 **出站韧性**（`httpclient`，基于 `failsafe-go`）：重试（指数退避 + 抖动，认 `Retry-After`）、按上游 host 的
 熔断器、出站 bulkhead 三件套。**策略在本仓库、机制在库里**：**默认只重试幂等方法**（POST 不隐式重放），
 429/502/503/504 可重试而 500 不可，这些规则仍在 `httpclient`；循环、退避调度与熔断状态机来自库。
 bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆盖到响应头。选型、被否的方案与三处语义变化见
 [resilience-decision.md](./resilience-decision.md)（ADR-0009），依赖表见 [dependencies.md](./dependencies.md)。
+
+**两条不许商量的出站规则**（同在上面的客户端里）：①**跨主机或降级的跳转一律拒绝**——那些请求带着
+`Authorization`（数据面）或 `refresh_token` + `client_secret`（换票），Go 只在跨域时剥离前者、从不剥离
+后者，所以"跟过去"就是把凭据交给对方；②**私网 / 环回 / 链路本地地址在拨号层拒绝**（`DenyPrivateAddresses`），
+检查发生在 DNS 解析之后，因此也覆盖"注册时公网、请求时私网"的那种解析；自托管数据源确实在私网时，
+用 `[upstream] allow_private_addresses = true` 显式承认（与 `expose_internal` 同一形状）。
 
 关键不变量（由 `internal/httpapi` 测试守护）：**协议平面绝不输出 problem+json，业务平面绝不输出
 `{error,error_description}`，浏览器平面两者都不输出**；三个平面各有独立子 mux、错误写出器与 panic 恢复，仅共享 request-id 中间件。
@@ -448,7 +456,10 @@ re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个
 - **多源仲裁**：源有 `active/degraded/retired` 状态。未 pin 时按「active → degraded」顺序尝试、跳过 retired；
   首个失败而后续成功 → `Re0Auth-Degraded: true`。**pin 的源绝不替换**（失败即失败；retired → `410 source_retired`）。
 - **raw 透传**：`GET /v1/games/{game}/sources/{source}/raw/{path...}` 逐字转发源的原始 API
-  （状态码、Content-Type、body 均不改），供需要上游原生方言的消费者使用。
+  （状态码、Content-Type、body 均不改），供需要上游原生方言的消费者使用。响应额外带**路由级 CSP**
+  （`default-src 'none'; frame-ancestors 'none'; sandbox`）与 `Content-Disposition: attachment`：
+  媒体类型是源的，而文档落在本服务的源上（同源有会话 cookie 与 CSRF token），没有 `script-src` 时
+  一份 `text/html` 就是一段在本源执行的脚本。API 消费方读 body 与媒体类型，浏览器既不渲染也不执行。
 - **HTTP**：`GET /v1/games/{game}/sources`（公开发现，含状态与 raw 支持）、
   `GET /v1/games/{game}/{resource}`（AT + scope）。响应带 `Re0Auth-Source`，降级时附 `Re0Auth-Degraded`。
 
@@ -612,7 +623,7 @@ row_hash  = SHA-256(prev_hash ‖ canonical(row))
 signature = HMAC-SHA256(key, row_hash)
 ```
 
-- **串行化是必需的**：单行 `audit_chain` 表在每次追加的整个事务里被 `FOR UPDATE` 锁住。没有它，两个并发插入会各自读到同一个前驱，链就**分叉**了。审计不是热路径，串行化的代价可以接受。
+- **串行化是必需的**：单行 `audit_chain` 表在每次追加的整个事务里被 `FOR UPDATE` 锁住。没有它，两个并发插入会各自读到同一个前驱，链就**分叉**了。**代价按批摊薄**：并发写入被 `auditbatch.go` 合并进一个事务（上限 64 行或 1ms 收集窗口），链头锁与往返每批各付一次，行序即入队序。调用方仍然只在**所属批次提交后**才拿到成功（`vault.Use` 的 I3 fail-closed 不变量因此不变）；`BatchSize = 1` 即退回逐行。
 - **`canonical` 必须确定性**：`detail` 的键要**排序**（Go 的 map 迭代顺序是随机的，不排序则每次算出不同的哈希，行会通不过自己的校验），时间戳要**截断到微秒**（那是 `timestamptz` 实际存的精度，哈希纳秒值会在读回时对不上）。前导域名标签防止与其它用途的哈希撞车，长度前缀防止字段边界歧义。`auditchain_test.go` 有专门的测试钉住这三点。
 - **能挡什么，不能挡什么**（写在迁移注释里，因为**夸大的完整性控制比没有更糟**）：
   - 改行 → `row_hash` 重算不出来

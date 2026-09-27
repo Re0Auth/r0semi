@@ -113,6 +113,14 @@ go test ./...   # 全部守卫都在这个套件里，不再需要 build tag
 
 ### C3-3 第二轮遗留假说：审批是非原子「读—判—写」（**机制确证，可利用性证伪**）
 
+> **处置（本次修复）**：写路径现在自带谓词——`ApproveDevice` 要求
+> `done = false AND denied = false AND expires_at > now()`，`DenyDevice` 要求 `denied = false`
+> （**不带** `done = false`，因此"deny 覆盖 approve、与写入顺序无关"这条结论仍然成立）。
+> 两个 store 一致：Postgres 在 `UPDATE ... WHERE` 里判，内存实现在同一把锁内判；0 行受影响时返回
+> `oauth.ErrDeviceNotFound`。判定与写入之间的窗口因此关闭，而不是留给读者兜底。
+> 守卫：`internal/store/memory/device_decision_test.go`（本地全跑）与
+> `internal/store/postgres/oidc_test.go::TestDeviceDecisionIsRefusedOnceTheCodeIsDecided`（CI）。
+
 - **不变量**：①②
 - **证据**：写侧在两个 store 里都是无条件的（`ApproveDevice` 没有 `AND done = false`，也不嗅探过期），
   判定只在**读者**里、且与写分属两次加锁 / 两条语句之间。实测：两次 `ApproveDevice`（`usr_1` 再 `usr_2`）**都成功**，
