@@ -484,6 +484,22 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// RFC 6750 §2: userinfo is a protected resource and its bearer is an access
+	// token. The library's bearer decoding is not that strict — pkg/op/userinfo.go
+	// getTokenIDAndSubject FALLS BACK from "decrypt the token" to "verify it as a
+	// signed JWT" when decryption fails, and the decrypt step of that fallback is a
+	// stub that returns its input unchanged (pkg/oidc/verifier.go DecryptToken,
+	// `return tokenString, nil // TODO: impl`). A compact JWS signed by this OP
+	// therefore authenticates — and the `id_token` is exactly such a JWS, handed to
+	// every RP by design. The access tokens this OP mints are compact JWEs (five
+	// segments), so the two shapes cannot collide and the fallback can be refused
+	// on sight, here, without waiting for the dependency to implement decryption.
+	if r.URL.Path == "/"+pathUserinfo {
+		if token := bearerOf(r); token != "" && isCompactJWS(token) {
+			writeUserinfoInvalidToken(w, "the userinfo endpoint accepts access tokens only")
+			return
+		}
+	}
 
 	const tokenPath = "/" + pathToken
 	// Path-only, not POST-only. `op.Exchange` dispatches on the `grant_type` it
@@ -544,6 +560,18 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		bw.header.Set("Pragma", "no-cache")
 	case r.URL.Path == "/"+pathIntrospection && bw.status == http.StatusOK:
 		body = h.filterIntrospection(body, callerClientID(r))
+	case bw.status == http.StatusForbidden && r.URL.Path == "/"+pathUserinfo:
+		// The storage refused the bearer: it is expired, revoked, erased, or it
+		// named an id this store never issued. The library's path for that writes
+		// 403 with the bare error marshalled as `{}`, and 403 is not in RFC 6750's
+		// contract for a protected resource — §3.1 makes a failed bearer
+		// authentication 401 with `invalid_token`, and a client that reads 403 as
+		// "authenticated but not allowed" would keep a dead token and never
+		// refresh it. Nothing else writes 403 at this path.
+		bw.status = http.StatusUnauthorized
+		bw.header.Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		bw.header.Set("Content-Type", "application/json")
+		body = userinfoInvalidTokenBody
 	case bw.status >= 400 && !isOAuthErrorBody(bw.header.Get("Content-Type"), body):
 		body = normalizeOAuthFailure(bw, r.URL.Path)
 	}
@@ -880,6 +908,53 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 		return true
 	}
 	return false
+}
+
+// bearerOf resolves the bearer credential a request carries the way the library's
+// own userinfo parse does (pkg/op/userinfo.go ParseUserinfoRequest): the
+// Authorization header when it holds a Bearer credential, and otherwise the
+// `access_token` parameter. Resolving it a different way here would mean checking
+// a token the handler is not about to use.
+func bearerOf(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); len(auth) >= len(oidc.PrefixBearer) &&
+		strings.EqualFold(auth[:len(oidc.PrefixBearer)], oidc.PrefixBearer) {
+		return strings.TrimSpace(auth[len(oidc.PrefixBearer):])
+	}
+	return strings.TrimSpace(requestParams(r).Get("access_token"))
+}
+
+// isCompactJWS reports whether s has the compact JWS shape: three segments
+// separated by two dots (RFC 7515 §7.1). Every access token this OP mints is a
+// compact JWE — five segments, four dots — so the shapes are disjoint, and a
+// two-dot bearer at userinfo is either an id_token or something that cannot be an
+// access token.
+func isCompactJWS(s string) bool {
+	return s != "" && strings.Count(s, ".") == 2
+}
+
+// userinfoInvalidTokenBody is the one refusal body for the userinfo endpoint. It
+// names no cause: an expired token, a revoked one, one whose id this store never
+// issued and a token that is not an access token at all all read the same, because
+// anyone holding a string can ask and distinguishing the cases would make the
+// endpoint an oracle for token validity.
+var userinfoInvalidTokenBody = []byte(`{"error":"invalid_token","error_description":"the bearer is not a live access token"}`)
+
+// writeUserinfoInvalidToken answers a refuted bearer exactly as the rewritten
+// storage refusal is answered, so the endpoint has one failure shape.
+func writeUserinfoInvalidToken(w http.ResponseWriter, description string) {
+	w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	out, err := json.Marshal(map[string]string{
+		"error":             "invalid_token",
+		"error_description": description,
+	})
+	if err != nil {
+		out = userinfoInvalidTokenBody
+	}
+	_, _ = w.Write(out)
 }
 
 // writeOAuthJSONError keeps the protocol plane's error format uniform even where

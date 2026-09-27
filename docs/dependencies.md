@@ -65,6 +65,18 @@
 - **`//go:embed` 的目录不能是空的。** 前端构建产物要嵌进二进制，就意味着新克隆必须能编译；
   而 `adapter-static` 每欠构建都会清空输出目录，把为了“新克隆能编译”而放的占位文件删掉。
   两个需求直接冲突，而“让 CI 记得先构建前端”不是解法——那只是一个能被忘掉的顺序。
+- **接口注释说“已废弃、实现成空”不等于那条路径不会被调用。** `op.Storage` 的
+  `SetUserinfoFromScopes` 注释写着 *deprecated and should have an empty implementation*，
+  但 `op.CreateIDToken` 正是通过它填充 `oidc.UserInfo`，紧接着 `claims.SetUserInfo` 是**赋值**
+  而不是合并（pkg/oidc/token.go）——于是“空实现”等于给每一张 `id_token` 写 `sub: ""`，
+  而 `sub` 是 OIDC Core §2 唯一强制要求的声明。**判据是调用链，不是注释**（P0-1）。
+- **依赖库里的 `TODO: impl` 会变成我们边界上的洞。** `pkg/oidc/verifier.go` 的 `DecryptToken`
+  是 `return tokenString, nil // TODO: impl`，而 `pkg/op/userinfo.go` 的
+  `getTokenIDAndSubject` 在解密失败后**回退**到 JWT 验签 ⇒ 本 OP 自己签的 `id_token`
+  被当作 bearer 接受（而 `id_token` 恰好是发给每个 RP 的东西）。修法不在依赖侧：
+  在 `internal/oidchttp` 拒绝三段式 compact JWS 形状的 bearer（本 OP 的访问令牌是五段 compact JWE，
+  形状不相交），并让 store 的 `SetUserinfoFromToken` 要求 `tokenID` 命中一条**活着的**行
+  ——一次查表同时决定过期、撤销与那次 JWT 回退（P0-2）。**不等待上游修 `DecryptToken`。**
 
 ## 5. 前端依赖（`web/`）
 

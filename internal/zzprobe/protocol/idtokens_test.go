@@ -76,27 +76,30 @@ func TestProbeIDTokenIsMissingTheSubjectClaim(t *testing.T) {
 	t.Logf("userinfo carries sub=%v while the id_token does not", claims["sub"])
 }
 
-// PROBE 7 — a bearer that is not an access token is accepted at userinfo.
+// PROBE 7 — a bearer that is not an access token must be REFUSED at userinfo.
 //
-// getTokenIDAndSubject (pkg/op/userinfo.go:91) falls back to VerifyAccessToken
-// when JWE decryption fails, and VerifyAccessToken's first step is
-// oidc.DecryptToken, which is `return tokenString, nil // TODO: impl`
-// (pkg/oidc/verifier.go:110). A plain JWS therefore goes straight to the
+// The defect this guards: getTokenIDAndSubject (pkg/op/userinfo.go:91) falls back
+// to VerifyAccessToken when JWE decryption fails, and VerifyAccessToken's first
+// step is oidc.DecryptToken, which is `return tokenString, nil // TODO: impl`
+// (pkg/oidc/verifier.go:110). A plain JWS therefore went straight to the
 // signature check — against THIS OP's signing key, which is exactly the key that
-// signed the id_token. So `Authorization: Bearer <id_token>` authenticates:
-// today the answer is `200 {}` only because PROBE 6 removed the subject; the
-// moment `sub` is restored (which OIDC requires), the same request answers
-// `200 {"sub":"usr_…"}`.
+// signed the id_token. So `Authorization: Bearer <id_token>` authenticated.
 //
-// That makes the id_token a bearer credential for a protected resource: it is
-// handed to every RP, RPs store and forward it, and it cannot be revoked —
-// /oauth/revoke takes the JWTID path, an id_token has no `jti`, so RevokeToken
-// matches nothing and RFC 7009's unknown-token-is-success answers 200.
+// Both halves of the guard are pinned here: the boundary refuses the compact-JWS
+// shape an opaque access token never has (internal/oidchttp), and the store
+// refuses any bearer whose id does not name a LIVE access-token row
+// (SetUserinfoFromToken), which is what makes expiry, revocation and the JWT
+// fallback one decision instead of three.
+//
+// The stakes: an id_token is handed to every RP by design, RPs store and forward
+// it, and it cannot be revoked — /oauth/revoke takes the JWTID path, an id_token
+// has no `jti`, so RevokeToken matches nothing and RFC 7009's unknown-token-is-
+// success answers 200.
 func TestProbeNonAccessTokenJWSIsAcceptedAtUserinfo(t *testing.T) {
 	e := newEnv(t, envOptions{issuer: "https://issuer.probe"})
 	tokens := asTokens(t, e.codeFlow(t, []string{"openid", "account.id"}))
 
-	userinfo := func(bearer string) (int, map[string]any) {
+	userinfo := func(bearer string) (int, http.Header, map[string]any) {
 		t.Helper()
 		req, err := http.NewRequest(http.MethodGet, e.server.URL+"/oauth/userinfo", nil)
 		if err != nil {
@@ -107,37 +110,50 @@ func TestProbeNonAccessTokenJWSIsAcceptedAtUserinfo(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return resp.StatusCode, decodeJSON(t, bodyOf(t, resp))
+		return resp.StatusCode, resp.Header, decodeJSON(t, bodyOf(t, resp))
 	}
 
 	// Controls: this endpoint does refuse a tampered opaque token and junk.
-	if status, _ := userinfo(tokens.AccessToken[:len(tokens.AccessToken)-2] + "xx"); status != http.StatusUnauthorized {
+	if status, _, _ := userinfo(tokens.AccessToken[:len(tokens.AccessToken)-2] + "xx"); status != http.StatusUnauthorized {
 		t.Fatalf("control failed: a tampered access token answered %d", status)
 	}
-	if status, _ := userinfo("not-a-token-at-all"); status != http.StatusUnauthorized {
+	if status, _, _ := userinfo("not-a-token-at-all"); status != http.StatusUnauthorized {
 		t.Fatalf("control failed: junk answered %d", status)
 	}
-
-	status, claims := userinfo(tokens.IDToken)
-	if status != http.StatusOK {
-		t.Fatalf("the id_token was refused at userinfo (behaviour changed): %d %v", status, claims)
+	// And the live access token still answers, so the refusal is not blanket.
+	if status, _, claims := userinfo(tokens.AccessToken); status != http.StatusOK || claims["sub"] != "usr_probe" {
+		t.Fatalf("control failed: the live access token answered %d %v", status, claims)
 	}
-	t.Logf("the id_token is accepted as a bearer access token: %d %v (subject empty only because PROBE 6 dropped it)",
-		status, claims)
 
-	// And revoking "it" is the RFC 7009 no-op: 200, nothing deleted, still usable.
+	status, header, claims := userinfo(tokens.IDToken)
+	if status == http.StatusOK {
+		t.Errorf("the id_token is accepted as a bearer access token: %d %v", status, claims)
+	}
+	if status != http.StatusUnauthorized {
+		t.Errorf("the id_token was refused with %d, want 401 (RFC 6750 §3.1)", status)
+	}
+	if challenge := header.Get("WWW-Authenticate"); !strings.Contains(challenge, "invalid_token") {
+		t.Errorf("the refusal carries no invalid_token Bearer challenge: %q", challenge)
+	}
+	if cc := header.Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Errorf("the refusal is cacheable: %q", cc)
+	}
+	t.Logf("the id_token is refused at userinfo: %d %s", status, header.Get("WWW-Authenticate"))
+
+	// The RFC 7009 no-op is no longer exploitable, and revoking the id_token keeps
+	// answering 200 — the point is that the bearer is refused either way.
 	resp, raw := e.postForm(t, "/oauth/revoke", url.Values{"token": {tokens.IDToken}}, e.webID, e.webSec)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("revoking an id_token answered %d %s", resp.StatusCode, raw)
 	}
-	if status, _ := userinfo(tokens.IDToken); status != http.StatusOK {
-		t.Fatalf("revoking the id_token actually worked (behaviour changed): %d", status)
+	if status, _, _ := userinfo(tokens.IDToken); status == http.StatusOK {
+		t.Errorf("the id_token became a bearer again after revocation: %d", status)
 	}
 
 	// The boundary of the impact: the business plane's introspector does NOT have
 	// the JWT fallback (internal/oidchttp/oidchttp.go Introspect only decrypts), so
-	// /v1 rejects the id_token. The confusion is confined to the protocol plane's
-	// own userinfo endpoint.
+	// /v1 rejects the id_token. The confusion was confined to the protocol plane's
+	// own userinfo endpoint — and is closed there too.
 	info, err := e.handler.Introspect(t.Context(), tokens.IDToken)
 	if err != nil {
 		t.Fatal(err)

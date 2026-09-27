@@ -681,17 +681,58 @@ func (s *OIDCStore) AuthorizeClientIDSecret(ctx context.Context, clientID, clien
 	return nil
 }
 
-// SetUserinfoFromScopes implements op.Storage (deprecated upstream; no-op).
-func (s *OIDCStore) SetUserinfoFromScopes(context.Context, *oidc.UserInfo, string, string, []string) error {
+// SetUserinfoFromScopes implements op.Storage. Only `sub` is ever exposed
+// (ADR-0001 O-3), and the subject is the whole of what it sets.
+//
+// It is NOT deprecated on this code path, whatever the upstream interface comment
+// says. `op.CreateIDToken` fills a fresh `oidc.UserInfo` through this callback and
+// then calls `claims.SetUserInfo`, which ASSIGNS `sub` from `UserInfo.Subject`
+// rather than merging it (pkg/oidc/token.go). A no-op stub therefore did not mean
+// "no extra claims": it meant `sub: ""` on every id_token minted by the
+// authorization-code, refresh and device grants — the one claim OIDC Core §2 makes
+// REQUIRED, and the identity an RP keys its session on. Both stores have to set it.
+func (s *OIDCStore) SetUserinfoFromScopes(_ context.Context, userinfo *oidc.UserInfo, userID, _ string, _ []string) error {
+	userinfo.Subject = userID
 	return nil
 }
 
 // SetUserinfoFromToken implements op.Storage. Only `sub` is ever exposed
 // (ADR-0001 O-3).
-func (s *OIDCStore) SetUserinfoFromToken(_ context.Context, userinfo *oidc.UserInfo, _, subject, _ string) error {
-	userinfo.Subject = subject
+//
+// The token is looked up rather than trusted. userinfo is a protected resource:
+// the library reaches this method either by decrypting an opaque token into its
+// ID, or — when decryption fails — by falling back to verifying the bearer as a
+// signed JWT. Only the first shape can name an access token this store issued, so
+// requiring `tokenID` to hit a LIVE row decides liveness (expiry, revocation and
+// erasure all delete the row) and, in the same lookup, removes the fallback: a
+// bearer that decrypts to nothing carries no ID that this store has ever seen.
+func (s *OIDCStore) SetUserinfoFromToken(_ context.Context, userinfo *oidc.UserInfo, tokenID, subject, _ string) error {
+	if tokenID == "" {
+		return errNotAnAccessToken
+	}
+	h := oauth.TokenHash(tokenID)
+	now := s.now()
+
+	s.mu.Lock()
+	t, ok := s.accessTokens[h]
+	// The subject is compared against the record, not against the caller's
+	// assertion: a decrypted pair is only meaningful together. What is published is
+	// the record's subject, which is the same value when they agree.
+	live := ok && t.subject == subject && now.Before(t.expiresAt)
+	stored := t.subject
+	s.mu.Unlock()
+	if !live {
+		return errNotAnAccessToken
+	}
+	userinfo.Subject = stored
 	return nil
 }
+
+// errNotAnAccessToken is the userinfo refusal. It says nothing about WHICH check
+// failed — an unparseable bearer, a revoked one, an expired one and an id_token
+// all read the same — because the endpoint is reachable by anyone holding a
+// string, and distinguishing the cases would turn it into an oracle.
+var errNotAnAccessToken = errors.New("not a live access token")
 
 // SetIntrospectionFromToken implements op.Storage.
 //
