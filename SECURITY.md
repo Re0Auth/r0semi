@@ -14,6 +14,18 @@ report them):
   database dump is useless without it, but a leaked key or a compromised process
   can read every credential it wrapped. There is no KMS/HSM adapter yet; what
   that would and would not buy is in `docs/threat-model.md` §6.0.
+- The credential vault stores `Identity` and `Record.Meta` in plaintext. They are
+  PII, not keys, and are deliberately unencrypted so they do not depend on the
+  KEK; a dump of the vault table reveals which games or sources an account is
+  bound to. See `docs/threat-model.md` §6.1.
+- The audit log's hash chain is anchored only by what a deployment ships to an
+  external sink. Rows removed from the tail are not detectable without one; see
+  `docs/architecture.md` §4.16 and the anchoring check in `docs/operations.md`.
+- The `raw` passthrough (`GET /v1/games/{game}/sources/{source}/raw/{path...}`)
+  forwards a source's native API verbatim and does not parse the body. If a
+  source's own API returns credentials, `raw` returns them too — that is the
+  source's defect and the raw contract, not something this service can detect.
+  See `docs/threat-model.md` §9.
 - The reference data source (`referencesource`) is a demonstration. Its own
   vault and sessions are in-memory, and its demo login is a stub.
 - v1 issues plain bearer tokens. DPoP (RFC 9449) is deliberately not offered,

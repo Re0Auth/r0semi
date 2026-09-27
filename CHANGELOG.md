@@ -8,6 +8,17 @@
 
 ## Unreleased
 
+- **撤销令牌的索引（迁移 `0018`）**：`oidc_refresh_tokens.id_hash` 此前没有索引，而 RFC 7009 撤销路径
+  （`RevokeToken` 的查找与两条 DELETE）都按它查/删，每次撤销都退化成全表扫描。新迁移在启动时自动执行；
+  影响面是撤销与应急响应端点，不是签发热路径。
+
+- **公开库 `idp` 自带的 fallback HTTP client 改为 fail-closed**：调用方不注入
+  `RegistryConfig.HTTPClient` 时，默认 client 现在也在拨号层拒绝 loopback / link-local / 私网地址，
+  与生产装配根一致。身份提供方确实在私网的直接库使用者，需显式注入自己的 client。HTTP 面与配置不受影响。
+
+- **`taptapoauth` 不再成段回显上游错误原文**：上游的 `error` / `error_description` / 原始 body
+  现在按上限（200 rune）截断并压平换行后才进错误与日志，避免噪声与伪造日志行；错误分类不受影响。
+
 - **新增 `perf` 工作流与 `make perf`（开发工具，无部署影响）**：每周/手动运行
   每基准 10 次采样的基准测试与 30s 容量画像，`cmd/perfreport` 把结果渲染成
   Markdown 报告（中位数、离散度、与上一次成功运行的基线对比），写入 job summary
