@@ -137,8 +137,15 @@ jobs:
       # the frontend step (idempotent, a few seconds): keeping the dependency is
       # what makes the ordering a guarantee instead of a step order somebody can
       # rearrange. It also produces the SBOM and checksums that cover both.
+      #
+      # The tag travels through the environment rather than being interpolated
+      # into the script: git allows shell metacharacters in a ref name, and this
+      # job holds contents: write, packages: write and id-token: write. The
+      # publish step below already reads GITHUB_REF_NAME for the same reason.
       - name: package
-        run: make release VERSION="${{ github.ref_name }}"
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make release VERSION="$VERSION"
 
       # Keyless signing: the signature's identity is this workflow, attested by
       # GitHub's OIDC provider and recorded in the transparency log. Nothing to
