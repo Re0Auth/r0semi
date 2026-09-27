@@ -12,15 +12,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
 type ctxKey int
 
-const (
-	requestIDCtxKey ctxKey = iota
-	traceIDCtxKey
-)
+// requestIDs are the identities a request carries: what it is called in a log
+// line, what it is called in a trace, and which bucket it is rate limited under.
+// They travel as one value because three context.WithValue calls meant three
+// context nodes allocated on every request, and a lookup that walked all of them.
+type requestIDs struct {
+	request   string
+	trace     string
+	clientKey string
+}
+
+const idsCtxKey ctxKey = iota
 
 // Security response headers. They are applied to every response on both planes,
 // for the same reason request ids are: the rule is identical on either side and
@@ -53,6 +61,18 @@ const (
 	// to the edge/reverse-proxy policy of a deployment, not to this binary. A
 	// deployment that wants them adds them where it terminates TLS.
 	hstsValue = "max-age=31536000"
+
+	// cspRawProxy is the policy for the one response on this service that can
+	// carry a document written somewhere else: the raw passthrough proxy. Its
+	// Content-Type is the source's by contract, so a source answering text/html
+	// would otherwise be markup running on this issuer's own origin — the origin
+	// that holds the session cookie and hands out a CSRF token at
+	// /v1/sessions/current. `default-src 'none'` covers script-src, and `sandbox`
+	// puts the document in an opaque origin with no script execution; the
+	// handler additionally sends Content-Disposition: attachment so a browser
+	// downloads rather than renders. frame-ancestors is restated because this
+	// value *replaces* cspFrameAncestorsNone rather than adding to it.
+	cspRawProxy = "default-src 'none'; frame-ancestors 'none'; sandbox"
 )
 
 // withSecurityHeaders sets the defensive headers. It sits outside the limiter
@@ -101,43 +121,68 @@ func (s *Server) withBodyLimit(next http.Handler) http.Handler {
 	})
 }
 
-// withRequestID assigns a request id, echoes it on the response, and puts it in
-// the context so the problem writer can include it.
+// withRequestContext assigns the identifiers every request carries — the request
+// id, the trace id, and the client key the limiter and the access log both need —
+// in one pass.
+//
+// They used to be two middlewares, which cost a request copy each (r.WithContext
+// allocates a shallow copy of the Request) and derived the client key twice, once
+// for the limiter and once for the log. Both derivations walk the trusted-proxy
+// list. One copy and one derivation; the values are unchanged.
 //
 // It is the outermost middleware, so a response produced by the limiter (or by a
-// panic) carries one too: a request id is most needed on exactly the responses
-// that never reach a handler.
-func withRequestID(next http.Handler) http.Handler {
+// panic) carries a request id too: a request id is most needed on exactly the
+// responses that never reach a handler.
+func (s *Server) withRequestContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")
 		if id == "" {
 			id = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", id)
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDCtxKey, id)))
+
+		trace := traceIDFromTraceparent(r.Header.Get("traceparent"))
+		if trace == "" {
+			trace = newTraceID()
+		}
+
+		ctx := context.WithValue(r.Context(), idsCtxKey, requestIDs{
+			request:   id,
+			trace:     trace,
+			clientKey: s.clientKey(r),
+		})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func requestID(r *http.Request) string {
-	if id, ok := r.Context().Value(requestIDCtxKey).(string); ok {
-		return id
-	}
-	return ""
+// idsOf returns the identities this request was tagged with, if the middleware
+// ran. Handlers mounted without it see the zero value.
+func idsOf(r *http.Request) requestIDs {
+	ids, _ := r.Context().Value(idsCtxKey).(requestIDs)
+	return ids
 }
 
-// withTrace adopts the caller's W3C trace context when it is well formed and
-// generates one otherwise, so every request has a trace id to log and to
-// propagate to upstreams. It is deliberately minimal: this service does not run
-// an OpenTelemetry exporter, so the id is correlated, not exported. An invalid
-// traceparent is ignored rather than rejected — a broken tracing header is not a
-// reason to fail an authorization request.
+func requestID(r *http.Request) string { return idsOf(r).request }
+
+// withTrace is withRequestContext's trace half on its own: it adopts the caller's
+// W3C trace context when it is well formed and generates one otherwise, so a
+// handler mounted without the full chain (a test, an embedding) still has an id to
+// correlate. The server does not use it — see withRequestContext, which assigns
+// every identifier in one pass.
+//
+// It is deliberately minimal: this service does not run an OpenTelemetry exporter,
+// so the id is correlated, not exported. An invalid traceparent is ignored rather
+// than rejected — a broken tracing header is not a reason to fail an authorization
+// request.
 func withTrace(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := traceIDFromTraceparent(r.Header.Get("traceparent"))
-		if traceID == "" {
-			traceID = newTraceID()
+		trace := traceIDFromTraceparent(r.Header.Get("traceparent"))
+		if trace == "" {
+			trace = newTraceID()
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), traceIDCtxKey, traceID)))
+		ids := idsOf(r)
+		ids.trace = trace
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), idsCtxKey, ids)))
 	})
 }
 
@@ -174,12 +219,7 @@ func newTraceID() string {
 	return hex.EncodeToString(b)
 }
 
-func traceID(r *http.Request) string {
-	if id, ok := r.Context().Value(traceIDCtxKey).(string); ok {
-		return id
-	}
-	return ""
-}
+func traceID(r *http.Request) string { return idsOf(r).trace }
 
 // withAccessLog writes one line per request: what was asked for, what came back,
 // how long it took, and under which request id.
@@ -221,7 +261,7 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			slog.String("plane", planeOf(r.URL.Path).String()),
 			slog.String("request_id", requestID(r)),
 			slog.String("trace_id", traceID(r)),
-			slog.String("client", s.clientKey(r)),
+			slog.String("client", s.clientKeyOf(r)),
 		)
 	})
 }
@@ -306,15 +346,16 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 		// can now hold one bucket per plane, so what it may spend in total is the
 		// configured rate times the number of planes; that is a bounded multiple of
 		// a number an operator already chose, rather than an unbounded one.
-		key := planeOf(r.URL.Path).String() + "|" + s.clientKey(r)
-		limit, remaining, reset := s.limiter.Status(key)
-		setRateLimitHeaders(w, limit, remaining, reset)
-		if !s.limiter.Allow(key) {
-			if after := s.limiter.RetryAfter(key); after > 0 {
-				seconds := int(after.Seconds() + 0.999)
-				if seconds < 1 {
-					seconds = 1
-				}
+		key := planeOf(r.URL.Path).String() + "|" + s.clientKeyOf(r)
+		// One call, one lock acquisition: the verdict and the three header values
+		// come from the same read of the bucket. Asking separately (status, then
+		// allow, then the retry hint) took the limiter's process-wide lock up to
+		// three times per request and could report a bucket another request had
+		// already moved past.
+		verdict := s.limiter.Check(key)
+		setRateLimitHeaders(w, verdict)
+		if !verdict.Allowed {
+			if seconds := int(verdict.Reset.Seconds() + 0.999); seconds > 0 {
 				w.Header().Set("Retry-After", strconv.Itoa(seconds))
 			}
 			switch planeOf(r.URL.Path) {
@@ -333,11 +374,11 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 
 // setRateLimitHeaders publishes the bucket's state as the IETF RateLimit-* fields
 // so a client can back off before being rejected rather than after.
-func setRateLimitHeaders(w http.ResponseWriter, limit, remaining int, reset time.Duration) {
+func setRateLimitHeaders(w http.ResponseWriter, v ratelimit.Verdict) {
 	h := w.Header()
-	h.Set("RateLimit-Limit", strconv.Itoa(limit))
-	h.Set("RateLimit-Remaining", strconv.Itoa(remaining))
-	seconds := int(reset.Seconds() + 0.999)
+	h.Set("RateLimit-Limit", strconv.Itoa(v.Limit))
+	h.Set("RateLimit-Remaining", strconv.Itoa(v.Remaining))
+	seconds := int(v.Reset.Seconds() + 0.999)
 	if seconds < 0 {
 		seconds = 0
 	}
@@ -385,6 +426,20 @@ func (s *Server) withInFlightLimit(next http.Handler) http.Handler {
 // addresses in front of it are its own.
 func (s *Server) clientKey(r *http.Request) string {
 	return clientAddr(r, s.trustedProxies)
+}
+
+// clientKeyOf returns the client key withRequestContext derived for this request.
+//
+// The limiter and the access log both need it, and deriving it twice meant walking
+// the trusted-proxy list twice per request. A handler mounted without that
+// middleware — a test, a future mount — still gets a key rather than an empty
+// bucket, which is why the fallback is here rather than an assumption that the
+// context is populated.
+func (s *Server) clientKeyOf(r *http.Request) string {
+	if key := idsOf(r).clientKey; key != "" {
+		return key
+	}
+	return s.clientKey(r)
 }
 
 // plane is which of the service's three surfaces a path belongs to.

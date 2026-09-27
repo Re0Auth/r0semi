@@ -24,6 +24,12 @@ import (
 // JSON encoding, the middleware chain) is included, because a number that
 // excludes half the request is not a capacity number.
 //
+// What is NOT included, and deliberately: building the handler. It was inside the
+// loop, which meant every iteration re-registered ~30 routes — net/http's mux
+// construction showed up as the single largest consumer in a CPU profile of the
+// benchmark, and none of it happens once per request in a deployment. `Handler()`
+// is called once, here, and the loop calls ServeHTTP.
+//
 // Run with: make bench
 
 // benchEnv is a fully mounted server plus a live access token and the client's
@@ -31,7 +37,7 @@ import (
 // can be introspected with its own credentials — a client may always introspect
 // its own tokens.
 type benchEnv struct {
-	handler *Server
+	handler http.Handler
 	token   string
 	basic   string
 }
@@ -75,7 +81,7 @@ func newBenchEnv(b *testing.B) benchEnv {
 	code := benchIssueCode(b, srv, store, clientID, verifier, scopes)
 	token := benchExchange(b, srv, clientID, secret, code, verifier)
 	return benchEnv{
-		handler: srv,
+		handler: srv.Handler(),
 		token:   token,
 		basic:   "Basic " + base64.StdEncoding.EncodeToString([]byte(clientID+":"+secret)),
 	}
@@ -167,7 +173,7 @@ func BenchmarkBusinessPlaneBearerMe(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		rec := httptest.NewRecorder()
-		env.handler.Handler().ServeHTTP(rec, req)
+		env.handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			b.Fatalf("GET /v1/me = %d: %s", rec.Code, rec.Body.String())
 		}
@@ -178,6 +184,10 @@ func BenchmarkBusinessPlaneBearerMe(b *testing.B) {
 // protocol-plane read a resource server makes on every downstream request. It is
 // a pure read — no state is written — so it measures the lookup and the JSON
 // answer rather than token minting.
+//
+// The form body is built per iteration on purpose: the handler parses it, and
+// reusing a parsed request would skip that parse. It stands in for the HTTP
+// layer's own request handling, which is not otherwise in the number.
 func BenchmarkProtocolIntrospect(b *testing.B) {
 	env := newBenchEnv(b)
 	form := url.Values{"token": {env.token}}.Encode()
@@ -188,7 +198,7 @@ func BenchmarkProtocolIntrospect(b *testing.B) {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Authorization", env.basic)
 		rec := httptest.NewRecorder()
-		env.handler.Handler().ServeHTTP(rec, req)
+		env.handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			b.Fatalf("introspect = %d: %s", rec.Code, rec.Body.String())
 		}
@@ -196,14 +206,16 @@ func BenchmarkProtocolIntrospect(b *testing.B) {
 }
 
 // BenchmarkProtocolDiscovery measures a discovery document fetch. It is cheap to
-// serve but polled by every client on a cold start, so it is worth a number.
+// serve but polled by every client on a cold start, so it is worth a number. The
+// document is rendered once and cached, so this measures the cache hit — the path
+// every client actually takes.
 func BenchmarkProtocolDiscovery(b *testing.B) {
 	env := newBenchEnv(b)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		rec := httptest.NewRecorder()
-		env.handler.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil))
+		env.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil))
 		if rec.Code != http.StatusOK {
 			b.Fatalf("discovery = %d", rec.Code)
 		}
