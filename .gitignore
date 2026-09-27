@@ -25,6 +25,11 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# Local performance report outputs (make perf); in CI they live in artifacts
+/bench.txt
+/load.txt
+/report.md
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

@@ -1,0 +1,156 @@
+name: perf
+
+# The performance report. Where ci.yml's `bench` and `load` jobs prove on every
+# change that the harnesses still run, this workflow measures properly and writes
+# the result up: ten samples per benchmark (so the report can show a median and a
+# spread instead of one one-second reading), a longer capacity profile, the
+# Postgres-backed audit benchmarks, and a comparison against the previous run.
+#
+# It does NOT run on push or pull request. ci.yml already executes every
+# benchmark on every change; duplicating that here would pay for a slower,
+# noisier copy of the same signal. This is the deep version: manual, or weekly,
+# with its report attached to the run.
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays 03:17 UTC. Off the hour on purpose: the top of the hour is when
+    # everything else on the shared fleet also starts, and a benchmark run on a
+    # busy fleet measures the fleet.
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+  # The baseline step reads the previous run's artifacts through `gh api`.
+  actions: read
+
+concurrency:
+  group: perf
+  # Two overlapping runs would compare against each other. A scheduled run that
+  # starts while a manual one is in flight waits instead of interleaving.
+  cancel-in-progress: false
+
+jobs:
+  report:
+    # One job, one machine, so every number in the report came from the same
+    # place. Splitting bench/load/postgres across jobs would parallelize minutes
+    # of a weekly run at the cost of making the deltas cross-machine.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        # The audit-chain benchmarks skip without TEST_DATABASE_URL (their
+        # fixture says so); the service is what makes them real numbers instead
+        # of a skip line in the report.
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: r0semi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/r0semi_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Ten samples of every benchmark in the repository, including the
+      # Postgres-backed audit pair (the service above makes them run rather than
+      # skip). The default -benchtime of 1s per benchmark per count is what makes
+      # ten samples affordable; the medians are what the report reads, and a
+      # median of ten one-second readings is stable enough to compare a weekly
+      # trend by.
+      #
+      # The floor is the anti-vacuous check, not a threshold: sixteen result
+      # lines per count is the full set (the ci.yml bench job's comment explains
+      # why no number here is ever gated), so anything under a hundred means the
+      # harness broke, not that the machine was slow.
+      - name: micro benchmarks (10 samples)
+        run: |
+          go test -run '^$' -bench . -benchmem -count=10 -timeout 40m ./... | tee bench.txt
+          results=$(grep -c 'ns/op' bench.txt || true)
+          echo "benchmark results: $results"
+          if [ "$results" -lt 100 ]; then
+            echo "::error::expected at least 100 benchmark results (16 benchmarks x 10 counts), got $results"
+            exit 1
+          fi
+
+      # The same capacity profile ci.yml runs, but 30s instead of 10s: three
+      # times the samples under the p99, which is the row a trend needs and the
+      # row a 10s window estimates worst.
+      - name: capacity profile (30s, 8 workers)
+        run: |
+          RE0AUTH_LOAD_PROFILE=1 RE0AUTH_LOAD_SECONDS=30 \
+            go test -count=1 -v -run TestLoadProfile ./internal/httpapi/ | tee load.txt
+          grep -q 'capacity profile:' load.txt
+
+      # The baseline: the previous successful run of this workflow on the same
+      # branch. Artifacts are how one run hands numbers to another; a run that
+      # finds none (the first, a renamed workflow, a pruned history) simply
+      # reports without a comparison column, which is why every failure here is
+      # tolerated rather than fatal.
+      #
+      # `gh api .../zip` streams the artifact archive; only bench.txt and
+      # load.txt are needed from it, and unzip is preinstalled on the runner.
+      - name: download the previous run's numbers (best effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          prev_id=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/perf.yml/runs?status=success&branch=${GITHUB_REF_NAME}&per_page=15" \
+            --jq '[.workflow_runs[] | select(.id != '"${GITHUB_RUN_ID}"')][0].id' 2>/dev/null || true)
+          if [ -z "${prev_id}" ]; then
+            echo "no previous run found; this report will have no baseline column"
+            exit 0
+          fi
+          art_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${prev_id}/artifacts" \
+            --jq '[.artifacts[] | select(.name == "perf-data" and .expired == false)][0].id' 2>/dev/null || true)
+          if [ -z "${art_id}" ]; then
+            echo "previous run ${prev_id} has no usable perf-data artifact; skipping the baseline"
+            exit 0
+          fi
+          mkdir -p baseline
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${art_id}/zip" > baseline.zip
+          unzip -o baseline.zip -d baseline
+          ls -la baseline
+
+      # The report: medians, spreads, the capacity profile verbatim, and — when
+      # the step above produced a baseline — per-benchmark deltas with a geomean
+      # headline. The same tool renders a laptop's local run (make perf), so the
+      # two cannot disagree about what a report says.
+      - name: render the report
+        run: |
+          args=""
+          if [ -f baseline/bench.txt ]; then args="$args -baseline-bench baseline/bench.txt"; fi
+          if [ -f baseline/load.txt ]; then args="$args -baseline-load baseline/load.txt"; fi
+          go run ./cmd/perfreport -load load.txt -commit "${GITHUB_SHA}" $args bench.txt | tee report.md
+
+      - name: job summary
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # The artifact is the report's persistence: it is what the next run
+      # downloads as its baseline, what the run page links, and what a trend
+      # spreadsheet reads. All three files travel together — the raw outputs
+      # beside the report, so any number in it can be recomputed by hand.
+      - name: upload the numbers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-data
+          path: |
+            bench.txt
+            load.txt
+            report.md
+          retention-days: 90

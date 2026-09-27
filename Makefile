@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test bench check lint load e2e play visual dist sbom checksums release docker clean bundle
+.PHONY: all web build test bench perf check lint load e2e play visual dist sbom checksums release docker clean bundle
 
 all: web build
 
@@ -61,6 +61,18 @@ bench:
 # in-memory stores make this a ceiling, not a promise.
 load:
 	RE0AUTH_LOAD_PROFILE=1 go test -count=1 -v -run TestLoadProfile ./internal/httpapi/
+
+# The full performance report: the local twin of the perf workflow. Ten samples
+# per benchmark (so the report shows a median and a spread, not one reading), the
+# 30-second capacity profile, and cmd/perfreport's Markdown report on stdout —
+# the same tool the workflow renders its job summary from, so the two cannot
+# drift. Needs no database: the Postgres-backed audit benchmarks skip here, and
+# the report's reading notes say what ran rather than pretending otherwise.
+# Output files are gitignored; in CI they live in the run's artifacts instead.
+perf:
+	go test -run '^$$' -bench . -benchmem -count=10 -timeout 40m ./... | tee bench.txt
+	RE0AUTH_LOAD_PROFILE=1 RE0AUTH_LOAD_SECONDS=30 go test -count=1 -v -run TestLoadProfile ./internal/httpapi/ | tee load.txt
+	go run ./cmd/perfreport -load load.txt bench.txt
 
 # Browser tests. They build and start their own re0auth plus a fake identity
 # provider, so nothing else needs to be running — and there is no test-only way
