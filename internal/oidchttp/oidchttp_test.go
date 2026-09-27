@@ -673,3 +673,46 @@ func TestAuthorizeRequiresPKCE(t *testing.T) {
 	plain.Set("code_challenge_method", "plain")
 	assertRejected(t, plain, "plain challenge method")
 }
+
+// The rendered discovery document is served from the cache once it has been built.
+//
+// The guard is written so it cannot pass by accident: a document planted in the
+// cache is what the handler must serve, which is only true if it reads the cache
+// rather than re-rendering and happening to agree. A cold fetch must also populate
+// it, and the two document paths keep separate entries.
+func TestDiscoveryIsServedFromCache(t *testing.T) {
+	f := newFixture(t)
+
+	if _, ok := f.handler.discovery.get(OIDCDiscoveryPath); ok {
+		t.Fatal("a fresh handler already had a cached discovery document")
+	}
+	resp := get(t, noRedirect, f.server.URL+OIDCDiscoveryPath)
+	cold, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	cached, ok := f.handler.discovery.get(OIDCDiscoveryPath)
+	if !ok {
+		t.Fatal("the first fetch did not populate the cache")
+	}
+	if string(cached.body) != string(cold) {
+		t.Fatal("the cached document is not what was served")
+	}
+
+	const sentinel = `{"issuer":"sentinel","planted":true}`
+	f.handler.discovery.put(OIDCDiscoveryPath, discoveryDoc{
+		status: http.StatusOK,
+		header: http.Header{"Content-Type": {"application/json"}},
+		body:   []byte(sentinel),
+	})
+	resp = get(t, noRedirect, f.server.URL+OIDCDiscoveryPath)
+	warm, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(warm) != sentinel {
+		t.Fatalf("the second fetch did not come from the cache: %s", warm)
+	}
+
+	// The RFC 8414 alias has its own entry: planting one path must not answer for
+	// the other.
+	if _, ok := f.handler.discovery.get(RFC8414Path); ok {
+		t.Fatal("planting one discovery path populated the other")
+	}
+}

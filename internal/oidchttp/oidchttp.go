@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
@@ -126,6 +127,8 @@ type Handler struct {
 	// metrics observes token issuance and token-endpoint failures. Optional; a nil
 	// *observability.Metrics records nothing.
 	metrics *observability.Metrics
+	// discovery caches the rendered discovery documents. See serveDiscovery.
+	discovery discoveryCache
 }
 
 // New builds the provider.
@@ -239,15 +242,86 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // decided not to offer removed. The library advertises end_session because it
 // implements it; O-9 says Re0Auth does not offer RP-initiated logout, and an
 // advertised endpoint that is out of contract is worse than a missing one.
+//
+// The rendered document is cached for the life of the handler, because it cannot
+// change: the issuer, the endpoints and the scope catalog are fixed at
+// construction, and the library's own marshalling reads nothing else. Rendering it
+// per request cost 53µs and 336 allocations on an endpoint that needs no
+// credentials — an amplification anyone could ask for as often as the limiter
+// allowed. Only a 200 is cached; an error response must not become the process's
+// permanent answer.
 func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path string) {
+	if doc, ok := h.discovery.get(path); ok {
+		doc.write(w)
+		return
+	}
+
 	clone := r.Clone(r.Context())
 	clone.URL.Path = path
-	bw := newBufferedWriter()
+	bw := acquireBufferedWriter()
 	// Discovery is public metadata; clients and intermediaries may cache it, and
 	// an explicit max-age is what keeps them from re-fetching it per request.
 	bw.header.Set("Cache-Control", "public, max-age=300")
 	h.provider.ServeHTTP(bw, clone)
-	bw.flush(w, stripUnsupportedDiscoveryFields(bw.body.Bytes()))
+
+	doc := discoveryDoc{
+		status: bw.status,
+		header: bw.header.Clone(),
+		body:   stripUnsupportedDiscoveryFields(bw.body.Bytes()),
+	}
+	releaseBufferedWriter(bw)
+	if doc.status == http.StatusOK {
+		h.discovery.put(path, doc)
+	}
+	doc.write(w)
+}
+
+// discoveryDoc is one rendered discovery document, cached by request path.
+type discoveryDoc struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+// write sends the document. The header is added rather than assigned, so this
+// composes with whatever the transport already set; Content-Length is dropped
+// because the rendered body may differ in length from the library's.
+func (d discoveryDoc) write(w http.ResponseWriter) {
+	dst := w.Header()
+	for k, vs := range d.header {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+	dst.Del("Content-Length")
+	w.WriteHeader(d.status)
+	_, _ = w.Write(d.body)
+}
+
+// discoveryCache holds the rendered discovery documents, one per path.
+//
+// A plain mutex rather than sync.Map: the two keys are written once each and read
+// on every fetch, so the map is tiny and the contention is on the read path, where
+// a mutex is the cheaper of the two.
+type discoveryCache struct {
+	mu sync.Mutex
+	m  map[string]discoveryDoc
+}
+
+func (c *discoveryCache) get(path string) (discoveryDoc, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	doc, ok := c.m[path]
+	return doc, ok
+}
+
+func (c *discoveryCache) put(path string, doc discoveryDoc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[string]discoveryDoc)
+	}
+	c.m[path] = doc
 }
 
 // stripUnsupportedDiscoveryFields removes advertised capabilities that are
@@ -260,10 +334,13 @@ func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path st
 // profile/email claim list — because it can implement them, not because every
 // embedding does. This deployment implements the code flow, refresh and device
 // grants, and returns only `sub`, so those are what the document may say.
+//
+// The result never aliases body, on any path: the caller's buffer is pooled and
+// rewound as soon as this returns.
 func stripUnsupportedDiscoveryFields(body []byte) []byte {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return body
+		return append([]byte(nil), body...)
 	}
 	for _, key := range []string{
 		"end_session_endpoint",
@@ -315,7 +392,7 @@ func stripUnsupportedDiscoveryFields(body []byte) []byte {
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {
-		return body
+		return append([]byte(nil), body...)
 	}
 	return out
 }
@@ -414,7 +491,7 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// answers some of them — an unauthenticated introspect or userinfo, for
 	// instance — in plain text, and a client that has to parse two shapes on one
 	// plane has no contract at all.
-	bw := newBufferedWriter()
+	bw := acquireBufferedWriter()
 	h.provider.ServeHTTP(bw, r)
 	body := bw.body.Bytes()
 
@@ -483,6 +560,7 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// ADR-0011: the provider's CORS headers are removed at the ServeHTTP boundary
 	// (corsFreeWriter), so nothing has to be done about them here.
 	bw.flush(w, body)
+	releaseBufferedWriter(bw)
 }
 
 // corsFreeWriter drops the CORS response headers a dependency may set.
@@ -1020,8 +1098,47 @@ type bufferedWriter struct {
 	status int
 }
 
-func newBufferedWriter() *bufferedWriter {
-	return &bufferedWriter{header: make(http.Header), status: http.StatusOK}
+// bufferedWriters reuses the capture buffers.
+//
+// Every protocol-plane response is buffered — the token response's id_token and
+// offline_access rules (O-2, O-6), the introspection filter, the RFC 9207 `iss`
+// parameter, the error-shape normalisation — so a Header and a Buffer were
+// allocated per request on the endpoints that have to stay cheap. The writer never
+// escapes the handler that acquired it: it is flushed synchronously and released.
+var bufferedWriters = sync.Pool{
+	New: func() any { return &bufferedWriter{header: make(http.Header), status: http.StatusOK} },
+}
+
+// maxPooledResponseBytes is the largest body whose buffer is kept for reuse. A
+// bigger one is dropped instead, so a single large response cannot pin its
+// capacity for the life of the process.
+const maxPooledResponseBytes = 64 << 10
+
+func acquireBufferedWriter() *bufferedWriter {
+	bw, _ := bufferedWriters.Get().(*bufferedWriter)
+	if bw == nil {
+		bw = &bufferedWriter{header: make(http.Header)}
+	}
+	bw.reset()
+	return bw
+}
+
+// release returns the writer for reuse. Anything still holding its bytes must have
+// copied them: the buffer is rewound and handed to the next request.
+func releaseBufferedWriter(bw *bufferedWriter) {
+	if bw.body.Cap() > maxPooledResponseBytes {
+		return
+	}
+	bw.reset()
+	bufferedWriters.Put(bw)
+}
+
+func (b *bufferedWriter) reset() {
+	for k := range b.header {
+		delete(b.header, k)
+	}
+	b.body.Reset()
+	b.status = http.StatusOK
 }
 
 func (b *bufferedWriter) Header() http.Header { return b.header }
