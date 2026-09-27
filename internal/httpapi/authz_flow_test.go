@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alexedwards/scs/v2"
+
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
@@ -36,13 +38,31 @@ func newBrowser(t *testing.T) *http.Client {
 // newFlowEnv assembles the whole stack: oauth AS, session/auth plane, and the
 // authorization-interaction API, backed by a fake GitHub IdP.
 func newFlowEnv(t *testing.T) (base string, accounts *account.MemoryStore) {
-	return newFlowEnvWith(t, nil)
+	base, accounts, _ = newFlowEnvWithOptions(t, flowEnvOptions{})
+	return base, accounts
 }
 
 // newFlowEnvWith is newFlowEnv plus an optional federation service, so tests can
 // exercise the binding-aware consent path without every existing test having to
 // stand up a data source.
 func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts *account.MemoryStore) {
+	base, accounts, _ = newFlowEnvWithOptions(t, flowEnvOptions{Federation: fed})
+	return base, accounts
+}
+
+// flowEnvOptions are the pieces a test may substitute. SessionStore is here so a
+// test can read what a browser actually committed: the default is an in-memory
+// store with no way to look inside it, and the session is where the browser-bound
+// handles live.
+type flowEnvOptions struct {
+	Federation   federation.Service
+	SessionStore scs.Store
+}
+
+// newFlowEnvWithOptions is the one implementation behind the two helpers above.
+// It also returns the session manager, so a test can ask what a session holds
+// after a flow rather than only what the wire answered.
+func newFlowEnvWithOptions(t *testing.T, opts flowEnvOptions) (string, *account.MemoryStore, *auth.Manager) {
 	t.Helper()
 
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,8 +121,8 @@ func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts
 		t.Fatal(err)
 	}
 
-	accounts = account.NewMemoryStore()
-	manager := auth.NewManager(auth.Options{Secure: false})
+	accounts := account.NewMemoryStore()
+	manager := auth.NewManager(auth.Options{Secure: false, Store: opts.SessionStore})
 	authHandler, err := auth.NewHandler(manager, registry, accounts)
 	if err != nil {
 		t.Fatal(err)
@@ -118,14 +138,14 @@ func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts
 		Sessions:          manager,
 		Accounts:          accounts,
 		Auth:              authHandler,
-		Federation:        fed,
+		Federation:        opts.Federation,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(api.Handler())
 	t.Cleanup(server.Close)
-	return server.URL, accounts
+	return server.URL, accounts, manager
 }
 
 func doReq(t *testing.T, c *http.Client, req *http.Request) *http.Response {

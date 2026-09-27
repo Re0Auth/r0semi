@@ -114,9 +114,20 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 	err := s.devices.DecideDeviceAuthorization(r.Context(), body.UserCode, string(user),
 		body.Decision == "approve", toScopes(body.Scopes), toScopes(body.Explicit))
 	if err != nil {
+		// A code the store no longer knows is a dead handle, so it is released
+		// rather than left in the session; anything else may be retried against the
+		// same handle.
+		if errors.Is(err, oauth.ErrDeviceNotFound) {
+			s.sessions.Unbind(r.Context(), deviceBindKind, body.UserCode)
+		}
 		s.writeDeviceProblem(w, r, err)
 		return
 	}
+	// Consumed. The consent screen releases its handle the same way; a device
+	// handle used to outlive its decision, and nothing ever removed it — every
+	// code a browser had ever loaded stayed in the session for the life of the
+	// cookie.
+	s.sessions.Unbind(r.Context(), deviceBindKind, body.UserCode)
 	decision := observability.DeviceDenied
 	if body.Decision == "approve" {
 		decision = observability.DeviceApproved

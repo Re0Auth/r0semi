@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -245,9 +246,28 @@ func (m *Manager) ValidCSRF(r *http.Request) bool {
 func handleKey(kind, id string) string { return "handle_" + kind + "_" + id }
 
 // ownerKey namespaces the account a handle was created for. It is a different
-// prefix from handleKey so the two can never collide, and the kind is spelled the
-// same on both sides by construction — Bind writes both.
+// prefix from handleKey so the two can never collide, and the kind is spelled
+// the same on both sides by construction — Bind writes both.
 func ownerKey(kind, id string) string { return "owner_" + kind + "_" + id }
+
+// queueKey namespaces the FIFO of ids a session has bound for one kind. It is the
+// eviction order for the cap below, and it is a single joined string rather than
+// a slice for the same reason handleKey is per-handle: session values stay the
+// types gob can encode without registration.
+func queueKey(kind string) string { return "boundq_" + kind }
+
+// maxBoundHandlesPerKind bounds how many handles one session may hold for one
+// kind. Handles are created by links a user can be sent to — a consent screen, a
+// device verification, a bind start — and each one used to live until it was
+// consumed. Nothing consumed an undecided one, so a browser that was made to
+// visit many of them accumulated state without bound, and a session is read and
+// rewritten on every request. The oldest entry is evicted past the cap.
+const maxBoundHandlesPerKind = 32
+
+// handleSep separates the ids in a kind's queue. It is the ASCII unit separator,
+// which cannot occur in a handle id: every id in this service is an opaque token
+// the service minted — a base64 value, a device user code, a bind state.
+const handleSep = '\x1f'
 
 // Bind scopes a server-side handle (an authorization request, an enrollment,
 // ...) to this browser session. Only the session that created it may read or
@@ -264,11 +284,52 @@ func ownerKey(kind, id string) string { return "owner_" + kind + "_" + id }
 // A handle created before anyone signed in carries no owner, and any signed-in
 // account may use it. That is the flow as designed rather than a gap: there was
 // nobody to bind it to. See OwnerMatches.
+//
+// Binding is idempotent, and the session keeps at most maxBoundHandlesPerKind
+// handles per kind: binding one more evicts the oldest, which is the only way a
+// session cannot be grown without bound by sending a browser to links.
 func (m *Manager) Bind(ctx context.Context, kind, id string) {
+	if id == "" || strings.ContainsRune(id, handleSep) {
+		// An id that could not be tracked is not bound at all. Binding it without
+		// a queue entry would put state in the session that nothing can evict,
+		// which is the failure this cap exists to prevent.
+		return
+	}
+	if m.sessions.GetString(ctx, handleKey(kind, id)) == "1" {
+		return
+	}
+	m.enqueue(ctx, kind, id)
 	m.sessions.Put(ctx, handleKey(kind, id), "1")
 	if user, ok := m.User(ctx); ok {
 		m.sessions.Put(ctx, ownerKey(kind, id), string(user))
 	}
+}
+
+// enqueue records id as the newest handle of its kind, evicting the oldest while
+// the kind is over its cap.
+func (m *Manager) enqueue(ctx context.Context, kind, id string) {
+	ids := append(m.boundQueue(ctx, kind), id)
+	for len(ids) > maxBoundHandlesPerKind {
+		m.release(ctx, kind, ids[0])
+		ids = ids[1:]
+	}
+	m.sessions.Put(ctx, queueKey(kind), strings.Join(ids, string(handleSep)))
+}
+
+// boundQueue returns the ids this session has bound for kind, oldest first.
+func (m *Manager) boundQueue(ctx context.Context, kind string) []string {
+	raw := m.sessions.GetString(ctx, queueKey(kind))
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, string(handleSep))
+}
+
+// release drops the keys that make a handle usable. The queue is the caller's
+// business: enqueue is mid-eviction when it calls this.
+func (m *Manager) release(ctx context.Context, kind, id string) {
+	m.sessions.Remove(ctx, handleKey(kind, id))
+	m.sessions.Remove(ctx, ownerKey(kind, id))
 }
 
 // Bound reports whether this browser created the handle.
@@ -289,10 +350,24 @@ func (m *Manager) OwnerMatches(ctx context.Context, kind, id string, user accoun
 	return owner == "" || owner == string(user)
 }
 
-// Unbind forgets a handle once it has been consumed.
+// Unbind forgets a handle once it has been consumed, and takes it out of its
+// kind's queue so the cap counts live handles rather than every handle the
+// session has ever seen.
 func (m *Manager) Unbind(ctx context.Context, kind, id string) {
-	m.sessions.Remove(ctx, handleKey(kind, id))
-	m.sessions.Remove(ctx, ownerKey(kind, id))
+	m.release(ctx, kind, id)
+
+	ids := m.boundQueue(ctx, kind)
+	kept := ids[:0]
+	for _, v := range ids {
+		if v != id {
+			kept = append(kept, v)
+		}
+	}
+	if len(kept) == 0 {
+		m.sessions.Remove(ctx, queueKey(kind))
+		return
+	}
+	m.sessions.Put(ctx, queueKey(kind), strings.Join(kept, string(handleSep)))
 }
 
 // requireSafeMethod reports whether a method is exempt from CSRF checks.
