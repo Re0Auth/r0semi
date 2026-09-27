@@ -137,8 +137,13 @@ func main() {
 
 func newTapTapLogin(tap tapTapSettings) (*referencesource.TapTapLogin, error) {
 	// Retry transient upstream failures. Only idempotent methods are retried, so
-	// the device-code and redeem POSTs are deliberately sent once.
-	doer := httpclient.Retry(&http.Client{Timeout: 15 * time.Second}, httpclient.RetryOptions{})
+	// the device-code and redeem POSTs are deliberately sent once. Redirects off
+	// the configured host are refused: these requests carry the device code, the
+	// MAC key and, on redeem, the app key.
+	doer := httpclient.Retry(&http.Client{
+		Timeout:       15 * time.Second,
+		CheckRedirect: httpclient.NoCrossHostRedirects,
+	}, httpclient.RetryOptions{})
 	enroller, err := taptapoauth.NewService(taptapoauth.Config{
 		DeviceCodeEndpoint: tap.DeviceCodeEndpoint,
 		TokenEndpoint:      tap.TokenEndpoint,
@@ -166,7 +171,7 @@ func newSocialLogin(cfg settings) (*referencesource.SocialLogin, error) {
 	registry, err := idp.NewRegistry(idp.RegistryConfig{
 		RedirectBase: cfg.Issuer,
 		CallbackPath: "/login/{provider}/callback",
-		HTTPClient:   &http.Client{Timeout: 10 * time.Second},
+		HTTPClient:   &http.Client{Timeout: 10 * time.Second, CheckRedirect: httpclient.NoCrossHostRedirects},
 		Credentials:  cfg.social,
 	})
 	if err != nil {
