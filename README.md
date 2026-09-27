@@ -82,6 +82,9 @@ gofmt -l .
 go vet ./...
 go test ./...
 make bench    # capacity benchmarks; CI runs these on every change
+make perf     # full performance report: 10 samples per benchmark + 30s capacity
+              # profile, rendered by cmd/perfreport (the perf workflow runs the
+              # same thing weekly and attaches the Markdown report to the run)
 ```
 
 前端：

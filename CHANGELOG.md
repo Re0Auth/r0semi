@@ -8,6 +8,12 @@
 
 ## Unreleased
 
+- **新增 `perf` 工作流与 `make perf`（开发工具，无部署影响）**：每周/手动运行
+  每基准 10 次采样的基准测试与 30s 容量画像，`cmd/perfreport` 把结果渲染成
+  Markdown 报告（中位数、离散度、与上一次成功运行的基线对比），写入 job summary
+  并随 run 存为 artifact。ci.yml 既有的 `bench`/`load` 门槛不变；本地 `make perf`
+  无需数据库，审计链基准会照实跳过并在报告中注明。
+
 - **破坏性（仅影响直接使用公开库 `oauth` 的代码）**：`oauth.DeviceStore` 的
   `UpdateDevice(ctx, DeviceAuthorizationRecord)` 拆成两个字段级方法——
   `RecordPoll(ctx, deviceCodeHash, at)` 与

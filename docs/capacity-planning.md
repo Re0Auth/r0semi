@@ -67,6 +67,21 @@ capacity profile: 8 workers, 10s, 237824 requests, 23782.4 req/s
 CI 每次都跑并把这张表写进 job summary（`GITHUB_STEP_SUMMARY`）：数字会随机器与代码变化，**能比较的
 前提是它一直存在**——与 `bench` 同一条理由，画像不因一次慢跑而失败，但"什么都没测到"会失败。
 
+### 性能报告（perf 工作流与 `make perf`）
+
+`bench`/`load` 证明的是"harness 还在跑"；要比较**趋势**用的是另一个入口：`perf` 工作流（每周一定时 +
+手动触发）与本地等价命令 `make perf`。两者跑同一套东西、用同一个渲染器（`cmd/perfreport`）：
+
+- 每条基准 **10 次采样**，报告给出中位数与离散度（min–max），而不是单次 1s 读数；
+- 容量画像跑 30s（CI 门槛版是 10s），p99 的样本量是它的三倍；
+- 报告与原始输出（`bench.txt` / `load.txt`）作为 `perf-data` artifact 存在 run 上；
+- 工作流会下载**上一次成功运行**的同名 artifact 作为基线，按"包名 + 基准名"逐条对比，给出
+  每条偏差、几何平均与超出噪声阈值的清单；被改名的基准显示为一条 new + 一条 missing，不会伪装成
+  ±100%。
+
+读报告的两条规矩写在报告尾部的 Reading notes 里：共享 runner 有噪声，阈值内的差异当天气不当信号；
+内存存储的数字是单核成本上界，Postgres 部署另有每次请求的往返（审计链基准是唯一带真库的部分）。
+
 ## 2. Postgres 连接预算
 
 `pgxpool` 的并发上限是**每进程**的（`postgres.go` 的 `PoolOptions` 注释与
