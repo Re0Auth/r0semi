@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/federation"
@@ -237,8 +238,58 @@ func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oaut
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
+	// The body, the status and the media type stay the source's, verbatim: that
+	// is this endpoint's contract. What is not left to the source is what a
+	// browser may do with the response, because the media type is now attached to
+	// *this* origin. A source answering text/html would be markup running beside
+	// the session cookie, with no script-src to stop it — the global policy is
+	// frame-ancestors only, and the SPA's script-src lives in its own document's
+	// meta tag rather than in a header. So the response carries a policy stricter
+	// than the global one, and a disposition that makes a browser download the
+	// body instead of rendering it. An API client reads neither.
+	w.Header().Set("Content-Security-Policy", cspRawProxy)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+rawDownloadName(game, source, r.PathValue("path"))+`"`)
 	w.WriteHeader(result.Status)
 	_, _ = w.Write(result.Body)
+}
+
+// rawDownloadName names the file a browser will save the raw response as, derived
+// from the operator-configured game and source plus the request's path.
+//
+// Every character outside [A-Za-z0-9._-] is replaced rather than escaped, because
+// the value goes inside a quoted header parameter: a source name from the
+// configuration or a path from the caller could otherwise close the quote or
+// inject a line break and write a header of its own.
+func rawDownloadName(game, source, path string) string {
+	const (
+		fallback = "download"
+		maxLen   = 64
+	)
+	name := strings.Trim(path, "/")
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	raw := game + "-" + source
+	if name != "" {
+		raw += "-" + name
+	}
+	safe := make([]byte, 0, len(raw))
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+			safe = append(safe, c)
+		default:
+			safe = append(safe, '_')
+		}
+	}
+	if len(safe) == 0 {
+		return fallback
+	}
+	if len(safe) > maxLen {
+		safe = safe[:maxLen]
+	}
+	return string(safe)
 }
 
 // handleBindStart begins the interactive binding flow: it redirects the browser

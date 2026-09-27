@@ -331,6 +331,17 @@ func TestGameRawAndDegraded(t *testing.T) {
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
 		t.Errorf("raw responses must not be cached: Cache-Control = %q", got)
 	}
+	// The media type belongs to the source, and the media type is attached to
+	// this origin. Nothing in the global header set constrains a document here
+	// (the policy carried by every other response is frame-ancestors only, and
+	// the SPA's script-src is in its own document), so this response states its
+	// own policy and forces a download.
+	if got := resp.Header.Get("Content-Security-Policy"); got != cspRawProxy {
+		t.Errorf("raw Content-Security-Policy = %q, want %q", got, cspRawProxy)
+	}
+	if got := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(got, "attachment;") {
+		t.Errorf("raw Content-Disposition = %q, want an attachment", got)
+	}
 	rawBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if string(rawBody) != `{"native":true}` {
@@ -355,6 +366,122 @@ func TestGameRawAndDegraded(t *testing.T) {
 		t.Fatalf("a doubly-encoded traversal = %d, want 400", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+// A source's raw API may answer with anything, HTML included, and the proxy puts
+// that document on this origin: the same origin as the session cookie, with
+// /v1/sessions/current handing out a CSRF token to any script that can run here.
+// The media type stays the source's — that is the endpoint's contract — but the
+// response must not be renderable or executable, and a browser must download it
+// instead.
+func TestRawProxyNeutralisesAnHTMLSource(t *testing.T) {
+	const html = `<html><body><script>fetch("/v1/sessions/current").then(r=>r.text())</script></body></html>`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(html))
+	}))
+	defer up.Close()
+
+	registry, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "html-src", Issuer: up.URL, TokenClass: "revocable", RawBase: up.URL,
+		Resources: []federation.Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := federation.NewMemoryBindingStore()
+	v := newTestVault(t)
+	b := federation.Binding{User: "usr_test", Game: "phigros", Source: "html-src", Version: 1}
+	if err := bindings.Put(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	seedBindingSecret(t, v, b, "up-token")
+	fed, err := federation.NewService(federation.Config{
+		Registry: registry, Bindings: bindings, Vault: v, Doer: up.Client(), BaseURL: "https://re0auth.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clients := oauth.NewMemoryClientRegistry()
+	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{fedRedirect}, []oauth.Scope{oauth.ScopePhigrosProfile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clients.Create(context.Background(), client); err != nil {
+		t.Fatal(err)
+	}
+	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, nil)
+	api, err := New(Config{
+		Issuer:            "https://re0auth.test",
+		OIDC:              opHandler,
+		TokenIntrospector: opHandler,
+		GrantStore:        store,
+		DeviceStore:       store,
+		Federation:        fed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(api.Handler())
+	defer srv.Close()
+
+	at := mintToken(t, api.Handler(), store, "cli", "usr_test", oauth.ScopePhigrosProfile)
+	resp := authedGet(t, srv.URL+"/v1/games/phigros/sources/html-src/raw/index.html", at)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("raw = %d", resp.StatusCode)
+	}
+	// Verbatim where it is a contract: the caller asked for the source's own
+	// dialect and gets it, media type included.
+	if got := resp.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want the source's", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != html {
+		t.Errorf("raw body = %q, want it verbatim", body)
+	}
+	// Not verbatim where it would be executable: no script may run, the document
+	// gets an opaque origin, and a browser saves the file instead of rendering it.
+	if got := resp.Header.Get("Content-Security-Policy"); got != cspRawProxy {
+		t.Errorf("Content-Security-Policy = %q, want %q", got, cspRawProxy)
+	}
+	if !strings.Contains(cspRawProxy, "sandbox") || !strings.Contains(cspRawProxy, "default-src 'none'") {
+		t.Fatal("the raw proxy policy must forbid scripts and give the document no origin")
+	}
+	if got := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(got, "attachment;") {
+		t.Errorf("Content-Disposition = %q, want an attachment", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+// The download name is built from operator-configured names and a caller-supplied
+// path, and it is written inside a quoted header parameter. Everything that could
+// close the quote, split the header or escape the filename is replaced.
+func TestRawDownloadNameIsHeaderSafe(t *testing.T) {
+	cases := []struct {
+		name               string
+		game, source, path string
+		want               string
+	}{
+		{name: "ordinary", game: "phigros", source: "fake", path: "/v1/native/scores", want: "phigros-fake-scores"},
+		{name: "quote and CRLF", game: "phi\"gros", source: "fake\r\nX-Injected: 1", path: "/a", want: "phi_gros-fake__X-Injected__1-a"},
+		{name: "path separators", game: "g", source: "s", path: "/a/../../etc/passwd", want: "g-s-passwd"},
+		{name: "empty path", game: "g", source: "s", path: "/", want: "g-s"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rawDownloadName(tc.game, tc.source, tc.path)
+			if got != tc.want {
+				t.Fatalf("rawDownloadName(%q, %q, %q) = %q, want %q", tc.game, tc.source, tc.path, got, tc.want)
+			}
+			if strings.ContainsAny(got, "\"\r\n/\\") {
+				t.Fatalf("download name %q carries a character that breaks the header", got)
+			}
+		})
+	}
 }
 
 // Round 4: the raw gate must fail closed when a source declares no scoped
