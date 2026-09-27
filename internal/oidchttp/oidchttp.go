@@ -432,12 +432,29 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 			"this endpoint does not accept "+r.Method)
 		return
 	}
+	// ONE parse, ONE parameter set, for the whole request.
+	//
+	// RFC 6749 §3.1: the parameters ARE the request. net/http commits `r.Form`
+	// from the query string even when the body cannot be decoded, and only the
+	// FIRST ParseForm call reports that error — so a body Go cannot parse made this
+	// wrapper see an empty set (every gate below passed) while the library, calling
+	// ParseForm a second time and getting nil, read the real query-string
+	// parameters. The two sides then validated and served different requests. A
+	// request whose parameters cannot be parsed is malformed on every endpoint and
+	// every method, so it is refused here, once, and every gate below is handed
+	// this same set: the value a gate checks is the value the library will use.
+	form, ok := requestParams(r)
+	if !ok {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
+			"the request parameters could not be parsed")
+		return
+	}
 	// RFC 6749 §3.1: request parameters must not be repeated. The library's
 	// decoder takes the last value, so a parameter-smuggling attempt (a duplicate
 	// client_id, redirect_uri, code or scope) silently picked one — which is how
 	// an attacker can make a validation and a use see different values. Refuse
 	// the whole request instead of choosing a winner.
-	if dup := duplicatedParam(requestParams(r)); dup != "" {
+	if dup := duplicatedParam(form); dup != "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
 			"duplicate parameter: "+dup)
 		return
@@ -446,7 +463,6 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// form as the challenge. The library only hashes and compares, so a malformed
 	// verifier would otherwise be accepted whenever it happened to hash correctly.
 	if r.URL.Path == "/"+pathToken && r.Method == http.MethodPost {
-		form := requestParams(r)
 		if form.Get("grant_type") == "authorization_code" {
 			if v := form.Get("code_verifier"); v != "" && !validPKCEValue(v) {
 				writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
@@ -461,7 +477,6 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// a bypass. This mirrors the device-endpoint rule.
 	if r.Method == http.MethodPost &&
 		(r.URL.Path == "/"+pathToken || r.URL.Path == "/"+pathIntrospection || r.URL.Path == "/"+pathRevocation) {
-		form := requestParams(r)
 		if basicID, _, hasBasic := r.BasicAuth(); hasBasic {
 			if id := strings.TrimSpace(form.Get("client_id")); id != "" && id != strings.TrimSpace(basicID) {
 				writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
@@ -474,13 +489,13 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// library's own leg and is deliberately not included: it carries no client or
 	// scope parameters, and validating it as an entrance would break the flow.
 	if r.URL.Path == "/"+pathAuthorize {
-		if h.validateAuthorize(w, r) {
+		if h.validateAuthorize(w, r, form) {
 			return
 		}
 	}
 	// Also method-independent: see the note on this function.
 	if r.URL.Path == "/"+pathDeviceAuthz {
-		if h.validateDeviceAuthorization(w, r) {
+		if h.validateDeviceAuthorization(w, r, form) {
 			return
 		}
 	}
@@ -495,7 +510,7 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// segments), so the two shapes cannot collide and the fallback can be refused
 	// on sight, here, without waiting for the dependency to implement decryption.
 	if r.URL.Path == "/"+pathUserinfo {
-		if token := bearerOf(r); token != "" && isCompactJWS(token) {
+		if token := bearerOf(r, form); token != "" && isCompactJWS(token) {
 			writeUserinfoInvalidToken(w, "the userinfo endpoint accepts access tokens only")
 			return
 		}
@@ -547,7 +562,7 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		// the protocol plane's core health signal: an issue rate and an error
 		// breakdown by grant type and OAuth error code. The grant_type is
 		// normalized inside observability, because it arrives from the request.
-		grantType := requestParams(r).Get("grant_type")
+		grantType := form.Get("grant_type")
 		if bw.status == http.StatusOK {
 			body = sanitizeTokenResponse(body)
 			h.metrics.ObserveTokenIssued(grantType)
@@ -559,7 +574,7 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		bw.header.Set("Cache-Control", "no-store")
 		bw.header.Set("Pragma", "no-cache")
 	case r.URL.Path == "/"+pathIntrospection && bw.status == http.StatusOK:
-		body = h.filterIntrospection(body, callerClientID(r))
+		body = h.filterIntrospection(body, callerClientID(r, form))
 	case bw.status == http.StatusForbidden && r.URL.Path == "/"+pathUserinfo:
 		// The storage refused the bearer: it is expired, revoked, erased, or it
 		// named an id this store never issued. The library's path for that writes
@@ -742,20 +757,45 @@ func splitProtocolScopes(scopes []string) (described, protocol []string) {
 }
 
 // requestParams returns a request's parameters from wherever this method carries
-// them: the query string, the form body, or both.
+// them: the query string, the form body, or both — and whether the request had a
+// readable parameter set at all.
 //
 // The library reads `r.Form` for GET and POST alike, so reading only
 // `r.URL.Query()` here is exactly how a POST slipped past every check. ParseForm
 // caches its result, so the library's own call costs nothing and sees what this
 // one read.
-func requestParams(r *http.Request) url.Values {
+//
+// The boolean is not decoration. ParseForm reports a body it could not decode only
+// on its FIRST call: it still commits `r.Form` from the query string, and every
+// later call returns nil because `r.PostForm` is non-nil by then. Answering
+// `url.Values{}` for that case — which is what this did — is indistinguishable
+// from "the request carried no parameters", so every gate fed by it could be
+// switched off with one unparsable body while the library went on to read the real
+// query-string parameters. A caller that cannot see the parameters must refuse the
+// request; serveOAuth does exactly that, once, and hands the same set to every
+// gate.
+func requestParams(r *http.Request) (url.Values, bool) {
 	if err := r.ParseForm(); err != nil {
-		// A malformed body is not a parameter set. Returning empty makes the
-		// pre-flight answer "invalid_request" for the missing field rather than
-		// letting the request through unvalidated.
-		return url.Values{}
+		return nil, false
 	}
-	return r.Form
+	return r.Form, true
+}
+
+// requestedScopes returns every scope a request asks for: all values of the
+// `scope` parameter, each split on whitespace.
+//
+// `Values.Get` returns the FIRST value while the library's decoder takes the LAST,
+// so a gate reading one value is checking a different request than the one being
+// served. serveOAuth refuses repeated parameters outright, which is the primary
+// rule; reading them all is what keeps this gate correct without depending on that
+// rule holding — the assumption "one value is the whole story" is precisely the
+// shape that failed here before.
+func requestedScopes(form url.Values) []string {
+	var out []string
+	for _, raw := range form["scope"] {
+		out = append(out, strings.Fields(raw)...)
+	}
+	return out
 }
 
 // scopeProblem returns the first requested scope this client may not ask for, or
@@ -782,10 +822,13 @@ func (h *Handler) scopeProblem(client oauth.Client, scopes []string) string {
 
 // validateAuthorize is the pre-flight the library does not do.
 //
+// `q` is the parameter set serveOAuth parsed for this request, not a fresh read:
+// checking a second parse of the same request is how "the gate saw one request and
+// the library served another" became possible in the first place.
+//
 // OAuth errors. A missing scope, an unknown client and an unregistered redirect
 // URI are all errors the resource owner must see, so none of them may redirect.
-func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool {
-	q := requestParams(r)
+func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q url.Values) bool {
 	clientID := q.Get("client_id")
 	if clientID == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
@@ -835,12 +878,18 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
 	}
-	rawScope := q.Get("scope")
-	if rawScope == "" {
+	// EVERY value of `scope`, not just the first. The library's decoder takes the
+	// last value of a repeated parameter, so a gate that read one value was
+	// checking a different request than the one being granted — the A1-1 escalation
+	// with the validation and the use pointing at different scopes. serveOAuth
+	// refuses repeats outright; reading them all is what makes this gate right even
+	// if that rule is ever relaxed.
+	scopes := requestedScopes(q)
+	if len(scopes) == 0 {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "scope is required")
 		return true
 	}
-	if h.scopeProblem(client, strings.Fields(rawScope)) != "" {
+	if h.scopeProblem(client, scopes) != "" {
 		params := map[string]string{"error": "invalid_scope", "state": q.Get("state"), "iss": h.issuerFor(r)}
 		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
@@ -851,13 +900,15 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request) bool
 // validateDeviceAuthorization enforces the client's scope allowance on the device
 // authorization request.
 //
+// `form` is the parameter set serveOAuth parsed for this request, not a fresh
+// read — see validateAuthorize.
+//
 // The library stores the requested scopes verbatim — it checks the grant type and
 // decodes the form, and nothing else — so without this a client registered for
 // one scope can obtain any scope the catalogue knows by asking the device
 // endpoint instead of the authorize endpoint. The answer is a JSON OAuth error
 // rather than a redirect: this endpoint has no redirect_uri to send it to.
-func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Request) bool {
-	form := requestParams(r)
+func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Request, form url.Values) bool {
 
 	// Resolve the client the way the library will, and refuse a request that names
 	// two different ones.
@@ -897,12 +948,13 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client", "unknown client")
 		return true
 	}
-	rawScope := form.Get("scope")
-	if rawScope == "" {
+	// Every value of `scope`: see validateAuthorize.
+	scopes := requestedScopes(form)
+	if len(scopes) == 0 {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "scope is required")
 		return true
 	}
-	if bad := h.scopeProblem(client, strings.Fields(rawScope)); bad != "" {
+	if bad := h.scopeProblem(client, scopes); bad != "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_scope",
 			"the scope "+bad+" is not registered for this client")
 		return true
@@ -914,13 +966,14 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 // own userinfo parse does (pkg/op/userinfo.go ParseUserinfoRequest): the
 // Authorization header when it holds a Bearer credential, and otherwise the
 // `access_token` parameter. Resolving it a different way here would mean checking
-// a token the handler is not about to use.
-func bearerOf(r *http.Request) string {
+// a token the handler is not about to use — so it reads the parameter set
+// serveOAuth parsed, not a second parse of its own.
+func bearerOf(r *http.Request, form url.Values) string {
 	if auth := r.Header.Get("Authorization"); len(auth) >= len(oidc.PrefixBearer) &&
 		strings.EqualFold(auth[:len(oidc.PrefixBearer)], oidc.PrefixBearer) {
 		return strings.TrimSpace(auth[len(oidc.PrefixBearer):])
 	}
-	return strings.TrimSpace(requestParams(r).Get("access_token"))
+	return strings.TrimSpace(form.Get("access_token"))
 }
 
 // isCompactJWS reports whether s has the compact JWS shape: three segments
@@ -971,12 +1024,14 @@ func writeOAuthJSONError(w http.ResponseWriter, status int, code, description st
 
 // callerClientID resolves the client the way the library will: HTTP Basic if
 // present, else the form's client_id. It is used for the introspection policy, so
-// it must not pick a different identity than the authenticated one.
-func callerClientID(r *http.Request) string {
+// it must not pick a different identity than the authenticated one — which is why
+// it is handed the parameter set serveOAuth parsed rather than reading the request
+// a second time.
+func callerClientID(r *http.Request, form url.Values) string {
 	if id, _, ok := r.BasicAuth(); ok {
 		return strings.TrimSpace(id)
 	}
-	return strings.TrimSpace(requestParams(r).Get("client_id"))
+	return strings.TrimSpace(form.Get("client_id"))
 }
 
 // filterIntrospection hides a token's details from a client that neither owns it

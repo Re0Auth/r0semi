@@ -243,12 +243,16 @@ func TestProbeParseFormIsErrorOnceThenNil(t *testing.T) {
 		o.firstErr, o.firstForm, o.secondErr, o.secondForm)
 }
 
-// PROBE 25 — the same premise seen from the OP: identical queries, one with a
-// parseable body and one without, get different validation and different outcomes.
-// This is the differential PROTO-1 is built on, stated as a single assertion.
+// PROBE 25 — the same premise seen from the OP, as the property that must hold:
+// identical queries, one with a parseable body and one without, are treated ALIKE.
+//
+// Before the fix this probe asserted the opposite — it required the two requests to
+// get DIFFERENT outcomes and required the unparsable one to be served (302 into the
+// login UI) — which is the seam itself. It now asserts the differential is gone:
+// both are refused, in the same shape, and neither reaches the login/consent leg.
 func TestProbeUnparsableBodyChangesWhatTheOPValidates(t *testing.T) {
 	e := newEnv(t, envOptions{issuer: "https://issuer.probe"})
-	query := url.Values{
+	params := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {e.deviceID},
 		"redirect_uri":          {"https://device.example/cb"},
@@ -256,17 +260,9 @@ func TestProbeUnparsableBodyChangesWhatTheOPValidates(t *testing.T) {
 		"state":                 {"state-probe"},
 		"code_challenge":        {pkceValue(strings.Repeat("v", 64))},
 		"code_challenge_method": {"S256"},
-	}.Encode()
+	}
+	query, body := params.Encode(), params.Encode()
 
-	body := url.Values{
-		"response_type":         {"code"},
-		"client_id":             {e.deviceID},
-		"redirect_uri":          {"https://device.example/cb"},
-		"scope":                 {"account.id", "phigros.score.read"},
-		"state":                 {"state-probe"},
-		"code_challenge":        {pkceValue(strings.Repeat("v", 64))},
-		"code_challenge_method": {"S256"},
-	}.Encode()
 	wellFormed, err := http.Post(e.server.URL+"/oauth/authorize", "application/x-www-form-urlencoded",
 		strings.NewReader(body))
 	if err != nil {
@@ -287,13 +283,25 @@ func TestProbeUnparsableBodyChangesWhatTheOPValidates(t *testing.T) {
 	brokenRaw := bodyOf(t, broken)
 
 	t.Logf("well-formed body: %d %s", wellFormed.StatusCode, wellRaw)
-	t.Logf("unparsable body:  %d %q", broken.StatusCode, broken.Header.Get("Location"))
-	if wellFormed.StatusCode == broken.StatusCode {
-		t.Fatalf("the two requests were treated alike (%d), so there is no seam to report",
-			wellFormed.StatusCode)
+	t.Logf("unparsable body:  %d %s", broken.StatusCode, brokenRaw)
+
+	// The well-formed shape is refused for the duplicate `scope` (RFC 6749 §3.1).
+	if wellFormed.StatusCode != http.StatusBadRequest {
+		t.Errorf("a well-formed body with a duplicated scope answered %d: %s", wellFormed.StatusCode, wellRaw)
 	}
-	if broken.StatusCode != http.StatusFound {
-		t.Fatalf("the unparsable-body request was refused after all (%d): %s", broken.StatusCode, brokenRaw)
+	// The unparsable shape must be refused too, rather than served with the query
+	// parameters the library can still read. 302 is the seam: it means the request
+	// went on to the login/consent leg validated by a set the attacker emptied.
+	if broken.StatusCode == http.StatusFound {
+		t.Errorf("an unparsable body still reached the login leg: %d %q",
+			broken.StatusCode, broken.Header.Get("Location"))
+	}
+	if broken.StatusCode != wellFormed.StatusCode {
+		t.Errorf("the two requests are still treated differently: well-formed %d, unparsable %d (%s) — the seam returns",
+			wellFormed.StatusCode, broken.StatusCode, brokenRaw)
+	}
+	if !strings.Contains(string(brokenRaw), `"invalid_request"`) {
+		t.Errorf("the unparsable-body refusal is not an OAuth error: %s", brokenRaw)
 	}
 }
 
