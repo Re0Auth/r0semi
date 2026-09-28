@@ -160,6 +160,18 @@ kubectl apply -k deploy/k8s/backup
 ## 可观测与排障
 
 - `/healthz` 存活、`/readyz` 依赖（Postgres ping）；两者纯文本、免限流，不属任何平面。
+  **裁定（取舍写在这里）：探针永远不因为「忙」而失败，代价是它必须便宜。**
+  两条一起才成立：
+  - 免限流**也免并发上限**（`isProbe` 在两者之前判断）。理由是反的写法会自伤：把桶打满的那股流量
+    会让**存活**探针被 429，于是编排系统重启一个本来没问题的进程；也会让**就绪**探针被 429，
+    于是把一个还能服务的实例摘出轮转。
+  - 因此免掉的那部分工作**必须廉价**：`/healthz` 什么都不查；`/readyz` 用
+    **`httpapi.readinessTTL`（1s）内的一次检查结果**作答，同一时刻最多只跑一个检查，其余请求
+    直接拿到上一次的结果——**不排队、不因为负载回 503**。没有这一条时，每个匿名请求就是一次
+    占用连接池的数据库往返，「报告连接池状态的端点」反而成了打满它的手段。
+  代价说清楚：就绪结论最多**旧 1 秒**（依赖掉了之后可能多报一秒 ready）。出厂 manifest 的
+  `readinessProbe.periodSeconds` 是 5，`failureThreshold` 是 3，所以真实 kubelet 看到的每一次
+  都仍是刚查过的；而它换来的是每个副本**每秒最多一次**数据库往返，而不是按请求数增长。
 - `/metrics` 与 `/debug/pprof/` 在 `server.internal_addr` 的独立内部监听器上，绝不暴露公网。
   绑一个**非 loopback** 地址需要显式承认：`server.expose_internal = true`（或
   `RE0AUTH_INTERNAL_EXPOSE=true`），否则拒绝启动。这条不是形式——`/debug/pprof/` 会导出堆、

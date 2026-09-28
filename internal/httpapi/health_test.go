@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 )
@@ -67,22 +69,87 @@ func TestReadyzWithoutProbeIsReady(t *testing.T) {
 
 // Readiness tracks the probe: 200 when the dependency answers, 503 when it does
 // not, so an orchestrator stops routing to an instance that cannot serve.
+//
+// It also pins the price of the probe's exemption: repeated probes inside
+// readinessTTL are answered from ONE check, because each check takes a pooled
+// database connection and this endpoint is reachable without credentials.
 func TestReadyzTracksTheProbe(t *testing.T) {
-	var err error
-	srv := healthServer(t, func(context.Context) error { return err }, nil)
+	var (
+		err    error
+		mu     sync.Mutex
+		checks int
+	)
+	srv := healthServer(t, func(context.Context) error {
+		mu.Lock()
+		checks++
+		mu.Unlock()
+		return err
+	}, nil)
 	handler := srv.Handler()
+	ran := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return checks
+	}
 
 	if rec := probe(t, handler, "/readyz", ""); rec.Code != http.StatusOK {
 		t.Fatalf("/readyz = %d with a healthy probe, want 200", rec.Code)
 	}
+	if got := ran(); got != 1 {
+		t.Fatalf("the probe ran %d times for one request, want 1", got)
+	}
 
+	// A burst inside the TTL is one check, not one per request.
+	for i := 0; i < 20; i++ {
+		if rec := probe(t, handler, "/readyz", ""); rec.Code != http.StatusOK {
+			t.Fatalf("/readyz = %d on burst request %d, want 200", rec.Code, i)
+		}
+	}
+	if got := ran(); got != 1 {
+		t.Errorf("20 probes inside the TTL ran %d checks, want 1: the endpoint is an amplification vector again", got)
+	}
+
+	// Past the TTL the check runs again, and the answer follows it.
 	err = errors.New("connection refused")
+	time.Sleep(readinessTTL + 50*time.Millisecond)
 	rec := probe(t, handler, "/readyz", "")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("/readyz = %d with a failing probe, want 503", rec.Code)
 	}
 	if body := rec.Body.String(); body != "not ready\n" {
 		t.Fatalf("/readyz body = %q, want %q", body, "not ready\n")
+	}
+	if got := ran(); got != 2 {
+		t.Errorf("the probe ran %d times, want 2: a stale result was served past the TTL", got)
+	}
+}
+
+// A probe must never be refused because the service is busy. That is the ruling
+// the exemption rests on (docs/operations.md): a 503 caused by someone else's load
+// would pull a healthy instance out of rotation, which is the opposite of what a
+// readiness probe is for.
+func TestReadyzAnswersUnderLoadRatherThanShedding(t *testing.T) {
+	srv := healthServer(t, func(context.Context) error { return nil }, nil)
+	handler := srv.Handler()
+
+	// One real request in flight and a saturated limiter, then 32 concurrent
+	// probes: every one of them must answer from the cached result.
+	const callers = 32
+	var wg sync.WaitGroup
+	codes := make([]int, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := probe(t, handler, "/readyz", "")
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("concurrent /readyz call %d = %d, want 200 (a probe must not be shed)", i, code)
+		}
 	}
 }
 

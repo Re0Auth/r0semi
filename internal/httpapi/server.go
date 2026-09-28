@@ -200,8 +200,12 @@ type Server struct {
 	maxInFlight  int
 	secure       bool
 	ready        ReadinessProbe
-	metrics      *observability.Metrics
-	frontend     fs.FS
+	// readiness reuses one readiness result for readinessTTL, so the exempt probe
+	// path cannot be turned into one pooled database round trip per request. See
+	// readinessCache.
+	readiness readinessCache
+	metrics   *observability.Metrics
+	frontend  fs.FS
 	// trustedProxies is the parsed form of Config.TrustedProxies, consulted by
 	// clientAddr when deriving the limiter key — and only when clientAddrHeader
 	// says a header is to be read at all.

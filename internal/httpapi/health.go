@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -12,6 +13,42 @@ import (
 // dead process to an orchestrator — and worse, it holds the probe connection
 // open while the dependency it is waiting on is already the problem.
 const readinessTimeout = 2 * time.Second
+
+// readinessTTL is how long one readiness result is reused.
+//
+// It is the price of the probe's exemption, and it is deliberately small: probes
+// skip the rate limiter and the in-flight cap (see isProbe for why that must not
+// change), so they are the one path an anonymous caller can drive without limit —
+// and this endpoint's check is a database round trip that takes a pooled
+// connection. Without a cache, N requests are N pool acquisitions, and the
+// endpoint that exists to report on the pool is the one that can exhaust it.
+// With it, the round trips are bounded at one per TTL per replica no matter the
+// request rate.
+//
+// One second is far below any orchestrator's probe period (the shipped manifest
+// asks every 5s), so a real kubelet sees every answer freshly checked; what the
+// TTL costs is that a probe may report ready for up to a second after the
+// dependency went away, which is inside the same failureThreshold window every
+// probe already has.
+const readinessTTL = time.Second
+
+// readinessCache holds the last readiness result for readinessTTL, and lets AT
+// MOST ONE check run at a time.
+//
+// A request that finds a check already running is answered from the cached result
+// instead of queueing behind it: queueing would rebuild the amplification this
+// exists to remove (each waiter still holds a connection and a request), and
+// answering from a result at most one second old is what a probe asked for
+// anyway. It never fails because of load — that is the ruling this endpoint's
+// exemption rests on, and a 503 caused by someone else's traffic would pull a
+// healthy instance out of rotation.
+type readinessCache struct {
+	mu        sync.Mutex
+	checkedAt time.Time
+	err       error
+	checked   bool
+	running   bool
+}
 
 // ReadinessProbe reports whether the service can serve: a nil return means every
 // dependency it needs is reachable. It is the readiness half of the health
@@ -34,14 +71,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // Without a configured probe there is nothing to reach — the in-memory
 // deployment — so it is always ready. That is an honest answer, not a shortcut:
 // there is no dependency whose loss would make this instance unable to serve.
+//
+// The check itself runs at most once per readinessTTL (see readinessCache), and a
+// caller never waits for another caller's check. What it must never do is answer
+// "not ready" because the service is busy: that is the ruling in
+// docs/operations.md, and the reason probes are exempt from the limiter and the
+// in-flight cap in the first place.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if s.ready == nil {
 		writeProbe(w, http.StatusOK, "ok")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), readinessTimeout)
-	defer cancel()
-	if err := s.ready(ctx); err != nil {
+	if err := s.readiness.check(r.Context(), s.ready); err != nil {
 		// The reason goes to the log, not the body: this endpoint is reachable
 		// without credentials, and a dependency error can name an internal host
 		// or topology an anonymous caller has no business learning.
@@ -52,13 +93,45 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeProbe(w, http.StatusOK, "ok")
 }
 
+// check returns the readiness result, running the probe only when the cached one
+// is missing or older than readinessTTL.
+//
+// It holds the lock only around the state, never around the probe call: a slow
+// dependency must not serialize the probes that arrive while it is slow, and those
+// probes are answered from the previous result.
+func (c *readinessCache) check(ctx context.Context, probe ReadinessProbe) error {
+	c.mu.Lock()
+	fresh := c.checked && time.Since(c.checkedAt) < readinessTTL
+	if fresh || c.running {
+		err := c.err
+		c.mu.Unlock()
+		return err
+	}
+	c.running = true
+	c.mu.Unlock()
+
+	probeCtx, cancel := context.WithTimeout(ctx, readinessTimeout)
+	defer cancel()
+	err := probe(probeCtx)
+
+	c.mu.Lock()
+	c.err = err
+	c.checkedAt = time.Now()
+	c.checked = true
+	c.running = false
+	c.mu.Unlock()
+	return err
+}
+
 // writeProbe writes a probe response. Probes are plain text on purpose: they are
 // not API, and an orchestrator reads the status code rather than the body. The
 // body exists so a human running curl gets an answer instead of an empty reply.
 //
 // no-store, because a cached readiness result is worse than no probe at all: a
 // proxy that remembers "ready" would keep routing to an instance that has since
-// lost its database.
+// lost its database. That is a statement about the CLIENT's cache; the server's
+// own one-second reuse above is a different thing, bounded and refreshed by this
+// process.
 func writeProbe(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -68,10 +141,17 @@ func writeProbe(w http.ResponseWriter, status int, body string) {
 
 // isProbe reports whether a path is an operational probe.
 //
-// Probes are exempt from the limiter. A saturated bucket must not be able to
-// fail a liveness probe and get a healthy process restarted, nor a readiness
-// probe and pull a serving instance out of rotation — which is exactly what
-// would happen under the load that made the bucket full in the first place.
+// Probes are exempt from the limiter AND from the in-flight cap. A saturated
+// bucket must not be able to fail a liveness probe and get a healthy process
+// restarted, nor a readiness probe and pull a serving instance out of rotation —
+// which is exactly what would happen under the load that made the bucket full in
+// the first place.
+//
+// The exemption is safe only because the exempted work is cheap, so it must stay
+// cheap: /healthz checks nothing, and /readyz answers from a cached result that is
+// refreshed at most once per readinessTTL. This is the ruling recorded in
+// docs/operations.md — "probes answer from a bounded amount of work, and never a
+// 503 because of load".
 func isProbe(path string) bool {
 	return path == "/healthz" || path == "/readyz"
 }
