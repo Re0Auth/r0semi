@@ -76,7 +76,7 @@ S1 的 99.9% 目标等价于 30 天滚动窗口内 **0.1% 的错误预算**。�
 
 ## 4. 接入
 
-部署方把内部监听器（`server.internal_addr`，默认 `:9090`）`/metrics` 接进 Prometheus，
+部署方把内部监听器（`server.internal_addr`，**默认不监听**，需显式配置）`/metrics` 接进 Prometheus，
 再把 `deploy/prometheus/re0auth.rules.yml` 作为规则文件加载（或翻译成自有告警系统）。
 `deploy/grafana/re0auth-dashboard.json` 可导入 Grafana，数据源指向同一个 Prometheus。
 

@@ -53,9 +53,13 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
+          # Only the version tag here. `latest` is NOT one of the tags this step
+          # produces: the image is pushed before the Trivy gate runs, so a build
+          # that fails the gate would already be the tag a redeploy picks up if
+          # `latest` were attached now. It is added below, and only after the scan
+          # passes (see "promote to latest").
           tags: |
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -65,6 +69,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The tag, so `re0auth -version` and the startup log answer "which build
+          # is this" in the released image too — without it ARG VERSION falls back
+          # to `dev`. ci.yml passes the same argument.
+          build-args: |
+            VERSION=${{ github.ref_name }}
           # provenance and SBOM are attached to the pushed manifest, so the
           # digest carries the build's own account of how it was made.
           provenance: true
@@ -95,6 +104,18 @@ jobs:
             -v "$HOME/.docker/config.json":/root/.docker/config.json:ro \
             aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
             image --exit-code 1 --severity HIGH,CRITICAL --no-progress \
+            "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
+
+      # Only now, with the image scanned clean, does the floating `latest` point at
+      # it. imagetools promotes the manifest by digest, so the exact bytes that
+      # passed the gate are what the tag resolves to — no rebuild, and the cosign
+      # signature below covers the same digest. A pre-release tag keeps no `latest`
+      # at all (the whole point of the tag, and the reason this is conditional).
+      - name: promote to latest
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.image.outputs.name }}:latest" \
             "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2

@@ -45,20 +45,33 @@ COPY --from=web /src/internal/webui/dist ./internal/webui/dist
 RUN test -f internal/webui/dist/index.html
 # VERSION stamps the binary the same way `make release` does, so `re0auth
 # -version` and the startup log answer "which build is this" in an image too.
+# release.yml passes the tag; without a build-arg it falls back to `dev`.
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/re0auth ./cmd/re0auth
+# Copy the CA bundle into the stage's output DEREFERENCING it. On Alpine that path
+# is a symlink into /usr/share/ca-certificates, and COPY of a symlink into a
+# scratch image that does not carry the target leaves a dangling link — every
+# outbound TLS connection then fails, and the failure surfaces at first login.
+# `cp -L` lands the bytes as a regular file, so the runtime image gets them
+# whatever the base image does with the path.
+RUN cp -L /etc/ssl/certs/ca-certificates.crt /out/ca-certificates.crt
 
 # ---- runtime --------------------------------------------------------------
 # scratch, not a distroless base: the binary is static (CGO_ENABLED=0), so the
-# runtime filesystem needs exactly two things — the binary and the CA bundle for
-# outbound TLS. A scratch image has no shell, package manager, libc or OS files,
-# and no base-image digest that can drift. The CA bundle is copied from the
-# pinned build stage, so it is the same trust store the binary was built against.
+# runtime filesystem needs exactly the binary, the licence/attribution and the CA
+# bundle for outbound TLS. A scratch image has no shell, package manager, libc or
+# OS files, and no base-image digest that can drift. The CA bundle is copied from
+# the pinned build stage, so it is the same trust store the binary was built
+# against.
 FROM scratch
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/re0auth /re0auth
+# The licence and the attribution ship inside the image too, not only in the
+# archive: NOTICE is what tells a redistributor which third-party code is in the
+# binary, so an image without it has the same gap as an archive without it.
+COPY LICENSE NOTICE /
 # Numeric uid 65532 is the conventional nonroot id; scratch has no passwd file,
 # so it stays unnamed. The process cannot write over its own image.
 USER 65532:65532

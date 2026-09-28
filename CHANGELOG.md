@@ -8,6 +8,37 @@
 
 ## Unreleased
 
+- **备份/恢复脚本收紧（`scripts/`）**：`restore.sh` 现在 ①校验**命令行给的那个文件**（此前
+  `sha256sum --check` 读的是 `.sha256` 里记录的路径——异地恢复被自己挡死，而截断件却能「校验通过」
+  进入 `pg_restore`）；②`.age` 路径**先校验密文再解密**（此前该分支一行校验都不跑）；③**缺失
+  `.sha256` 即拒绝**（此前静默跳过）；④解密到 0700 临时目录并在退出时清理（此前明文留在备份目录）；
+  ⑤`pg_restore` 加 `--single-transaction`（此前半途失败会留下半填充的库，而空库守卫又挡住重试）。
+  `backup.sh` 以 `umask 077` 写转储（此前世界可读），并在落盘**之前**检查 `age` 是否存在；
+  `deploy/k8s/backup` 的内联脚本同样加了 `umask 077`。
+
+- **发布镜像的门禁顺序、版本标记与许可**：`release.yml` 不再在扫描前推 `latest`——镜像先按 tag 推送，
+  Trivy（`--exit-code 1`）扫过之后才用 `buildx imagetools` 把 `latest` 指到那个 digest，预发布 tag
+  不产生 `latest`；同一 job **补传 `VERSION` build-arg**，镜像里的 `-version` 与启动日志不再报 `dev`。
+  `deploy/k8s/base/deployment.yaml` 的基线镜像由 `:latest` 改为钉住的 tag。运行镜像（scratch）
+  现在 `COPY LICENSE NOTICE`；发布增加 npm 许可清单（`make npm-licenses` 产出，随 `SHA256SUMS`
+  一起发布），补上 NOTICE 只覆盖 Go 模块的那一半。Dockerfile 的 CA bundle 改为在构建阶段 `cp -L`
+  解引用后再 COPY，避免符号链接在 scratch 里悬空导致出站 TLS 全挂。
+
+- **前端依赖审计门现在会响**：CI 的 `pnpm audit` 从 `--audit-level high` 降为 `low`（树里唯一的
+  告警是 low，此前这道门永远不会红），并把已知不可达的那条（`cookie@0.6.0`，SvelteKit 的
+  dev-only 传递依赖）列进 `web/package.json` 的 `pnpm.audit.ignore`。
+
+- **`make dist` 不再静默漏文件**：`cp` 加 `|| exit 1`，并对每个归档逐个断言 `re0auth` 与五个随附
+  文件都在（此前 `LICENSE`/`README.md`/`SECURITY.md` 缺失会静默发出去）。`VERSION` 改为经环境变量
+  进配方（`$${VERSION}`），不再在 make 期插值进脚本文本。
+
+- **文档与实现对齐**：runbook/incident-response 的 `[admin].allow` 更正为真键 `[admin].subjects`；
+  内部监听器「默认 `:9090`」更正为**默认不监听**；`RE0AUTH_DATABASE_URL` 更正为 `DATABASE_URL`
+  （或 `[storage].dsn_env` 指向的变量）；`architecture.md` 的「构建产物可复现」更正为「可签名」
+  （前端 `_app/version.json` 带构建时刻）；`dependencies.md` §7 说明 action SHA 与基础镜像 digest
+  两半已有 archtest 守卫、工具版本那半没有；`upstream-protocol.md` 的「名称映射表」更正为
+  「不存在映射表，用的是同一个 scope 字符串，唯一例外是硬编码的 `account.read`」。
+
 - **撤销索引补齐（迁移 `0022`）**：迁移 `0021` 只给 OIDC 引擎的 `oidc_access_tokens` / `oidc_refresh_tokens`
   补了 `client_id` 前导索引，而按 `client_id` 单独过滤的批量撤销还有四处：`revokeMatching` 触及的三张
   legacy `oauth_access_tokens` / `oauth_refresh_tokens` / `oauth_codes`，以及 `revokePendingAuthorizations`

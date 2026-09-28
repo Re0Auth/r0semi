@@ -6,9 +6,12 @@
 
 ## 通用前提
 
-- **操作面**：`/v1/admin/*` 只对 `[admin].allow` 允许列表里的 `usr_…` 开放，且变更类接口需要
-  在 `[admin].reauth_window`（默认 15 分钟）内重新登录过。见 [admin.md](./admin.md)。
-- **看指标**：内部监听器 `server.internal_addr`（默认 `:9090`）的 `/metrics`；`/debug/pprof` 也在这里。
+- **操作面**：`/v1/admin/*` 只对 `[admin].subjects` 允许列表里的 `usr_…` 开放，且变更类接口需要
+  在 `[admin].reauth_window`（默认 15 分钟）内重新登录过。列表为空时整个 `/v1/admin/*` **不挂载**。
+  见 [admin.md](./admin.md)。
+- **看指标**：内部监听器 `server.internal_addr` 的 `/metrics`；`/debug/pprof` 也在这里。
+  **它默认不监听**（`internal_addr` 为空即不启用）；k8s 基线显式设成 `0.0.0.0:9090` 并靠同目录的
+  NetworkPolicy 兜安全，自托管需自己选一个地址。
 - **看数据库/迁移**：`docs/operations.md` 的“排障”与“升级”两节。
 - **先看面板**：`deploy/grafana/re0auth-dashboard.json` 的 overview；顶部的 “Telemetry volume (self-check)”
   面板若在流量正常时不动，说明领域埋点没被打到，不要据此判断“没发生”。
@@ -24,7 +27,8 @@
 2. 看面板 “5xx error rate” 与 “Request rate by plane”，确认是哪个面（protocol / business）在涨。
 3. 看日志里带 `request_id` 的错误行；`status=500` 的 handler 会记真实错误。
 
-**处置**：数据库连接问题 → 检查 `RE0AUTH_DATABASE_URL`、Postgres `max_connections`、连接池
+**处置**：数据库连接问题 → 检查 `DATABASE_URL`（或 `[storage].dsn_env` 指向的那个变量）、
+Postgres `max_connections`、连接池
 `max_conns × 副本数`（见 [capacity-planning.md](./capacity-planning.md)）。若是代码路径 panic，
 `/debug/pprof/` 与访问日志的 `trace_id` 能定位。
 

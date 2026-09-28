@@ -50,6 +50,10 @@ spec:
               args:
                 - |
                   set -euo pipefail
+                  # 0600 from the first byte: the dump is plain SQL holding
+                  # credentials and audit history, and a default umask would make
+                  # it world-readable on the (shared) backup volume.
+                  umask 077
                   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
                   out="/backups/re0auth-$stamp.dump"
                   pg_dump --format=custom --no-owner --no-privileges \

@@ -334,7 +334,13 @@ jobs:
           node-version: '24'
       - name: audit frontend dependencies
         working-directory: web
-        run: pnpm audit --audit-level high
+        # `high` made this gate unable to fire: the only advisory in the tree is
+        # `cookie@0.6.0` (severity low, patched in 0.7.0), a dev-only transitive of
+        # SvelteKit that is not in the shipped static output — it is the entry in
+        # web/package.json's `pnpm.audit.ignore`. At `low` the gate now fails on the
+        # next low-or-worse advisory, which is the point; the ignore keeps it from
+        # failing on the one already known to be unreachable.
+        run: pnpm audit --audit-level low
 
       # Vulnerabilities in the dependency graph that are actually reachable from
       # this code, which is what govulncheck's call-graph analysis answers and a

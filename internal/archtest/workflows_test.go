@@ -3,11 +3,81 @@ package archtest
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+// fullSHA matches the pin form a remote `uses:` must carry: a 40-hex commit.
+var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// TestWorkflowActionsArePinnedToFullSHAs makes the SHA-pinning rule a check rather
+// than a comment.
+//
+// Every remote `uses:` runs with this repository's token, inside a job that may
+// hold the release secrets, so an unpinned `@v4` is somebody else's code that can
+// change without a commit here. The rule was stated in a comment at the top of
+// ci.yml and enforced by nobody, so a new step added with a floating tag was green
+// until it was not. The base-image digest rule already has a guard
+// (dockerfile_test.go); this is the action half. The tool-version half
+// (`go install …@vX.Y.Z`) stays unguarded, and docs/dependencies.md §7 says so.
+func TestWorkflowActionsArePinnedToFullSHAs(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, ".github", "workflows")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pinned := 0
+	for _, entry := range entries {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".yml") && !strings.HasSuffix(entry.Name(), ".yaml")) {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimPrefix(strings.TrimSpace(line), "- ")
+			if !strings.HasPrefix(line, "uses:") {
+				continue
+			}
+			// Keep only the ref: drop a trailing `# vX` comment and any quotes.
+			fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "uses:")))
+			if len(fields) == 0 {
+				continue
+			}
+			value := strings.Trim(fields[0], `"'`)
+			// A local reusable workflow is this repository's own code, reviewed
+			// in the commit that changes it — not what this guard is about.
+			if strings.HasPrefix(value, "./") || strings.HasPrefix(value, "docker://") {
+				continue
+			}
+			pinned++
+			at := strings.LastIndex(value, "@")
+			if at < 0 {
+				t.Errorf("%s:%d: %s has no @<ref>", entry.Name(), i+1, value)
+				continue
+			}
+			if sha := value[at+1:]; !fullSHA.MatchString(sha) {
+				t.Errorf("%s:%d: %s is not pinned to a full commit SHA; a tag can move under the build",
+					entry.Name(), i+1, value)
+			}
+		}
+	}
+
+	// Anti-vacuous: the walk passes by finding nothing, which is also what a parse
+	// that stopped reading the directory looks like.
+	if pinned < 30 {
+		t.Fatalf("only %d remote `uses:` were found; the parse is not reading the workflows", pinned)
+	}
+}
 
 // TestWorkflowsCacheOnlyWhatTheyCreate: a Node cache in a workflow is only correct
 // when the same job populates what it saves.

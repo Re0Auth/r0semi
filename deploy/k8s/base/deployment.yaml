@@ -34,7 +34,11 @@ spec:
             matchLabels: { app.kubernetes.io/name: re0auth }
       containers:
         - name: re0auth
-          image: ghcr.io/re0auth/r0semi:latest # kustomize image override pins the tag/digest
+          # Pinned to the released tag, kept in step with kustomization.yaml's
+          # newTag. NOT `latest`: a floating tag here means `kubectl apply` of the
+          # base (without kustomize's override) deploys whatever was pushed last,
+          # which is exactly what a pinned baseline is meant to prevent.
+          image: ghcr.io/re0auth/r0semi:v0.0.0-rc.3
           imagePullPolicy: IfNotPresent
           args: ["-config=/etc/re0auth/re0auth.toml"]
           ports:

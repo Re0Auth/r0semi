@@ -185,9 +185,11 @@ Kit 侧：`Hooks.CascadeRevoke` 非 nil 时端点与 discovery 字段一起出�
 
 - 数据源 **MUST** 接受它声明资源对应的规范化 scope；**MAY** 支持扩展（`<game>.<resource>.<action>.<ext>`）。
 - **聚合 scope（如 `scores.read`）是 Re0Auth 专有的下游便利**，数据源**不会**收到它——Re0Auth 会把它拆解成逐游戏的 scope 再发给数据源。
-- **名称映射**：Re0Auth 的下游 scope 与数据源 canonical scope 不必同名，映射表由 Re0Auth 的源注册表维护。
-  已知特例：下游 `account.id` ↔ 上游 `account.read`。
-- 这样下游的 scope 稳定，不受数据源差异影响。
+- **没有可配置的名称映射表。** Re0Auth 的资源门禁要求令牌持有 `resources[].scope`——`internal/federation`
+  直接使用注册表里的这个字符串——所以下游与数据源用的**是同一个 scope 字符串**，不是两张表之间的映射。
+  唯一的例外是**硬编码**的 `account.read`（源的账号 scope，见 `internal/federation/federation.go`），
+  它不是一张可配置的映射表。
+- 这样下游的 scope 由源注册表直接给出，不受数据源差异影响。
 
 ## 8. 数据契约（规范化）
 

@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test bench perf check lint load e2e play visual dist sbom checksums release docker clean bundle
+.PHONY: all web build test bench perf check lint load e2e play visual dist sbom npm-licenses checksums release docker clean bundle
 
 all: web build
 
@@ -143,6 +143,11 @@ play:
 # someone has to remember invites. `release` is the whole thing: archives, the
 # SBOM, and checksums that cover both.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# Exported so the recipes read it as a shell variable ($${VERSION}) instead of
+# letting make interpolate $(VERSION) into the script text. This is a git ref
+# (release.yml passes the tag), and a ref may contain shell metacharacters;
+# interpolated at make time they would become part of the program the shell runs.
+export VERSION
 RELEASE_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 ZIP ?= zip
 # sha256sum is coreutils; macOS ships shasum instead.
@@ -157,14 +162,17 @@ dist: web
 	rm -rf dist && mkdir -p dist
 	@for platform in $(RELEASE_PLATFORMS); do \
 		os=$${platform%/*}; arch=$${platform#*/}; \
-		name="re0auth_$(VERSION)_$${os}_$${arch}"; \
+		name="re0auth_$${VERSION}_$${os}_$${arch}"; \
 		echo "  $$name"; \
 		mkdir -p "dist/$$name"; \
 		ext=""; [ "$$os" = windows ] && ext=".exe"; \
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath \
-			-ldflags "-s -w -X main.version=$(VERSION)" \
+			-ldflags "-s -w -X main.version=$${VERSION}" \
 			-o "dist/$$name/re0auth$$ext" ./cmd/re0auth || exit 1; \
-		cp config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md "dist/$$name/"; \
+		cp config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md "dist/$$name/" || exit 1; \
+		for f in re0auth$$ext config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md; do \
+			test -s "dist/$$name/$$f" || { echo "refusing to package: $$f is missing from $$name"; exit 1; }; \
+		done; \
 		if [ "$$os" = windows ]; then \
 			(cd dist && $(ZIP) -qr "$$name.zip" "$$name") || exit 1; \
 		else \
@@ -172,7 +180,7 @@ dist: web
 		fi; \
 		rm -rf "dist/$$name"; \
 	done
-	@echo "packaged $(VERSION):"; ls -1 dist
+	@echo "packaged $${VERSION}:"; ls -1 dist
 
 # The software bill of materials: a CycloneDX inventory of every module linked
 # into the binaries.
@@ -190,17 +198,35 @@ sbom: dist
 		echo "the SBOM generator is not on PATH; install it with:"; \
 		echo "  go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0"; \
 		exit 1; }
-	$(SBOM) mod -json -output "dist/re0auth_$(VERSION)_sbom.cdx.json"
-	@test -s "dist/re0auth_$(VERSION)_sbom.cdx.json" || { echo "refusing to ship an empty SBOM"; exit 1; }
-	@echo "sbom: dist/re0auth_$(VERSION)_sbom.cdx.json"
+	$(SBOM) mod -json -output "dist/re0auth_$${VERSION}_sbom.cdx.json"
+	@test -s "dist/re0auth_$${VERSION}_sbom.cdx.json" || { echo "refusing to ship an empty SBOM"; exit 1; }
+	@echo "sbom: dist/re0auth_$${VERSION}_sbom.cdx.json"
+
+# The npm half of the attribution.
+#
+# NOTICE covers the Go modules. The SPA is third-party code too (Svelte, SvelteKit,
+# Tailwind), and it ships inside every binary, archive and image, so it needs the
+# same attribution. This lists every npm package in the tree and its license, as
+# JSON, into dist/ — one file for all platforms, so it is generated here rather
+# than inside the archive loop, and the checksum glob below covers it.
+#
+# It reads the INSTALLED tree, so it needs the frontend dependencies; `dist` (and
+# therefore `web`) has already run by the time this does.
+npm-licenses: dist
+	@command -v node >/dev/null 2>&1 || { \
+		echo "node is required to list the npm licences; run this where the frontend can be installed"; \
+		exit 1; }
+	cd web && pnpm licenses list --json > "../dist/re0auth_$${VERSION}_npm-licenses.json"
+	@test -s "dist/re0auth_$${VERSION}_npm-licenses.json" || { echo "refusing to ship an empty npm licence list"; exit 1; }
+	@echo "npm licences: dist/re0auth_$${VERSION}_npm-licenses.json"
 
 # Requires sha256sum (coreutils) or shasum (macOS), and zip for the Windows
 # archives. CI runs on ubuntu-latest, where all three exist; a Windows checkout
 # can build the project but not cut a release.
-checksums: sbom
-	@cd dist && $(SHA256) re0auth_$(VERSION)_* > SHA256SUMS && echo "checksums: $$(wc -l < SHA256SUMS) file(s)"
+checksums: sbom npm-licenses
+	@cd dist && $(SHA256) re0auth_$${VERSION}_* > SHA256SUMS && echo "checksums: $$(wc -l < SHA256SUMS) file(s)"
 
-release: dist sbom checksums
+release: dist sbom npm-licenses checksums
 
 # Container image. There is no registry and no push here: this builds the image
 # from the same source the release archives come from, for a deployment to tag
@@ -208,8 +234,9 @@ release: dist sbom checksums
 # multi-arch is a `docker buildx build --platform` flag away rather than a change
 # to any of this.
 IMAGE ?= re0auth
+export IMAGE
 docker:
-	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
+	docker build --build-arg VERSION=$${VERSION} -t $${IMAGE}:$${VERSION} .
 
 clean:
 	rm -rf web/node_modules web/.svelte-kit dist

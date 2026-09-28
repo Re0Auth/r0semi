@@ -133,8 +133,10 @@ checksum 文件比没有更糟），签名签的是 `SHA256SUMS` 本身——于
 - **做了的**：CI action 按 commit SHA 固定、基础镜像按 digest 固定、扫描器与工具按精确版本固定
   （见上一节的表）；SBOM 列出链接进二进制的全部模块；`SHA256SUMS` 与 SBOM 由 cosign **keyless**
   签名，身份是发布 workflow 本身并记入 Rekor 透明日志；`govulncheck` 按**可达性**报漏洞；
-  `gitleaks` 扫全量历史。固定本身由 `internal/archtest` 与 `internal/observability` 的产物一致性
-  测试守住，不靠约定。
+  `gitleaks` 扫全量历史。**其中两半由 `internal/archtest` 机器守住**：基础镜像的 digest
+  （`TestDockerfileBaseImagesArePinned`）与 workflow 里每个远程 `uses:` 的 commit SHA
+  （`TestWorkflowActionsArePinnedToFullSHAs`）。工具版本（`go install …@vX.Y.Z`）那一半仍靠评审，
+  没有守卫——它写在同一批 workflow 里，改动会被评审看到，但没有测试会在它漂移时变红。
 - **不做的**：**不声明任何 SLSA 等级**；**不校验依赖自身的来源证明**——没有对模块做 sigstore 验证，
   边界就是 `go.sum` 与 Go 的校验和数据库（`sum.golang.org`）：它能发现被替换或篡改的模块，
   **不能**保证上游仓库本身没被入侵；也不为不在构建图里的模块（如测试专用的 `yaml.v3`）伪造记录。
