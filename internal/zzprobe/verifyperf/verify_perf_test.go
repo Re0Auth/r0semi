@@ -178,6 +178,11 @@ type envConfig struct {
 	doer       httpclient.Doer
 	httpClient *http.Client
 	scopes     []string
+	// maxBufferedBytes is the data plane's joint buffer budget. Zero takes the
+	// service default (64 MiB); a probe that deliberately parks MANY large bodies
+	// at once has to say so, because the default would shed it (that is the
+	// property P0-3 added — see internal/zzprobe/federation/zzprobe_p03_test.go).
+	maxBufferedBytes int
 }
 
 type env struct {
@@ -266,6 +271,9 @@ func newEnv(tb testing.TB, cfg envConfig) *env {
 		HTTPClient: cfg.httpClient,
 		BaseURL:    verifyIssuer,
 		Metrics:    metrics,
+		// Explicit, because this probe measures what the buffering costs: it parks
+		// up to 32 x 4 MiB at once on purpose, which the shipped budget would shed.
+		MaxBufferedBytes: cfg.maxBufferedBytes,
 	})
 	if err != nil {
 		tb.Fatal(err)
@@ -428,6 +436,11 @@ func TestVerifyInFlightAttribution(t *testing.T) {
 			binding: bearerBinding(),
 			doer:    gated,
 			scopes:  []string{oauth.ScopeAccountID.String(), verifyScope},
+			// Headroom for the sweep's worst point (32 x 4 MiB = 128 MiB): this
+			// probe is about what io.ReadAll holds, so the budget under test must
+			// not be what ends the measurement. The gated Doer below declares no
+			// Content-Length, so every read reserves the full cap.
+			maxBufferedBytes: 512 << 20,
 		})
 		req := rawRequest()
 		req.Header.Set("Authorization", "Bearer "+env.token)

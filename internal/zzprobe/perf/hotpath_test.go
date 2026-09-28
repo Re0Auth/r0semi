@@ -221,6 +221,15 @@ func (d *gatedDoer) Do(req *http.Request) (*http.Response, error) {
 
 func newProbeEnvWithDoer(tb testing.TB, doer httpclient.Doer) *probeEnv {
 	tb.Helper()
+	return newProbeEnvWithBudget(tb, doer, 0)
+}
+
+// newProbeEnvWithBudget is newProbeEnvWithDoer with the data plane's joint buffer
+// budget spelled out. Zero takes the service default (64 MiB, see P0-3); a probe
+// that deliberately parks MANY large bodies at once has to ask for the room,
+// because the default now sheds the surplus instead of allocating it.
+func newProbeEnvWithBudget(tb testing.TB, doer httpclient.Doer, maxBufferedBytes int) *probeEnv {
+	tb.Helper()
 	// The access log writes a line per request, which at these iteration counts
 	// buries the measurements. It has its own test.
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -311,6 +320,8 @@ func newProbeEnvWithDoer(tb testing.TB, doer httpclient.Doer) *probeEnv {
 		Doer:     doer,
 		BaseURL:  probeIssuer,
 		Metrics:  metrics,
+		// The budget under measurement, not the budget under test.
+		MaxBufferedBytes: maxBufferedBytes,
 	})
 	if err != nil {
 		tb.Fatal(err)
@@ -465,12 +476,14 @@ func pkce(verifier string) string {
 // TestProbeInFlightBytesPerDataPlaneRequest is the number that decides whether
 // docs/capacity-planning.md §3 is true.
 //
-// That section says a 4MiB response body is the main heap term, but nothing in the
-// configuration ties `server.max_in_flight` to it: the cap is derived from the
-// database pool (8 × max_conns, i.e. 128 by default), and the only per-body bound
-// is federation's 4MiB. This measures the live heap one in-flight proxy request
-// costs — with the requests parked inside the upstream read, so nothing is
-// garbage — and multiplies it by the default cap.
+// That section says a 4MiB response body is the main heap term. It used to add
+// that nothing in the configuration tied the request cap to it — the cap came from
+// the database pool (8 × max_conns, i.e. 128 by default) and the only per-body
+// bound was federation's 4MiB, so the product was unbounded in practice. P0-3
+// closed that with `server.max_upstream_buffer_bytes`, a joint budget counted in
+// bytes (internal/federation's bufferBudget); this probe parks 32 bodies *because
+// the measurement needs them all live at once*, so it raises that budget for
+// itself and keeps measuring the per-request cost.
 func TestProbeInFlightBytesPerDataPlaneRequest(t *testing.T) {
 	if testing.Short() {
 		t.Skip("perf probe: skipped under -short")
@@ -479,7 +492,9 @@ func TestProbeInFlightBytesPerDataPlaneRequest(t *testing.T) {
 	body := exactJSONBody(maxUpstreamBodyOfInterest - 1024)
 
 	gated := newGatedDoer(inFlight, body)
-	env := newProbeEnvWithDoer(t, gated)
+	// 512 MiB: room for the 32 x 4 MiB this probe holds on purpose. The gated Doer
+	// declares no Content-Length, so every read reserves the full cap.
+	env := newProbeEnvWithBudget(t, gated, 512<<20)
 	req := httptest.NewRequest(http.MethodGet,
 		"/v1/games/"+probeGame+"/sources/"+probeSource+"/raw/big", nil)
 	req.Header.Set("Authorization", "Bearer "+env.token)

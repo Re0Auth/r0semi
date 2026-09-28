@@ -144,6 +144,16 @@ func (s *Server) writeFederationError(w http.ResponseWriter, r *http.Request, er
 		// condition is only expressible as a gateway failure.
 		s.writeProblem(w, r, http.StatusBadGateway, "upstream_unavailable",
 			"the source's response is larger than this proxy will pass through")
+	case errors.Is(err, federation.ErrBufferBudget):
+		// The data plane is already holding as much upstream response body in
+		// memory as it may, so this read is shed before the bytes are allocated.
+		// That direction is the point: the alternative is reaching the container's
+		// memory limit and being OOM-killed, which loses every request in flight
+		// rather than this one. Retry-After is the same hint the in-flight limiter
+		// gives for the same reason.
+		w.Header().Set("Retry-After", "1")
+		s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable",
+			"too much upstream response data is being buffered right now")
 	case errors.Is(err, federation.ErrBindUnavailable):
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "the source is not configured for binding")
 	default:

@@ -41,6 +41,17 @@ spec:
             - { name: http, containerPort: 8080 }
             - { name: internal, containerPort: 9090 }
           env:
+            # The Go heap's soft limit, set below the container's hard one on
+            # purpose. The container limit is enforced by the kernel with a SIGKILL
+            # and no unwinding: the process never learns it is about to die, so
+            # every request in flight is lost rather than refused. GOMEMLIMIT makes
+            # the collector work harder as the heap approaches it, which turns
+            # "about to be killed" into "slower and then shedding" (the data plane
+            # sheds on its own byte budget — see max_upstream_buffer_bytes in the
+            # ConfigMap). 384MiB leaves the runtime, the connection pool and the
+            # audit buffers room under the 512Mi limit below.
+            - name: GOMEMLIMIT
+              value: "384MiB"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef: { name: re0auth-secrets, key: database-url }

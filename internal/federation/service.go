@@ -11,6 +11,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Re0Auth/r0semi/httpclient"
@@ -21,6 +22,88 @@ import (
 
 // maxBody caps how much of an upstream resource we read.
 const maxBody = 4 << 20
+
+// defaultMaxBufferedBytes is the default joint budget for upstream response
+// bodies held in memory at once. See Config.MaxBufferedBytes for the derivation;
+// 64 MiB is a quarter of the shipped container limit, and sixteen worst-case
+// (4 MiB) reads.
+const defaultMaxBufferedBytes = 64 << 20
+
+// ErrBufferBudget reports that the data plane is already holding as much upstream
+// response body in memory as it is allowed to, so this read is shed instead of
+// allocated. It is the fail-closed answer to "in-flight reads x body size":
+// serving it anyway is exactly how the process reaches its memory limit and is
+// killed, which loses every request in flight rather than this one.
+var ErrBufferBudget = errors.New("federation: the upstream response buffer budget is exhausted")
+
+// bufferBudget admits an upstream read by the BYTES it will hold, not by the
+// number of requests.
+//
+// The distinction is the whole point. A request cap says nothing about memory when
+// one endpoint may hold four megabytes per request and another a few hundred
+// bytes: 512 in flight is harmless for a session read and 2 GiB for a proxied
+// upstream body. Counting the bytes the reading path will actually hold makes the
+// invariant the deployment can be sized against — held <= limit — instead of a
+// request count that has to be re-derived for every body cap.
+//
+// It never blocks. Waiting would move the memory pressure into a queue of
+// goroutines each still holding a connection and a request, so a caller that does
+// not fit is shed (ErrBufferBudget), the same direction the in-flight limiter and
+// the outbound bulkhead already fail in.
+type bufferBudget struct {
+	mu    sync.Mutex
+	limit int
+	held  int
+}
+
+func newBufferBudget(limit int) *bufferBudget { return &bufferBudget{limit: limit} }
+
+// acquire reserves n bytes, reporting whether they fit. A budget that was never
+// constructed (nil) refuses: "no budget" must not read as "unbounded", since that
+// is the state the finding is about.
+func (b *bufferBudget) acquire(n int) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.held+n > b.limit {
+		return false
+	}
+	b.held += n
+	return true
+}
+
+func (b *bufferBudget) release(n int) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.held -= n
+	if b.held < 0 {
+		// A release without its acquire is a bug in the caller, and letting the
+		// counter drift negative would hand out budget that was never reserved.
+		b.held = 0
+	}
+	b.mu.Unlock()
+}
+
+// reserveFor is what one upstream read must hold: the cap it will read to, or
+// one byte past the length the upstream declared when that is smaller — and only
+// when the declaration is positive.
+//
+// A declared length is safe to use because Go's transport refuses a body longer
+// than the Content-Length it was given, so an upstream that lies fails the read
+// rather than outgrowing its reservation. A declared length of ZERO is different:
+// for a response built by hand (a stub Doer, an adapter) it is the zero value and
+// says nothing about the reader, so it reserves the cap. Shrinking on it would let
+// a body that is not empty spend a reservation of one byte.
+func reserveFor(resp *http.Response, readCap int) int {
+	if n := resp.ContentLength; n > 0 && n < int64(readCap) {
+		return int(n) + 1
+	}
+	return readCap
+}
 
 // NotBoundError reports that the chosen source needs to be bound first. It
 // wraps ErrNotBound so callers can use errors.Is.
@@ -126,6 +209,25 @@ type Config struct {
 	// Metrics, when set, records upstream reads and token refreshes. Nil records
 	// nothing; the *observability.Metrics methods are nil-safe.
 	Metrics *observability.Metrics
+	// MaxBufferedBytes is the joint budget for upstream response bodies held in
+	// memory at once, across every in-flight read on BOTH data-plane paths (the
+	// verbatim proxy and the normalized fetch). Zero takes
+	// defaultMaxBufferedBytes.
+	//
+	// It is the "in-flight x body size" bound that a request cap cannot express.
+	// Each buffering read reserves what it may hold — up to maxBody (4 MiB) for a
+	// raw passthrough, or the upstream's declared Content-Length plus one when that
+	// is smaller — and a read that does not fit is shed with ErrBufferBudget
+	// instead of allocated. Size it against the container's memory limit, not
+	// against the traffic: the number that matters is
+	//
+	//	MaxBufferedBytes <= (container limit - runtime, pool and audit overhead)
+	//
+	// The shipped default (64 MiB) is a quarter of the 512Mi limit in
+	// deploy/k8s/base/deployment.yaml and permits sixteen worst-case reads; the
+	// same manifest sets GOMEMLIMIT so the heap has a soft limit below the
+	// container's hard one.
+	MaxBufferedBytes int
 }
 
 // NewService validates cfg and returns a Service.
@@ -163,6 +265,12 @@ func NewService(cfg Config) (Service, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.MaxBufferedBytes == 0 {
+		cfg.MaxBufferedBytes = defaultMaxBufferedBytes
+	}
+	if cfg.MaxBufferedBytes < 0 {
+		return nil, errors.New("federation: MaxBufferedBytes must not be negative")
+	}
 	return &service{
 		registry:   cfg.Registry,
 		bindings:   cfg.Bindings,
@@ -176,6 +284,7 @@ func NewService(cfg Config) (Service, error) {
 		locks:      &keyedMutex{},
 		now:        cfg.Now,
 		metrics:    cfg.Metrics,
+		buffers:    newBufferBudget(cfg.MaxBufferedBytes),
 	}, nil
 }
 
@@ -196,6 +305,9 @@ type service struct {
 	// metrics observes upstream reads and refreshes. Optional; a nil
 	// *observability.Metrics records nothing.
 	metrics *observability.Metrics
+	// buffers is the joint budget for the response bodies held in memory by the
+	// two data-plane read paths. See Config.MaxBufferedBytes.
+	buffers *bufferBudget
 }
 
 func (s *service) Sources(game string) []Source { return s.registry.Sources(game) }
@@ -514,6 +626,16 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	// (NDJSON, CSV, plain text) the truncation stays syntactically valid, so
 	// nothing downstream can notice it. The normalized path cannot have this
 	// problem: its body has to parse as JSON, and a cut one does not.
+	//
+	// The reservation happens BEFORE the read and covers the worst case, because
+	// the bytes exist from the moment ReadAll starts copying them: admitting after
+	// the fact would mean the budget can only report an overrun it has already
+	// suffered.
+	reserve := reserveFor(resp, maxBody+1)
+	if !s.buffers.acquire(reserve) {
+		return RawResult{}, ErrBufferBudget
+	}
+	defer s.buffers.release(reserve)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return RawResult{}, fmt.Errorf("federation: read raw %s: %w", src.Name, err)
@@ -542,6 +664,13 @@ func (s *service) fetchResource(ctx context.Context, src Source, resource, token
 		return nil, fmt.Errorf("federation: source %s: %w", src.Name, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// Same joint budget as the raw path: a normalized fetch holds one body of up
+	// to maxBody while it parses. See Config.MaxBufferedBytes.
+	reserve := reserveFor(resp, maxBody)
+	if !s.buffers.acquire(reserve) {
+		return nil, ErrBufferBudget
+	}
+	defer s.buffers.release(reserve)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return nil, fmt.Errorf("federation: read %s: %w", src.Name, err)

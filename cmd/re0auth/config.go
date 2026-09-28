@@ -87,6 +87,12 @@ type serverSection struct {
 	// MaxInFlight bounds concurrent requests. Pointer for the same reason as
 	// rate_limit: absent takes the default, explicit 0 disables the cap.
 	MaxInFlight *int `toml:"max_in_flight"`
+	// MaxUpstreamBufferBytes is the joint budget for upstream response bodies the
+	// data plane may hold in memory at once, across every in-flight read. Absent
+	// takes the default; there is no "unbounded" value, because unbounded is the
+	// state that reaches the container's memory limit. Size it against the
+	// container limit, not against traffic.
+	MaxUpstreamBufferBytes *int `toml:"max_upstream_buffer_bytes"`
 	// TrustedProxies are the networks whose X-Forwarded-For header is believed
 	// when attributing a request to a client. Empty means none: the peer address
 	// is the client. Set it only to your own reverse proxies' addresses.
@@ -234,6 +240,10 @@ type settings struct {
 	RateLimitBurst int
 	// MaxInFlight caps concurrent requests. Zero disables the cap.
 	MaxInFlight int
+	// MaxUpstreamBufferBytes is the joint budget, in bytes, for upstream response
+	// bodies held in memory at once by the data plane. Always positive: a read
+	// that does not fit is shed with 503 rather than allocated.
+	MaxUpstreamBufferBytes int
 	// AdminReauthWindow bounds how old an operator login may be for a mutating
 	// admin call. Zero disables the check.
 	AdminReauthWindow time.Duration
@@ -316,6 +326,16 @@ const (
 	// keeps a small pool from shaping ordinary traffic.
 	maxInFlightPerConn = 8
 	minMaxInFlight     = 64
+
+	// defaultMaxUpstreamBufferBytes is the joint budget for upstream response
+	// bodies held in memory at once, in bytes. 64 MiB is a quarter of the 512Mi
+	// memory limit in deploy/k8s/base/deployment.yaml, and it is the number that
+	// actually bounds the data plane: a request cap cannot, because the two data
+	// plane paths may hold up to 4 MiB each (federation.maxBody) while every other
+	// endpoint holds a few hundred bytes. Sixteen worst-case reads fit; a body that
+	// declares a small Content-Length reserves only its own size, so ordinary
+	// traffic is not shaped by it at all.
+	defaultMaxUpstreamBufferBytes = 64 << 20
 
 	// defaultAdminReauthWindow is how long an operator login stays fresh enough
 	// for a mutating admin call. Long enough not to re-login mid-incident, short
@@ -483,6 +503,26 @@ func loadConfig(path string) (settings, error) {
 	if maxInFlight < -1 {
 		return settings{}, errors.New("server.max_in_flight cannot be negative (use 0 to disable the cap)")
 	}
+
+	// The data plane's buffer budget. -1 is "not chosen", like max_in_flight; every
+	// other negative value is refused, and there is no value that means unbounded.
+	bufferedBytes := -1
+	if f.Server.MaxUpstreamBufferBytes != nil {
+		bufferedBytes = *f.Server.MaxUpstreamBufferBytes
+	}
+	bufferedBytes, err = config.Int("RE0AUTH_MAX_UPSTREAM_BUFFER_BYTES", bufferedBytes)
+	if err != nil {
+		return settings{}, err
+	}
+	if bufferedBytes < -1 {
+		return settings{}, errors.New(
+			"server.max_upstream_buffer_bytes cannot be negative (there is no unbounded setting: " +
+				"that is the state which reaches the container's memory limit)")
+	}
+	if bufferedBytes == -1 {
+		bufferedBytes = defaultMaxUpstreamBufferBytes
+	}
+	cfg.MaxUpstreamBufferBytes = bufferedBytes
 
 	// Trusted proxies. The environment overrides the file, like every other
 	// setting. Absent means no proxy is trusted, which is the safe default: the

@@ -21,7 +21,17 @@ data:
     cookie_secure = true
     rate_limit       = 50
     rate_limit_burst = 100
-    max_in_flight    = 512
+    # max_in_flight is deliberately NOT set here. This manifest runs postgres, so
+    # the cap is derived from the connection pool (max(64, max_conns x 8) = 128
+    # with the default pool of 16 — see docs/capacity-planning.md §4). Writing 512
+    # here, as this file used to, contradicted the derivation the code applies and
+    # the ambient 512 the in-memory mode keeps, and 512 concurrent requests each
+    # holding a 4 MiB upstream body is 2 GiB against this pod's 512Mi limit.
+    #
+    # The data plane's own bound is the byte budget below: it is what actually
+    # caps "in flight x body size", because every other endpoint holds hundreds of
+    # bytes per request.
+    max_upstream_buffer_bytes = 67108864 # 64 MiB: a quarter of the 512Mi limit
     trusted_proxies  = ["10.0.0.0/8"]
 
     [storage]

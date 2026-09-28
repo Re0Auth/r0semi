@@ -482,6 +482,11 @@ func run() error {
 		HTTPClient: federationClient,
 		BaseURL:    cfg.Issuer,
 		Metrics:    metrics,
+		// The data plane is the only surface that holds megabytes per request, so
+		// its memory is bounded in bytes rather than in requests: a read that does
+		// not fit the budget is shed with 503 instead of allocated. Sized against
+		// the container's memory limit — see defaultMaxUpstreamBufferBytes.
+		MaxBufferedBytes: cfg.MaxUpstreamBufferBytes,
 	})
 	if err != nil {
 		return die("federation", err)

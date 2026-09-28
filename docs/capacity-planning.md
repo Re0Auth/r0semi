@@ -17,7 +17,8 @@
 | CPU / 内存 | 同上 `resources` | request `100m`/`128Mi`，limit `1`/`512Mi` |
 | 滚动发布峰值 | `maxSurge: 1` / `maxUnavailable: 0` | 短暂 **3** 个实例 |
 | 出站并发 | `cmd/re0auth` `federationMaxConcurrent` | `256` |
-| 入站并发 | `server.max_in_flight` | `512` |
+| 入站并发 | `server.max_in_flight` | 随连接池推导（默认池 → `128`）；内存模式 `512` |
+| 数据面响应体内存预算 | `server.max_upstream_buffer_bytes` | `67108864`（64 MiB，见 §4） |
 
 ## 1. 单请求成本
 
@@ -103,22 +104,33 @@ CI 每次都跑并把这张表写进 job summary（`GITHUB_STEP_SUMMARY`）：�
 
 k8s 默认 limit `512Mi`，`Re0AuthMemoryHigh` 告警阈值取 `400MiB`（比 limit 略低，先于 OOMKill 报警）。
 Go 堆之外的主要占用来自连接缓冲与并发请求的响应体；数据面单个响应体有 `maxBody = 4 MiB` 的上限
-（`internal/federation`），所以“在途请求数 × 平均响应体”是堆压力的主项。
+（`internal/federation`），所以“在途请求数 × 平均响应体”是堆压力的主项——**而这一项不能靠请求数来限**，
+见 §4 的 `max_upstream_buffer_bytes`。
 
 ## 4. 并发上限
 
-两个上限作用在不同层，别混淆：
+三个上限作用在不同层，别混淆：
 
 - `server.max_in_flight`（**默认随连接池推导**）：**入站准入**，超过即 503。它环在限流器之外，
   限的是“同时在处理的工作量”，不是到达速率。缺省值 = `max(64, max_conns × 8)`（默认池 16 → **128**）；
   内存模式没有池可比，仍是 512。显式配置的值原样使用，`0` 关闭。
+  **它限的是数量，不是内存**：512 个会话读是小事，512 个各持有 4 MiB 上游响应体的数据面读是 2 GiB。
+- `server.max_upstream_buffer_bytes`（默认 **64 MiB**）：**数据面的内存预算，按字节计**。生产代码里是
+  `internal/federation` 的 `bufferBudget`：两条会缓冲响应体的路径（raw 透传与归一化抓取）在
+  `io.ReadAll` **之前**按自己可能持有的字节数预约——最坏 `maxBody`（4 MiB），
+  若上游声明了更小的 `Content-Length` 就只预约那么多——预约不下就**当场 503**
+  （`federation.ErrBufferBudget` → `temporarily_unavailable` + `Retry-After: 1`），不排队、不分配。
+  不变量是 `held <= max_upstream_buffer_bytes`，所以这个数要与容器 limit 挂钩而不是与流量挂钩：
+  `max_upstream_buffer_bytes <= 容器 limit − 运行时/连接池/审计缓冲的开销`（出厂 k8s 是 512Mi limit
+  与 64 MiB 预算；`deployment.yaml` 另设 `GOMEMLIMIT=384MiB`，让 GC 在撞上硬 limit 之前先变慢，
+  而不是被 SIGKILL 掉整进程）。没有“无上限”取值。
 - `federationMaxConcurrent`（默认 256）：**出站 bulkhead**，限制数据面对某个上游的在途请求数；
   一个请求可以在占用一个入站名额的同时等待一个出站名额。
 
-一次数据面读的链路是：入站名额 → （可能需要一个连接池连接）→ 出站名额 → 上游。
+一次数据面读的链路是：入站名额 → 数据面字节预算 → （可能需要一个连接池连接）→ 出站名额 → 上游。
 因此 **`max_in_flight` 应 ≥ 连接池总量**，否则请求会先在池上排队而不是在准入上被挡住；而设得远高于池容量
 同样没有意义——它只是把“快速 503”换成“在 pgx 上慢慢等一个进程没有的连接”，期间客户端断连是唯一的界。
-这就是缺省值按池推导而不是写死 512 的原因。
+这就是缺省值按池推导而不是写死 512 的原因；`deploy/k8s/base/configmap.yaml` 因此**不再**写死 512。
 
 **两个上限都是每副本值**——与 §2 的 `max_conns` 同理：N 个副本合起来是 **N × `max_in_flight` 的入站准入**与
 **N × 256 的出站并发**。扩容时要把这个乘法算进去，别只看单副本的数字；按地址的限流桶
