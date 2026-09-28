@@ -7,24 +7,29 @@ on:
   push:
     tags: ['v*']
 
-# gh release create writes a release; packages:write pushes the image to GHCR;
-# id-token is what keyless signing exchanges for a short-lived certificate from
-# Fulcio, and what buildx uses for provenance.
-permissions:
-  contents: write
-  packages: write
-  id-token: write
-
+# Deliberately no workflow-level `permissions`. A block here arms every job that
+# does not narrow itself, so the reusable CI gate and the packaging job both used
+# to carry contents/packages/id-token write — a token that can publish a release,
+# held by jobs whose job is to read the repository and write a tag's worth of
+# files. Each job below names the scopes it actually uses (githubactions:S8233).
 jobs:
   # The tag gate is not a hand-picked subset. It is ci.yml itself, called as a
   # reusable workflow, so a release cannot run with a check that CI has but this
   # file forgot to copy. Whatever turns main red turns a tag red.
   ci:
     uses: ./.github/workflows/ci.yml
+    # ci.yml declares `contents: read` and its own image job builds with
+    # `push: false`, so the gate reads the repository and needs nothing more.
+    permissions:
+      contents: read
 
   # A runnable image is part of a release, not a side effect of one: amd64 and
   # arm64, an SBOM and provenance attestation, a signed digest, and a scan that
   # fails the job on HIGH/CRITICAL vulnerabilities.
+  #
+  # packages: write is the push to GHCR; id-token is what buildx exchanges for the
+  # provenance attestation and what keyless signing exchanges for a Fulcio
+  # certificate.
   image:
     needs: ci
     runs-on: ubuntu-latest
@@ -99,6 +104,12 @@ jobs:
   release:
     needs: [ci, image]
     runs-on: ubuntu-latest
+    # gh release create writes the release, and cosign signs the checksums keyless,
+    # which exchanges id-token for a Fulcio certificate. It pushes no image — that
+    # is the job above — so it holds no packages: write.
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -140,8 +151,8 @@ jobs:
       #
       # The tag travels through the environment rather than being interpolated
       # into the script: git allows shell metacharacters in a ref name, and this
-      # job holds contents: write, packages: write and id-token: write. The
-      # publish step below already reads GITHUB_REF_NAME for the same reason.
+      # job holds contents: write and id-token: write. The publish step below
+      # already reads GITHUB_REF_NAME for the same reason.
       - name: package
         env:
           VERSION: ${{ github.ref_name }}

@@ -153,3 +153,71 @@ func makeTargetInstallsPnpm(makefile []byte, target string) bool {
 	}
 	return false
 }
+
+// TestWorkflowsGrantWriteScopesOnlyToTheJobThatUsesThem pins githubactions:S8233.
+//
+// A `permissions` block at the top of a workflow arms every job that does not
+// narrow itself. release.yml carried one — contents, packages and id-token all
+// writable — so the reusable CI gate and the packaging job both ran holding a
+// token that can publish a release, while all either needed was to read the
+// repository. The block is gone and each job now states its own scopes; this
+// keeps it that way, because putting it back is one convenient line and its cost
+// is invisible until a step that should not have it spends the token.
+//
+// Read scopes may stay at workflow level. They widen nothing, and one honest line
+// describes a whole file of jobs that only read.
+func TestWorkflowsGrantWriteScopesOnlyToTheJobThatUsesThem(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, ".github", "workflows")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// `permissions` is either a mapping of scope to level, or one of the two
+	// shorthands (`read-all` / `write-all`), so it is decoded as it is written
+	// rather than into a shape that would reject a valid workflow.
+	var workflow struct {
+		Permissions any `yaml:"permissions"`
+	}
+
+	checked := 0
+	for _, entry := range entries {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".yml") && !strings.HasSuffix(entry.Name(), ".yaml")) {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		workflow.Permissions = nil
+		if err := yaml.Unmarshal(raw, &workflow); err != nil {
+			t.Fatalf("%s: %v", entry.Name(), err)
+		}
+		checked++
+
+		switch p := workflow.Permissions.(type) {
+		case string:
+			if p == "write-all" {
+				t.Errorf("%s: workflow-level `permissions: write-all` arms every job "+
+					"that does not narrow itself; scope it to the jobs that write", entry.Name())
+			}
+		case map[string]any:
+			for scope, level := range p {
+				if level == "write" {
+					t.Errorf("%s: workflow-level `%s: write` arms every job that does "+
+						"not narrow itself; move it to the job that uses it", entry.Name(), scope)
+				}
+			}
+		}
+	}
+
+	// Anti-vacuous: every check above passes by finding nothing, which is also
+	// what a parse that stopped reading the directory looks like.
+	if checked == 0 {
+		t.Fatal("no workflow was read, so this guard would pass vacuously")
+	}
+}
