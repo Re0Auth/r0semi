@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sort"
@@ -69,12 +70,38 @@ type Record struct {
 // ErrNotFound reports a missing credential.
 var ErrNotFound = errors.New("vault: credential not found")
 
+// Envelope is the part of a record a key rotation replaces: the wrapped DEK, the
+// id of the key that wrapped it, and when. Everything else in a Record belongs to
+// the identity or the payload, and a rotation must not touch any of it — which is
+// the point of naming this much rather than passing a whole Record.
+type Envelope struct {
+	KEKID      string
+	WrappedDEK []byte
+	UpdatedAt  time.Time
+}
+
 // Repo persists credential records. It stores opaque crypto material and needs
 // no knowledge of the vault's envelope format.
 type Repo interface {
 	Put(ctx context.Context, rec Record) error
 	Get(ctx context.Context, id Identity) (Record, error)
 	Delete(ctx context.Context, id Identity) error
+	// RewrapIfUnchanged replaces ONLY the envelope of id, and only when the stored
+	// wrapped DEK still equals expect. It reports whether it applied.
+	//
+	// It is on the interface rather than assembled by the caller from Get+Put
+	// because the window between those two is where a credential is lost: a
+	// rotation that writes back the whole record it read restores that record's old
+	// ciphertext, metadata and timestamps, so a credential enrolled by another
+	// process in the meantime is silently rolled back while the rotation reports
+	// success. Only the store can make "read, compare, write" one atomic step.
+	//
+	// expect is the wrapped DEK the caller read. It works as a compare-and-swap
+	// token because it is specific to the row's crypto material: a concurrent enrol
+	// (new DEK, new ciphertext) and a concurrent re-wrap (new envelope) both change
+	// it. A row that is no longer there reports false: there is nothing left to
+	// re-wrap, and that is not an error.
+	RewrapIfUnchanged(ctx context.Context, id Identity, expect []byte, next Envelope) (bool, error)
 	// List returns every record, ordered by identity.
 	//
 	// It exists for one caller: key rotation, which has to visit everything. No
@@ -123,6 +150,25 @@ func (r *MemoryRepo) Put(_ context.Context, rec Record) error {
 	defer r.mu.Unlock()
 	r.records[rec.Identity] = cloneRecord(rec)
 	return nil
+}
+
+// RewrapIfUnchanged implements Repo. The comparison and the write happen under one
+// lock, which is what makes it a compare-and-swap rather than a narrower race.
+func (r *MemoryRepo) RewrapIfUnchanged(_ context.Context, id Identity, expect []byte, next Envelope) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.records[id]
+	if !ok {
+		return false, nil
+	}
+	if !bytes.Equal(rec.WrappedDEK, expect) {
+		return false, nil
+	}
+	rec.WrappedDEK = append([]byte(nil), next.WrappedDEK...)
+	rec.KEKID = next.KEKID
+	rec.UpdatedAt = next.UpdatedAt
+	r.records[id] = rec
+	return true, nil
 }
 
 // Get implements Repo.

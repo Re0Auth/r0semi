@@ -214,13 +214,29 @@ kek_env = "RE0AUTH_KEK"
 # start a rotation rather than let that pass quietly.
 kek_id = "kek-1"
 
-# Rotating the key, in three steps:
+# Rotating the key, in four steps:
 #   1. generate the new key, put it in RE0AUTH_KEK, and bump kek_id (say "kek-2");
 #   2. declare the old key below, under the id it had while it was current;
 #   3. run:    re0auth -rotate-keys -config config/re0auth.toml
-#      then remove the block below and restart. The old key is no longer needed.
+#      and repeat it until it prints `rewrapped=0 skipped=0` AND exits 0;
+#   4. only then remove the block below and restart.
 #
-# Rotation re-wraps each record's DEK under the new key. It does not decrypt or
+# **Step 3's gate is "a run that had nothing to do", not "a run happened".** Two
+# reasons, neither of which the command can see for itself:
+#
+#   - a process still configured with the old key writes records ON the old key
+#     after the rotation cursor has passed them, and the rotation cannot see them;
+#     with replicas > 1 and a rolling update that is the normal case, so take the
+#     old-key processes down and run it once more;
+#   - a record whose row changed while the run was reading it is NOT re-wrapped.
+#     The command then prints `skipped>0` and exits non-zero, and the
+#     `vault.rotate_keys` audit event is recorded as `error` rather than `ok`.
+#
+# Removing the retired key before that gate is reached makes every credential left
+# on it permanently unreadable — not an error, just undecryptable.
+#
+# Rotation re-wraps each record's DEK under the new key, and now writes ONLY that
+# envelope, and only if the row is still the one it read. It does not decrypt or
 # rewrite payloads, so it is cheap and safe to run again. It cannot undo a leak:
 # if the old key and a copy of the database escaped together, those credentials
 # are compromised and have to be re-enrolled at the source. What rotation does is

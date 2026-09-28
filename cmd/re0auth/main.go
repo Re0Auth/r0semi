@@ -1094,14 +1094,56 @@ func rotateAndReport(ctx context.Context, v vault.Service) error {
 	if err != nil {
 		return die("rotate keys", err)
 	}
-	slog.Info("key rotation complete",
-		"scanned", rotation.Scanned,
-		"rewrapped", rotation.Rewrapped,
-		"already_current", rotation.AlreadyCurrent)
-	if rotation.Scanned == 0 {
-		slog.Warn("there was nothing to rotate; is the configured storage the one holding credentials?")
+	lines, incomplete := rotationReport(rotation)
+	for _, line := range lines {
+		if incomplete {
+			slog.Warn(line)
+			continue
+		}
+		slog.Info(line)
+	}
+	if incomplete {
+		return die("rotate keys", errors.New(lines[len(lines)-1]))
 	}
 	return nil
+}
+
+// rotationReport renders what an operator should read after a rotation run and
+// says whether the run may be reported as successful.
+//
+// It reports the counts AND the one thing the counts cannot express. A rotation
+// cannot see a credential written by a process that is still configured with the
+// retired key — that write happens in another process, under a key this one does
+// not choose — and it cannot move a row that changed while its page was in flight.
+// So the honest end state is "run this again until it re-wrapped nothing and
+// skipped nothing, and remove the retired key only then", and a run that cannot say
+// that must not look like a success: it exits non-zero, because "the command
+// printed {Rewrapped:1} and exited 0" while a credential sits on a key the operator
+// is about to delete is the exact shape of the finding.
+//
+// The last line is the remedy, so it can be handed to die verbatim.
+func rotationReport(r vault.Rotation) ([]string, bool) {
+	lines := []string{fmt.Sprintf(
+		"key rotation run finished: scanned=%d rewrapped=%d already_current=%d skipped=%d",
+		r.Scanned, r.Rewrapped, r.AlreadyCurrent, r.Skipped)}
+	if r.Scanned == 0 {
+		lines = append(lines, "there was nothing to rotate; is the configured storage the one holding credentials?")
+	}
+	if r.Skipped > 0 {
+		incomplete := fmt.Sprintf(
+			"%d of %d records were not re-wrapped: their rows changed while this run was reading them "+
+				"(a credential enrolled by another process, or an erasure). Do NOT remove the retired key. "+
+				"Run -rotate-keys again until it reports rewrapped=0 skipped=0",
+			r.Skipped, r.Scanned)
+		return append(lines, incomplete), true
+	}
+	// Unconditional, even for a run that re-wrapped everything: those counts only
+	// speak for the records this run read.
+	lines = append(lines,
+		"a rotation cannot see credentials written by a process still configured with the retired key: "+
+			"run -rotate-keys again after the last such process has stopped, and remove the retired key only "+
+			"when a run reports rewrapped=0 skipped=0")
+	return lines, false
 }
 
 // oidcBackend is the OP store surface the composition root needs. Both

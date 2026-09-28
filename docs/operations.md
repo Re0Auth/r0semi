@@ -144,7 +144,13 @@ kubectl apply -k deploy/k8s/backup
 ## 密钥轮换
 
 - KEK：配置新 `kek_id`，把旧 key 放进 `vault.retired`，启动时 `-rotate-keys`，
-  确认没有待重包记录后再移除旧 key。
+  **重复到它报 `rewrapped=0 skipped=0` 且退出码为 0**，再移除旧 key。
+  两条判据都不是「跑过一次」：
+  - `skipped>0` 表示本轮有记录的行在读取期间被别的进程改了（新凭据入册 / 抹除），
+    命令**非零退出**且审计记 `error`；重跑即可收敛。
+  - `rewrapped=0` 还必须**在旧键进程全部下线之后**确认一次：游标走过之后写进来的凭据留在旧键上，
+    轮换看不到它们，而 `replicas: 2` 的滚动更新让这件事成为常态。
+  在这之前删键 ⇒ 落在旧键上的凭据**永久不可读**（不是报错，是解不开）。
 - OP 签名密钥：新私钥签发，旧公钥留在 `RE0AUTH_OIDC_RETIRED_SIGNING_KEYS`，
   等最长 id_token 寿命过去后移除。
 - OP 令牌加密密钥：新 key 加密，旧 key 留在 `RE0AUTH_OIDC_RETIRED_TOKEN_KEYS`，

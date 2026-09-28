@@ -33,13 +33,18 @@ func key32(t *testing.T, id string, material byte) *vault.LocalKeyWrapper {
 }
 
 // hookRepo is a vault.Repo that can run an action in the window between a page
-// read and the re-wrap writes a rotation performs. That window is the whole
-// question for "can a rotation run while a server is serving".
+// read and the re-wrap a rotation performs. That window is the whole question for
+// "can a rotation run while a server is serving".
+//
+// onRewrap fires when the rotation is about to apply its compare-and-swap, i.e.
+// after the page was read and before the row is touched — the same window onPut
+// used to model, now that a rotation writes an envelope rather than a whole record.
 type hookRepo struct {
-	inner   *vault.MemoryRepo
-	onPage  func()
-	onPut   func(rec vault.Record)
-	putSeen []vault.Record
+	inner    *vault.MemoryRepo
+	onPage   func()
+	onPut    func(rec vault.Record)
+	onRewrap func()
+	putSeen  []vault.Record
 }
 
 func (r *hookRepo) Put(ctx context.Context, rec vault.Record) error {
@@ -48,6 +53,13 @@ func (r *hookRepo) Put(ctx context.Context, rec vault.Record) error {
 	}
 	r.putSeen = append(r.putSeen, rec)
 	return r.inner.Put(ctx, rec)
+}
+
+func (r *hookRepo) RewrapIfUnchanged(ctx context.Context, id vault.Identity, expect []byte, next vault.Envelope) (bool, error) {
+	if r.onRewrap != nil {
+		r.onRewrap()
+	}
+	return r.inner.RewrapIfUnchanged(ctx, id, expect, next)
 }
 
 func (r *hookRepo) Get(ctx context.Context, id vault.Identity) (vault.Record, error) {
@@ -79,13 +91,14 @@ func (r *hookRepo) DeleteSubject(ctx context.Context, subject string) (int, erro
 }
 
 // TestProbeRotationOverwritesARecordEnrolledDuringTheRun is the confirmed
-// data-loss window: Rotate reads a page, re-wraps the DEK, then Put()s the WHOLE
-// record back (vault/rotate.go:130-135) — including the stale nonce and
-// ciphertext it read. An Enroll (or a federation refresh) that commits in
-// between is silently overwritten by the old payload.
+// data-loss window: Rotate read a page, re-wrapped the DEK, then Put() the WHOLE
+// record back — including the stale nonce and ciphertext it read. An Enroll (or a
+// federation refresh) that committed in between was silently overwritten by the
+// old payload, and the rotation reported success.
 //
-// The positive control is the second half: with no concurrent writer the
-// rotation is clean.
+// The guard is the property that must hold: the concurrently written secret is the
+// one that survives. The positive control is the second half: with no concurrent
+// writer the rotation is clean.
 func TestProbeRotationOverwritesARecordEnrolledDuringTheRun(t *testing.T) {
 	ctx := context.Background()
 	id := vault.Identity{Subject: "usr_race", Provider: "taptap"}
@@ -103,12 +116,12 @@ func TestProbeRotationOverwritesARecordEnrolledDuringTheRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The racing writer enrolls a NEW secret in the window between the rotation's
+	// The racing writer enrols a NEW secret in the window between the rotation's
 	// page read and its write — exactly the interleaving a live server produces.
-	// The hook fires on the rotation's own Put (outer wrapper), so it runs AFTER
-	// the page was read and BEFORE the stale record is stored.
+	// The hook fires when the rotation is about to apply its compare-and-swap, so it
+	// runs AFTER the page was read and BEFORE the stale envelope could be written.
 	var raced bool
-	repo.onPut = func(vault.Record) {
+	repo.onRewrap = func() {
 		if raced {
 			return
 		}
@@ -126,13 +139,18 @@ func TestProbeRotationOverwritesARecordEnrolledDuringTheRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rotation reported an error: %v", err)
 	}
-	newWriter, err := vault.NewService(repo, fresh, logger)
+	if !raced {
+		t.Fatal("the hook never fired: the rotation did not attempt a re-wrap, so nothing below is meaningful")
+	}
+	// With BOTH keys configured the newer payload must be the one that survived.
+	// (The racing writer was a process on the RETIRED key, so its row is on the
+	// retired key — which is the other half of this finding, and the reason the
+	// retired key must stay configured until a re-run moves it.)
+	both, err := vault.NewService(repo, fresh, logger, vault.WithRetiredKeys(old))
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	got := readSecret(t, newWriter, id)
-	switch string(got) {
+	switch got := string(readSecret(t, both, id)); got {
 	case "second-secret":
 		t.Log("rotation preserved the concurrently written secret (the window is closed)")
 	case "first-secret":
@@ -142,15 +160,32 @@ func TestProbeRotationOverwritesARecordEnrolledDuringTheRun(t *testing.T) {
 	default:
 		t.Fatalf("secret = %q", got)
 	}
+	// The record the racing writer re-enrolled could not be re-wrapped by this run —
+	// the CAS refused — and that must be reported, not swallowed. It is also the
+	// signal the operator needs: a process still on the retired key is writing.
+	if rotation.Skipped != 1 {
+		t.Errorf("rotation = %+v, want Skipped 1: the row changed under it", rotation)
+	}
+	if rotation.Scanned != rotation.Rewrapped+rotation.AlreadyCurrent+rotation.Skipped {
+		t.Errorf("rotation = %+v: the counts do not add up to Scanned", rotation)
+	}
 
-	// Control: a second, uncontended rotation must be a clean no-op.
-	repo.onPut = nil
+	// Control: a second, uncontended run converges — the row moves to the current
+	// key and is then readable without the retired one.
+	repo.onRewrap = nil
 	second, err := rotator.Rotate(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Scanned != 1 || second.Rewrapped != 0 || second.AlreadyCurrent != 1 {
-		t.Fatalf("uncontended rotation = %+v", second)
+	if second.Scanned != 1 || second.Rewrapped != 1 || second.AlreadyCurrent != 0 || second.Skipped != 0 {
+		t.Fatalf("the converging rotation = %+v", second)
+	}
+	newWriter, err := vault.NewService(repo, fresh, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(readSecret(t, newWriter, id)); got != "second-secret" {
+		t.Fatalf("after the second run the record reads %q, want the concurrently written secret", got)
 	}
 }
 
@@ -248,8 +283,13 @@ func TestProbeRotationPublishesPartialProgressOnFailure(t *testing.T) {
 	}
 }
 
-// failOnNthPut makes a repo's Put fail on the n-th call, standing in for any way
-// a rotation run can die halfway.
+// failOnNthPut makes a re-wrap fail on the n-th call, standing in for any way a
+// rotation run can die halfway.
+//
+// It fails the CAS re-wrap rather than Put: a rotation no longer writes whole
+// records (that was P1-2 — it rolled back whatever another process had enrolled
+// in the meantime), so a probe that injected the failure at Put would inject it
+// nowhere and the run would succeed.
 type failOnNthPut struct {
 	vault.Repo
 	mu     sync.Mutex
@@ -257,15 +297,23 @@ type failOnNthPut struct {
 	failAt int
 }
 
-func (r *failOnNthPut) Put(ctx context.Context, rec vault.Record) error {
+func (r *failOnNthPut) RewrapIfUnchanged(ctx context.Context, id vault.Identity, expect []byte, next vault.Envelope) (bool, error) {
 	r.mu.Lock()
 	r.seen++
 	n := r.seen
 	r.mu.Unlock()
 	if n == r.failAt {
-		return context.DeadlineExceeded
+		return false, context.DeadlineExceeded
 	}
-	return r.Repo.Put(ctx, rec)
+	return r.Repo.RewrapIfUnchanged(ctx, id, expect, next)
+}
+
+// rewrapped counts how many re-wraps this repo has been asked to apply and applies
+// them, so a probe can name the write that failed.
+func (r *failOnNthPut) rewrapped() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seen
 }
 
 // TestProbeRotationDoesNotDecryptPayloads is the brief's explicit question. It

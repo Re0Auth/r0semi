@@ -44,7 +44,7 @@ RE0AUTH_KEK=$(head -c 32 /dev/urandom | base64) \
 
 ### KEK 轮换
 
-三步（`config/re0auth.example.toml` 的 `[vault]` 段里有同样的说明）：
+四步（`config/re0auth.example.toml` 的 `[vault]` 段里有同样的说明）：
 
 ```sh
 # 1. 生成新 KEK 放进 RE0AUTH_KEK，并把 vault.kek_id 改成新的（例如 "kek-2"）
@@ -52,9 +52,21 @@ RE0AUTH_KEK=$(head -c 32 /dev/urandom | base64) \
 #      [[vault.retired]]
 #      kek_id  = "kek-1"
 #      kek_env = "RE0AUTH_KEK_OLD"
-# 3. 轮换，然后删掉这段声明并重启
+# 3. 轮换：必须等到它打印 rewrapped=0 skipped=0 且退出码为 0
 re0auth -rotate-keys -config config/re0auth.toml
+# 4. 第 3 步成立之后，才删掉 [[vault.retired]] 那段声明并重启
 ```
+
+**第 3 步的门槛不是「跑过一次」，而是「跑过一次什么都不用做」。** 两条原因都不是命令自己能看出来的：
+
+- **还有进程按旧键在服务。** 轮换游标走过之后写进来的凭据留在旧 KEK 上，轮换看不到它们，
+  而 `replicas: 2` 的滚动更新让这件事成为常态。所以先让所有旧键进程下线，**再**跑一次，
+  直到它报 `rewrapped=0`。
+- **本轮可能有记录没被重封装**（行在本轮读它的时候被别的进程改了）。这时命令**打印 `skipped>0`
+  并以非零退出**，审计里那条 `vault.rotate_keys` 也记为 `error` 而不是 `ok`——它正是运维在决定
+  删键之前会去看的记录。
+
+在这个门槛达到之前删掉退役键，落在旧键上的那些凭据会**永久不可读**（不是报错，是解不开）。
 
 参考数据源（独立进程，用来验证 Upstream Kit）：
 

@@ -95,6 +95,30 @@ func (s *Vault) Put(ctx context.Context, rec vault.Record) error {
 	return err
 }
 
+// RewrapIfUnchanged implements vault.Repo.
+//
+// One statement, and the comparison is part of it: `WHERE wrapped_dek = $3` makes
+// this a compare-and-swap inside Postgres rather than a read followed by a write
+// with a window between them. The columns a rotation must not touch — nonce,
+// ciphertext, meta, created_at — are not in the SET list at all, so a credential
+// enrolled by another process while a rotation page is being processed cannot be
+// rolled back to the stale record the rotation read.
+//
+// Zero rows affected means the row changed under us (or is gone). That is a
+// refusal, not an error: the caller reports the record as not re-wrapped, and a
+// re-run resolves it.
+func (s *Vault) RewrapIfUnchanged(ctx context.Context, id vault.Identity, expect []byte, next vault.Envelope) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE vault_credentials
+		   SET wrapped_dek = $4, kek_id = $5, updated_at = $6
+		 WHERE subject = $1 AND provider = $2 AND wrapped_dek = $3`,
+		id.Subject, id.Provider, expect, next.WrappedDEK, next.KEKID, next.UpdatedAt)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // Get implements vault.Repo.
 func (s *Vault) Get(ctx context.Context, id vault.Identity) (vault.Record, error) {
 	var (

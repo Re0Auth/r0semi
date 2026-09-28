@@ -49,11 +49,12 @@ func key32(t *testing.T, id string, material byte) *vault.LocalKeyWrapper {
 }
 
 // hookRepo is a Repo that can run an action inside a rotation's write, which is
-// the window between "the page was read" and "the stale record was stored".
+// the window between "the page was read" and "the row was touched".
 type hookRepo struct {
-	inner  *vault.MemoryRepo
-	onPage func()
-	onPut  func(vault.Record)
+	inner    *vault.MemoryRepo
+	onPage   func()
+	onPut    func(vault.Record)
+	onRewrap func()
 }
 
 func (r *hookRepo) Put(ctx context.Context, rec vault.Record) error {
@@ -61,6 +62,13 @@ func (r *hookRepo) Put(ctx context.Context, rec vault.Record) error {
 		r.onPut(rec)
 	}
 	return r.inner.Put(ctx, rec)
+}
+
+func (r *hookRepo) RewrapIfUnchanged(ctx context.Context, id vault.Identity, expect []byte, next vault.Envelope) (bool, error) {
+	if r.onRewrap != nil {
+		r.onRewrap()
+	}
+	return r.inner.RewrapIfUnchanged(ctx, id, expect, next)
 }
 
 func (r *hookRepo) Get(ctx context.Context, id vault.Identity) (vault.Record, error) {
@@ -87,7 +95,9 @@ func (r *hookRepo) DeleteSubject(ctx context.Context, s string) (int, error) {
 	return r.inner.DeleteSubject(ctx, s)
 }
 
-// failOnNthPut fails one write, standing in for any way a run dies halfway.
+// failOnNthPut fails one write, standing in for any way a run dies halfway. The
+// write a rotation performs is the compare-and-swap re-wrap (P1-2 replaced the
+// whole-record Put), so that is the call this injects at.
 type failOnNthPut struct {
 	vault.Repo
 	failAt int
@@ -95,15 +105,15 @@ type failOnNthPut struct {
 	seen   int
 }
 
-func (r *failOnNthPut) Put(ctx context.Context, rec vault.Record) error {
+func (r *failOnNthPut) RewrapIfUnchanged(ctx context.Context, id vault.Identity, expect []byte, next vault.Envelope) (bool, error) {
 	r.mu.Lock()
 	r.seen++
 	n := r.seen
 	r.mu.Unlock()
 	if n == r.failAt {
-		return context.DeadlineExceeded
+		return false, context.DeadlineExceeded
 	}
-	return r.Repo.Put(ctx, rec)
+	return r.Repo.RewrapIfUnchanged(ctx, id, expect, next)
 }
 
 func readSecret(t *testing.T, svc vault.Service, id vault.Identity) (string, error) {
@@ -138,7 +148,15 @@ func mustRead(t *testing.T, svc vault.Service, id vault.Identity) string {
 // corruption.
 // ---------------------------------------------------------------------------
 
-func TestVerifyRotateOverwriteLeavesARecordThatStillDecrypts(t *testing.T) {
+// The verifier's refutation of k2's mechanism, restated as the guard for the fix.
+//
+// What it used to show: the stale record left behind by a rotation's whole-record
+// Put was still self-consistent and readable, so the harm was a SILENT ROLLBACK to
+// the previous payload rather than an unreadable row. P1-2 replaced that write with
+// a compare-and-swap on the envelope, so the rollback must no longer happen at all:
+// the row a concurrent enrol committed is the row that survives, and the rotation
+// reports the record as not re-wrapped instead of reporting success.
+func TestVerifyRotateDoesNotRollBackAConcurrentEnroll(t *testing.T) {
 	ctx := context.Background()
 	id := vault.Identity{Subject: "usr_race", Provider: "taptap"}
 	repo := &hookRepo{inner: vault.NewMemoryRepo()}
@@ -156,7 +174,7 @@ func TestVerifyRotateOverwriteLeavesARecordThatStillDecrypts(t *testing.T) {
 	}
 
 	raced := false
-	repo.onPut = func(vault.Record) {
+	repo.onRewrap = func() {
 		if raced {
 			return
 		}
@@ -180,42 +198,47 @@ func TestVerifyRotateOverwriteLeavesARecordThatStillDecrypts(t *testing.T) {
 		t.Fatal("the probe never reached the interleaving it claims to model")
 	}
 
-	// Rotate with ONLY the new key configured: this is the post-rotation
-	// deployment (the retired key is supposed to be removable by then).
+	// With both keys configured — the state the documentation requires until a run
+	// reports nothing left to do — the newer payload is the one that survived.
+	both, err := vault.NewService(repo, fresh, logger, vault.WithRetiredKeys(old))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, rerr := readSecret(t, both, id)
+	if rerr != nil {
+		t.Fatalf("the record does not decrypt with both keys configured: %v", rerr)
+	}
+	if got != "second-secret" {
+		t.Errorf("the surviving payload is %q, want the concurrently enrolled one: the rotation rolled the row back "+
+			"(rotation reported %+v)", got, rotation)
+	}
+	if rotation.Skipped != 1 || rotation.Rewrapped != 0 {
+		t.Errorf("rotation = %+v, want Skipped 1 / Rewrapped 0: a refused re-wrap must be reported, not counted as done",
+			rotation)
+	}
+
+	// A re-run converges, and THEN the retired key can go: the row is on the current
+	// key and the payload is still the newer one.
+	repo.onRewrap = nil
+	second, err := rotator.Rotate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Rewrapped != 1 || second.Skipped != 0 {
+		t.Fatalf("the converging run = %+v", second)
+	}
 	afterOnly, err := vault.NewService(repo, fresh, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	got, rerr := readSecret(t, afterOnly, id)
+	got, rerr = readSecret(t, afterOnly, id)
 	if rerr != nil {
-		// This is what the report predicts (AES-GCM rejecting a mismatched pair).
-		t.Errorf("REFUTED-BY-FAILURE: the overwritten row does NOT decrypt (%v); "+
-			"the report's 'permanently unreadable' mechanism holds", rerr)
-		return
+		t.Fatalf("after the converging run the record does not decrypt under the current key alone: %v", rerr)
 	}
-	if got != "first-secret" {
-		t.Fatalf("secret = %q, want the stale payload the report describes", got)
+	if got != "second-secret" {
+		t.Fatalf("after the converging run the payload is %q, want the newer one", got)
 	}
-
-	// What survives: a self-consistent, fully readable row holding the PREVIOUS
-	// payload. The newer secret is gone and rotation reported %+v (success).
-	t.Logf("REFUTED: the stale record is still readable and self-consistent under the "+
-		"NEW key (read back %q, no unwrap or GCM failure). rotation reported %+v. "+
-		"So the harm is a SILENT ROLLBACK to the previous payload, not an unreadable row.",
-		got, rotation)
-
-	// The wrap/key pair is genuinely the new one, which is why the pair matches.
-	recs, err := repo.List(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if recs[0].KEKID != "kek-2" {
-		t.Fatalf("kek_id = %q, want kek-2", recs[0].KEKID)
-	}
-	t.Logf("the surviving row is on kek_id=%q (new envelope) with the payload it was read "+
-		"with, i.e. a MATCHED pair: the DEK rotation re-wrapped is the one that payload "+
-		"was encrypted under", recs[0].KEKID)
+	t.Logf("first run %+v (CAS refused), second run %+v, payload preserved under the current key alone", rotation, second)
 }
 
 // ---------------------------------------------------------------------------

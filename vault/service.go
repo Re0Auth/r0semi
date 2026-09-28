@@ -138,6 +138,15 @@ type Rotation struct {
 	// AlreadyCurrent is how many were on the current key and verified as readable
 	// by it.
 	AlreadyCurrent int
+	// Skipped is how many records were NOT re-wrapped because the row was no longer
+	// the one that was read — a credential enrolled or re-wrapped by another process
+	// in between, or deleted (an erasure). A non-zero value means the run cannot be
+	// called complete: whatever the other process wrote may still be on a retired
+	// key, so the retired key must stay configured and the rotation must be run
+	// again until Skipped and Rewrapped are both zero.
+	//
+	// Scanned == Rewrapped + AlreadyCurrent + Skipped always holds.
+	Skipped int
 }
 
 // NewService wires a vault service. The first three arguments are required.
