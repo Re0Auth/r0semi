@@ -33,7 +33,7 @@
 | PERF-4 | 高 | **低** | **已知非发现** | `docs/operations.md:171-182` 已写明「45 s 也扫不完的规模，那是要上增量校验点」，`main.go:96-99` 复述同一条；报告的"修法建议"就是文档已有的处置。且标题"从约一千万行起就不可能完成"被它自己的表推翻（1e7 = 13–15 s，仅预算 1/3） |
 | PERF-5 | 中 | **低** | **部分成立（降级）** | 扫除是 O(live) 且持全局锁——我复跑确认；但 ①内存模式**明确不提供生产运维保证**（ADR-0006 决策 6），②外推用的是"每 grant 2 条记录保留 30 天"，而 **accessTTL = 1 h**（`memory/oidc.go:306`）⇒ 保留量高估 2 倍，③"没有任何文档/告警说这件事"被 `Re0AuthMemoryHigh`（slo.md:65）与 `capacity-planning.md:104` 推翻 |
 | PERF-6 | 中 | **低** | **部分成立（降级）** | 代码确证（`StoreDeviceAuthorization` 在 `s.mu` 下先全表 `purgeExpiredDevicesLocked`，`memory/oidc.go:753-756,818-828`），探针 0s→333 µs@2 万也复现；但同样只存在于 ADR-0006 排除生产保证的内存模式 |
-| PERF-7 | 中 | **中** | **CONFIRMED（读 + 库源码）** | `token.go:138` 确实是 `Crypto.Encrypt(tokenID+":"+subject)`，`aes256GCMCrypto` 确实是 `jose.ParseEncrypted`+`Decrypt`、`Encrypt` 每次 `jose.NewEncrypter`；`op.WithCrypto`/`NewCompositeCrypto` 在 v3.51.3 存在且接口只有 `Encrypt/Decrypt(string)(string,error)`，接缝**可用**。唯一收窄：97% 来自两次**不同进程**的基准，违反报告自己定的"只引同一次运行的相对倍数" |
+| PERF-7 | 低（提示） | **低** | **CONFIRMED（读 + 库源码）** | `token.go:138` 确实是 `Crypto.Encrypt(tokenID+":"+subject)`，`aes256GCMCrypto` 确实是 `jose.ParseEncrypted`+`Decrypt`、`Encrypt` 每次 `jose.NewEncrypter`；`op.WithCrypto`/`NewCompositeCrypto` 在 v3.51.3 存在且接口只有 `Encrypt/Decrypt(string)(string,error)`，接缝**可用**。**「97%」已撤回**：来自两次**不同进程**的基准，违反报告自己定的"只引同一次运行的相对倍数"；成立的是分配口径（每请求约 12 KB，store 占约 1.6%），且在 S4（p99 < 1 s）余量内（µs 级，约 10⁴ 倍），无门槛被触及 |
 | PERF-8 | 中 | **中** | **部分成立** | `B/op`/`allocs/op` 全部复现（209→210、252、394→395、`/v1/me` 180 allocs/14 887 B 对报告 14 910）；`Sources()` 每次复制+排序二次调用确证（`federation.go:234-238`+`service.go:207,306`）；但 12–15 次 Postgres 往返只有"读；无 DB 执行" |
 | PERF-9 | 中 | **低** | **部分成立** | (d) 成立；(b) 的"已过期"不成立（`capacity-planning.md:25` 自己就写 `-bench . ./...`），只剩覆盖缺口；(c) 成立但引文被截取；(a) **判断方向错**——见 PERF-1，出厂配置真的写 512，不能断言"表里那行是错的" |
 | PERF-10 | 低 | **低** | **CONFIRMED（读）** | `planeOf` 把 `/v1/*` 一律判为 business（`middleware.go:489-497`），而 `http_request_duration_seconds` 只有 `plane`/`method` 两个标签（`observability.go:97-102`） |
@@ -267,7 +267,7 @@ heap=44589440 bytes for 50000 grants (100000 records): 892 bytes/grant, 446 byte
 （`memstore_test.go:188,193`），`after` 必然 ≥ `before`，所以这个"停顿"仪器**结构上不可能失败**——它给的是量级
 （3.5–5.1 ms vs 1.7 ms），不能当"隔离了扫除期间"的证据。结论由代码（sweep 持 `s.mu`）与第一条探针支撑，仍然成立。
 
-### 2.6 PERF-7：机制、库、接缝我都核了，全部成立；只有"97%"的方法要收窄
+### 2.6 PERF-7：机制、库、接缝我都核了，全部成立；「97%」应撤回，改为分配口径 + 预算余量
 
 读（`$GOMODCACHE/github.com/zitadel/oidc/v3@v3.51.3/pkg/op/crypto.go`）：
 ```go
@@ -285,13 +285,17 @@ func (c *aes256GCMCrypto) Decrypt(s string) (string, error) {
 **所以"`op.WithCrypto` 是可替换的缝"不是猜想，是现成接口**（自己实现 AES-GCM+base64url 只要满足两个单方法接口）。
 报告没说的两点：①这条缝**不只管 bearer**，`op/auth_request.go:614` 也用同一个 Crypto 加密 auth request ID，
 换格式要连它一起双读；②"保留 JWE 但缓存 `jose.Encrypter`"这个选项帮助有限（签发路径省一点，**解密路径
-`ParseEncrypted` 一点没省**，而 97% 在解密路径上）。
+`ParseEncrypted` 一点没省**）。
 
-**"97%"的方法收窄**：11 423 ns（`internal/oidchttp/bench_test.go` 的 `BenchmarkIntrospectHandler`）与 340.5 ns
-（`internal/store/memory/oidc_bench_test.go` 的 `BenchmarkIntrospect`）来自**两个不同的测试二进制、两次不同负载的运行**，
-这正好违反报告开头自己定的"只引用同一次运行内的相对倍数"。**同一份证据里与负载无关的那一半是对的**：
-12 208 B/op vs 192 B/op（store 占 1.6%）、131 allocs/op vs 4。结论（每请求成本的大头是 go-jose JWE 解析，
-不是 store）因此**成立**，但应当用 `B/op`/`allocs/op` 讲，而不是用两个跨进程的 ns 比值讲。
+**「97%」应撤回，改为分配口径 + 预算余量**：11 423 ns（`internal/oidchttp/bench_test.go` 的
+`BenchmarkIntrospectHandler`）与 340.5 ns（`internal/store/memory/oidc_bench_test.go` 的 `BenchmarkIntrospect`）
+来自**两个不同的测试二进制、两次不同负载的运行**，这正好违反报告开头自己定的"只引用同一次运行内的相对倍数"。
+**同一份证据里与负载无关的那一半成立**：12 208 B/op vs 192 B/op（store 占 1.6%）、131 allocs/op vs 4——
+每请求约 12 KB 分配，大头是 go-jose 的 JWE 解析。但把账算全：单请求是 **µs 级**，业务面 SLO 是
+**S4: p99 < 1 s**（`docs/slo.md`），余量约 **10⁴ 倍**；CI **不按阈值卡基准**（ADR-0007 决策 5）。
+**所以 PERF-7 是成本观察，不是缺陷，无门槛被触及**；裁定是**维持原状**——继续用 go-jose 标准库，
+不自造加密轮子（`docs/dependencies.md` §1）。仅当业务量上到「分配/延迟进入 SLO 预算」时再立项，
+届时优先讨论「换令牌语义（随机串 + Redis/DB 查找）」，而非自写 AES-GCM。
 
 ### 2.7 PERF-9：四条里两条要改口径
 

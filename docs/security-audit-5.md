@@ -163,7 +163,7 @@
 | **DEP-03 / 04 / 07 / 08 / 09 / 10** | 发布镜像不传 `VERSION` build-arg（报 `version=dev`）；Trivy 阻断发生在 push 之后；备份脚本写出**世界可读**的明文转储（keys 脚本反而有 0600）；`restore.sh` 把明文解密在备份目录不清理；runbook 写的 `[admin].allow` 不是真键（真名 `subjects`，未知键**拒绝启动**）；`runbooks.md`/`slo.md` 称内部监听器「默认 :9090」（实际默认不监听） | 复核逐条 CONFIRMED |
 | **DEP-12** | 备份 Pod **无任何标签** ⇒ 不被任何 NetworkPolicy 选中（default-deny 集群上每次转储静默失败）；而 DEP-06 已证「备份停了没有告警」 | 两处静默叠加 |
 | **FO-V1 / FO-V2**（复核新发现） | ① 同意面按 **scope** 判「已满足」而数据面按**资源名** ⇒ 同意页可能叫用户连 a、而读取由 b 服务；② 闸门可被**已 retired 的源**决定 ⇒ 退役一个源会静默改变另一个源的授权判据、把在用的令牌打成 403 | 复核 CONFIRMED |
-| **PERF-7** | 不透明 bearer 是 compact JWE，解析走 go-jose 通用路径：**97% 的成本与内存都在 JWE**（12 208 B/op vs store 查询 192 B/op）；`op.WithCrypto` 是现成替换缝 | 复核 CONFIRMED（并指出 97% 跨进程基准不可用，应以 B/op 表述） |
+| **PERF-7** | 不透明 bearer 是 compact JWE，解析走 go-jose 通用路径：每请求分配约 **12 KB**（12 208 B/op vs store 查询 192 B/op），**仍在延迟预算余量内**（µs 级 vs S4 p99 < 1 s）。原「97%」已撤回（跨进程 ns 比值，不可引用）。裁定：维持原状、用 go-jose 标准库、不自造轮子 | 复核 CONFIRMED（并指出 97% 跨进程基准不可用，应以 B/op 表述） |
 | **A-FE-5** | CI 前端依赖审计门是 `pnpm audit --audit-level high`，而树里唯一告警 `cookie@0.6.0` 恰在门槛下 ⇒ **这道门永远不会响** | 复核 CONFIRMED（high=exit 0、low=exit 1；且该包在产物中不可达） |
 | **SUP-1** | 内嵌进二进制的 npm 前端代码在 27 个交付文件里**零版权/许可文本**，而 `NOTICE` 只覆盖 Go 模块图 | 复核见 §5 |
 

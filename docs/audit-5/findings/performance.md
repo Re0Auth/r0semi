@@ -260,16 +260,17 @@ CGO_ENABLED=1 go test -race -count=1 -run TestConcurrentUseIsSafe ./internal/rat
   或按 expiresAt 分桶；插入路径只做一次 map 写入。
 - 复现/守卫: `internal/zzprobe/perf/memstore_test.go:TestMemStoreDevicePurgeIsPerInsert`。
 
-### PERF-7 每个已认证 `/v1` 请求花约 11.4 µs / 12.2 KB / 131 次分配在「解析自己签发的 opaque 令牌」上，其中仅 3% 是 store 查询
-- 严重度: **中**
+### PERF-7 每个已认证 `/v1` 请求在「解析自己签发的 opaque 令牌」上分配约 12 KB，**仍在延迟预算余量内**
+- 严重度: **低（提示）** — 这是一条成本观察，不是缺陷：没有 SLO/CI 门槛被它触及，见下「影响」。
 - 类别: 性能
 - 不变量/性质: 业务面每请求成本预算：令牌解析应当是常数级的小操作，而不是通用 JWE 解析。
-- 证据（CONFIRMED，实测 + 行级 + profile）：
+- 证据（CONFIRMED，实测 + 行级 + profile；**只引同一次运行内的分配口径**）：
   - `internal/oidchttp/bench_test.go:BenchmarkIntrospectHandler`（隔离：解密 bearer + store 查询）：
-    `serial 11423 ns/op 12208 B/op 131 allocs/op`；
+    `12208 B/op`、`131 allocs/op`；
     同一个令牌在 store 层的成本（`internal/store/memory/oidc_bench_test.go:BenchmarkIntrospect`）
-    是 `340.5 ns/op 192 B/op 4 allocs/op`。
-    → **97% 的时间、98% 的字节不在 store 里，在 go-jose 的 JWE 解析里**。
+    是 `192 B/op`、`4 allocs/op`。
+    → **每请求分配约 12 KB，其中 store 查询占约 1.6%**（`B/op` / `allocs/op` 与负载无关，可跨
+    二进制引用）。ns 数**不**并排引用：两个基准来自不同测试二进制、不同负载，比值不成立。
   - 端到端：`BenchmarkBusinessPlaneBearerMe` = **19.3 µs/op、14 910 B/op、180 allocs/op**；
     `-memprofile` + `go tool pprof -top -sample_index=alloc_space` 归因
     `oidchttp.(*Handler).Introspect` 累计 23 557 kB / 2000 次 = **11.8 kB/请求**，
@@ -280,17 +281,25 @@ CGO_ENABLED=1 go test -race -count=1 -run TestConcurrentUseIsSafe ./internal/rat
     即「JSON 头反序列化 + 反射 + base64 + AES-KW unwrap + AES-GCM」——而我们的令牌
     实际上只是一个 AES-256-GCM 加密的 `id:subject` 串，**只有本服务会读它**。
   - 另外 `Encrypt` 里是**每次调用都 `jose.NewEncrypter`**（同文件 :52），令牌签发路径也吃这个。
-- 状态: CONFIRMED
-- 影响: 业务面每个请求 12 KB 垃圾 + 11 µs CPU；10k RPS 就是 120 MB/s 的分配速率与
-  约 11% 的一个核心（未计 GC），而这是**唯一**的常驻每请求成本大头。同时它抬高了
-  `/v1/*` p99 的底座，压缩了 S4（p99 < 1 s）里留给真正工作的余量。
-- 修法建议: 这是**裁定点**：`oidchttp.New` 已经用 `op.WithCrypto`/`op.NewCompositeCrypto`
-  （`oidchttp.go:190-196`），也就是「加密格式」是可替换的缝。选择有三：① 自己实现一个
-  `Encrypter/Decrypter`（AES-GCM + base64url，几十行），彻底摆脱 JWE；② 保留 JWE 但
-  缓存 `jose.Encrypter`；③ 不动，接受 12 KB/请求。我建议 ①，因为它同时消灭签发路径的
-  `NewEncrypter`；但要注意令牌格式变更需要**双读**（旧令牌仍可解析）与一次轮换窗口。
+- 状态: CONFIRMED（机制与分配口径）。**「97%」这一条已撤回**：它是两个跨进程基准的 ns 比值，
+  违反报告自己定的「只引同一次运行内的相对倍数」，不构成结论。
+- 影响（**账目算清**）：每请求约 12 KB 分配、约 10 µs 级 CPU。但业务面的 SLO 是
+  **S4: p99 < 1 s**（`docs/slo.md`），而单请求处于 **µs 级**——距 1 s 预算还有
+  **约 10⁴ 倍以上余量**。CI **不按阈值卡基准**（ADR-0007 决策 5，`.github/workflows/perf.yml`），
+  所以这条**没有任何门槛被触及**。量级推演（非当前负载）：10k RPS ≈ 120 MB/s 分配速率、
+  约 11% 一个核心（未计 GC）——只有在业务真到达那个量级时才值得立项，见「修法建议」。
+- 修法建议（本报告的建议：**维持原状**）：继续使用 go-jose 这一大厂背书的 JWE 标准库，
+  享受其算法固定（`A256GCMKW`+`A256GCM`）与解析硬化；**不改代码**，也不自造加密轮子
+  （`docs/dependencies.md` §1「密码学不自己写」）。
+  - 为什么不在此时动：`op.WithCrypto`/`op.NewCompositeCrypto`（`oidchttp.go:190-196`）确实是
+    可替换的缝，但 ① 自写 `Encrypter/Decrypter` 把安全属性换成自己的几十行，代价是密码学风险；
+    ② 缓存 `jose.Encrypter` 对解密路径一点没省；③ 换令牌载体（纯随机串 + DB/Redis 查找）是
+    **语义变更**，要每次请求一次额外往返，且丢掉令牌自证 `id:subject` 的抗篡改——更大的架构决定，
+    且从未被论证。
+  - **立项门槛（备忘）**：仅当业务量真的上到「分配/延迟进入 SLO 预算」时再立项，届时优先讨论
+    「换令牌语义（随机串 + Redis/DB 查找）」，而不是自造 AES-GCM。
 - 复现/守卫: `internal/oidchttp/bench_test.go:BenchmarkIntrospectHandler`（项目自己的基准，
-  我把它的数字与 store 层的 `BenchmarkIntrospect` 并排读）；端到端见
+  我把它的数字与 store 层的 `BenchmarkIntrospect` 并排读，只取 `B/op`/`allocs/op`）；端到端见
   `internal/httpapi/bench_test.go:BenchmarkBusinessPlaneBearerMe`。
 
 ### PERF-8 数据面每请求成本实测：210 allocs / 29.7 KB（4 KiB 上游体），比被基准覆盖的 `/v1/me` 贵约 2 倍；Postgres 模式下每请求另有 7 次往返
