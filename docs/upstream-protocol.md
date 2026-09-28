@@ -164,6 +164,12 @@ token=<Re0Auth 持有的令牌>&token_type_hint=refresh_token
   **必须丢弃**。留下它等于：用户在自己所有设备上被登出，而数据源悄悄持有活着的会话——一次伪装成登出的劫持。
 - 上游不可达时**必须返回错误**，不能返回 200。Re0Auth 收到错误时**什么都不删**，
   因为 vault 里的凭据是重试的唯一手段；此时删掉它，用户就永远做不成他想做的事了。
+- **该端点必须先认证客户端。** 它签的是「一个人在所有设备上被登出」，所以调用者必须是注册过的
+  机密客户端：用上例已经出现的 `Authorization: Basic …`（或等价的表单 `client_secret`），
+  未知 client 或错误 secret 一律 401 `invalid_client`，**在产生任何效果之前**。这是数据源能做到的
+  最响的一件事，不能留给「谁能说出一个 token」的人。Kit 生成的端点已在钩子之前做这个校验
+  （`upstreamkit.handleCascadeRevocation`），conformance 也会对**没有**做校验的端点判错——
+  从规范自己实现那半边时也必须照做，否则套件不过。
 
 Kit 侧：`Hooks.CascadeRevoke` 非 nil 时端点与 discovery 字段一起出现，为 nil 时一起消失。
 `referencesource` 的 TapTap 登录实现了它（旋转 session token 并丢弃替代品）。
@@ -309,7 +315,8 @@ GET /v1/games/{game}/sources/{source}/raw/{path...}     原始透传
 - [ ] 按声明实现规范化资源 schema（§8）
 - [ ] `problem+json` 错误 + 限流头
 - [ ] `token_class` 如实声明；`revocable` 时撤销真正生效
-- [ ] 若声明 `cascade_revocation_endpoint`，该端点确实存在（conformance 的 `cascade.present`）；不声明则 Re0Auth 不提供该操作
+- [ ] 若声明 `cascade_revocation_endpoint`，该端点确实存在（`cascade.present`）**且拒绝未认证调用**
+      （`cascade.requires_auth`：无凭据 / 未知 client 的 POST 必须 401）；不声明则 Re0Auth 不提供该操作
 - [ ] （可选）`raw` API + OpenAPI，以支持中立透传（§9）
 - [ ] 通过 conformance suite（§13）
 

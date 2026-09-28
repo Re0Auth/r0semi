@@ -122,7 +122,7 @@ func TestCascadeIsAdvertisedOnlyWhenImplemented(t *testing.T) {
 			t.Fatalf("cascade endpoint = %q", endpoint)
 		}
 
-		resp, err := http.PostForm(base+"/oauth/cascade_revocation", url.Values{
+		resp, err := cascadePost(base+"/oauth/cascade_revocation", url.Values{
 			"token":           {"upstream-refresh-token"},
 			"token_type_hint": {"refresh_token"},
 		})
@@ -143,6 +143,68 @@ func TestCascadeIsAdvertisedOnlyWhenImplemented(t *testing.T) {
 			t.Fatalf("hook received %+v", got)
 		}
 	})
+
+	// The endpoint ends a whole upstream session, so it must authenticate the
+	// client before the hook runs. Anyone who can name a token must not be able to
+	// sign the subject out everywhere. ADR-0010 §4: the kit is copied, so the check
+	// cannot live in each hook.
+	t.Run("unauthenticated is refused", func(t *testing.T) {
+		base, calls := cascadeKit(t, true)
+		req, err := http.NewRequest(http.MethodPost, base+"/oauth/cascade_revocation",
+			strings.NewReader(url.Values{"token": {"upstream-refresh-token"}}.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		// No Authorization header at all.
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("anonymous cascade = %d, want 401", resp.StatusCode)
+		}
+		if len(*calls) != 0 {
+			t.Fatal("the hook ran for an unauthenticated caller")
+		}
+	})
+
+	// …and a client it does not know is refused the same way, so the endpoint is
+	// not simply checking that some credentials were present.
+	t.Run("unknown client is refused", func(t *testing.T) {
+		base, calls := cascadeKit(t, true)
+		req, err := http.NewRequest(http.MethodPost, base+"/oauth/cascade_revocation",
+			strings.NewReader(url.Values{"token": {"upstream-refresh-token"}}.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.SetBasicAuth("conformance-unknown-client", "wrong")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("cascade from an unknown client = %d, want 401", resp.StatusCode)
+		}
+		if len(*calls) != 0 {
+			t.Fatal("the hook ran for an unknown client")
+		}
+	})
+}
+
+// cascadePost POSTs the form to the cascade endpoint with the registered client's
+// Basic credentials — the shape Re0Auth itself uses (internal/federation).
+func cascadePost(url string, form url.Values) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("re0auth", testSecret)
+	return http.DefaultClient.Do(req)
 }
 
 // A source that cannot do it must not be able to claim it succeeded.
@@ -186,7 +248,9 @@ func TestCascadeReportsAHookFailure(t *testing.T) {
 	srv := httptest.NewServer(kit.Handler())
 	t.Cleanup(srv.Close)
 
-	resp, err := http.PostForm(srv.URL+"/oauth/cascade_revocation", url.Values{"token": {"x"}})
+	// With valid credentials, so the request reaches the hook and the failure is
+	// the hook's — not a 401 from the client authentication in front of it.
+	resp, err := cascadePost(srv.URL+"/oauth/cascade_revocation", url.Values{"token": {"x"}})
 	if err != nil {
 		t.Fatal(err)
 	}

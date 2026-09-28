@@ -264,14 +264,21 @@ func (r *runner) checkRevocationEndpoint() {
 	}
 }
 
-// checkCascadeEndpoint checks the claim, not the effect.
+// checkCascadeEndpoint checks the claim AND the one property that makes it safe.
 //
 // Nothing destructive is attempted, on purpose: a conformance run must not sign
 // the person running it out of their own devices. What can be checked without
-// doing harm is that an advertised endpoint exists and is addressed absolutely —
-// because a source that advertises a capability it does not serve is worse than
-// one that stays quiet, and Re0Auth offers "sign out everywhere" only where it is
-// claimed.
+// doing harm is that an advertised endpoint exists, is addressed absolutely, and
+// REFUSES an unauthenticated caller — because a source that advertises a
+// capability it does not serve is worse than one that stays quiet, and an endpoint
+// that ends a whole session for anyone who can name a token is the loudest thing a
+// source can do. The probe carries a bogus token and no credentials, so it is
+// rejected before any effect.
+//
+// The auth check is asserted even though the kit now authenticates for its
+// generated endpoint: a source that hand-rolls the endpoint from the spec rather
+// than using the kit must still be caught. (upstreamkit.handleCascadeRevocation
+// does the same check; that is the belt to this suspenders.)
 func (r *runner) checkCascadeEndpoint(disc upstreamkit.Discovery) {
 	endpoint := disc.OAuth.CascadeRevocationEndpoint
 	if endpoint == "" {
@@ -284,6 +291,7 @@ func (r *runner) checkCascadeEndpoint(disc upstreamkit.Discovery) {
 		return
 	}
 
+	// No credentials, an unknown client id, and a token that means nothing.
 	form := url.Values{"token": {"conformance-bogus-token"}, "client_id": {"conformance-unknown-client"}}
 	resp, err := r.request(http.MethodPost, parsed.RequestURI(), form.Encode(),
 		map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
@@ -294,6 +302,14 @@ func (r *runner) checkCascadeEndpoint(disc upstreamkit.Discovery) {
 	defer closeBody(resp)
 	if resp.StatusCode == http.StatusNotFound {
 		r.err("cascade.present", "advertised but missing: %s", endpoint)
+		return
+	}
+	// An unauthenticated POST must be refused. 2xx means the endpoint accepted an
+	// unknown client, which is the "anyone can end every session" shape.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		r.err("cascade.requires_auth", "the cascade endpoint answered %d to an unauthenticated caller "+
+			"(no credentials, unknown client): it must authenticate the client before ending a session",
+			resp.StatusCode)
 	}
 }
 

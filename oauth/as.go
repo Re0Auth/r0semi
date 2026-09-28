@@ -261,6 +261,18 @@ func (s *service) Introspect(ctx context.Context, accessToken string) (TokenInfo
 	if !s.now().Before(at.ExpiresAt) {
 		return TokenInfo{Active: false}, nil
 	}
+	// A suspended or deleted client is reported as unknown by EVERY protocol
+	// entrance (oauth/client.go ClientStatus): its token must not stay usable, or
+	// the data plane keeps serving a client an operator has switched off. Consulted
+	// after the expiry check so an already-dead token costs no lookup, and answered
+	// as inactive rather than as an error so it is indistinguishable, to the caller,
+	// from a token that never existed. `client()` is the same door every other
+	// entrance (AuthenticateClient/Exchange/Refresh/Revoke) goes through.
+	if _, err := s.clients.Get(ctx, at.ClientID); errors.Is(err, ErrClientNotFound) {
+		return TokenInfo{Active: false}, nil
+	} else if err != nil {
+		return TokenInfo{}, err
+	}
 	return TokenInfo{
 		Active:    true,
 		Subject:   at.Subject,

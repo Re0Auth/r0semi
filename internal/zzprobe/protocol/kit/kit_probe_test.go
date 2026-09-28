@@ -259,8 +259,11 @@ func TestA3_PublicClientSecretIgnored(t *testing.T) {
 	}
 }
 
-// Suspension is enforced on the way in and NOT on the way out.
-func TestA4_SuspendedClientTokensStayLive(t *testing.T) {
+// A4 (FIXED) — suspension is enforced on the way OUT too: a token issued to a
+// client that is suspended afterwards introspects as inactive, because
+// oauth.Introspect now consults the client registry (it was the one protocol
+// entrance that did not).
+func TestA4_SuspendedClientTokensGoInactive(t *testing.T) {
 	svc, clients, _, _ := newAS(t)
 	code := issueCode(t, svc, confClientID, confRedirect, probeVerifier, accountScope, profileScope)
 	tok, err := svc.Exchange(context.Background(), oauth.CodeExchangeRequest{
@@ -298,8 +301,10 @@ func TestA4_SuspendedClientTokensStayLive(t *testing.T) {
 	}
 }
 
-// Deleting the registration entirely is the same story.
-func TestA5_DeletedClientTokensStayLive(t *testing.T) {
+// A5 (FIXED) — deleting the registration entirely is the same story: the token
+// goes inactive, because a deleted client is reported as unknown by every
+// protocol entrance (oauth/client.go ClientStatus) and now by Introspect as well.
+func TestA5_DeletedClientTokensGoInactive(t *testing.T) {
 	svc, clients, _, _ := newAS(t)
 	code := issueCode(t, svc, confClientID, confRedirect, probeVerifier, accountScope)
 	tok, err := svc.Exchange(context.Background(), oauth.CodeExchangeRequest{
@@ -825,20 +830,31 @@ func newKit(t *testing.T, withCascade bool) (string, oauth.Service, *[]upstreamk
 	return f.base, f.svc, f.cascadeCalls, f.consentCalls
 }
 
-func kitClients(t *testing.T) *oauth.MemoryClientRegistry {
+// kitClientsFor returns the client registry of the fixture for this key, so a test
+// that mutates a client's status does it in the registry the fixture's service
+// actually consults. Selecting an arbitrary fixture (the previous kitClients) made
+// the mutation miss whenever more than one fixture existed.
+func kitClientsFor(t *testing.T, withCascade bool) *oauth.MemoryClientRegistry {
 	t.Helper()
+	key := fmt.Sprintf("cascade=%v", withCascade)
 	kitMu.Lock()
 	defer kitMu.Unlock()
-	for _, f := range kitFixtures {
+	if f, ok := kitFixtures[key]; ok {
 		return f.clients
 	}
-	t.Fatal("no kit fixture")
+	t.Fatal("no kit fixture for " + key)
 	return nil
 }
 
-// The generated cascade endpoint calls the hook for a request that carries NO
-// credentials at all.
-func TestE1_CascadeRevocationNeedsNoAuthentication(t *testing.T) {
+// E1 (FIXED) — the generated cascade endpoint authenticates the client before the
+// hook runs, so an anonymous request never reaches CascadeRevoke.
+//
+// Was: the kit extracted whatever credentials were present and forwarded them to
+// the hook without checking, so a request with no client_id/client_secret reached
+// CascadeRevoke and was answered 200 — anyone who could name a token could end the
+// subject's whole upstream session. The endpoint now calls
+// OAuth.AuthenticateClient first (upstreamkit/server.go handleCascadeRevocation).
+func TestE1_CascadeRevocationRequiresAuthentication(t *testing.T) {
 	base, _, calls, _ := newKit(t, true)
 
 	resp, err := http.PostForm(base+"/oauth/cascade_revocation", url.Values{
@@ -852,16 +868,14 @@ func TestE1_CascadeRevocationNeedsNoAuthentication(t *testing.T) {
 	t.Logf("anonymous POST /oauth/cascade_revocation -> %d %s (hook calls=%d)",
 		resp.StatusCode, truncate(string(body), 120), len(*calls))
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("the anonymous request did not reach the hook: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("an anonymous cascade POST = %d, want 401: the endpoint ends a whole upstream "+
+			"session and must authenticate the client first", resp.StatusCode)
 	}
-	if len(*calls) == 0 {
-		t.Fatal("vacuity: the hook never ran")
+	if len(*calls) != 0 {
+		t.Errorf("the cascade hook ran for an unauthenticated caller (%d calls): it is handed an "+
+			"empty client identity an attacker controls", len(*calls))
 	}
-	got := (*calls)[0]
-	t.Logf("hook received ClientID=%q ClientSecret=%q token=%q", got.ClientID, got.ClientSecret, got.Token)
-	t.Errorf("POST %s/oauth/cascade_revocation with no client_id/client_secret reached CascadeRevoke and was answered 200: "+
-		"the hook is handed an empty client identity and nothing is checked", base)
 }
 
 // Control: with real credentials the same call also succeeds, so the endpoint is
@@ -883,9 +897,9 @@ func TestE2_CascadeRevocationAcceptsCredentials(t *testing.T) {
 	}
 }
 
-// The kit never validates the client itself: an unknown client id with a bogus
-// secret is forwarded to the hook verbatim and answered 200.
-func TestE3_CascadeRevocationAcceptsAnUnknownClient(t *testing.T) {
+// E3 (FIXED) — an unknown client id with a bogus secret is refused before the
+// hook, so the endpoint is not merely checking that some credentials were present.
+func TestE3_CascadeRevocationRefusesAnUnknownClient(t *testing.T) {
 	base, _, calls, _ := newKit(t, true)
 	before := len(*calls)
 	resp, err := http.PostForm(base+"/oauth/cascade_revocation", url.Values{
@@ -895,11 +909,11 @@ func TestE3_CascadeRevocationAcceptsAnUnknownClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode == http.StatusOK && len(*calls) > before {
-		got := (*calls)[len(*calls)-1]
-		t.Errorf("an unknown client id (%q) was forwarded to the cascade hook and answered 200; the kit performs no client authentication", got.ClientID)
-	} else {
-		t.Logf("unknown client at cascade -> %d (hook calls delta=%d)", resp.StatusCode, len(*calls)-before)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("cascade with an unknown client id = %d, want 401", resp.StatusCode)
+	}
+	if len(*calls) != before {
+		t.Errorf("the hook ran for an unknown client (calls delta=%d)", len(*calls)-before)
 	}
 }
 
@@ -1123,7 +1137,8 @@ func TestE9_AuthorizeUnknownClient(t *testing.T) {
 }
 
 // The generated surface's /account and /resources endpoints enforce the bearer
-// token and the scope, and a suspended client's token still opens them.
+// token and the scope. E10 (FIXED): a suspended client's token no longer opens
+// them, because Introspect reports it inactive.
 func TestE10_DataPlaneRequiresTokenAndScope(t *testing.T) {
 	base, svc, _, _ := newKit(t, false)
 
@@ -1168,10 +1183,10 @@ func TestE10_DataPlaneRequiresTokenAndScope(t *testing.T) {
 		t.Errorf("a token without %s read a resource that requires it", profileScope)
 	}
 
-	// A suspended client's token still opens the data plane: the end-to-end form
-	// of the library-level finding.
+	// A suspended client's token no longer opens the data plane: Introspect reports
+	// it inactive, so the end-to-end form of the library-level fix holds.
 	tok2 := mint(t, svc, confClientID, confSecret, confRedirect, accountScope)
-	if err := kitClients(t).SetStatus(context.Background(), confClientID, oauth.ClientSuspended); err != nil {
+	if err := kitClientsFor(t, false).SetStatus(context.Background(), confClientID, oauth.ClientSuspended); err != nil {
 		t.Fatal(err)
 	}
 	req, _ = http.NewRequest(http.MethodGet, base+"/account", nil)
@@ -1471,9 +1486,15 @@ func TestF2_ConformanceIgnoresClientAuthentication(t *testing.T) {
 	t.Errorf("a source that declares client_secret_basic and authenticates nobody passes conformance with zero errors")
 }
 
-// A source that advertises cascade revocation and answers 200 to an UNKNOWN
-// client id passes the cascade check: the check only looks for 404.
-func TestF3_ConformancePassesAnUnauthenticatedCascade(t *testing.T) {
+// F3 (FIXED) — a source that advertises cascade revocation and answers 200 to an
+// UNKNOWN client id now FAILS the cascade check: conformance asserts the endpoint
+// refuses an unauthenticated caller, not merely that it exists.
+//
+// Was: the check only looked for 404, so an endpoint that ends a real upstream
+// session for anyone who can name a token passed. That is the shape a third party
+// hand-rolling the spec (rather than using the kit) would ship, which is why the
+// assertion lives in the suite as well as in the kit.
+func TestF3_ConformanceFailsAnUnauthenticatedCascade(t *testing.T) {
 	var sawUnknownClientCascade, sawAnonymousCascade bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/re0auth-upstream", func(w http.ResponseWriter, r *http.Request) {
@@ -1498,8 +1519,8 @@ func TestF3_ConformancePassesAnUnauthenticatedCascade(t *testing.T) {
 	mux.HandleFunc("/oauth/revoke", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	// The vulnerability: this endpoint ends a real upstream session for anyone
-	// who can name a token, whatever credentials they present.
+	// The vulnerability under test: this endpoint ends a real upstream session for
+	// anyone who can name a token, whatever credentials they present.
 	mux.HandleFunc("/oauth/cascade_revocation", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		_, _, basic := r.BasicAuth()
@@ -1524,14 +1545,14 @@ func TestF3_ConformancePassesAnUnauthenticatedCascade(t *testing.T) {
 		}
 	}
 	if !sawUnknownClientCascade {
-		t.Fatalf("vacuity: the suite never posted to the advertised cascade endpoint")
+		t.Fatalf("vacuity: the suite never posted to the advertised cascade endpoint with an unknown client")
 	}
-	t.Logf("the suite DID post to the cascade endpoint with an unknown client id and no Basic auth, "+
+	t.Logf("the suite posted to the cascade endpoint with an unknown client id and no Basic auth, "+
 		"and the endpoint answered 200; a truly anonymous call was also accepted=%v", sawAnonymousCascade)
-	if cascadeErrs != 0 {
-		t.Errorf("the suite errored on a cascade endpoint that accepts any client; it must not, since that is the vulnerability")
+	if cascadeErrs == 0 {
+		t.Errorf("the suite passed a cascade endpoint that accepts any client: it must report an error, " +
+			"since that is the vulnerability")
 	}
-	t.Logf("cascade check verdict for an endpoint that ends sessions for anyone holding a token: PASS")
 }
 
 // ---------------------------------------------------------------------------

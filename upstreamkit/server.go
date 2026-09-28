@@ -315,6 +315,15 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // It answers 404 when no hook is configured, so that "advertised" and
 // "implemented" stay the same statement. A caller should never reach that branch:
 // the endpoint is absent from discovery too.
+//
+// It authenticates the CLIENT before doing anything. This is the loudest thing a
+// source can do — it signs the person out of every device — and the kit is the
+// component a third party copies, so the identity check cannot be left to each
+// hook: a hook that trusted CascadeRevocationRequest.ClientID (two strings that
+// look pre-validated) would let anyone who can name a token end a whole session.
+// The credentials are still passed to the hook unchanged, for a hook that wants to
+// re-check them, but they are verified here first. ADR-0010 §4: a defect in the
+// public kit is an external defect.
 func (s *Server) handleCascadeRevocation(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
@@ -325,6 +334,12 @@ func (s *Server) handleCascadeRevocation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	clientID, clientSecret := oauth.ClientCredentials(r)
+	if err := s.hooks.OAuth.AuthenticateClient(r.Context(), clientID, clientSecret); err != nil {
+		// invalid_client → 401: an unauthenticated caller must not reach the hook,
+		// and must not be able to tell an unknown client from a bad secret.
+		writeProtocolError(w, r, err)
+		return
+	}
 	err := s.hooks.CascadeRevoke(r.Context(), CascadeRevocationRequest{
 		ClientID:      clientID,
 		ClientSecret:  clientSecret,
