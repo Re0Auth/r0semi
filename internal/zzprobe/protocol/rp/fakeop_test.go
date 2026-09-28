@@ -352,6 +352,14 @@ func idpCred() idp.Credentials { return idp.Credentials{} }
 // replaces the fake OP's URL for that field.
 func newRegistry(t *testing.T, f *fakeOP, provider idp.Provider, cred idp.Credentials) *idp.Client {
 	t.Helper()
+	return newRegistryTTL(t, f, provider, cred, 0)
+}
+
+// newRegistryTTL is newRegistry with an explicit provider cache TTL. Zero means
+// the library default; a tiny value makes the next call re-discover, which is how
+// a probe exercises "the upstream rotated its signing key".
+func newRegistryTTL(t *testing.T, f *fakeOP, provider idp.Provider, cred idp.Credentials, ttl time.Duration) *idp.Client {
+	t.Helper()
 	cred.Provider = provider
 	if cred.ClientID == "" {
 		cred.ClientID = "cid"
@@ -369,9 +377,10 @@ func newRegistry(t *testing.T, f *fakeOP, provider idp.Provider, cred idp.Creden
 		cred.Issuer = f.srv.URL
 	}
 	reg, err := idp.NewRegistry(idp.RegistryConfig{
-		RedirectBase: "https://re0auth.test",
-		HTTPClient:   f.srv.Client(),
-		Credentials:  []idp.Credentials{cred},
+		RedirectBase:     "https://re0auth.test",
+		HTTPClient:       f.srv.Client(),
+		ProviderCacheTTL: ttl,
+		Credentials:      []idp.Credentials{cred},
 	})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)

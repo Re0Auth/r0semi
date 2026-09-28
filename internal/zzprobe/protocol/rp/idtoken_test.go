@@ -37,15 +37,16 @@ func TestRPControlOIDCLoginSucceeds(t *testing.T) {
 	}
 }
 
-// OIDC Core 3.1.3.7: when the token has more than one audience, azp MUST be
-// present and MUST name this client. go-oidc checks only that our client_id is
+// OIDC Core 3.1.3.7 (FIXED): when the token has more than one audience, azp MUST
+// be present and MUST name this client. go-oidc checks only that our client_id is
 // *among* the audiences, and says so in its own comment ("This check DOES NOT
-// ensure that the ClientID is the party to which the ID Token was issued").
+// ensure that the ClientID is the party to which the ID Token was issued"). The
+// idp wrapper now enforces the rule itself.
 //
-// A parseable instance: an id_token minted for another client at the same
-// issuer, whose aud happens to list ours too, is accepted as this client's
-// identity -- and the RP then signs a session in as the token's subject.
-func TestRPAzpNamingAnotherClientIsAccepted(t *testing.T) {
+// Defence in depth, not a live takeover path: the callback takes the id_token only
+// from this service's own code exchange (carrying its own secret and PKCE), so a
+// parseable instance requires an issuer that already mints for another client.
+func TestRPAzpNamingAnotherClientIsRejected(t *testing.T) {
 	f := newFakeOP(t)
 	c := newRegistry(t, f, "google", idpCred())
 	nonce := c.NewNonce()
@@ -55,7 +56,7 @@ func TestRPAzpNamingAnotherClientIsAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("control failed: %v", err)
 	}
-	control := ident.Subject
+	t.Logf("control sub=%q", ident.Subject)
 
 	// The same issuer mints a token for "other-client" that also lists our
 	// client id as an audience, and says so in azp.
@@ -65,16 +66,16 @@ func TestRPAzpNamingAnotherClientIsAccepted(t *testing.T) {
 		m["sub"] = "victim-of-another-client"
 	})
 	ident, err = login(t, c, f, nonce)
-	if err != nil {
-		t.Logf("accepted=no (rejected): %v", err)
+	if err == nil {
+		t.Errorf("RP accepted an id_token whose azp is another client: sub=%q aud=[cid other-client] azp=other-client",
+			ident.Subject)
 		return
 	}
-	t.Errorf("RP accepted an id_token whose azp is another client: sub=%q aud=[cid other-client] azp=other-client (control sub=%q)",
-		ident.Subject, control)
+	t.Logf("rejected as expected: %v", err)
 }
 
 // The other half of the same rule: multiple audiences with no azp at all.
-func TestRPAzpMissingWithMultipleAudiencesIsAccepted(t *testing.T) {
+func TestRPAzpMissingWithMultipleAudiencesIsRejected(t *testing.T) {
 	f := newFakeOP(t)
 	c := newRegistry(t, f, "google", idpCred())
 	nonce := c.NewNonce()
@@ -86,16 +87,16 @@ func TestRPAzpMissingWithMultipleAudiencesIsAccepted(t *testing.T) {
 		m["sub"] = "no-azp-subject"
 	})
 	ident, err := login(t, c, f, nonce)
-	if err != nil {
-		t.Logf("accepted=no (rejected): %v", err)
+	if err == nil {
+		t.Errorf("RP accepted a multi-audience id_token with no azp: sub=%q aud=[cid other-client]", ident.Subject)
 		return
 	}
-	t.Errorf("RP accepted a multi-audience id_token with no azp: sub=%q aud=[cid other-client]", ident.Subject)
+	t.Logf("rejected as expected: %v", err)
 }
 
 // A single audience plus a foreign azp: OIDC says azp, when present, must be
 // this client.
-func TestRPAzpMismatchSingleAudienceIsAccepted(t *testing.T) {
+func TestRPAzpMismatchSingleAudienceIsRejected(t *testing.T) {
 	f := newFakeOP(t)
 	c := newRegistry(t, f, "google", idpCred())
 	nonce := c.NewNonce()
@@ -106,21 +107,26 @@ func TestRPAzpMismatchSingleAudienceIsAccepted(t *testing.T) {
 		m["azp"] = "someone-else"
 	})
 	ident, err := login(t, c, f, nonce)
-	if err != nil {
-		t.Logf("accepted=no (rejected): %v", err)
+	if err == nil {
+		t.Errorf("RP accepted an id_token whose azp (%q) is neither the audience nor this client: sub=%q",
+			"someone-else", ident.Subject)
 		return
 	}
-	t.Errorf("RP accepted an id_token whose azp (%q) is neither the audience nor this client: sub=%q",
-		"someone-else", ident.Subject)
+	t.Logf("rejected as expected: %v", err)
 }
 
-// The JWKS cache has no TTL and is only replaced when a fetch happens, and a
-// fetch happens only when no cached key verifies the token. So a key the
-// provider has revoked keeps verifying -- and no request to the provider is
-// made to notice.
-func TestRPRetiredSigningKeyKeepsVerifyingAfterRotation(t *testing.T) {
+// The JWKS cache is bounded by a TTL (FIXED), so a key the provider has revoked
+// stops verifying once the provider is rebuilt.
+//
+// Was: the provider was cached for the process lifetime and only replaced when a
+// token's kid matched no cached key — a retired key matched, so no request was
+// ever made and the "we rotated because the key leaked" case kept working. The
+// cache now expires (default 15 minutes; the probe sets a tiny TTL to exercise it)
+// and a rebuild discards the old key set.
+func TestRPRetiredSigningKeyStopsVerifyingAfterRotation(t *testing.T) {
 	f := newFakeOP(t)
-	c := newRegistry(t, f, "google", idpCred())
+	// A tiny TTL so the provider (and its key set) is rebuilt on the next call.
+	c := newRegistryTTL(t, f, "google", idpCred(), time.Nanosecond)
 	nonce := c.NewNonce()
 	f.setNonce(nonce)
 
@@ -137,7 +143,7 @@ func TestRPRetiredSigningKeyKeepsVerifyingAfterRotation(t *testing.T) {
 	f.setJWKS(rotated.publicJWK())
 
 	// The retired key alone. It is signed by a key the provider no longer
-	// publishes, so accepting it means the RP never asked again.
+	// publishes, so accepting it means the cached key set was never rebuilt.
 	now := time.Now()
 	forged := old.sign(t, map[string]any{
 		"iss": f.issuer(), "sub": "attacker-with-the-retired-key", "aud": "cid",

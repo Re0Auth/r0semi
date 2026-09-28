@@ -242,6 +242,64 @@ func TestIdentityValidate(t *testing.T) {
 	}
 }
 
+// The built-in Microsoft issuer is the multi-tenant /common/v2.0, whose discovery
+// document reports a literal {tenantid} placeholder, so it can never verify an
+// id_token. Because the endpoints are static the login is SENT to Microsoft and
+// only the callback fails, generically — so the misconfiguration is refused at
+// construction, where an operator sees it, and the tenant form is accepted.
+func TestMicrosoftBuiltInIssuerIsRefusedAtConstruction(t *testing.T) {
+	if _, err := NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		Credentials:  []Credentials{{Provider: Microsoft, ClientID: "cid", ClientSecret: "sec"}},
+	}); err == nil {
+		t.Fatal("accepted the built-in microsoft provider with no tenant issuer; it can never complete a login")
+	} else if !strings.Contains(err.Error(), "tenant") {
+		t.Fatalf("the refusal does not name the fix: %v", err)
+	}
+
+	// Anti-vacuity: the tenant form builds, and another built-in is unaffected.
+	reg, err := NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		Credentials: []Credentials{
+			{Provider: Microsoft, ClientID: "cid", ClientSecret: "sec",
+				Issuer: "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0"},
+			{Provider: GitHub, ClientID: "cid", ClientSecret: "sec"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("the tenant form (and github) was refused: %v", err)
+	}
+	if _, ok := reg.Get(Microsoft); !ok {
+		t.Error("microsoft with a tenant issuer was not registered")
+	}
+	if _, ok := reg.Get(GitHub); !ok {
+		t.Error("github was not registered")
+	}
+}
+
+// A discovered OAuth endpoint that is not on the configured issuer's origin is
+// refused, so the client secret cannot be sent to another origin. Paths may
+// differ; scheme and host may not.
+func TestDiscoveredEndpointMustMatchIssuerOrigin(t *testing.T) {
+	c := &Client{provider: "authentik", issuer: "https://auth.example/application/o/re0auth/"}
+	// Same origin, different path: allowed.
+	if err := c.pinToIssuer("https://auth.example/application/o/re0auth/authorize",
+		"https://auth.example/application/o/re0auth/token"); err != nil {
+		t.Fatalf("a same-origin endpoint was refused: %v", err)
+	}
+	// Another host, and another scheme: refused.
+	if err := c.pinToIssuer("https://evil.example/authorize", ""); err == nil {
+		t.Error("accepted an authorization endpoint on another host")
+	}
+	if err := c.pinToIssuer("", "http://auth.example/token"); err == nil {
+		t.Error("accepted a token endpoint on a downgraded scheme")
+	}
+	// A missing endpoint is not this check's business.
+	if err := c.pinToIssuer("", ""); err != nil {
+		t.Errorf("pinToIssuer rejected empty endpoints: %v", err)
+	}
+}
+
 // The fallback client, used when a caller does not inject one, must carry the
 // same address guard as the composition root: a provider whose endpoint resolves
 // to a private address is refused at dial time rather than reached. The

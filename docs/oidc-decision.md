@@ -52,6 +52,10 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 - **2025 年对抗审计后的协议收紧**（POST-only、重复参数、RFC 9207 `iss`、discovery 真实性、PKCE 语法、
   授权码单次消费、refresh 重放错误码、introspection 资源服务器白名单、整链撤销、设备 scope 与轮询节流、
   `auth_time` 语义、签名密钥校验）记录在 [ADR-0005](./protocol-hardening-decision.md)，不改变本节选型。
+- **RP 侧（`idp`，本服务作为对外 IdP 的客户端）的加固**：discovery/JWKS 结果按 TTL 重建（否则上游
+  退役的密钥永远可验）、发现的 OAuth 端点必须与 issuer 同源（否则客户端密钥被送到别的源）、`azp`
+  按 OIDC Core §3.1.3.7 校验、内置 `microsoft` 未给 tenant issuer 时启动即失败。都在 `idp` 的包装层，
+  不 fork `go-oidc`（[dependencies.md](./dependencies.md) §1）。
 
 ## 5. 后果（必须接受）
 

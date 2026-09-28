@@ -342,10 +342,13 @@ func TestVerifyRPCallbackCannotBeHandedAnIDToken(t *testing.T) {
 	}
 }
 
-// Control: the same forged token IS accepted when it comes from the token
-// endpoint. This pins the report's code-level fact (azp unread) and proves the
-// test above measured delivery, not a broken flow.
-func TestVerifyRDTokenEndpointTokenWithForeignAzpIsAccepted(t *testing.T) {
+// Control (FIXED): the same forged token, coming from the token endpoint, is now
+// REFUSED too. The report's code-level fact was "azp unread"; idp now enforces
+// OIDC Core §3.1.3.7, so a multi-audience token whose azp names another client is
+// rejected before it becomes an identity. This still proves the test above
+// measured delivery rather than a broken flow: the callback path works, the token
+// is refused on its own merits.
+func TestVerifyRDTokenEndpointTokenWithForeignAzpIsRejected(t *testing.T) {
 	s := newRPStack(t)
 	c := browser(t)
 
@@ -353,26 +356,13 @@ func TestVerifyRDTokenEndpointTokenWithForeignAzpIsAccepted(t *testing.T) {
 	s.forgedForeignClientToken(t, nonce, "victim-of-another-client")
 
 	status, loc := s.callback(t, c, "code=c&state="+url.QueryEscape(state))
-	if status != http.StatusSeeOther {
-		t.Fatalf("control callback = %d %q", status, loc)
+	if user := s.signedIn(t, c); user != "" {
+		t.Fatalf("the session signed in from a token whose azp names another client: user_id=%q", user)
 	}
-	if user := s.signedIn(t, c); user == "" {
-		t.Fatal("control: the forged token from the token endpoint was refused too")
+	if status == http.StatusSeeOther && loc != "" && !containsError(loc) {
+		t.Fatalf("the callback reported success for an id_token whose azp names another client: %d %q", status, loc)
 	}
-	identities, err := s.accounts.Identities(t.Context(), account.UserID(mustSignedIn(t, s, c)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, id := range identities {
-		if id.Provider == "oidcx" && id.Subject == "victim-of-another-client" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("the session's identities do not include the forged subject: %+v", identities)
-	}
-	t.Logf("confirmed at unit level: an id_token with azp=other-client and aud=[cid other-client] is accepted as this client's identity")
+	t.Logf("an id_token with azp=other-client and aud=[cid other-client] is refused: callback answered %d %q", status, loc)
 }
 
 func mustSignedIn(t *testing.T, s *rpStack, c *http.Client) string {

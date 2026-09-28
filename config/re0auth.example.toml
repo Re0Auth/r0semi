@@ -296,6 +296,11 @@ reauth_window = "15m"
 #
 # google and microsoft are OIDC: their id_token is verified against the issuer's
 # JWKS, so the issuer must be reachable from this server.
+#
+# microsoft REQUIRES an explicit tenant issuer (below): the built-in
+# /common/v2.0 value cannot discover (Microsoft's document reports a literal
+# {tenantid} placeholder), so NewRegistry rejects `[idp.microsoft]` without one
+# rather than letting the login fail silently at the callback.
 
 [idp.github]
 client_id         = "Ov23li..."
@@ -310,13 +315,19 @@ client_secret_env = "GOOGLE_CLIENT_SECRET"
 # needed: the endpoints and JWKS are discovered from it, and `display_name` is
 # the label the sign-in button shows. The section name (`authentik`) becomes the
 # identity namespace, so it must not collide with a built-in name.
+#
+# A discovered endpoint must be on the issuer's origin (scheme + host): the
+# discovery document is attacker-influenced in a mix-up, and the client secret
+# must not be sent to another origin. A provider that really hosts its endpoints
+# on a different host sets `auth_url`/`token_url` explicitly, which skips
+# discovery.
 # [idp.authentik]
 # client_id         = "..."
 # client_secret_env = "AUTHENTIK_CLIENT_SECRET"
 # issuer            = "https://auth.example/application/o/re0auth/"
 # display_name      = "Authentik"
 
-# Pointing a provider at a self-hosted or proxied endpoint:
+# A self-hosted or proxied endpoint, and the required Microsoft tenant form:
 # [idp.microsoft]
 # client_id         = "..."
 # client_secret_env = "MICROSOFT_CLIENT_SECRET"

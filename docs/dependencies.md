@@ -8,7 +8,7 @@
 | 库 | 用在哪 | 为什么是它 |
 |---|---|---|
 | `golang.org/x/oauth2` | `idp`（对外 IdP 客户端）、`federation`（对上游 AS 的客户端、PKCE） | OAuth 2.0 客户端的既成标准；`S256ChallengeOption` 等 |
-| `github.com/coreos/go-oidc/v3` | `idp` 的 OIDC 提供方（Google / 微软） | 验 `id_token` 的签名（issuer JWKS）、issuer、audience、过期；discovery 缓存。**OIDC 是被攻得最多的点，绝不自己写** |
+| `github.com/coreos/go-oidc/v3` | `idp` 的 OIDC 提供方（Google / 微软） | 验 `id_token` 的签名（issuer JWKS）、issuer、audience、过期；discovery 缓存。**OIDC 是被攻得最多的点，绝不自己写**。三处包装层加固（都在 `idp`，不 fork 库）：discovery/JWKS 结果按 TTL（默认 15 分钟）重建，否则上游退役的签名密钥会永远可验——keyset 归 provider 所有，重建 provider 是唯一不手写 `RemoteKeySet` 的做法；discovery 得到的端点必须与 issuer 同源（scheme+host），否则客户端密钥会被送到别的源；`azp` 按 OIDC Core §3.1.3.7 校验（go-oidc 只查 audience 包含关系） |
 | `github.com/go-jose/go-jose/v4` | **直接依赖**：`oidcstore` 用 `jose.SignatureAlgorithm`、JWKS 类型；也是 `go-oidc` 的传递依赖 | **只有一套 JOSE 栈**。DPoP/JWT 若将来要做，必须用它，绝不用第二套（如 `jwx`） |
 | `github.com/alexedwards/scs/v2` | `internal/auth`（re0auth 会话）、`referencesource`（源侧会话） | 服务端会话、Cookie 属性、登录时轮换 |
 | `golang.org/x/time/rate` | `internal/ratelimit`（按 key 令牌桶），`httpapi` 限流中间件 | 标准令牌桶。**注意它内部用真实时钟，不要和注入的假时钟混用**（会静默算错补充速率） |

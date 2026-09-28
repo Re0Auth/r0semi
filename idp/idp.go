@@ -29,6 +29,11 @@ import (
 // Provider identifies an external identity provider.
 type Provider string
 
+// defaultProviderCacheTTL is how long a discovered OIDC provider (and the JWKS
+// key set inside it) is reused before it is rebuilt. It bounds how long a signing
+// key the upstream has retired can keep verifying.
+const defaultProviderCacheTTL = 15 * time.Minute
+
 const (
 	GitHub    Provider = "github"
 	Google    Provider = "google"
@@ -209,6 +214,12 @@ type RegistryConfig struct {
 	// HTTPClient is used for token and userinfo calls. Defaults to a client
 	// with a 10s timeout.
 	HTTPClient *http.Client
+	// ProviderCacheTTL bounds how long a custom OIDC provider's discovery result
+	// is reused. The provider owns the JWKS cache inside it, so this is also how
+	// long a key the upstream has retired can keep verifying: at zero the default
+	// (15 minutes) is used. A very small value re-discovers on every call, which
+	// is what a test wants; a deployment normally leaves it at the default.
+	ProviderCacheTTL time.Duration
 	// Credentials lists the providers to enable. Unlisted providers are simply
 	// absent, so the frontend only offers what is configured.
 	Credentials []Credentials
@@ -230,8 +241,14 @@ type Client struct {
 
 	// providerMu guards lazy discovery of the issuer's document. A failed
 	// discovery is not cached, so it can be retried on the next request.
-	providerMu sync.Mutex
-	discovered *oidc.Provider
+	providerMu   sync.Mutex
+	discovered   *oidc.Provider
+	discoveredAt time.Time
+	// providerTTL bounds the cache. The provider owns its JWKS cache, so
+	// rebuilding the provider is the only way to stop a retired signing key from
+	// verifying without hand-rolling a key set (which docs/dependencies.md
+	// forbids: "OIDC 绝不自己写").
+	providerTTL time.Duration
 }
 
 // NewRegistry builds a registry from configuration.
@@ -260,6 +277,10 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 	if callbackPath == "" {
 		callbackPath = "/auth/{provider}/callback"
 	}
+	providerTTL := cfg.ProviderCacheTTL
+	if providerTTL <= 0 {
+		providerTTL = defaultProviderCacheTTL
+	}
 
 	r := &Registry{clients: make(map[Provider]*Client, len(cfg.Credentials))}
 	for _, cred := range cfg.Credentials {
@@ -281,6 +302,16 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 		}
 		if cred.ClientID == "" {
 			return nil, fmt.Errorf("idp: %s: ClientID is required", cred.Provider)
+		}
+		// The built-in Microsoft issuer is the multi-tenant /common/v2.0, whose
+		// discovery document reports a literal "{tenantid}" placeholder — a value
+		// go-oidc refuses. The endpoints are static, so the login is SENT to
+		// Microsoft and only the callback fails, generically. A token can never be
+		// verified without a tenant-specific issuer, so refuse the built-in default
+		// at construction, where an operator sees it, and name the fix.
+		if builtIn && cred.Provider == Microsoft && cred.Issuer == "" {
+			return nil, errors.New("idp: microsoft: set issuer to https://login.microsoftonline.com/<tenant>/v2.0 " +
+				"(the built-in /common issuer cannot discover)")
 		}
 
 		def := baseDef
@@ -321,6 +352,8 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 				Scopes:       def.scopes,
 			},
 			http: hc,
+
+			providerTTL: providerTTL,
 		}
 	}
 	return r, nil
@@ -422,6 +455,14 @@ func (c *Client) Exchange(ctx context.Context, code, verifier string) (*oauth2.T
 // oauthConfig returns the oauth2 configuration with its endpoints resolved. A
 // built-in provider carries AuthURL/TokenURL statically; a custom OIDC provider
 // has them discovered from its issuer.
+//
+// A discovered endpoint is pinned to the issuer's scheme and host. The document
+// is the thing an attacker controls in a mix-up or a hijacked-discovery scenario,
+// and the client secret is a long-lived credential that outlives their control of
+// the answer — so a document that names another origin must not receive it. Path
+// prefixes may differ (https://auth.example/application/o/re0auth/ is legal); a
+// provider whose endpoints really live on another host sets auth_url/token_url
+// explicitly, which skips discovery entirely.
 func (c *Client) oauthConfig(ctx context.Context) (oauth2.Config, error) {
 	cfg := c.oauth
 	if cfg.Endpoint.AuthURL != "" && cfg.Endpoint.TokenURL != "" {
@@ -431,8 +472,40 @@ func (c *Client) oauthConfig(ctx context.Context) (oauth2.Config, error) {
 	if err != nil {
 		return oauth2.Config{}, err
 	}
-	cfg.Endpoint = provider.Endpoint()
+	endpoint := provider.Endpoint()
+	if err := c.pinToIssuer(endpoint.AuthURL, endpoint.TokenURL); err != nil {
+		return oauth2.Config{}, err
+	}
+	cfg.Endpoint = endpoint
 	return cfg, nil
+}
+
+// pinToIssuer refuses a discovered endpoint that is not on the configured
+// issuer's origin. An empty endpoint is left to the caller's own validation (a
+// document missing authorization_endpoint is a separate omission).
+func (c *Client) pinToIssuer(authURL, tokenURL string) error {
+	issuer, err := url.Parse(c.issuer)
+	if err != nil {
+		return fmt.Errorf("idp: %s: issuer is not a URL: %w", c.provider, err)
+	}
+	for _, endpoint := range []struct{ name, value string }{
+		{"authorization_endpoint", authURL},
+		{"token_endpoint", tokenURL},
+	} {
+		if endpoint.value == "" {
+			continue
+		}
+		u, err := url.Parse(endpoint.value)
+		if err != nil {
+			return fmt.Errorf("idp: %s: discovered %s is not a URL: %w", c.provider, endpoint.name, err)
+		}
+		if u.Scheme != issuer.Scheme || u.Host != issuer.Host {
+			return fmt.Errorf("idp: %s: discovered %s %q is not on the issuer's origin %q; "+
+				"set auth_url/token_url explicitly for a provider that hosts its endpoints elsewhere",
+				c.provider, endpoint.name, endpoint.value, c.issuer)
+		}
+	}
+	return nil
 }
 
 // Identity verifies and canonicalizes the authenticated user.
@@ -482,6 +555,7 @@ type oidcClaims struct {
 	Email   string `json:"email"`
 	Picture string `json:"picture"`
 	Nonce   string `json:"nonce"`
+	AZP     string `json:"azp"`
 }
 
 func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, nonce string) (Identity, error) {
@@ -505,6 +579,19 @@ func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, n
 	if nonce == "" || claims.Nonce != nonce {
 		return Identity{}, fmt.Errorf("idp: %s: id_token nonce does not match the authorization request", c.provider)
 	}
+	// OIDC Core §3.1.3.7: go-oidc checks only that our client_id is AMONG the
+	// audiences, and says so itself ("this check DOES NOT ensure that the ClientID
+	// is the party to which the ID Token was issued"). When there is more than one
+	// audience, azp must be present and must name us; when azp is present at all,
+	// it must name us. Defence in depth: the callback takes the id_token only from
+	// this service's own code exchange, so this is not a live takeover path — it
+	// closes a door a future caller could reach through.
+	if len(idToken.Audience) > 1 && claims.AZP == "" {
+		return Identity{}, fmt.Errorf("idp: %s: id_token has %d audiences but no azp", c.provider, len(idToken.Audience))
+	}
+	if claims.AZP != "" && claims.AZP != c.oauth.ClientID {
+		return Identity{}, fmt.Errorf("idp: %s: id_token azp %q is not this client", c.provider, claims.AZP)
+	}
 	if claims.Subject == "" {
 		return Identity{}, fmt.Errorf("idp: %s: id_token has no sub", c.provider)
 	}
@@ -516,19 +603,36 @@ func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, n
 	}, nil
 }
 
-// oidcProvider discovers the issuer once and caches the result. It is used both
-// to verify id_tokens and, for a custom provider, to learn the OAuth endpoints.
+// oidcProvider discovers the issuer and caches the result for at most
+// providerTTL. It is used both to verify id_tokens and, for a custom provider, to
+// learn the OAuth endpoints.
+//
+// The provider owns its JWKS key set, and go-oidc only refetches when a token's
+// kid matches no cached key — so without a TTL a signing key the upstream has
+// retired keeps verifying forever. Rebuilding the provider is what ages the key
+// set out, and it is the only way to do that without hand-rolling a RemoteKeySet.
+//
+// The new provider replaces the old ONLY on success: a failed re-discovery must
+// not clear the working cache (that would be a downgrade, and it would stop a
+// token whose key is already cached from verifying). A failed discovery is
+// likewise not cached, so it can be retried on the next call.
 func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 	c.providerMu.Lock()
 	defer c.providerMu.Unlock()
-	if c.discovered != nil {
+	if c.discovered != nil && time.Since(c.discoveredAt) < c.providerTTL {
 		return c.discovered, nil
 	}
 	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, c.http), c.issuer)
 	if err != nil {
+		if c.discovered != nil {
+			// Keep serving the cached provider: the alternative is a login outage
+			// whenever the issuer's discovery endpoint has a bad minute.
+			return c.discovered, nil
+		}
 		return nil, fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err)
 	}
 	c.discovered = provider
+	c.discoveredAt = time.Now()
 	return provider, nil
 }
 
