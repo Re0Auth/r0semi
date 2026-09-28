@@ -29,6 +29,13 @@ const maxBody = 4 << 20
 // (4 MiB) reads.
 const defaultMaxBufferedBytes = 64 << 20
 
+// defaultTotalTimeout is how long one data-plane request may take, end to end. It
+// bounds a path that can make several outbound calls in series, and it is
+// deliberately below the server's write timeout (60s) so the refusal has a
+// connection to be written on. The 20s outbound deadline is a per-call bound and
+// stays as it is.
+const defaultTotalTimeout = 45 * time.Second
+
 // ErrBufferBudget reports that the data plane is already holding as much upstream
 // response body in memory as it is allowed to, so this read is shed instead of
 // allocated. It is the fail-closed answer to "in-flight reads x body size":
@@ -228,6 +235,18 @@ type Config struct {
 	// same manifest sets GOMEMLIMIT so the heap has a soft limit below the
 	// container's hard one.
 	MaxBufferedBytes int
+	// TotalTimeout bounds ONE data-plane request end to end, across every outbound
+	// call it makes in series (candidate sources, token refreshes, the fetch again
+	// after a 401). Zero takes defaultTotalTimeout.
+	//
+	// It exists because per-call deadlines do not bound a request: this path makes
+	// several calls, so its worst case is a multiple of the outbound deadline, and
+	// that multiple was larger than the HTTP server's write timeout. The client
+	// then got a dropped connection with no error body — the one answer it cannot
+	// interpret. Whatever this is set to, the server's write timeout must be
+	// larger; cmd/re0auth keeps the two in step and a guard test fails if they
+	// drift.
+	TotalTimeout time.Duration
 }
 
 // NewService validates cfg and returns a Service.
@@ -268,23 +287,30 @@ func NewService(cfg Config) (Service, error) {
 	if cfg.MaxBufferedBytes == 0 {
 		cfg.MaxBufferedBytes = defaultMaxBufferedBytes
 	}
+	if cfg.TotalTimeout == 0 {
+		cfg.TotalTimeout = defaultTotalTimeout
+	}
+	if cfg.TotalTimeout < 0 {
+		return nil, errors.New("federation: TotalTimeout must not be negative")
+	}
 	if cfg.MaxBufferedBytes < 0 {
 		return nil, errors.New("federation: MaxBufferedBytes must not be negative")
 	}
 	return &service{
-		registry:   cfg.Registry,
-		bindings:   cfg.Bindings,
-		vault:      cfg.Vault,
-		flows:      cfg.Flows,
-		doer:       cfg.Doer,
-		httpClient: cfg.HTTPClient,
-		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
-		bindTTL:    cfg.BindTTL,
-		sweepPage:  cfg.KillSwitchPageSize,
-		locks:      &keyedMutex{},
-		now:        cfg.Now,
-		metrics:    cfg.Metrics,
-		buffers:    newBufferBudget(cfg.MaxBufferedBytes),
+		registry:      cfg.Registry,
+		bindings:      cfg.Bindings,
+		vault:         cfg.Vault,
+		flows:         cfg.Flows,
+		doer:          cfg.Doer,
+		httpClient:    cfg.HTTPClient,
+		baseURL:       strings.TrimRight(cfg.BaseURL, "/"),
+		bindTTL:       cfg.BindTTL,
+		sweepPage:     cfg.KillSwitchPageSize,
+		locks:         &keyedMutex{},
+		now:           cfg.Now,
+		metrics:       cfg.Metrics,
+		buffers:       newBufferBudget(cfg.MaxBufferedBytes),
+		totalDeadline: cfg.TotalTimeout,
 	}, nil
 }
 
@@ -308,9 +334,34 @@ type service struct {
 	// buffers is the joint budget for the response bodies held in memory by the
 	// two data-plane read paths. See Config.MaxBufferedBytes.
 	buffers *bufferBudget
+	// totalDeadline bounds one data-plane request end to end. See
+	// Config.TotalTimeout.
+	totalDeadline time.Duration
 }
 
 func (s *service) Sources(game string) []Source { return s.registry.Sources(game) }
+
+// withinTotalTimeout bounds one data-plane request as a whole.
+//
+// Every outbound call already has its own deadline, and that is not enough: one
+// request can make several of them in series — a candidate source, a token
+// refresh, the fetch again after a 401, then the same for the next candidate — so
+// the real worst case is "how many calls can this path make" times the outbound
+// deadline, a number nothing was checking. It is larger than the server's write
+// timeout, which means the client gets a dropped connection instead of an error
+// body: the one response a caller cannot interpret.
+//
+// The total deadline makes the worst case a single configured number, so the write
+// timeout can be set above it and every refusal has somewhere to be written. When
+// the caller has already imposed its own deadline (a client disconnect, an outer
+// handler), the earlier one wins — context deadlines compose that way, which is
+// why this wraps rather than replaces.
+func (s *service) withinTotalTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.totalDeadline <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, s.totalDeadline)
+}
 
 // AllSources implements Service.
 func (s *service) AllSources() []Source { return s.registry.AllSources() }
@@ -325,6 +376,9 @@ func (s *service) ResourceScope(game, resource string) (string, bool) {
 }
 
 func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, error) {
+	ctx, cancel := s.withinTotalTimeout(ctx)
+	defer cancel()
+
 	candidates, err := s.candidates(req.Game, req.Resource, req.Source)
 	if err != nil {
 		return FetchResult{}, err
@@ -466,6 +520,9 @@ type RawResult struct {
 // Raw proxies a source's native API without modifying the body, preserving the
 // upstream status and content type.
 func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
+	ctx, cancel := s.withinTotalTimeout(ctx)
+	defer cancel()
+
 	src, ok := s.registry.Get(req.Game, req.Source)
 	if !ok {
 		return RawResult{}, ErrUnknownSource

@@ -74,8 +74,11 @@ const (
 // failure trips it again.
 //
 // Only failures that say something about the upstream count: a transport error
-// the caller did not cause, or a 5xx. A 4xx is the request's problem, and a
-// caller-side cancellation is nobody's fault here, so neither is recorded.
+// the caller did not cause, a 5xx, or a 401 on a call that carried our credential
+// (a token we cannot refresh is a source we cannot use, and without this a
+// permanently-401 source cost a refresh round trip on every request forever). A
+// caller-side cancellation is nobody's fault here, and other 4xx statuses are the
+// request's own business, so neither is recorded.
 //
 // The state machine, the cooldown, the half-open probes and the recording are
 // failsafe-go's circuitbreaker. What remains here is the per-host map — the
@@ -176,11 +179,26 @@ func circuitStateName(state circuitbreaker.State) string {
 }
 
 // breakerFailure reports whether an attempt says something about the upstream's
-// health. A transport error the caller did not cause, or a 5xx, does; anything
-// else — a 4xx, or a cancellation — is the request's own business.
+// health. A transport error the caller did not cause, a 5xx, or a 401 does;
+// anything else — another 4xx, or a cancellation — is the request's own business.
+//
+// **A 401 counts, and it is the one status here that is not obviously the
+// upstream's fault.** The rule the rest of this function follows is "a 4xx is the
+// request's problem", and for a 401 on a call that carries OUR credential that is
+// the wrong way round: the credential is ours, the upstream is answering that it is
+// no longer usable, and the data plane's answer to a 401 is to refresh and try
+// once more — so a source whose tokens cannot be refreshed costs two or four round
+// trips per request, forever, and never trips a breaker that does not count 401.
+// Measuring it: `WithFailureThreshold(5)` is a ratio over the last five attempts,
+// so a healthy refresh (401, then 200) can never open the breaker — the success is
+// in the window. Only a source whose last five attempts were ALL failures opens it,
+// which is exactly the source that should be skipped for a cooldown.
 func breakerFailure(resp *http.Response, err error) bool {
 	if err != nil {
 		return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 	}
-	return resp != nil && resp.StatusCode >= http.StatusInternalServerError
+	if resp == nil {
+		return false
+	}
+	return resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusUnauthorized
 }

@@ -104,6 +104,14 @@ const (
 	// and Write bound a whole exchange: the data plane proxies an upstream
 	// response, so Write is generous enough to cover the outbound client's own
 	// deadline rather than cut a legitimately slow read short.
+	//
+	// Write is the SECOND bound on a data-plane request, and the one that must never
+	// be the one that fires: past it the connection is closed with no response at
+	// all, which is the only answer a client cannot interpret. The first bound is
+	// dataPlaneTimeout, the federation service's own deadline for one request across
+	// every outbound call it makes in series; when that fires the caller gets a
+	// 504 with an error body. The relationship is asserted by
+	// TestDataPlaneTimeoutFitsInsideTheWriteTimeout.
 	readHeaderTimeout = 10 * time.Second
 	readTimeout       = 30 * time.Second
 	writeTimeout      = 60 * time.Second
@@ -117,6 +125,18 @@ const (
 	// requests to finish after a signal, before closing their connections anyway.
 	// It bounds the drain so a stuck handler cannot hold a deploy open forever.
 	shutdownTimeout = 30 * time.Second
+
+	// dataPlaneTimeout is how long ONE data-plane request may take, end to end,
+	// across every outbound call it makes in series — each candidate source, each
+	// token refresh, and the fetch again after a 401. It is passed to the federation
+	// service and must stay BELOW writeTimeout, so that the refusal is a response
+	// the caller can read rather than a closed connection.
+	//
+	// 45s is chosen against the per-call outbound deadline (20s): it admits a
+	// refresh plus a retry with room to spare, and it refuses a path that would
+	// otherwise spend a minute and a half of someone's attention on a source that is
+	// not answering.
+	dataPlaneTimeout = 45 * time.Second
 )
 
 // headReader is the chained audit sink's current head. Only the durable chain has
@@ -487,6 +507,10 @@ func run() error {
 		// not fit the budget is shed with 503 instead of allocated. Sized against
 		// the container's memory limit — see defaultMaxUpstreamBufferBytes.
 		MaxBufferedBytes: cfg.MaxUpstreamBufferBytes,
+		// And the only surface that can make several outbound calls in series, so
+		// its worst case is bounded in TIME as well — below the server's write
+		// timeout, so the refusal is written rather than the connection dropped.
+		TotalTimeout: dataPlaneTimeout,
 	})
 	if err != nil {
 		return die("federation", err)

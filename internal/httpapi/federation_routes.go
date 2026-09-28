@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
@@ -154,6 +155,15 @@ func (s *Server) writeFederationError(w http.ResponseWriter, r *http.Request, er
 		w.Header().Set("Retry-After", "1")
 		s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable",
 			"too much upstream response data is being buffered right now")
+	case errors.Is(err, context.DeadlineExceeded):
+		// The data plane's own deadline for one request, which exists so that this
+		// answer is written at all: before it, the candidate loop times the outbound
+		// deadline could take longer than the server's write timeout, and the client
+		// got a dropped connection instead of a status. 504 says "the gateway gave
+		// up waiting", which is the truth, and distinguishes it from the 502 that
+		// means the source refused us.
+		s.writeProblem(w, r, http.StatusGatewayTimeout, "upstream_unavailable",
+			"the source did not answer within the time this service allows for one read")
 	case errors.Is(err, federation.ErrBindUnavailable):
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "the source is not configured for binding")
 	default:
