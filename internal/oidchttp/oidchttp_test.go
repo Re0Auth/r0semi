@@ -245,6 +245,20 @@ func TestDiscoveryAndKeys(t *testing.T) {
 	if disc["authorization_response_iss_parameter_supported"] != true {
 		t.Fatalf("authorization_response_iss_parameter_supported = %v, want true", disc["authorization_response_iss_parameter_supported"])
 	}
+	// …and that advertisement is only truthful if the offered response modes can
+	// carry `iss`. Only `query` can: a form_post response is a 200 HTML form the
+	// annotation never reaches, so it is refused and not advertised (ADR-0005 §6).
+	if modes, _ := disc["response_modes_supported"].([]any); len(modes) != 1 || modes[0] != "query" {
+		t.Fatalf("response_modes_supported = %v, want [query]", disc["response_modes_supported"])
+	}
+	// ADR-0005 §5: the document states only real capabilities. Introspection
+	// authenticates with HTTP Basic only — the library never reads a posted secret
+	// there — so client_secret_post must NOT be offered. token and revoke do accept
+	// it, and internal/httpapi's discovery test pins those two.
+	if methods, _ := disc["introspection_endpoint_auth_methods_supported"].([]any); len(methods) != 1 || methods[0] != "client_secret_basic" {
+		t.Fatalf("introspection_endpoint_auth_methods_supported = %v, want [client_secret_basic]",
+			disc["introspection_endpoint_auth_methods_supported"])
+	}
 	// The library's defaults advertise implicit/hybrid and unsupported grants.
 	if got := disc["response_types_supported"]; got != nil {
 		if types, _ := got.([]any); len(types) != 1 || types[0] != "code" {

@@ -312,6 +312,106 @@ func TestAdversarialIntrospectionAndRevocationRejectGET(t *testing.T) {
 	}
 }
 
+// POST-only endpoints must also refuse to take their parameters from the query
+// string. `r.Form` merges the two, so before this guard a POST whose whole
+// exchange lived in the URL was served — the exposure the GET refusal above
+// closes, reached through a legal method (ADR-0005 §3).
+func TestAdversarialPostOnlyEndpointsRejectQueryString(t *testing.T) {
+	f := newFixture(t)
+	verifier := strings.Repeat("a", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	scopes := []string{"account.id"}
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {adversaryCode(t, f, scopes, challenge)},
+		"client_id":     {f.webID},
+		"client_secret": {"s3cret"},
+		"redirect_uri":  {"https://client.example/cb"},
+		"code_verifier": {verifier},
+	}
+
+	// Control: the same parameters in the body are served, so the refusals below
+	// are about WHERE they arrived, not about them being invalid.
+	control, err := http.PostForm(f.server.URL+"/oauth/token", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := adversaryBody(t, control); control.StatusCode != http.StatusOK {
+		t.Fatalf("control: POST /oauth/token = %d: %s", control.StatusCode, body)
+	}
+
+	for _, target := range []string{
+		"/oauth/token?" + form.Encode(),
+		"/oauth/introspect?token=secret-token",
+		"/oauth/revoke?token=secret-token",
+		"/oauth/device_authorization?client_id=" + f.webID + "&scope=account.id",
+	} {
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+target, strings.NewReader(""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := adversaryBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST %s = %d, want 400 (parameters in the query string must be refused): %s",
+				target, resp.StatusCode, body)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("POST %s refusal is not JSON: %s", target, body)
+		}
+		if _, ok := payload["error"].(string); !ok {
+			t.Fatalf("POST %s refusal is not an OAuth error: %s", target, body)
+		}
+	}
+}
+
+// Only `query` is offered, because only it can carry the RFC 9207 `iss` the
+// discovery document advertises: a form_post response is a 200 HTML form the
+// Location rewrite never reaches. The refusal goes through the registered
+// redirect, and — per ADR-0005 §6 — carries `iss` itself.
+func TestAdversarialFormPostResponseModeIsRefused(t *testing.T) {
+	f := newFixture(t)
+	verifier := strings.Repeat("a", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {f.webID},
+		"redirect_uri":          {"https://client.example/cb"},
+		"scope":                 {"account.id"},
+		"state":                 {"st"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"response_mode":         {"form_post"},
+	}
+	resp := get(t, noRedirect, f.server.URL+"/oauth/authorize?"+q.Encode())
+	body := adversaryBody(t, resp)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("authorize with response_mode=form_post = %d, want a 302 back to the client: %s",
+			resp.StatusCode, body)
+	}
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc.Host != "client.example" {
+		t.Fatalf("refusal redirected to %q, want the registered client", loc.Host)
+	}
+	if got := loc.Query().Get("error"); got != "invalid_request" {
+		t.Fatalf("error = %q, want invalid_request", got)
+	}
+	if loc.Query().Get("iss") == "" {
+		t.Error("the refusal carries no iss; ADR-0005 §6 says failures carry it too")
+	}
+}
+
 // RFC 6749 §3.1 forbids repeated request parameters. The library's decoder
 // takes the last value, so a duplicate let validation and use disagree.
 func TestAdversarialDuplicateParametersAreRejected(t *testing.T) {

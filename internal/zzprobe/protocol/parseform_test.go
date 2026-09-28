@@ -115,27 +115,40 @@ func TestProbeUnparsableBodyHidesParametersFromThePreFlights(t *testing.T) {
 	}
 }
 
-// PROBE 21 — the protocol plane enforces the METHOD (POST) but not the LOCATION of
-// the parameters, so a POST with everything in the query string is served and the
-// code, the refresh token and even the client secret end up in the URL, the
-// access log and the browser history — the exact exposure ADR-0005 point 3 exists
-// to remove ("凭据不再进入 URL 与访问日志").
-func TestProbeTokenEndpointAcceptsItsParametersFromTheQueryString(t *testing.T) {
+// PROBE 21 (FIXED) — the protocol plane now enforces the LOCATION of the
+// parameters, not only the method.
+//
+// Was: a POST with everything in the query string was served, so the code, the
+// refresh token and the client secret ended up in the URL, the access log and the
+// browser history — the exposure ADR-0005 §3 exists to remove ("凭据不再进入 URL
+// 与访问日志"), reached through a legal method. The POST-only endpoints now refuse
+// a non-empty query string, so this is a positive guard: the query-string shape is
+// refused, and the same request with its parameters in the body succeeds (the
+// control that the refusal is about location, not validity).
+func TestProbeTokenEndpointRefusesItsParametersFromTheQueryString(t *testing.T) {
 	const redirect = "https://client.example/cb"
 	e := newEnv(t, envOptions{issuer: "https://issuer.probe"})
 	verifier := strings.Repeat("q", 64)
 
 	code := issueCode(t, e, redirect, verifier)
-	u := e.server.URL + "/oauth/token?" + url.Values{
-		"grant_type": {
-			"authorization_code",
-		},
+	params := url.Values{
+		"grant_type":    {"authorization_code"},
 		"code":          {code},
 		"redirect_uri":  {redirect},
 		"code_verifier": {verifier},
 		"client_id":     {e.webID},
-		"client_secret": {e.webSec}, // a secret in a URL
-	}.Encode()
+		"client_secret": {e.webSec},
+	}
+
+	// Control: the same parameters in the body are served.
+	body, status := postParams(t, e.server.URL+"/oauth/token", params)
+	if status != http.StatusOK {
+		t.Fatalf("control: POST /oauth/token with a body = %d: %s", status, body)
+	}
+
+	// The finding: the same parameters in the query string must be refused, so no
+	// credential can travel in the URL.
+	u := e.server.URL + "/oauth/token?" + params.Encode()
 	req, err := http.NewRequest(http.MethodPost, u, strings.NewReader(""))
 	if err != nil {
 		t.Fatal(err)
@@ -146,39 +159,29 @@ func TestProbeTokenEndpointAcceptsItsParametersFromTheQueryString(t *testing.T) 
 		t.Fatal(err)
 	}
 	raw := bodyOf(t, resp)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("a POST with its parameters in the query was refused: %d %s", resp.StatusCode, raw)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a POST with its parameters in the query was answered %d, want 400: %s", resp.StatusCode, raw)
 	}
-	payload := decodeJSON(t, raw)
-	if payload["access_token"] == nil {
-		t.Fatalf("no access token: %s", raw)
+	if strings.Contains(string(raw), "access_token") {
+		t.Fatalf("the query-string exchange still minted a token: %s", raw)
 	}
-	t.Logf("the token endpoint served an exchange whose code, secret and verifier were all in the URL: %s", raw)
+	t.Logf("the query-string exchange is refused: %s", raw)
+}
 
-	// The same shape for a refresh token, which is the credential that matters
-	// most: it is long-lived.
-	tokens := asTokens(t, decodeJSON(t, raw))
-	if tokens.RefreshToken != "" {
-		u = e.server.URL + "/oauth/token?" + url.Values{
-			"grant_type":    {"refresh_token"},
-			"refresh_token": {tokens.RefreshToken},
-			"client_id":     {e.webID},
-			"client_secret": {e.webSec},
-		}.Encode()
-		req, err = http.NewRequest(http.MethodPost, u, strings.NewReader(""))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		resp, err = noRedirect.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("the refresh in the query was refused: %d %s", resp.StatusCode, bodyOf(t, resp))
-		}
-		t.Logf("a long-lived refresh token was accepted from the query string: %d", resp.StatusCode)
+// postParams sends form-encoded parameters in the body and returns the body and
+// status.
+func postParams(t *testing.T, u string, form url.Values) (string, int) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, u, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
 	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(bodyOf(t, resp)), resp.StatusCode
 }
 
 // PROBE 24 — the net/http semantics that PROTO-1 rests on, isolated from Re0Auth.

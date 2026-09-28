@@ -9,28 +9,47 @@ import (
 	"testing"
 )
 
-// PROBE 15 — `response_mode=form_post` is accepted, and the authorization
-// response it produces carries no RFC 9207 `iss`.
+// PROBE 15 (FIXED) — `response_mode=form_post` is refused, so every authorization
+// response this server produces can carry RFC 9207 `iss`.
 //
-// ADR-0005 point 6 requires the authorization response to carry `iss` "成功与失败都带"
-// and the discovery document advertises
-// `authorization_response_iss_parameter_supported: true`
-// (internal/oidchttp/oidchttp.go stripUnsupportedDiscoveryFields). The wrapper adds
-// it only to a 3xx redirect (`isAuthorizationResponse(...) && bw.status >= 300 &&
-// bw.status < 400`), while the library renders a 200 HTML page for form_post
-// (pkg/op/auth_request.go AuthResponseCode -> handleFormPostResponse). So the one
-// client that negotiated `iss` for mix-up protection gets a response without it —
-// and discovery never advertises `response_modes_supported` at all, so the same
-// client cannot discover that form_post exists.
-func TestProbeFormPostAuthorizationResponseHasNoIss(t *testing.T) {
+// Was: form_post was accepted and the library rendered it as a 200 HTML form,
+// which the `iss` annotation (a Location-header rewrite) never reached, while the
+// discovery document advertised `authorization_response_iss_parameter_supported`.
+// ADR-0005 §6 requires the authorization response to carry `iss` and §5 requires
+// the document to advertise only real capabilities; both are satisfied by offering
+// only `query` and refusing the rest. This is now a positive guard: form_post is
+// refused through the registered redirect with `iss` on the refusal, and the
+// default query mode still succeeds carrying `iss`.
+func TestProbeFormPostIsRefusedSoEveryResponseCarriesIss(t *testing.T) {
 	e := newEnv(t, envOptions{issuer: "https://issuer.probe"})
 
 	authz := authValues(e, "https://client.example/cb", []string{"account.id"})
 	authz.Set("response_mode", "form_post")
 	resp := e.get(t, noRedirect, e.server.URL+"/oauth/authorize?"+authz.Encode())
 	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("authorize = %d %s", resp.StatusCode, bodyOf(t, resp))
+		t.Fatalf("authorize with response_mode=form_post = %d, want a 302 refusal: %s",
+			resp.StatusCode, bodyOf(t, resp))
 	}
+	loc, err := parseLocation(t, resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loc.Query().Get("error"); got != "invalid_request" {
+		t.Fatalf("refusal error = %q, want invalid_request", got)
+	}
+	// ADR-0005 §6: failures carry `iss` too.
+	if loc.Query().Get("iss") == "" {
+		t.Error("the form_post refusal carries no `iss`, which ADR-0005 §6 requires on failures as well")
+	}
+	// And it must never have reached the login/consent handoff.
+	if strings.Contains(resp.Header.Get("Location"), "authRequestID=") {
+		t.Error("the refused request still allocated a pending auth request and started the login handoff")
+	}
+
+	// Control for the shape: the default (query) mode completes and its
+	// authorization response carries `iss` — the property form_post could not meet.
+	control := authValues(e, "https://client.example/cb", []string{"account.id"})
+	resp = e.get(t, noRedirect, e.server.URL+"/oauth/authorize?"+control.Encode())
 	login, err := parseLocation(t, resp)
 	if err != nil {
 		t.Fatal(err)
@@ -42,41 +61,17 @@ func TestProbeFormPostAuthorizationResponseHasNoIss(t *testing.T) {
 	if err := e.store.CompleteLogin(t.Context(), id, "usr_probe", []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-
 	resp = e.get(t, noRedirect, e.server.URL+"/oauth/authorize/callback?id="+urlQueryEscape(id))
-	page := bodyOf(t, resp)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("the form_post callback = %d: %s", resp.StatusCode, page)
-	}
-	if !strings.Contains(string(page), "<form") {
-		t.Fatalf("the callback did not render a form, so this probe is aimed at nothing: %s", page)
-	}
-	if !strings.Contains(string(page), "code") || !strings.Contains(string(page), "state") {
-		t.Fatalf("the form does not carry the authorization response: %s", page)
-	}
-	if strings.Contains(string(page), "iss") {
-		t.Skipf("the form_post response now carries iss: %s", page)
-	}
-	t.Errorf("the form_post authorization response has no `iss` parameter while discovery advertises iss support: %s", page)
-
-	// Control for the shape: the same request in the default (query) mode is a
-	// redirect that DOES carry iss, which is why the wrapper's condition is the seam.
-	control := authValues(e, "https://client.example/cb", []string{"account.id"})
-	resp = e.get(t, noRedirect, e.server.URL+"/oauth/authorize?"+control.Encode())
-	login, err = parseLocation(t, resp)
+	loc, err = parseLocation(t, resp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id = login.Query().Get("authRequestID")
-	if err := e.store.CompleteLogin(t.Context(), id, "usr_probe", []string{"account.id"}); err != nil {
-		t.Fatal(err)
+	if loc.Query().Get("code") == "" {
+		t.Fatalf("the query-mode callback carried no code: %s", resp.Header.Get("Location"))
 	}
-	resp = e.get(t, noRedirect, e.server.URL+"/oauth/authorize/callback?id="+urlQueryEscape(id))
-	loc := resp.Header.Get("Location")
-	if !strings.Contains(loc, "iss=") {
-		t.Fatalf("control failed: the query-mode redirect has no iss either: %q", loc)
+	if loc.Query().Get("iss") == "" {
+		t.Errorf("the query-mode authorization response carries no `iss`: %s", resp.Header.Get("Location"))
 	}
-	t.Logf("query mode: %s", loc)
 }
 
 // PROBE 16 — `prompt=none` is not implemented anywhere.

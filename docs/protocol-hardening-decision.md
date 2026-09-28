@@ -15,12 +15,22 @@
    返回 `400 invalid_request`，绝不静默升级为全部。授权码流与设备流共用同一语义。
 3. **敏感端点只接受 POST。** `token`、`introspect`、`revoke`、`device_authorization` 的非 POST
    返回 OAuth JSON 405；凭据不再进入 URL 与访问日志。`authorize`/`userinfo` 保留标准 GET。
+   **并且参数只从请求体取**：这些 POST-only 端点拒绝非空查询串（`400 invalid_request`），因为
+   `r.Form` 会把查询串并进表单，一个「方法合法、参数在 URL」的请求曾把 code / refresh token /
+   client_secret 送进 URL 与中间层日志——同一处暴露，换了一扇门。`authorize` 除外：它的参数
+   本来就合法地放在查询串里（GET 形态）。
 4. **重复参数一律拒绝。** 库只取最后一个值，会让校验与使用看到不同的值；协议入口对重复参数
    返回 `400 invalid_request`。
 5. **发现文档只声明真实能力。** 覆写库默认的 `response_types_supported`、`grant_types_supported`、
    `claims_supported` 与各端点认证方法；删除未实现的注册、检查会话、加密/私钥 JWT 能力。
+   内省端点只广告 `client_secret_basic`：库的 `ClientIDFromRequest` 表单结构没有 `client_secret`
+   字段，投递的 secret 从不被读取，广告 `client_secret_post` 只会让按文档协商的客户端撞上 401。
 6. **授权响应带 RFC 9207 `iss`**，成功与失败都带；同时广告
-   `authorization_response_iss_parameter_supported`。
+   `authorization_response_iss_parameter_supported`。**这条只在 `query` 响应模式下成立**：`iss`
+   是 Location 头的改写，而 `form_post` 是库渲染的 200 HTML 表单，永远不经过它。所以本服务
+   **只提供 `query`**（discovery 广告 `response_modes_supported: ["query"]`），`form_post` 在
+   `authorize` 前置检查里被拒（回客户端一个带 `iss` 的重定向错误）。「接受 form_post 再往库生成的
+   HTML 里注 `iss`」被否决：那是改写库的渲染产物，比只收 query 脆。ADR-0005 §5 与 §6 由此一致。
 7. **PKCE 按 RFC 7636 校验语法**：challenge 与 verifier 均为 43–128 unreserved 字符。
 8. **授权码在查询时即被消费，并检查过期。** 消除并发双兑换窗口；过期码不依赖 sweep 才失效。
 9. **refresh token 重放是 `400 invalid_grant`**，不是 `500 server_error`。

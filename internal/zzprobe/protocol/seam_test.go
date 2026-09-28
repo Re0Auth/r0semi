@@ -137,65 +137,58 @@ func TestProbePublicClientIDIsNotASecret(t *testing.T) {
 	}
 }
 
-// PROBE 2 — the discovery document advertises `client_secret_post` for the
-// introspection endpoint, but the endpoint only ever reads HTTP Basic.
+// PROBE 2 (FIXED) — the introspection advertisement now matches the endpoint.
 //
-// internal/oidchttp/oidchttp.go's overrides set
-// introspection_endpoint_auth_methods_supported = [client_secret_basic,
-// client_secret_post]. The library's own answer was [client_secret_basic]
-// (pkg/op/discovery.go AuthMethodsIntrospectionEndpoint), which is the truthful
-// one: pkg/op/token_intospection.go ParseTokenIntrospectionRequest goes through
-// ClientIDFromRequest, whose form struct (pkg/op/client.go clientData) has only
-// `client_id` and the client_assertion fields — there is no `client_secret`
-// field, so a posted secret is never seen, `authenticated` stays false and the
-// endpoint answers 401. ADR-0005 point 5 ("发现文档只声明真实能力") is what this
-// violates. The revocation endpoint, by contrast, does read the posted secret
-// (pkg/op/token_revocation.go), which is the control that shows the probe sends a
-// well-formed request.
-func TestProbeDiscoveryAdvertisesClientSecretPostForIntrospection(t *testing.T) {
+// Was: discovery advertised `client_secret_post` for introspection, but the
+// library serves introspection through ClientIDFromRequest, whose form struct has
+// only `client_id` and the client_assertion fields — no `client_secret` — so a
+// posted secret was never seen and the endpoint answered 401. ADR-0005 §5 ("发现
+// 文档只声明真实能力") is what that violated. The advertisement is now
+// `["client_secret_basic"]` (internal/oidchttp/oidchttp.go overrides), so this is
+// a positive guard: Basic is offered and works, a posted secret is refused, and
+// the revocation endpoint — which really does read a posted secret — is the
+// control that the request shape is well formed.
+func TestProbeIntrospectionAdvertisesOnlyBasicAndRefusesPostedSecrets(t *testing.T) {
 	e := newEnv(t, envOptions{issuer: "https://issuer.probe"})
 
 	resp := e.get(t, noRedirect, e.server.URL+"/.well-known/openid-configuration")
 	disc := decodeJSON(t, bodyOf(t, resp))
 	methods, _ := disc["introspection_endpoint_auth_methods_supported"].([]any)
-	advertised := map[string]bool{}
-	for _, m := range methods {
-		if s, ok := m.(string); ok {
-			advertised[s] = true
-		}
+	if len(methods) != 1 || methods[0] != "client_secret_basic" {
+		t.Fatalf("introspection_endpoint_auth_methods_supported = %v, want [client_secret_basic]: "+
+			"the endpoint only accepts Basic, so advertising anything else is a lie a negotiating "+
+			"client discovers as a 401", methods)
 	}
-	if !advertised["client_secret_post"] {
-		t.Skipf("discovery no longer advertises client_secret_post for introspection: %v", methods)
-	}
-	t.Logf("discovery advertises %v for introspection", methods)
 
 	tokens := asTokens(t, e.codeFlow(t, []string{"account.id"}))
 
-	// What the advertisement promises: a posted secret authenticates.
-	resp, raw := e.postForm(t, "/oauth/introspect", url.Values{
+	// The advertised method works.
+	resp, raw := e.postForm(t, "/oauth/introspect",
+		url.Values{"token": {tokens.AccessToken}}, e.webID, e.webSec)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("introspection refused Basic, the one advertised method: %d %s", resp.StatusCode, raw)
+	}
+
+	// And the un-advertised one must NOT work, or the document understates.
+	resp, raw = e.postForm(t, "/oauth/introspect", url.Values{
 		"token":         {tokens.AccessToken},
 		"client_id":     {e.webID},
 		"client_secret": {e.webSec},
 	}, "", "")
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("introspection refused a documented client_secret_post authentication: %d %s", resp.StatusCode, raw)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("introspection accepted a posted secret (%d) while the document does not advertise "+
+			"client_secret_post: either advertise it or refuse it: %s", resp.StatusCode, raw)
 	}
 
-	// Control: the same POST shape works where the protocol really supports it.
+	// Control: the same POST shape works where the protocol really supports it, so
+	// the refusal above is about the endpoint, not a malformed request.
 	resp, raw = e.postForm(t, "/oauth/revoke", url.Values{
 		"token":         {tokens.AccessToken},
 		"client_id":     {e.webID},
 		"client_secret": {e.webSec},
 	}, "", "")
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("control failed: revocation refused client_secret_post too: %d %s", resp.StatusCode, raw)
-	}
-
-	// And Basic on introspection still works, so the endpoint is not simply broken.
-	resp, raw = e.postForm(t, "/oauth/introspect",
-		url.Values{"token": {tokens.AccessToken}}, e.webID, e.webSec)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("control failed: introspection refused Basic: %d %s", resp.StatusCode, raw)
+		t.Fatalf("control failed: revocation refused client_secret_post, which it advertises: %d %s", resp.StatusCode, raw)
 	}
 	_ = json.Valid(raw)
 }

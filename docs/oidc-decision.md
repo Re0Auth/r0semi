@@ -34,7 +34,8 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 |---|---|
 | O-1 | **发现**：服务 `/.well-known/openid-configuration`（OIDC Discovery 1.0）；**同时**保留 `/.well-known/oauth-authorization-server`（RFC 8414），两者内容一致。纯 OAuth2 客户端不受影响。 |
 | O-2 | **`id_token` 只在请求含 `openid` scope 时签发**；不含 `openid` 时**绝不**返回。签名 RS256，公钥在 JWKS。 |
-| O-3 | **`userinfo`**（`GET /oauth/userinfo`，Bearer）：默认只返回 `sub`。**email 永不返回**（[account-model.md](./account-model.md) I-3 的延伸）。展示型 claims（`name` / `picture`）留待将来独立的 `profile` scope，单独决策。 |
+| O-3 | **`userinfo`**（`GET /oauth/userinfo`，Bearer）：默认只返回 `sub`。**email 永不返回**（[account-model.md](./account-model.md) I-3 的延伸）。展示型 claims（`name` / `picture`）留待将来独立的 `profile` scope，单独决策。**userinfo 不以 `openid` 为闸门**：任何活访问令牌都返回 `sub`，即使它从未请求 `openid`（库的 userinfo 路径不看 scope，本项目的 `SetUserinfoFromToken` 只拿 tokenID/subject）。这是**有意**的——O-2 的 `openid` 闸门只约束 `id_token`（谁拿到签名的身份断言），userinfo 回的是资源所有者的 subject；由默认套件的 `TestUserinfoReturnsOnlySub` 钉住。 |
+| O-3a | **授权交互 handle 不绑 origin / 设备 / 方法**：同意页与设备决策用的 handle 只绑「创建它的会话 + 账号」（[ADR-0004](./consent-binding-decision.md)），失败一律 404。残余危害仅是「用户看到一个他没请求过的同意页」——而批准它得到的授权，请求者本就能拿到（他必须是持有 `client_id` 与精确 `redirect_uri` 的客户端）。不做 origin 绑定：那会与 ADR-0004 §3「handle 跨登录存活」的设计冲突，且需要记录发起方（PAR 不在契约内，见 O-9）。 |
 | O-4 | **`sub` = Re0Auth 的 `usr_...`**：随机、稳定、伪匿名。 |
 | O-5 | **access token 仍是不透明引用令牌 + introspect**（[api-design.md](./api-design.md) D-2 不变）；`id_token` 是唯一的 JWT。 |
 | O-6 | **refresh token 总是签发**。`offline_access` 是**兼容性空操作**：客户端带上它不报错、不要求、也不对外呈现（token `scope` / introspect / grants 都不含它）；仅内部用它触发 refresh token 的签发。是否将来收紧为“必须显式请求”留待后续。 |

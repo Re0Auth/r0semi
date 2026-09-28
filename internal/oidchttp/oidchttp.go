@@ -388,8 +388,14 @@ func stripUnsupportedDiscoveryFields(body []byte) []byte {
 	}
 	overrides := map[string]any{
 		"response_types_supported": []string{"code"},
-		// RFC 9207: the authorization response carries `iss`.
+		// RFC 9207: the authorization response carries `iss`. Kept true by
+		// validateAuthorize offering only the response modes that can carry it.
 		"authorization_response_iss_parameter_supported": true,
+		// Only `query`. A form_post response is a 200 HTML form rendered by the
+		// library, and the `iss` annotation below is a Location-header rewrite it
+		// never reaches — so offering form_post would advertise a capability the
+		// response for it contradicts. validateAuthorize refuses it (ADR-0005 §6).
+		"response_modes_supported": []string{"query"},
 		"grant_types_supported": []string{
 			"authorization_code",
 			"refresh_token",
@@ -399,8 +405,15 @@ func stripUnsupportedDiscoveryFields(body []byte) []byte {
 		"token_endpoint_auth_methods_supported": []string{
 			"none", "client_secret_basic", "client_secret_post",
 		},
+		// Basic only, and truthfully so: the library serves introspection through
+		// ClientIDFromRequest, whose form struct carries `client_id` and an
+		// assertion but no `client_secret`, so a posted secret is never read and the
+		// request 401s. token and revoke genuinely accept client_secret_post; this
+		// endpoint does not, and advertising it made a client that negotiated from
+		// the document fail (ADR-0005 §5: the document states only real
+		// capabilities).
 		"introspection_endpoint_auth_methods_supported": []string{
-			"client_secret_basic", "client_secret_post",
+			"client_secret_basic",
 		},
 		"revocation_endpoint_auth_methods_supported": []string{
 			"none", "client_secret_basic", "client_secret_post",
@@ -447,6 +460,18 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	if !endpointMethods[r.URL.Path][r.Method] {
 		writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
 			"this endpoint does not accept "+r.Method)
+		return
+	}
+	// The same table that decides the method decides whether the parameters may
+	// arrive in the URL. The POST-only endpoints carry the request in the body, and
+	// `r.Form` merges the query string into it — so a POST whose exchange lived in
+	// the query put a refresh token, a client_secret or an authorization code into
+	// the URL, browser history and every intermediary log. That is the exposure
+	// ADR-0005 §3 closed for GET, through a different door. `authorize` is not here:
+	// its parameters legitimately live in the query string.
+	if methods := endpointMethods[r.URL.Path]; len(methods) == 1 && methods[http.MethodPost] && r.URL.RawQuery != "" {
+		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
+			"this endpoint takes its parameters in the request body, not the query string")
 		return
 	}
 	// ONE parse, ONE parameter set, for the whole request.
@@ -885,6 +910,22 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 	redirectURI := client.RegisteredRedirect(q.Get("redirect_uri"))
 	if redirectURI == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "the redirect_uri is not registered for this client")
+		return true
+	}
+	// RFC 9207 + ADR-0005 §6: only a response mode that can carry `iss` is offered.
+	// A form_post response is rendered by the library as a 200 HTML form, which the
+	// `iss` annotation (a Location rewrite) never reaches, so accepting the request
+	// would produce exactly the response the advertisement denies. It is refused
+	// through the redirect, like the PKCE refusals below: the redirect_uri is
+	// validated by now, so RFC 6749 §4.1.2.1 says the client is told through it.
+	if responseMode := q.Get("response_mode"); responseMode != "" && responseMode != "query" {
+		params := map[string]string{
+			"error":             "invalid_request",
+			"error_description": "response_mode " + responseMode + " is not supported; only query is offered",
+			"state":             q.Get("state"),
+			"iss":               h.issuerFor(r),
+		}
+		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
 	}
 	// OAuth 2.1 requires PKCE on every authorization code request, confidential
