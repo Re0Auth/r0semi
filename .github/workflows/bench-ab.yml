@@ -1,0 +1,220 @@
+name: bench-ab
+
+# An on-demand A/B between two revisions, measured on ONE machine.
+#
+# The problem this solves, and that perf.yml cannot: `perf` compares each run's
+# numbers against the PREVIOUS run's artifact, so the two sides are usually
+# different machines, and GitHub's runner pool is not uniform — the delta it shows
+# is partly the code and partly the hardware. Here both revisions are benchmarked
+# back to back in the same job, minutes apart, so the delta benchstat reports is
+# about the code.
+#
+# What it is not: a gate. ci.yml's `bench` job and perf.yml already report, and
+# ADR-0007 decision 5 still stands — a benchmark gate that fails on a busy runner
+# is a gate people delete. A statistically significant regression is printed, never
+# enforced; making it enforce is a separate decision and needs an ADR amendment.
+#
+# It is manual on purpose: it answers "did this change move the needle, or was it
+# the machine?" for the change you are already asking that about.
+#
+# The harness must be identical on both sides, or the comparison is meaningless —
+# ns/op would differ because the benchmark changed, not the code. Every benchmark
+# in the repository uses b.Loop() as of commit 699b8ba ("test(bench): 全仓基准改用
+# b.Loop()"). A baseline older than that is NOT comparable (the old
+# `for i := 0; i < b.N; i++` form and b.Loop() do not measure the same thing), and
+# benchstat will print a confident number for it anyway. Pick a baseline at or
+# after that commit.
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: >-
+          Baseline commit: a full 40-character lowercase SHA, at or after the
+          b.Loop() migration. Compared against the revision this workflow was
+          dispatched on (github.sha).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-ab
+  # Two overlapping runs are not on the same machine, so they cannot be compared
+  # with each other. Queue rather than cancel: a dispatch is never silently dropped.
+  cancel-in-progress: false
+
+jobs:
+  ab:
+    # One job, one machine. That is the whole point: splitting the two sides across
+    # jobs would put the runner back into the measurement.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # Both revisions are built with the toolchain setup-go installed, which it
+      # takes from the dispatched tree's go.mod. `local` refuses to *download* a
+      # different toolchain for the baseline, which would make the two sides differ
+      # by compiler as well as by code — silently. If the baseline genuinely needs a
+      # newer toolchain this fails loudly, and the answer is to pick a newer
+      # baseline.
+      GOTOOLCHAIN: local
+      COUNT: '10'
+      BENCHTIME: 1s
+      # Belt and braces for the database-backed benchmarks. The package is excluded
+      # from the walk below as well; this catches a benchmark that would otherwise
+      # join the comparison from somewhere else. (Both sides get the same -skip, so
+      # the exclusion cannot itself become a difference.)
+      SKIP: 'AuditAppend'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The baseline is an arbitrary commit. Without the full history
+          # `git cat-file` cannot reach it, and the failure would read as "no such
+          # commit" rather than "fetch more".
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The input is attacker-influenced in the general case, so it is validated
+      # before it reaches git: exactly 40 lowercase hex characters, then a real
+      # commit object in this repository. No shell metacharacter can survive that,
+      # and nothing here runs with more than `contents: read` anyway.
+      - name: resolve the baseline
+        id: base
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          case "$BASE" in
+            *[!0-9a-f]* | '')
+              echo "::error::base must be lowercase hex (a commit SHA), got ${#BASE} characters"
+              exit 1
+              ;;
+          esac
+          if [ "${#BASE}" -ne 40 ]; then
+            echo "::error::base must be a full 40-character SHA, got ${#BASE}"
+            exit 1
+          fi
+          # Best effort: a commit that is reachable on the server but not in the
+          # checkout (another branch, a squash-merged PR). `git cat-file` below is
+          # what actually decides.
+          git fetch --no-tags --quiet origin "$BASE" || true
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "::error::no such commit in this repository: $BASE (a fork-only commit cannot be measured)"
+            exit 1
+          fi
+          # A dirty checkout would mean the "head" side is not the commit we think it
+          # is. Refuse rather than measure an unknown tree — a benchmark of the wrong
+          # tree is worse than no benchmark.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the checkout is dirty; refusing to benchmark an unknown tree"
+            git status --short
+            exit 1
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "baseline: $(git log -1 --format='%h %s' "$BASE")"
+          echo "head:     $(git log -1 --format='%h %s' "$GITHUB_SHA")"
+
+      # Two working trees, so neither side is ever checked out over the other's
+      # files. The baseline gets a worktree outside the checkout; the head side is
+      # the checkout itself, already at $GITHUB_SHA.
+      #
+      # The alternative — toggle one tree with `git checkout -f --detach` plus
+      # `git clean -fd` — works, and `clean -fd` without `-x` is safe (it respects
+      # .gitignore, so web/node_modules is not touched). But it puts a force-clean
+      # in the path of a measurement for no reason: nothing here needs both sides to
+      # live in the same directory, and a worktree cannot clobber anything.
+      - name: lay out the baseline worktree
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/base" "${{ steps.base.outputs.base }}"
+          ( cd "$RUNNER_TEMP/base" && git log -1 --format='baseline worktree at %h' )
+
+      # The benchmark set: every package's benchmarks except the database-backed
+      # ones. `internal/store/postgres` measures the Postgres round trip (the chained
+      # audit append); its variance swamps what benchstat is looking for, and without
+      # a service it skips anyway. Excluded by package here and by name via -skip
+      # above, so a future database-backed benchmark in another package cannot
+      # quietly join the comparison.
+      #
+      # -count=10 is what benchstat needs (it compares distributions, not two
+      # readings); -benchtime=1s is the default, passed explicitly so a future
+      # default change cannot alter what this workflow means.
+      - name: benchmarks (baseline)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/base"
+          go test -run '^$' -bench . -benchmem -count="$COUNT" -benchtime="$BENCHTIME" \
+            -timeout 40m -skip "$SKIP" \
+            $(go list ./... | grep -v '/store/postgres$') | tee "$GITHUB_WORKSPACE/old.txt"
+          n=$(grep -c 'ns/op' "$GITHUB_WORKSPACE/old.txt" || true)
+          echo "baseline results: $n"
+          # Anti-vacuous, in the same spirit as perf.yml: the set is 16 results per
+          # count, so anything under a hundred means the walk stopped reaching the
+          # benchmarks, not that the machine was quiet.
+          if [ "$n" -lt 100 ]; then
+            echo "::error::only $n baseline results across $COUNT counts; the benchmark walk is not running"
+            exit 1
+          fi
+
+      - name: benchmarks (head)
+        run: |
+          set -euo pipefail
+          go test -run '^$' -bench . -benchmem -count="$COUNT" -benchtime="$BENCHTIME" \
+            -timeout 40m -skip "$SKIP" \
+            $(go list ./... | grep -v '/store/postgres$') | tee new.txt
+          n=$(grep -c 'ns/op' new.txt || true)
+          echo "head results: $n"
+          if [ "$n" -lt 100 ]; then
+            echo "::error::only $n head results across $COUNT counts; the benchmark walk is not running"
+            exit 1
+          fi
+
+      # Pinned like every other CI tool (docs/dependencies.md §6): an unpinned
+      # reporter turns a green run red on somebody else's release schedule.
+      # `go install …@version` does not touch this module's go.mod.
+      - name: install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260908200009-22c9c6c9d4da
+
+      # The report. benchstat pairs the benchmarks by name, reports whether each
+      # delta is statistically significant (p-value, and "~" when it is not), and
+      # prints new/missing for anything only one side has. It never fails the run:
+      # a regression is a sentence in the summary, not a red check.
+      - name: compare
+        run: |
+          set -euo pipefail
+          benchstat="$(go env GOPATH)/bin/benchstat"
+          {
+            echo "## Benchmark A/B — same runner, back to back"
+            echo
+            echo "- baseline \`${{ steps.base.outputs.base }}\`"
+            echo "- head \`${{ steps.base.outputs.head }}\`"
+            echo "- \`go test -run '^$' -bench . -benchmem -count=$COUNT -benchtime=$BENCHTIME\` on one runner"
+            echo "- database-backed benchmarks excluded (\`internal/store/postgres\`)"
+            echo
+            echo '```'
+            "$benchstat" old.txt new.txt
+            echo '```'
+            echo
+            echo "Reported, not gated (ADR-0007 decision 5): benchstat's p-value says whether a"
+            echo "delta is the code or the runner. Nothing here blocks a merge."
+          } >> "$GITHUB_STEP_SUMMARY"
+          "$benchstat" old.txt new.txt
+
+      # The raw outputs travel with the report, so any number in the summary can be
+      # recomputed or re-analysed (a different confidence level, a per-benchmark
+      # grep) without re-running the benchmarks.
+      - name: upload the raw numbers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-ab
+          path: |
+            old.txt
+            new.txt
+          retention-days: 90
