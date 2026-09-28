@@ -111,78 +111,84 @@ func newTwoSourceRig(t *testing.T, statusA, statusB federation.SourceStatus, sco
 	return &twoSourceRig{a: a, b: b, reqsA: logA, reqsB: logB, svc: svc}
 }
 
-// The downstream scope is resolved from the FIRST source declaring the resource.
-// If that source declares a different scope than the one that actually serves
-// the read, the authorisation and the delivery disagree.
-func TestProbeResourceScopeComesFromOneSourceButDataFromAnother(t *testing.T) {
-	// "a" sorts first and is active; the caller is bound to "b" only.
+// The gate's criterion and the read's source must be the SAME decision.
+//
+// The old accessor answered "the scope of the first source that declares the
+// resource, in config order", while the read is served by whichever source
+// candidates() picks — status-ranked, binding-filtered, and reachable by
+// fallback. Two different functions, so the gate was wrong in both directions at
+// once: a token holding source a's scope could read source b's data, and a token
+// holding the scope of the source that actually served was refused.
+//
+// The replacement answers with every source that could serve, and the HTTP gate
+// requires all of them. The property this probe pins is the one that matters:
+// **the source that serves a read is always one the gate named**, so no read can
+// be delivered under a scope the gate did not require.
+func TestProbeScopeGateNamesEverySourceThatCouldServe(t *testing.T) {
 	rig := newTwoSourceRig(t, federation.StatusActive, federation.StatusActive,
 		"phigros.profile.read", "phigros.score.read")
 
-	scope, ok := rig.svc.ResourceScope("phigros", "profile")
-	if !ok {
-		t.Fatal("no scope for the resource")
+	reqs, err := rig.svc.ResourceRequirements("phigros", "profile", "")
+	if err != nil {
+		t.Fatalf("ResourceRequirements: %v", err)
 	}
-	t.Logf("ResourceScope(phigros, profile) = %q — this is source a's declaration", scope)
-	if scope != "phigros.profile.read" {
-		t.Fatalf("fixture assumption changed: got %q", scope)
+	byName := map[string]string{}
+	for _, r := range reqs {
+		byName[r.Source] = r.Scope
+	}
+	if byName["a"] != "phigros.profile.read" || byName["b"] != "phigros.score.read" {
+		t.Fatalf("requirements = %+v, want both sources' scopes: a token holding only one of them "+
+			"must not be able to read the other's data", reqs)
+	}
+	t.Logf("the gate requires %+v", reqs)
+
+	// Pinning narrows the requirement to the pinned source: that is how a caller
+	// asks for exactly one source's scope, and the old gate ignored the pin.
+	pinned, err := rig.svc.ResourceRequirements("phigros", "profile", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pinned) != 1 || pinned[0].Source != "b" || pinned[0].Scope != "phigros.score.read" {
+		t.Errorf("pinned requirements = %+v, want only source b's", pinned)
 	}
 
-	// A token carrying exactly the scope the gate asked for. Under the
-	// scope-per-resource model that should grant "phigros.profile.read" — which
-	// is a scope source b does not recognise at all.
+	// And the read itself: whichever source serves it, its scope was required.
 	res, err := rig.svc.Fetch(context.Background(), federation.FetchRequest{
 		User: "usr_1", Game: "phigros", Resource: "profile",
 	})
 	if err != nil {
-		t.Logf("fetch refused: %v", err)
-		return
+		t.Fatalf("fetch: %v", err)
 	}
-	t.Logf("a token holding %q (source a's scope, source a NOT bound) was served by %q with %s",
-		scope, res.Source, res.Data)
-	t.Logf("source a was asked for: %v", rig.reqsA.all())
-	t.Logf("source b was asked for: %v", rig.reqsB.all())
-	if res.Source == "b" {
-		t.Errorf("the read was served by source b, which the token was never scoped for: "+
-			"the gate named %q (source a's scope) and the fetch used source %q", scope, res.Source)
+	if _, required := byName[res.Source]; !required {
+		t.Errorf("the read was served by source %q, which the gate never named (requirements: %+v): "+
+			"the authorization and the delivery disagree", res.Source, reqs)
 	}
+	t.Logf("served by %q, whose scope %q the gate required", res.Source, byName[res.Source])
 }
 
-// The mirror image: a token holding only source b's scope is refused for a
-// resource that source b serves, because the gate asked for source a's scope.
-// This is the non-vacuity control — it proves the gate is really reading a
-// single source's declaration rather than the union.
-func TestProbeScopeGateRefusesTheBoundSourcesOwnScope(t *testing.T) {
-	rig := newTwoSourceRig(t, federation.StatusActive, federation.StatusActive,
-		"phigros.profile.read", "phigros.score.read")
-
-	// Bind source a as well, so the fetch cannot be blamed on a missing binding.
-	// Instead: ask for the resource with b's scope and observe the gate's answer.
-	scope, _ := rig.svc.ResourceScope("phigros", "profile")
-	t.Logf("gate scope = %q; source b declares %q", scope, "phigros.score.read")
-	if scope == "phigros.score.read" {
-		t.Error("the gate used source b's declaration; the ordering assumption changed")
-	}
-}
-
-// A degraded source can be reached without the caller asking for it and without
-// knowing which source answered — unless it reads Re0Auth-Degraded. This checks
-// the scope used for that read is still the gate source's scope.
-func TestProbeDegradedSourceIsServedUnderTheGatesScope(t *testing.T) {
+// The degraded case, which is how a read reaches a source the caller did not ask
+// for: the serving source's scope must be among the requirements there too.
+func TestProbeDegradedSourceIsServedUnderARequiredScope(t *testing.T) {
 	rig := newTwoSourceRig(t, federation.StatusActive, federation.StatusDegraded,
 		"phigros.profile.read", "phigros.score.read")
-	// a is active but unbound; b is degraded and bound.
+
+	reqs, err := rig.svc.ResourceRequirements("phigros", "profile", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]string{}
+	for _, r := range reqs {
+		byName[r.Source] = r.Scope
+	}
 	res, err := rig.svc.Fetch(context.Background(), federation.FetchRequest{
 		User: "usr_1", Game: "phigros", Resource: "profile",
 	})
 	if err != nil {
-		t.Logf("refused: %v", err)
-		return
+		t.Fatalf("fetch: %v", err)
 	}
 	t.Logf("served by %q degraded=%v data=%s", res.Source, res.Degraded, res.Data)
-	if res.Source == "b" {
-		t.Logf("a read whose scope came from source a was served by degraded source b: "+
-			"Re0Auth-Degraded=%v is the only signal", res.Degraded)
+	if _, required := byName[res.Source]; !required {
+		t.Errorf("the degraded read was served by %q, which the gate never named: %+v", res.Source, reqs)
 	}
 }
 

@@ -224,15 +224,35 @@ func TestFetchSurfacesSourceError(t *testing.T) {
 	}
 }
 
-func TestResourceScope(t *testing.T) {
+// The requirements a gate has to ask for: one per source that could serve the
+// read, in the order Fetch will try them. It replaced a "the scope of the first
+// source that declares the resource" accessor, which disagreed with the serving
+// source in both directions (see docs/api-design.md §2.7).
+func TestResourceRequirements(t *testing.T) {
 	up := fakeSource(t, http.StatusOK, `{}`)
 	svc := testService(t, up, backend{store: NewMemoryBindingStore(), vault: newVault(t)})
 
-	if scope, ok := svc.ResourceScope(game, "profile"); !ok || scope != profileScope {
-		t.Fatalf("scope = %q, %v", scope, ok)
+	reqs, err := svc.ResourceRequirements(game, "profile", "")
+	if err != nil {
+		t.Fatalf("ResourceRequirements: %v", err)
 	}
-	if _, ok := svc.ResourceScope(game, "nope"); ok {
-		t.Fatal("unknown resource reported a scope")
+	if len(reqs) != 1 || reqs[0].Scope != profileScope || reqs[0].Source != sourceName {
+		t.Fatalf("requirements = %+v, want one entry for %s/%s", reqs, sourceName, profileScope)
+	}
+	// Pinning is how a caller asks for one source's requirement.
+	if reqs, err := svc.ResourceRequirements(game, "profile", sourceName); err != nil || len(reqs) != 1 {
+		t.Fatalf("pinned requirements = %+v, %v", reqs, err)
+	}
+	// A pin at an unknown or retired source is the fetch's own error, so a gate can
+	// map it with the same switch the data plane uses.
+	if _, err := svc.ResourceRequirements(game, "profile", "nope"); !errors.Is(err, ErrUnknownSource) {
+		t.Fatalf("unknown pin = %v, want ErrUnknownSource", err)
+	}
+	if _, err := svc.ResourceRequirements(game, "nope", ""); !errors.Is(err, ErrUnknownResource) {
+		t.Fatalf("unknown resource = %v, want ErrUnknownResource", err)
+	}
+	if _, err := svc.ResourceRequirements("nope", "profile", ""); !errors.Is(err, ErrUnknownGame) {
+		t.Fatalf("unknown game = %v, want ErrUnknownGame", err)
 	}
 }
 

@@ -144,8 +144,10 @@ func zzMintToken(t *testing.T, h http.Handler, store *memory.OIDCStore, clientID
 
 // zzTwoSourceHTTP stands up the real HTTP surface with two sources for one game,
 // both declaring the same resource name under different downstream scopes, and
-// the caller bound to the SECOND one only.
-func zzTwoSourceHTTP(t *testing.T) (base, token string, askedIn *[]string) {
+// the caller bound to the SECOND one only. The returned token is minted for the
+// OFFICIAL source's scope, which is the shape every probe here is about; mint()
+// makes a token for any other scope.
+func zzTwoSourceHTTP(t *testing.T) (base, token string, askedIn *[]string, mint func(scopes ...string) string) {
 	t.Helper()
 	asked := &[]string{}
 	mk := func(log *[]string, body string) *httptest.Server {
@@ -202,9 +204,11 @@ func zzTwoSourceHTTP(t *testing.T) (base, token string, askedIn *[]string) {
 	}
 
 	clients := oauth.NewMemoryClientRegistry()
-	// Registered for the OFFICIAL source's scope only.
+	// Registered for BOTH sources' scopes, so a probe can mint a token for either
+	// one and compare what the gate does with each. The token every other probe here
+	// uses is minted for the official source's scope only.
 	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{zzRedirect},
-		[]oauth.Scope{"phigros.profile.read"})
+		[]oauth.Scope{"phigros.profile.read", "phigros.community.read"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,25 +230,31 @@ func zzTwoSourceHTTP(t *testing.T) (base, token string, askedIn *[]string) {
 	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(srv.Close)
 
-	at := zzMintToken(t, api.Handler(), store, "cli", "usr_test", "phigros.profile.read")
+	mint = func(scopes ...string) string {
+		return zzMintToken(t, api.Handler(), store, "cli", "usr_test", scopes...)
+	}
+	at := mint("phigros.profile.read")
 	t.Cleanup(func() {
 		t.Logf("source aa-official was asked for: %v", *aLog)
 		t.Logf("source zz-community was asked for: %v", *bLog)
 	})
-	return srv.URL, at, asked
+	return srv.URL, at, asked, mint
 }
 
-// The gate names ONE source's scope while the read is served by ANOTHER source.
+// The gate and the serving source must be the SAME decision.
 //
-// A token minted for "phigros.profile.read" 鈥?a scope only the OFFICIAL source
-// declares, and the only scope the client is registered for 鈥?reads the
-// COMMUNITY source's copy of the same resource name. handleGameResource asks
-// federation.ResourceScope(game, resource), which returns the first source (by
-// name order) that declares the resource; Fetch() then picks a source by binding
-// and status. The two need not be the same source, and nothing downstream can
-// tell which one answered except the Re0Auth-Source header.
+// The defect: a token minted for "phigros.profile.read" — a scope only the
+// OFFICIAL source declares, and the only scope the client was registered for —
+// was served the COMMUNITY source's copy of the same resource name.
+// handleGameResource asked federation.ResourceScope(game, resource), which returned
+// the first source (by name order) declaring the resource, while Fetch() picked a
+// source by binding and status. Two lookups, one decision.
+//
+// Now the gate asks for EVERY source that could serve the read, so a token holding
+// only the official scope is refused: it cannot read the community source's data,
+// and the refusal names the scope and the source that requires it.
 func TestZZProbeScopeGateAndServingSourceDisagree(t *testing.T) {
-	base, at, _ := zzTwoSourceHTTP(t)
+	base, at, _, _ := zzTwoSourceHTTP(t)
 
 	req, _ := http.NewRequest(http.MethodGet, base+"/v1/games/phigros/profile", nil)
 	req.Header.Set("Authorization", "Bearer "+at)
@@ -257,26 +267,25 @@ func TestZZProbeScopeGateAndServingSourceDisagree(t *testing.T) {
 	t.Logf("GET /v1/games/phigros/profile => %d, Re0Auth-Source=%q, body=%s",
 		resp.StatusCode, resp.Header.Get("Re0Auth-Source"), body)
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("the fetch was refused (%d); the confusion did not materialise in this shape: %s",
-			resp.StatusCode, body)
+	if resp.StatusCode == http.StatusOK {
+		t.Errorf("a token holding only the OFFICIAL source's scope (%q) was served %s: the gate did not "+
+			"require the scope of the source that could answer (body: %s)",
+			"phigros.profile.read", resp.Header.Get("Re0Auth-Source"), body)
 	}
-	served := resp.Header.Get("Re0Auth-Source")
-	if served != "zz-community" {
-		t.Fatalf("fixture: expected the community source to answer, got %q", served)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("the refusal was %d, want 403 insufficient_scope", resp.StatusCode)
 	}
-	t.Errorf("a token holding %q 鈥?the OFFICIAL source's scope, and the only scope its client was "+
-		"registered for 鈥?was served the COMMUNITY source's data (Re0Auth-Source=%q). The scope gate "+
-		"resolved its requirement from the first source declaring the resource; the read came from a "+
-		"different one, which the token was never scoped for and which is not the source the operator "+
-		"registered that scope for.", "phigros.profile.read", served)
+	if !strings.Contains(string(body), "zz-community") {
+		t.Errorf("the refusal does not name the source whose scope is required: %s", body)
+	}
 }
 
 // The sharper shape: the caller names the community source explicitly, and the
-// official source's scope still admits it. ?source= pins the source but does not
-// re-resolve the scope.
+// official source's scope must still not admit it. ?source= pins the source AND
+// (now) narrows the requirement to it, which is the honest way to ask for one
+// source's scope.
 func TestZZProbePinnedSourceAdmitsAnotherSourcesScope(t *testing.T) {
-	base, at, _ := zzTwoSourceHTTP(t)
+	base, at, _, _ := zzTwoSourceHTTP(t)
 
 	req, _ := http.NewRequest(http.MethodGet, base+"/v1/games/phigros/profile?source=zz-community", nil)
 	req.Header.Set("Authorization", "Bearer "+at)
@@ -293,11 +302,41 @@ func TestZZProbePinnedSourceAdmitsAnotherSourcesScope(t *testing.T) {
 	}
 }
 
+// The control that keeps the refusal from being a blanket one: a token holding the
+// scope of the source the caller PINNED is admitted by the gate. Pinning narrows
+// the requirement to that source, which is the honest way to ask for one source's
+// scope — and without this control, closing the gate by refusing everything would
+// pass.
+//
+// The request then stops one layer further in: the user is bound to the community
+// source only, so the official source answers "not bound" (409). A 409 rather than
+// a 403 is exactly what this asserts: the scope gate let it through.
+func TestZZProbeThePinnedSourcesOwnScopeIsAdmitted(t *testing.T) {
+	base, _, _, mint := zzTwoSourceHTTP(t)
+
+	at := mint("phigros.profile.read") // the pinned source's own scope
+	req, _ := http.NewRequest(http.MethodGet, base+"/v1/games/phigros/profile?source=aa-official", nil)
+	req.Header.Set("Authorization", "Bearer "+at)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	t.Logf("GET .../profile?source=aa-official => %d body=%s", resp.StatusCode, body)
+	if resp.StatusCode == http.StatusForbidden {
+		t.Errorf("the gate refused a token holding the pinned source's own scope: %s", body)
+	}
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409 source_not_bound (the gate admitted it, the binding did not)", resp.StatusCode)
+	}
+}
+
 // Non-vacuity: the same request with a scope the OFFICIAL source does not declare
 // is refused, proving the gate is really consulted (and not, say, bypassed by a
 // missing token or a 404).
 func TestZZProbeGateIsActuallyConsulted(t *testing.T) {
-	base, _, asked := zzTwoSourceHTTP(t)
+	base, _, asked, _ := zzTwoSourceHTTP(t)
 
 	// No token at all: 401.
 	req, _ := http.NewRequest(http.MethodGet, base+"/v1/games/phigros/profile", nil)

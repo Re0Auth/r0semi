@@ -244,7 +244,7 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 
 | `GET` | `/v1/sources` | — （公开） | 本部署提供的全部数据源（供「可连接」列表用） |
 | `GET` | `/v1/games/{game}/sources` | — （公开） | 该游戏的数据源、能力与 `token_class` |
-| `GET` | `/v1/games/{game}/{resource}` | 资源对应 scope | 归一化数据；`?source=` 可 pin（已实现，见 architecture.md §4.11） |
+| `GET` | `/v1/games/{game}/{resource}` | **每一个可能服务这次读取的源各自声明的 scope**（见下） | 归一化数据；`?source=` 可 pin（已实现，见 architecture.md §4.11），pin 会把判据收窄到该源 |
 | `GET` | `/v1/games/{game}/sources/{source}/raw/{path...}` | 该源任一资源 scope（粗粒度） | 逐字透传源的原始 API；状态码/Content-Type/body 不改，另加路由级 CSP 与 `Content-Disposition: attachment`（浏览器不渲染、不执行脚本，见下） |
 
 > **raw 响应为什么多两个头。** 媒体类型是源的，而响应落在**本服务的源**上——同一个持有会话 cookie、
@@ -255,6 +255,22 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 > `[A-Za-z0-9._-]`，防止引号或换行注入头。
 
 > 具体游戏的资源名与 scope 由 `/v1/games/{game}/sources` 公布，无需在下游硬编码。
+
+**归一化资源的 scope 判据（裁定）。** 一个资源**没有唯一的 scope**：同一个 `(game, resource)`
+可以由多个源提供（官方源与社区源），各自声明自己的 scope；而哪一个是真正被读的，由
+**绑定 + 状态排序**（`internal/federation` 的 `candidates()`）决定，不由配置里的名字顺序决定。
+因此判据是 **「本次读取可能用到的每一个源，其 scope 都必须在令牌里」**
+（`Service.ResourceRequirements` → `handleGameResource` 逐个校验）：
+
+- 该源声明的 scope **就是**它交付数据的凭据。只持有 A 源 scope 的令牌读到 B 源的数据，
+  不是「更宽松」，而是**同意与交付不一致**；反过来，持有真正服务那次读取的源的 scope 却被拒，
+  同样是错的——旧的 `ResourceScope(game, resource)`（取「按名字排序第一个声明该资源的源」）
+  两个方向都判错。
+- **两个源声明相同 scope 时合并为一条要求**，所以「同一声明」的部署（常见情形）不受影响，
+  客户端不会被告知去持有它已经持有的 scope。
+- `?source=` **pin 会把判据收窄到该源**：这是「只想用某一个源的 scope」的正当写法。
+  pin 一个已退役的源仍然是 404/410，退役源不参与判据（它永远不会被选中）。
+- 判据在**读取之前**判定：被拒的请求不会去问上游（探针断言上游日志为空）。
 
 ### 授权列表的两个决定
 

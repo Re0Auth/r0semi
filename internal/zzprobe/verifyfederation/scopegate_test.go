@@ -70,15 +70,21 @@ func newTwoSourceRig(t *testing.T, statusA, statusB federation.SourceStatus, sco
 }
 
 // TestVerifyGateAndServingSourceAreIndependent re-derives FO-01 from the service
-// layer: the scope the gate names and the source that answers come from two
-// different lookups.
+// layer, asserted as the property the fix provides: the requirements name EVERY
+// source that could serve the read, so whichever one answers, its scope was
+// required. The old accessor named source a's scope while source b served, and
+// there was nothing in its signature that could have said otherwise.
 func TestVerifyGateAndServingSourceAreIndependent(t *testing.T) {
 	rig := newTwoSourceRig(t, federation.StatusActive, federation.StatusActive,
 		"phigros.profile.read", "phigros.community.read", "b")
 
-	gateScope, ok := rig.svc.ResourceScope("phigros", "profile")
-	if !ok {
-		t.Fatal("no scope for the resource")
+	reqs, err := rig.svc.ResourceRequirements("phigros", "profile", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]string{}
+	for _, r := range reqs {
+		byName[r.Source] = r.Scope
 	}
 	res, err := rig.svc.Fetch(context.Background(), federation.FetchRequest{
 		User: "usr_1", Game: "phigros", Resource: "profile",
@@ -87,23 +93,21 @@ func TestVerifyGateAndServingSourceAreIndependent(t *testing.T) {
 		t.Fatalf("fetch: %v", err)
 	}
 	a, b := rig.requests()
-	t.Logf("gate names %q (source a's declaration); the read came from %q with %s", gateScope, res.Source, res.Data)
+	t.Logf("the gate requires %+v; the read came from %q with %s", reqs, res.Source, res.Data)
 	t.Logf("source a was asked for %v; source b was asked for %v", a, b)
 
-	if gateScope != rig.scopeA {
-		t.Fatalf("fixture: the gate did not resolve from source a (%q)", gateScope)
-	}
 	if res.Source != "b" {
 		t.Fatalf("fixture: expected source b to serve, got %q", res.Source)
 	}
-	// The gate is a signature fact: ResourceScope cannot be source-aware because
-	// it takes no source.
-	var sig func(string, string) (string, bool) = rig.svc.ResourceScope
-	_ = sig
-	t.Logf("Service.ResourceScope(game, resource) has no source parameter, so the gate cannot name the source it is gating")
-
-	// The mirror image: source b's own declared scope does NOT admit the read.
-	if gateScope == rig.scopeB {
+	// The property: the serving source is one the gate named. Source b's own scope
+	// is required now, which is the direction that used to be refused.
+	if byName["b"] != rig.scopeB {
+		t.Errorf("the serving source %q is not among the gate's requirements: %+v", res.Source, reqs)
+	}
+	if byName["a"] != rig.scopeA {
+		t.Errorf("the gate dropped source a's requirement: %+v", reqs)
+	}
+	if rig.scopeA == rig.scopeB {
 		t.Error("fixture: the two sources must declare different scopes for this test to mean anything")
 	}
 }
@@ -157,16 +161,20 @@ func TestVerifyConsentPlaneNamesASourceTheReadDoesNotNeed(t *testing.T) {
 	}
 }
 
-// TestVerifyRetiredSourceCanSetTheGate is a case the audit did not report: the
-// gate's requirement can be resolved from a source that is retired, and retired
-// sources are never selectable.
-func TestVerifyRetiredSourceCanSetTheGate(t *testing.T) {
+// TestVerifyRetiredSourceCannotSetTheGate is the case the verifier found and the
+// audit did not report: a RETIRED source used to set the gate's requirement, and
+// retired sources are never selectable — so retiring one source silently changed
+// the authorization criterion for another, and could turn a live token into a 403.
+//
+// The requirements come from candidates() now, which excludes retired sources, so
+// the retired declaration is not among them.
+func TestVerifyRetiredSourceCannotSetTheGate(t *testing.T) {
 	rig := newTwoSourceRig(t, federation.StatusRetired, federation.StatusActive,
 		"phigros.profile.read", "phigros.community.read", "b")
 
-	gateScope, ok := rig.svc.ResourceScope("phigros", "profile")
-	if !ok {
-		t.Fatal("no scope for the resource")
+	reqs, err := rig.svc.ResourceRequirements("phigros", "profile", "")
+	if err != nil {
+		t.Fatal(err)
 	}
 	res, err := rig.svc.Fetch(context.Background(), federation.FetchRequest{
 		User: "usr_1", Game: "phigros", Resource: "profile",
@@ -174,30 +182,44 @@ func TestVerifyRetiredSourceCanSetTheGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	t.Logf("source a is RETIRED and declares %q; the gate still requires it, and the read is served by %q",
-		gateScope, res.Source)
-	if gateScope != rig.scopeA || res.Source != "b" {
-		t.Fatalf("fixture: got gate=%q served=%q", gateScope, res.Source)
+	t.Logf("source a is RETIRED and declares %q; the requirements are %+v; the read is served by %q",
+		rig.scopeA, reqs, res.Source)
+
+	if res.Source != "b" {
+		t.Fatalf("fixture: expected source b to serve, got %q", res.Source)
+	}
+	for _, r := range reqs {
+		if r.Source == "a" {
+			t.Errorf("a retired source set the gate's requirement: %+v", reqs)
+		}
+	}
+	if len(reqs) != 1 || reqs[0].Scope != rig.scopeB {
+		t.Errorf("requirements = %+v, want only the active source's %q", reqs, rig.scopeB)
 	}
 }
 
-// TestVerifyConsistentScopesCollapseTheDivergence states the condition the whole
-// finding rests on, so the severity claim is auditable: when the operator declares
-// the SAME scope for the same resource name on both sources, the gate's answer is
-// the serving source's answer.
+// TestVerifyConsistentScopesCollapseTheDivergence states the condition the finding
+// rested on, now as the property that makes the fix cheap where it should be: when
+// the operator declares the SAME scope for the same resource name on both sources,
+// the two requirements collapse into one, and a client that already holds that
+// scope needs nothing new.
 func TestVerifyConsistentScopesCollapseTheDivergence(t *testing.T) {
 	rig := newTwoSourceRig(t, federation.StatusActive, federation.StatusActive,
 		"phigros.profile.read", "phigros.profile.read", "b")
-	gateScope, _ := rig.svc.ResourceScope("phigros", "profile")
+	reqs, err := rig.svc.ResourceRequirements("phigros", "profile", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	res, err := rig.svc.Fetch(context.Background(), federation.FetchRequest{
 		User: "usr_1", Game: "phigros", Resource: "profile",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("both sources declare %q; gate=%q served-by=%q", rig.scopeB, gateScope, res.Source)
-	if gateScope != rig.scopeB {
-		t.Errorf("fixture: with identical declarations the gate and the source must agree, got %q", gateScope)
+	t.Logf("both sources declare %q; requirements=%+v served-by=%q", rig.scopeB, reqs, res.Source)
+	if len(reqs) != 1 || reqs[0].Scope != rig.scopeB {
+		t.Errorf("requirements = %+v, want one entry for %q: identical declarations must not "+
+			"make a client hold the same scope twice", reqs, rig.scopeB)
 	}
 }
 

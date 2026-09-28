@@ -135,6 +135,13 @@ func (e *SourceError) Error() string {
 	return fmt.Sprintf("federation: source %s returned HTTP %d", e.Source, e.Status)
 }
 
+// ResourceRequirement is one source that could serve a resource, and the scope
+// that source requires for it.
+type ResourceRequirement struct {
+	Source string
+	Scope  string
+}
+
 // FetchRequest asks for one resource on behalf of one user.
 type FetchRequest struct {
 	User     account.UserID
@@ -159,8 +166,16 @@ type Service interface {
 	// AllSources lists every configured source, for the page that offers what
 	// could be connected.
 	AllSources() []Source
-	// ResourceScope returns the downstream scope a resource requires.
-	ResourceScope(game, resource string) (string, bool)
+	// ResourceRequirements returns, in the order Fetch will try them, every source
+	// that could serve (game, resource) together with the scope that source
+	// requires. A pinned source narrows the list to itself. It is what an
+	// authorization gate has to ask: the resource does not have ONE scope, it has
+	// one per source that can answer, and which of them answers is decided by
+	// candidates() rather than by the config's name order.
+	//
+	// The errors are the fetch's own vocabulary — ErrUnknownGame, ErrUnknownSource,
+	// ErrSourceRetired, ErrUnknownResource — so a caller maps them the same way.
+	ResourceRequirements(game, resource, pinned string) ([]ResourceRequirement, error)
 	// Fetch proxies a normalized resource from a bound source.
 	Fetch(ctx context.Context, req FetchRequest) (FetchResult, error)
 	// Raw proxies a source's native API verbatim.
@@ -366,13 +381,32 @@ func (s *service) withinTotalTimeout(ctx context.Context) (context.Context, cont
 // AllSources implements Service.
 func (s *service) AllSources() []Source { return s.registry.AllSources() }
 
-func (s *service) ResourceScope(game, resource string) (string, bool) {
-	for _, src := range s.registry.Sources(game) {
-		if res, ok := src.Resource(resource); ok {
-			return res.Scope, true
-		}
+func (s *service) ResourceRequirements(game, resource, pinned string) ([]ResourceRequirement, error) {
+	candidates, err := s.candidates(game, resource, pinned)
+	if err != nil {
+		return nil, err
 	}
-	return "", false
+	out := make([]ResourceRequirement, 0, len(candidates))
+	seen := make(map[string]bool, len(candidates))
+	for _, src := range candidates {
+		res, ok := src.Resource(resource)
+		if !ok {
+			continue
+		}
+		// Two sources declaring the same scope is one requirement: the common
+		// deployment shape is several sources of one game, all declaring the same
+		// resource scope, and listing it twice would tell a client to hold a scope
+		// it already holds.
+		if seen[res.Scope] {
+			continue
+		}
+		seen[res.Scope] = true
+		out = append(out, ResourceRequirement{Source: src.Name, Scope: res.Scope})
+	}
+	if len(out) == 0 {
+		return nil, ErrUnknownResource
+	}
+	return out, nil
 }
 
 func (s *service) Fetch(ctx context.Context, req FetchRequest) (FetchResult, error) {

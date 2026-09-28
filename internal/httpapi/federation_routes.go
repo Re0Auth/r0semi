@@ -83,25 +83,49 @@ func (s *Server) handleGameSources(w http.ResponseWriter, r *http.Request) {
 // handleGameResource proxies a normalized resource from a bound source. The
 // body is the source's canonical payload, passed through untouched, with the
 // answering source named in a header.
+//
+// The authorization gate asks the federation service which sources could serve
+// this read, and requires the scope of EVERY one of them. The rule used to be
+// "the scope of the first source that declares the resource, in config order",
+// while the read is served by whichever source candidates() picks — so the gate
+// was wrong in both directions at once: it let a token holding source A's scope
+// read source B's data, and it refused a token holding the scope of the source
+// that actually served. A gate whose criterion is decided by a different function
+// than the read is not a gate.
+//
+// Requiring all of them is the fail-closed direction, and it is cheap in the case
+// that matters: two sources that declare the SAME scope for a resource produce one
+// requirement, so a deployment whose sources agree sees no change. Pinning
+// `?source=` narrows the list to that source, which is the honest way to ask for
+// one source's scope.
+//
+// The alternative — checking the scope of the source that ends up answering —
+// cannot be decided before the read, and deciding it after means fetching data the
+// caller may not be allowed to see.
 func (s *Server) handleGameResource(w http.ResponseWriter, r *http.Request, info oauth.TokenInfo) {
 	game := r.PathValue("game")
 	resource := r.PathValue("resource")
+	pinned := r.URL.Query().Get("source")
 
-	scope, ok := s.federate.ResourceScope(game, resource)
-	if !ok {
-		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown game or resource")
+	requirements, err := s.federate.ResourceRequirements(game, resource, pinned)
+	if err != nil {
+		s.writeFederationError(w, r, err)
 		return
 	}
-	if !hasScopeString(info.Scopes, scope) {
-		s.insufficientScope(w, r, scope, "this token does not include '"+scope+"'")
-		return
+	for _, requirement := range requirements {
+		if !hasScopeString(info.Scopes, requirement.Scope) {
+			s.insufficientScope(w, r, requirement.Scope,
+				"this token does not include '"+requirement.Scope+"', which source '"+
+					requirement.Source+"' requires for this resource")
+			return
+		}
 	}
 
 	result, err := s.federate.Fetch(r.Context(), federation.FetchRequest{
 		User:     account.UserID(info.Subject),
 		Game:     game,
 		Resource: resource,
-		Source:   r.URL.Query().Get("source"),
+		Source:   pinned,
 	})
 	if err != nil {
 		s.writeFederationError(w, r, err)
