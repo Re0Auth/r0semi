@@ -46,7 +46,7 @@ func BenchmarkGrantsAtScale(b *testing.B) {
 
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				grants, err := store.Grants(ctx, "usr_me")
 				if err != nil {
 					b.Fatal(err)

@@ -23,7 +23,7 @@ func BenchmarkIntrospectHandler(b *testing.B) {
 	b.Run("serial", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			info, err := h.Introspect(ctx, access)
 			if err != nil || !info.Active {
 				b.Fatalf("introspect: err=%v active=%v", err, info.Active)

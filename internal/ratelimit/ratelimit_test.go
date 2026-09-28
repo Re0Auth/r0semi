@@ -168,8 +168,12 @@ func BenchmarkCheckAtCapacity(b *testing.B) {
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			// The body makes a distinct key per iteration, and b.Loop() does not
+			// hand out an iteration number, so it is counted here.
+			i := 0
+			for b.Loop() {
 				l.Check("new-" + strconv.Itoa(i))
+				i++
 			}
 		})
 	}
@@ -181,7 +185,7 @@ func BenchmarkCheckExistingKey(b *testing.B) {
 	l.Allow("hot")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		l.Check("hot")
 	}
 }

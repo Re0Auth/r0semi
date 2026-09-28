@@ -414,7 +414,7 @@ func BenchmarkSingleLargeWrite(b *testing.B) {
 	b.SetBytes(int64(len(body)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rec := serve(c, http.MethodGet, "/v1/thing", "zstd", "application/json", nil, body)
 		if rec.Code != http.StatusOK {
 			b.Fatalf("status = %d", rec.Code)

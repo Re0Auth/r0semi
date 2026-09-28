@@ -631,7 +631,7 @@ func BenchmarkProbeRawProxy4MiBGzip(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(body)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		w.reset(http.StatusOK)
 		env.handler.ServeHTTP(w, req)
 		if w.status != http.StatusOK {
@@ -651,7 +651,7 @@ func BenchmarkProbeDataPlaneResource(b *testing.B) {
 	w := newDiscardWriter()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		w.reset(http.StatusOK)
 		env.handler.ServeHTTP(w, req)
 		if w.status != http.StatusOK {
@@ -673,7 +673,7 @@ func BenchmarkProbeRawProxy4MiB(b *testing.B) {
 	w := newDiscardWriter()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		w.reset(http.StatusOK)
 		env.handler.ServeHTTP(w, req)
 		if w.status != http.StatusOK {
@@ -700,7 +700,7 @@ func BenchmarkProbeTokenExchange(b *testing.B) {
 	w := newDiscardWriter()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if at == len(codes) {
 			b.StopTimer()
 			codes = mint()
@@ -734,7 +734,7 @@ func BenchmarkProbeIntrospect(b *testing.B) {
 	w := newDiscardWriter()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		req := httptest.NewRequest(http.MethodPost, "/oauth/introspect", strings.NewReader(form))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Authorization", env.basic)

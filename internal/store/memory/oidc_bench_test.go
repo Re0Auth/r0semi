@@ -24,7 +24,7 @@ func BenchmarkIntrospect(b *testing.B) {
 		resp := new(oidc.IntrospectionResponse)
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			if err := store.SetIntrospectionFromToken(ctx, resp, accessID, "usr_1", ""); err != nil {
 				b.Fatal(err)
 			}
@@ -67,7 +67,10 @@ func BenchmarkTokenLifecycleWithJanitor(b *testing.B) {
 	peak := 0
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	// The body needs the iteration number — it sweeps every sweepEvery grants —
+	// and b.Loop() does not hand one out, so it is counted here.
+	i := 0
+	for b.Loop() {
 		accessID, _, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
 		if err != nil {
 			b.Fatal(err)
@@ -86,6 +89,7 @@ func BenchmarkTokenLifecycleWithJanitor(b *testing.B) {
 				b.Fatal("the janitor found nothing to remove after every record was aged past its deadline")
 			}
 		}
+		i++
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(peak), "peak_records")

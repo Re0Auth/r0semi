@@ -57,7 +57,7 @@ func benchmarkAuditAppend(b *testing.B, parallel bool) {
 
 	b.ResetTimer()
 	if !parallel {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			if err := logger.Record(ctx, event); err != nil {
 				b.Fatal(err)
 			}

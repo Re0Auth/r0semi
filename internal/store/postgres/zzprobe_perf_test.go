@@ -113,7 +113,7 @@ func BenchmarkPerfProbeVerifyRowCost(b *testing.B) {
 
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rowHash := chainHash(prev, row.canonical())
 		if !hmacEqual(logger.sign(rowHash), logger.sign(rowHash)) {
 			b.Fatal("signature mismatch")

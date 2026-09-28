@@ -171,7 +171,7 @@ func BenchmarkBusinessPlaneBearerMe(b *testing.B) {
 	req.Header.Set("Authorization", "Bearer "+env.token)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rec := httptest.NewRecorder()
 		env.handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -193,7 +193,7 @@ func BenchmarkProtocolIntrospect(b *testing.B) {
 	form := url.Values{"token": {env.token}}.Encode()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		req := httptest.NewRequest(http.MethodPost, "/oauth/introspect", strings.NewReader(form))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Authorization", env.basic)
@@ -213,7 +213,7 @@ func BenchmarkProtocolDiscovery(b *testing.B) {
 	env := newBenchEnv(b)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rec := httptest.NewRecorder()
 		env.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil))
 		if rec.Code != http.StatusOK {
