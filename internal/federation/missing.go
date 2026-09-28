@@ -24,13 +24,20 @@ type BindingRequirement struct {
 // the requested scopes can be served.
 //
 // A scope no configured source declares is ignored: it needs no data source
-// (account.id, for example). A scope already satisfiable by a connected,
-// non-retired source is also ignored, because the data plane will use that
-// binding. When a scope several sources declare has no binding, the preferred
-// source (active before degraded) is named; retired sources are never offered.
+// (account.id, for example). A scope that is already servable through a connected
+// source is also ignored, because the data plane will use that binding.
 //
-// One source can cover several scopes, so requirements are keyed by
-// (game, source) and carry the whole scope set.
+// "Servable" is the DATA PLANE's criterion, not the scope string: the read
+// selects a source by RESOURCE NAME (candidates), so a scope is satisfied when
+// any connected, non-retired source in the same game declares a resource of that
+// name — which need not be a source that declares the scope string itself.
+// docs/upstream-protocol.md fixes one scope per resource name, so the two
+// coincide in a canonical registry; keying on the scope alone made the consent
+// screen name a source the read does not need whenever they diverge.
+//
+// When a scope has no binding, the preferred source (active before degraded) is
+// named; retired sources are never offered. One source can cover several scopes,
+// so requirements are keyed by (game, source) and carry the whole scope set.
 func (s *service) MissingBindings(ctx context.Context, user account.UserID, scopes []string) ([]BindingRequirement, error) {
 	wanted := make(map[string]bool, len(scopes))
 	for _, scope := range scopes {
@@ -51,12 +58,31 @@ func (s *service) MissingBindings(ctx context.Context, user account.UserID, scop
 		connected[sourceKey(b.Game, b.Source)] = true
 	}
 
-	// Every source that declares a wanted scope, grouped by scope.
+	// Every source the data plane would try for a resource whose declared scope is
+	// wanted, grouped by scope — the same set candidates() builds, per resource.
 	byScope := make(map[string][]Source)
+	seen := make(map[string]map[string]bool)
 	for _, src := range s.registry.AllSources() {
 		for _, res := range src.Resources {
-			if res.Scope != "" && wanted[res.Scope] {
-				byScope[res.Scope] = append(byScope[res.Scope], src)
+			if res.Scope == "" || !wanted[res.Scope] {
+				continue
+			}
+			for _, cand := range s.registry.Sources(src.Game) {
+				if cand.Status == StatusRetired {
+					continue
+				}
+				if _, ok := cand.Resource(res.Name); !ok {
+					continue
+				}
+				key := sourceKey(cand.Game, cand.Name)
+				if seen[res.Scope] == nil {
+					seen[res.Scope] = make(map[string]bool)
+				}
+				if seen[res.Scope][key] {
+					continue
+				}
+				seen[res.Scope][key] = true
+				byScope[res.Scope] = append(byScope[res.Scope], cand)
 			}
 		}
 	}
@@ -81,11 +107,11 @@ func (s *service) MissingBindings(ctx context.Context, user account.UserID, scop
 	for _, scope := range scopeNames {
 		candidates := byScope[scope]
 
-		// Satisfied when any connected source that declares the scope is still
-		// servable, mirroring the data plane's "skip retired" rule.
+		// Satisfied when any connected source is a candidate for the resource,
+		// exactly as the data plane will pick one.
 		satisfied := false
 		for _, src := range candidates {
-			if src.Status != StatusRetired && connected[sourceKey(src.Game, src.Name)] {
+			if connected[sourceKey(src.Game, src.Name)] {
 				satisfied = true
 				break
 			}
@@ -94,12 +120,7 @@ func (s *service) MissingBindings(ctx context.Context, user account.UserID, scop
 			continue
 		}
 
-		usable := make([]Source, 0, len(candidates))
-		for _, src := range candidates {
-			if src.Status != StatusRetired {
-				usable = append(usable, src)
-			}
-		}
+		usable := candidates
 		if len(usable) == 0 {
 			continue
 		}

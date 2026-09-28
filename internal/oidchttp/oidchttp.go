@@ -97,6 +97,20 @@ type Config struct {
 	// records nothing; the *observability.Metrics methods are nil-safe, so a
 	// deployment that does not want them simply omits this.
 	Metrics *observability.Metrics
+	// Sessions answers "is this browser already signed in". It is what
+	// `prompt=none` needs (OIDC Core §3.1.2.1): a silent authorization must return
+	// `login_required` instead of sending an iframe to the login page. Nil means the
+	// wrapper cannot tell, so it refuses `prompt=none` rather than guessing — a
+	// silent request must never be answered as if it were interactive.
+	Sessions SessionLookup
+}
+
+// SessionLookup reports whether the current request carries a signed-in account.
+// It is implemented by internal/auth.Manager; the wrapper imports only this
+// interface so the protocol plane stays free of the session package.
+type SessionLookup interface {
+	// User returns the signed-in account id and whether there is one.
+	User(ctx context.Context) (string, bool)
 }
 
 // ConsentStore is what the consent screen needs beyond op.Storage: marking an
@@ -134,6 +148,8 @@ type Handler struct {
 	// metrics observes token issuance and token-endpoint failures. Optional; a nil
 	// *observability.Metrics records nothing.
 	metrics *observability.Metrics
+	// sessions answers "is this browser signed in", for prompt=none. Optional.
+	sessions SessionLookup
 	// discovery caches the rendered discovery documents. See serveDiscovery.
 	discovery discoveryCache
 }
@@ -220,6 +236,7 @@ func New(cfg Config) (*Handler, error) {
 		issuer:               strings.TrimRight(cfg.Issuer, "/"),
 		introspectionClients: allowedIntrospectors,
 		metrics:              cfg.Metrics,
+		sessions:             cfg.Sessions,
 	}, nil
 }
 
@@ -928,6 +945,39 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 		return true
 	}
+	// OIDC Core 1.0 §3.1.2.1: `prompt=none` asks for a silent authorization. If the
+	// browser has no live session the OP MUST NOT render a UI — it returns
+	// `login_required` to the client through the redirect. Without this the request
+	// fell through to the ordinary interactive path: a hidden-iframe RP got the
+	// login page inside the frame (and a 30-minute pending request nobody would
+	// answer). `none` MUST NOT be combined with any other prompt value.
+	if fields := strings.Fields(q.Get("prompt")); slices.Contains(fields, "none") {
+		if len(fields) > 1 {
+			// "prompt=none login" is contradictory; the spec calls it invalid_request.
+			params := map[string]string{
+				"error":             "invalid_request",
+				"error_description": "prompt=none must not be combined with other prompt values",
+				"state":             q.Get("state"),
+				"iss":               h.issuerFor(r),
+			}
+			http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+			return true
+		}
+		// A live session satisfies the silent request, so it proceeds to consent.
+		// Nil Sessions (or no session) means it cannot be satisfied without a UI:
+		// fail closed to login_required rather than answering a silent request as
+		// if it were interactive.
+		if !h.signedIn(r) {
+			params := map[string]string{
+				"error":             "login_required",
+				"error_description": "prompt=none requires an existing session",
+				"state":             q.Get("state"),
+				"iss":               h.issuerFor(r),
+			}
+			http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+			return true
+		}
+	}
 	// OAuth 2.1 requires PKCE on every authorization code request, confidential
 	// clients included. The engine only demands it of a public client, so the
 	// requirement is enforced here rather than left to the library. The failure is
@@ -1219,6 +1269,16 @@ func (h *Handler) issuerFor(r *http.Request) string {
 		return strings.TrimRight(h.provider.IssuerFromRequest(r), "/")
 	}
 	return ""
+}
+
+// signedIn reports whether the request carries a live session, for `prompt=none`.
+// Nil Sessions cannot answer, so this fails closed (false).
+func (h *Handler) signedIn(r *http.Request) bool {
+	if h.sessions == nil {
+		return false
+	}
+	_, ok := h.sessions.User(r.Context())
+	return ok
 }
 
 // withIssuer adds the RFC 9207 `iss` parameter to an absolute redirect. A

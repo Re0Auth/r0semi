@@ -341,6 +341,23 @@ func TestGracefulShutdownWindowsAgree(t *testing.T) {
 	}
 	drain, _ := strconv.Atoi(m[1])
 
+	// The endpoint-removal wait is the preStop step done in-process (scratch has no
+	// /bin/sleep): it runs BEFORE the drain, so it adds to the total shutdown time
+	// the pod needs before SIGKILL.
+	w := regexp.MustCompile(`endpointRemovalWait\s*=\s*(\d+)\s*\*\s*time\.Second`).FindStringSubmatch(main)
+	if w == nil {
+		t.Error("could not find endpointRemovalWait in cmd/re0auth/main.go: the rolling-update " +
+			"connection-refused window has no in-process wait (and scratch cannot run a preStop sleep)")
+	}
+	wait := 0
+	if w != nil {
+		wait, _ = strconv.Atoi(w[1])
+	}
+	if wait == 0 {
+		t.Error("endpointRemovalWait is zero: shutdown would stop accepting connections before the " +
+			"orchestrator removed the endpoint, routing new connections to a refusing socket")
+	}
+
 	var grace int
 	for _, doc := range yamlDocs(t, filepath.Join(root, "deploy", "k8s", "base", "deployment.yaml")) {
 		if doc["kind"] != "Deployment" {
@@ -354,12 +371,12 @@ func TestGracefulShutdownWindowsAgree(t *testing.T) {
 	if grace == 0 {
 		t.Fatal("the Deployment has no terminationGracePeriodSeconds: a 30s drain would be SIGKILLed")
 	}
-	// The margin is the point: kubelet sends SIGTERM, the process drains, and the
-	// pod also has to be removed from the Service endpoints and have its
-	// connections closed. Grace equal to the drain leaves no room for any of that.
-	if grace < drain+5 {
-		t.Errorf("terminationGracePeriodSeconds = %ds against a %ds drain: in-flight requests are killed "+
-			"mid-drain (want at least %ds)", grace, drain, drain+5)
+	// The margin is the point: kubelet sends SIGTERM, the process waits out the
+	// endpoint removal, then drains; the pod also has to have its connections
+	// closed. Grace must cover the wait AND the drain with room to spare.
+	if total := wait + drain; grace < total+5 {
+		t.Errorf("terminationGracePeriodSeconds = %ds against a %ds wait + %ds drain = %ds: in-flight "+
+			"requests are killed mid-drain (want at least %ds)", grace, wait, drain, total, total+5)
 	}
 
 	// The proxy in front must also outwait the drain, or a request the server
@@ -369,8 +386,8 @@ func TestGracefulShutdownWindowsAgree(t *testing.T) {
 	if pm == nil {
 		t.Error("the Ingress sets no proxy-read-timeout; nginx's default (60s) happens to cover the drain, " +
 			"but nothing states or checks it")
-	} else if v, _ := strconv.Atoi(pm[1]); v < drain {
-		t.Errorf("Ingress proxy-read-timeout = %ss is shorter than the %ds drain", pm[1], drain)
+	} else if v, _ := strconv.Atoi(pm[1]); v < wait+drain {
+		t.Errorf("Ingress proxy-read-timeout = %ss is shorter than the %ds wait + %ds drain", pm[1], wait, drain)
 	}
 }
 

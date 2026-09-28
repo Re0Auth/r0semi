@@ -126,6 +126,16 @@ const (
 	// It bounds the drain so a stuck handler cannot hold a deploy open forever.
 	shutdownTimeout = 30 * time.Second
 
+	// endpointRemovalWait is how long shutdown waits, after flipping /readyz to
+	// 503, before it stops accepting connections. Kubernetes sends SIGTERM and
+	// removes the pod from Service endpoints concurrently, so without this wait a
+	// new connection can be routed here after the listener has closed — the
+	// connection-refused window of a rolling update. It runs inside the process
+	// because the scratch image has no /bin/sleep for a preStop hook. It is only
+	// as long as one endpoint-slice propagation needs, and is well inside
+	// terminationGracePeriodSeconds alongside the drain.
+	endpointRemovalWait = 5 * time.Second
+
 	// dataPlaneTimeout is how long ONE data-plane request may take, end to end,
 	// across every outbound call it makes in series — each candidate source, each
 	// token refresh, and the fetch again after a 401. It is passed to the federation
@@ -672,6 +682,10 @@ func run() error {
 		return die("listen", err)
 	}
 	endpoints := []endpoint{{server: newServer(api.Handler()), listener: listener}}
+	// Flip /readyz to 503 on shutdown, so the orchestrator removes this instance
+	// before the listener closes. api is the only endpoint with /readyz; the
+	// internal surface has none.
+	beginDrain := api.BeginDraining
 
 	// The operational surface — metrics and the runtime profiling endpoints — is
 	// a separate listener, off unless an address is configured. It is separate on
@@ -692,7 +706,7 @@ func run() error {
 	}
 
 	slog.Info("listening", "addr", listener.Addr().String(), "issuer", cfg.Issuer, "version", version)
-	if err := serveUntilSignal(ctx, shutdownTimeout, endpoints...); err != nil {
+	if err := serveUntilSignal(ctx, shutdownTimeout, endpointRemovalWait, beginDrain, endpoints...); err != nil {
 		// Returned rather than logged and exited here. main owns the wording (this is
 		// not a start failure), and — the reason this is a return at all — returning
 		// is what lets this function's defers run: the loop join and the pool close.
@@ -760,9 +774,17 @@ func newServer(h http.Handler) *http.Server {
 // are given the chance to finish; the listeners stop accepting new ones first, so
 // a load balancer sees the instance go away cleanly.
 //
+// beginDrain, when set, is called first on shutdown: it flips /readyz to 503 so
+// the orchestrator removes this instance from rotation. endpointRemovalWait then
+// gives that removal time to reach the proxies before the listener closes —
+// without it, the window between SIGTERM and endpoint removal routes new
+// connections to a socket that is already refusing them (a connection-refused
+// 502/503 on every rolling update). It is skipped in the ordinary in-test case by
+// passing zero.
+//
 // It returns nil for a shutdown it performed itself, and the underlying error
 // only when serving failed for some other reason.
-func serveUntilSignal(ctx context.Context, timeout time.Duration, endpoints ...endpoint) error {
+func serveUntilSignal(ctx context.Context, timeout, endpointRemovalWait time.Duration, beginDrain func(), endpoints ...endpoint) error {
 	serveErr := make(chan error, len(endpoints))
 	for _, ep := range endpoints {
 		go func(ep endpoint) { serveErr <- ep.server.Serve(ep.listener) }(ep)
@@ -777,6 +799,20 @@ func serveUntilSignal(ctx context.Context, timeout time.Duration, endpoints ...e
 		return err
 	case <-ctx.Done():
 		slog.Info("shutdown signal received; draining in-flight requests", "timeout", timeout)
+		// Stop being ready first, then wait out the orchestrator's endpoint
+		// removal, then drain. See the doc comment.
+		if beginDrain != nil {
+			beginDrain()
+		}
+		if endpointRemovalWait > 0 {
+			// No /bin/sleep in the scratch image, so the wait is here, in the
+			// process, rather than a preStop hook. It is short: it only needs to
+			// outlast one endpoint-slice propagation, not the whole drain. Not
+			// selectable against ctx — ctx is already cancelled, that is why we are
+			// here — and a second signal kills the process via the restored default
+			// handler rather than being observed here.
+			time.Sleep(endpointRemovalWait)
+		}
 		// The drain gets its own deadline and is deliberately NOT derived from ctx:
 		// ctx is already done — that is why we are here — so a context cancelled at
 		// birth would make every Shutdown below return without draining a single
@@ -1302,11 +1338,24 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 		Consent:          oidcStore,
 		RetiredTokenKeys: retiredTokens,
 		Metrics:          metrics,
+		// prompt=none must know whether the browser is signed in, or it cannot
+		// answer login_required instead of rendering the login page in an iframe.
+		Sessions: sessionLookupAdapter{sessions},
 	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	return handler, oidcStore, janitor, nil
+}
+
+// sessionLookupAdapter adapts auth.Manager.User to oidchttp.SessionLookup: the
+// protocol plane takes `string`, and the session manager returns account.UserID.
+// The id is never used, only the "is there one" bit, so the conversion is safe.
+type sessionLookupAdapter struct{ m *auth.Manager }
+
+func (a sessionLookupAdapter) User(ctx context.Context) (string, bool) {
+	u, ok := a.m.User(ctx)
+	return string(u), ok
 }
 
 // oidcTokenKey reads the 32-byte bearer-token encryption key.

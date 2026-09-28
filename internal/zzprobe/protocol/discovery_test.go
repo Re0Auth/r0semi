@@ -74,18 +74,16 @@ func TestProbeFormPostIsRefusedSoEveryResponseCarriesIss(t *testing.T) {
 	}
 }
 
-// PROBE 16 — `prompt=none` is not implemented anywhere.
+// PROBE 16 (FIXED) — `prompt=none` now returns `login_required` when there is no
+// session, instead of sending an interactive client to the login page.
 //
-// OIDC Core 1.0 §3.1.2.1: when `prompt=none` is sent and the End-User is not
-// already authenticated, the OP MUST return `error=login_required` to the client.
-// Nothing in this repository mentions `prompt` at all
-// (`grep -r 'prompt' internal/` finds only the library's own prompt handling, which
-// merely maps `prompt=login` to max_age=0 — pkg/op/auth_request.go
-// ValidateAuthReqPrompt), so the request is treated as an ordinary interactive one
-// and the browser is sent to the login page. A client doing silent
-// authentication with a hidden iframe therefore renders the OP's login page inside
-// the frame and never receives an error.
-func TestProbePromptNoneIsIgnored(t *testing.T) {
+// Was: nothing in the repository read `prompt`, so a silent authorization request
+// was treated as an ordinary interactive one and the browser was redirected to
+// /login?… — a hidden-iframe RP rendered the OP's login page inside the frame and
+// never received an error (and left a 30-minute pending request behind). OIDC Core
+// 1.0 §3.1.2.1 requires `error=login_required` to the client when the End-User is
+// not already authenticated.
+func TestProbePromptNoneReturnsLoginRequired(t *testing.T) {
 	e := newEnv(t, envOptions{issuer: "https://issuer.probe"})
 
 	withPrompt := authValues(e, "https://client.example/cb", []string{"account.id"})
@@ -95,20 +93,56 @@ func TestProbePromptNoneIsIgnored(t *testing.T) {
 	loc := resp.Header.Get("Location")
 	t.Logf("prompt=none answered %d %q", resp.StatusCode, loc)
 
-	if resp.StatusCode == http.StatusFound && strings.HasPrefix(loc, "/login?") {
-		t.Errorf("prompt=none redirected the browser to the interactive login page instead of error=login_required: %q", loc)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("prompt=none = %d, want a 302 back to the client", resp.StatusCode)
 	}
-	if strings.Contains(loc, "login_required") {
-		t.Skipf("prompt=none is now answered with login_required: %q", loc)
+	redirect, err := parseLocation(t, resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redirect.Host != "client.example" {
+		t.Fatalf("prompt=none redirected to %q, want the registered client", redirect.Host)
+	}
+	if got := redirect.Query().Get("error"); got != "login_required" {
+		t.Errorf("prompt=none error = %q, want login_required (no session)", got)
+	}
+	if redirect.Query().Get("iss") == "" {
+		t.Error("the prompt=none refusal carries no `iss`; ADR-0005 §6 says failures carry it too")
+	}
+	if strings.HasPrefix(loc, "/login?") {
+		t.Errorf("prompt=none reached the interactive login plane: %q", loc)
 	}
 
-	// The control: the same request without prompt reaches the login plane, so the
-	// finding is that `prompt` changed nothing.
+	// Control: the same request without prompt still reaches the login plane, so
+	// the refusal above is about `prompt`, not a broken authorize.
 	resp = e.get(t, noRedirect, e.server.URL+"/oauth/authorize?"+
 		authValues(e, "https://client.example/cb", []string{"account.id"}).Encode())
 	if resp.StatusCode != http.StatusFound || !strings.HasPrefix(resp.Header.Get("Location"), "/login?") {
 		t.Fatalf("control failed: a plain authorize no longer reaches the login plane: %d %q",
 			resp.StatusCode, resp.Header.Get("Location"))
+	}
+}
+
+// The other half: with a live session, `prompt=none` is satisfied and proceeds to
+// consent rather than returning an error.
+func TestProbePromptNoneWithASessionProceeds(t *testing.T) {
+	signedIn := "usr_probe"
+	e := newEnv(t, envOptions{issuer: "https://issuer.probe", sessionUser: &signedIn})
+
+	withPrompt := authValues(e, "https://client.example/cb", []string{"account.id"})
+	withPrompt.Set("prompt", "none")
+	resp := e.get(t, noRedirect, e.server.URL+"/oauth/authorize?"+withPrompt.Encode())
+	loc := resp.Header.Get("Location")
+	t.Logf("prompt=none with a session answered %d %q", resp.StatusCode, loc)
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("prompt=none with a session = %d, want a 302 to consent", resp.StatusCode)
+	}
+	if strings.Contains(loc, "error=login_required") {
+		t.Errorf("prompt=none returned login_required despite a live session: %q", loc)
+	}
+	if !strings.Contains(loc, "authRequestID=") {
+		t.Errorf("prompt=none with a session did not start the consent flow: %q", loc)
 	}
 }
 

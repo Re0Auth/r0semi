@@ -18,8 +18,11 @@ spec:
       labels: { app.kubernetes.io/name: re0auth }
     spec:
       serviceAccountName: re0auth
-      # Longer than the server's own 30s drain, so the pod outlives the requests
-      # it is finishing instead of being killed mid-shutdown.
+      # Longer than the server's own shutdown: it flips /readyz to 503 and waits
+      # out the endpoint removal (5s), then drains in-flight requests (30s) — 35s
+      # total. 45s means the pod outlives the requests it is finishing instead of
+      # being killed mid-shutdown. The endpoint-removal wait is in the process, not
+      # a preStop hook: the scratch image has no /bin/sleep to run one with.
       terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true

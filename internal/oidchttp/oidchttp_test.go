@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/zitadel/oidc/v3/pkg/oidc"
@@ -44,6 +45,27 @@ type fixture struct {
 	// named its absence as the reason the device-flow client-identity hypothesis
 	// could not be reproduced; round 4 needed exactly this shape.
 	narrowID string
+	// sessions backs prompt=none's "is the browser signed in" question. Flipping
+	// its user changes the answer without rebuilding the handler.
+	sessions *stubSessions
+}
+
+// stubSessions is a SessionLookup a test can change: user == "" means no session.
+type stubSessions struct {
+	mu   sync.Mutex
+	user string
+}
+
+func (s *stubSessions) User(context.Context) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.user, s.user != ""
+}
+
+func (s *stubSessions) set(user string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.user = user
 }
 
 func newFixture(t testing.TB) fixture {
@@ -103,6 +125,7 @@ func newFixture(t testing.TB) fixture {
 		scopes = append(scopes, d.Scope.String())
 	}
 
+	sessions := &stubSessions{}
 	handler, err := New(Config{
 		Storage:       store,
 		CryptoKey:     cryptoKey,
@@ -112,13 +135,14 @@ func newFixture(t testing.TB) fixture {
 		Clients:       clients,
 		Registry:      oauth.DefaultRegistry(),
 		Consent:       store,
+		Sessions:      sessions,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID, narrowID: narrowID}
+	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID, narrowID: narrowID, sessions: sessions}
 }
 
 func get(t testing.TB, client *http.Client, u string) *http.Response {
@@ -206,6 +230,79 @@ func codeFlow(t testing.TB, f fixture, scopes []string) map[string]any {
 		t.Fatalf("token status = %d: %v", status, tokens)
 	}
 	return tokens
+}
+
+// OIDC Core 1.0 §3.1.2.1: prompt=none is a silent request. Without a session it
+// must answer login_required through the registered redirect — never render the
+// login page (a hidden-iframe RP would get the UI inside the frame and no error).
+// With a session it proceeds to consent.
+func TestPromptNoneRequiresASession(t *testing.T) {
+	f := newFixture(t)
+	base := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {f.webID},
+		"redirect_uri":          {"https://client.example/cb"},
+		"scope":                 {"account.id"},
+		"state":                 {"st"},
+		"code_challenge":        {strings.Repeat("a", 43)},
+		"code_challenge_method": {"S256"},
+		"prompt":                {"none"},
+	}
+
+	// No session: login_required, back to the client, carrying `iss`.
+	resp := get(t, noRedirect, f.server.URL+"/oauth/authorize?"+base.Encode())
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("prompt=none = %d, want a 302", resp.StatusCode)
+	}
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc.Host != "client.example" {
+		t.Fatalf("prompt=none redirected to %q, want the client", loc.Host)
+	}
+	if got := loc.Query().Get("error"); got != "login_required" {
+		t.Fatalf("prompt=none error = %q, want login_required", got)
+	}
+	if loc.Query().Get("iss") == "" {
+		t.Error("the prompt=none refusal carries no iss")
+	}
+
+	// `none` combined with another value is contradictory: invalid_request.
+	combined := url.Values{}
+	for k, v := range base {
+		combined[k] = v
+	}
+	combined.Set("prompt", "none login")
+	resp = get(t, noRedirect, f.server.URL+"/oauth/authorize?"+combined.Encode())
+	loc, _ = url.Parse(resp.Header.Get("Location"))
+	if got := loc.Query().Get("error"); got != "invalid_request" {
+		t.Errorf("prompt=none+login error = %q, want invalid_request", got)
+	}
+
+	// With a session it proceeds to consent rather than erroring.
+	f.sessions.set("usr_1")
+	resp = get(t, noRedirect, f.server.URL+"/oauth/authorize?"+base.Encode())
+	next := resp.Header.Get("Location")
+	if strings.Contains(next, "error=") {
+		t.Fatalf("prompt=none with a session returned an error: %q", next)
+	}
+	if !strings.Contains(next, "authRequestID=") {
+		t.Fatalf("prompt=none with a session did not start consent: %q", next)
+	}
+
+	// Control: without prompt, an unauthenticated request still reaches the login
+	// plane, so the refusals above are about `prompt`.
+	plain := url.Values{}
+	for k, v := range base {
+		plain[k] = v
+	}
+	plain.Del("prompt")
+	f.sessions.set("")
+	resp = get(t, noRedirect, f.server.URL+"/oauth/authorize?"+plain.Encode())
+	if !strings.HasPrefix(resp.Header.Get("Location"), "/login?") {
+		t.Fatalf("control: a plain authorize did not reach the login plane: %q", resp.Header.Get("Location"))
+	}
 }
 
 // O-1: OIDC discovery is served, and the RFC 8414 alias is byte-identical.

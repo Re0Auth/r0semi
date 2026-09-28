@@ -67,6 +67,29 @@ func TestReadyzWithoutProbeIsReady(t *testing.T) {
 	}
 }
 
+// A draining instance is not ready, even when its dependencies are healthy: the
+// orchestrator must remove it from rotation before the listener closes. This is
+// what closes the connection-refused window a rolling update otherwise has.
+func TestReadyzIsNotReadyWhileDraining(t *testing.T) {
+	srv := healthServer(t, func(context.Context) error { return nil }, nil)
+	handler := srv.Handler()
+
+	// Control: healthy and not draining.
+	if rec := probe(t, handler, "/readyz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("/readyz = %d before draining, want 200", rec.Code)
+	}
+
+	srv.BeginDraining()
+	rec := probe(t, handler, "/readyz", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz = %d while draining, want 503", rec.Code)
+	}
+	// Liveness is untouched: the process is fine, it is just leaving.
+	if rec := probe(t, handler, "/healthz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("/healthz = %d while draining, want 200 (liveness must not fail on shutdown)", rec.Code)
+	}
+}
+
 // Readiness tracks the probe: 200 when the dependency answers, 503 when it does
 // not, so an orchestrator stops routing to an instance that cannot serve.
 //

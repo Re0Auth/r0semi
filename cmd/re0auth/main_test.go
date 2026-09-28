@@ -438,7 +438,7 @@ func TestServeUntilSignalDrainsInFlightRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveUntilSignal(ctx, 5*time.Second, endpoint{server: srv, listener: ln}) }()
+	go func() { errCh <- serveUntilSignal(ctx, 5*time.Second, 0, nil, endpoint{server: srv, listener: ln}) }()
 
 	respCh := make(chan *http.Response, 1)
 	reqErrCh := make(chan error, 1)
@@ -473,6 +473,76 @@ func TestServeUntilSignalDrainsInFlightRequest(t *testing.T) {
 	}
 }
 
+// On shutdown the process must stop being ready BEFORE it stops accepting
+// connections, and wait out the orchestrator's endpoint removal, so a rolling
+// update does not route a new connection to a socket that is already refusing
+// (the connection-refused window the deployment had no preStop to close).
+func TestServeUntilSignalDrainsOnlyAfterBecomingUnready(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})}
+
+	var mu sync.Mutex
+	unreadyAt := time.Time{}
+	refusedAt := time.Time{}
+	drained := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- serveUntilSignal(ctx, 5*time.Second, 200*time.Millisecond, func() {
+			mu.Lock()
+			unreadyAt = time.Now()
+			mu.Unlock()
+		}, endpoint{server: srv, listener: ln})
+		close(drained)
+	}()
+
+	// Wait until it is serving, then signal shutdown and poll for the moment the
+	// listener stops accepting.
+	resp, err := http.Get("http://" + ln.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("initial GET: %v", err)
+	}
+	_ = resp.Body.Close()
+	cancel()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err != nil {
+			mu.Lock()
+			refusedAt = time.Now()
+			mu.Unlock()
+			break
+		}
+		_ = resp.Body.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("the listener never stopped accepting")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	<-drained
+	if err := <-errCh; err != nil {
+		t.Fatalf("serveUntilSignal = %v, want nil", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !refusedAt.After(unreadyAt) {
+		t.Fatalf("the listener stopped accepting at %v, not after it became unready at %v",
+			refusedAt, unreadyAt)
+	}
+	if waited := refusedAt.Sub(unreadyAt); waited < 100*time.Millisecond {
+		t.Fatalf("the listener stopped accepting only %v after becoming unready; the endpoint-removal wait did not run", waited)
+	}
+}
+
 // A handler that will not finish must not hold a deploy open forever: once the
 // drain timeout passes, the connections are closed and the error is reported so
 // the caller can decide what to do about it.
@@ -493,7 +563,9 @@ func TestServeUntilSignalClosesHungConnectionsAfterTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveUntilSignal(ctx, 50*time.Millisecond, endpoint{server: srv, listener: ln}) }()
+	go func() {
+		errCh <- serveUntilSignal(ctx, 50*time.Millisecond, 0, nil, endpoint{server: srv, listener: ln})
+	}()
 
 	go func() { _, _ = http.Get("http://" + ln.Addr().String() + "/") }()
 	<-started
@@ -834,7 +906,7 @@ func TestServeUntilSignalDrainsEveryEndpoint(t *testing.T) {
 	}
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- serveUntilSignal(ctx, 5*time.Second, endpoints...) }()
+	go func() { errCh <- serveUntilSignal(ctx, 5*time.Second, 0, nil, endpoints...) }()
 
 	// Both are serving before the signal.
 	for _, addr := range addrs {

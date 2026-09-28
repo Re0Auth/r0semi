@@ -49,6 +49,19 @@
   此前不查 `endpointMethods`，因此任意动词都回 `200` 与完整文档。现在与其它协议端点一致：只收
   `GET`/`HEAD`，其余动词回 `405` 的 OAuth 错误体。
 
+- **关停顺序：先翻 `/readyz` 503，等窗口，再排空（滚动更新不再有 connection-refused 窗口）**：
+  此前收到 SIGTERM 立即 `Shutdown`（先关监听器），而 K8s 摘 Endpoint 与发信号是并发的，于是每次滚动
+  更新都有一小段把新连接路由到已关监听器的窗口（502/503，消耗 S1 可用性预算）。现在进程先让
+  `/readyz` 返 503，等 **`endpointRemovalWait`（5s，进程内，因为 scratch 没有 `/bin/sleep` 跑
+  `preStop`）** 让编排摘完端点，再走 **`shutdownTimeout`（30s）** 的排空。部署方需要确保
+  `terminationGracePeriodSeconds ≥ 35s`（出厂基线 45s）。
+
+- **协议面 `prompt=none` 实现（OIDC Core §3.1.2.1）**：此前不读 `prompt`，静默授权请求被当作普通
+  交互请求，把 iframe 客户端送到登录页并留下一条 30 分钟的孤儿 pending 请求。现在无活会话时经
+  `redirect_uri` 返回 `error=login_required`（带 `iss`），`prompt=none` 与其它值组合返回
+  `invalid_request`。实现方式（记入 [oidc-decision.md](docs/oidc-decision.md) O-8a）：给
+  `oidchttp.Config` 注入会话查询钩子；未注入即 fail-closed。
+
 - **业务面的失败响应补齐 `Cache-Control: no-store`**：此前该指令只在 `/v1` 子 mux 的包装器与确认
   `200` 的写路径上；限流 `429`、体限 `413`、在途上限 `503` 由子 mux 之外的中件写出，从未带上它。
   现在由 `writeProblem` 自身设置，与协议面一致，也覆盖编码路径上的 `404`。

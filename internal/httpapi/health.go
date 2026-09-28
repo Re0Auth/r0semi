@@ -78,6 +78,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // docs/operations.md, and the reason probes are exempt from the limiter and the
 // in-flight cap in the first place.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	// A draining instance is not ready, whatever its dependencies say: readiness is
+	// "may new traffic come here", and during shutdown the answer is no. This is
+	// what lets the orchestrator remove the endpoint before the listener closes,
+	// so new connections are not routed to a socket that is about to stop
+	// accepting (the connection-refused window of a rolling update).
+	if s.draining.Load() {
+		writeProbe(w, http.StatusServiceUnavailable, "draining")
+		return
+	}
 	if s.ready == nil {
 		writeProbe(w, http.StatusOK, "ok")
 		return

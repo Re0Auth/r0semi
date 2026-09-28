@@ -41,6 +41,7 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 | O-6 | **refresh token 总是签发**。`offline_access` 是**兼容性空操作**：客户端带上它不报错、不要求、也不对外呈现（token `scope` / introspect / grants 都不含它）；仅内部用它触发 refresh token 的签发。是否将来收紧为“必须显式请求”留待后续。 |
 | O-7 | **scope 语义不变**：未知 / 未授权的 scope → `invalid_scope`，**不是静默丢弃**（库默认会静默丢弃，迁移必须补校验）。 |
 | O-8 | **设备码流（RFC 8628）保持**，由 OP 原生提供。 |
+| O-8a | **`prompt=none` 实现**（OIDC Core §3.1.2.1）：无活会话时经 `redirect_uri` 返回 `error=login_required`（带 `iss`），绝不渲染交互 UI；`prompt=none` 与其它值组合返回 `invalid_request`。实现方式是给 `oidchttp.Config` 注入会话查询钩子（`Sessions`）；未注入即无会话，fail-closed 到 `login_required`。这是对一条 MUST 的补齐，不是可选项。 |
 | O-9 | **明确不做**：`end_session`（RP-Initiated Logout）、`id_token_hint`、PAR（RFC 9126）、动态客户端注册（RFC 7591）、OIDC Session Management。不广告、不实现。 |
 
 ## 4. 引擎

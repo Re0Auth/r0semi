@@ -179,6 +179,17 @@ kubectl apply -k deploy/k8s/backup
   （容器必须绑 `0.0.0.0` 才可能被 Service 选中），安全性来自同目录的 NetworkPolicy：
   只有 `monitoring` 命名空间能到 9090。**在别的编排系统上，请自己提供那个网络控制**，
   或者直接绑 loopback。
+  - **前提（必须自己确认，仓库查不到）**：那条 NetworkPolicy **只有在 CNI 真的实现它时才生效**。
+    有些 CNI（老版 flannel 等）会让 `kubectl apply` 成功而策略被静默忽略，此时任何集群内 Pod 都能
+    读 9090（`/debug/pprof/heap` 含会话/在途凭据）。所以 `expose_internal = true` 的正当性押在
+    「CNI 实现了 NetworkPolicy」这一条上，请自行验收：
+    ```sh
+    # 从一个不在 monitoring 命名空间的 Pod 里，这一步必须失败（超时/拒绝）
+    kubectl -n default run probe --rm -it --image=curlimages/curl -- \
+      curl -m2 -fsS http://re0auth-internal.re0auth.svc:9090/metrics
+    ```
+    若它能成功返回指标，说明策略没有被执行：请换一个支持 NetworkPolicy 的 CNI，或把
+    `internal_addr` 绑回 loopback（用 sidecar / `kubectl port-forward` 抓取）。
 - `/metrics` 导出**黄金指标**（按平面的请求/错误/时延/在途）与**业务与安全信号**（登录结果、
   令牌签发与错误、撤销、上游读取与刷新、vault 操作、审计链校验、设备流、运维动作）。
   **SLO 与告警规则**见 [slo.md](./slo.md) 与 `deploy/prometheus/re0auth.rules.yml`，
@@ -260,6 +271,11 @@ curl -fsS -H "Cookie: ..." https://auth.example.com/v1/admin/audit/verify
 1. 读 [CHANGELOG.md](../CHANGELOG.md)、release notes 与 `docs/*-decision.md` 中受影响的 ADR；
 2. 在 staging 跑一次恢复演练到新版本；
 3. 滚动更新（PDB 保证至少一个可用副本），观察 `/readyz`、错误率与 429/503；
+   **关停顺序**：收到 SIGTERM 后，进程先把 `/readyz` 翻成 503，等 **`endpointRemovalWait`（5s）**
+   让编排系统把本实例摘出轮转，再开始 **`shutdownTimeout`（30s）** 的排空——所以
+   `terminationGracePeriodSeconds` 必须 ≥ 35s（出厂 45s）。这三处的量级由
+   `TestGracefulShutdownWindowsAgree` 交叉校验。等待放在**进程内**而非 `preStop`：scratch 镜像
+   没有 `/bin/sleep` 可跑。
 4. 数据库迁移在启动时执行，多实例由 advisory lock 串行化；迁移前先做一次备份。
    迁移的兼容性规则与回滚策略见 [migration-decision.md](./migration-decision.md)（ADR-0008）：
    同一版本只做加法，破坏性变更延后一版；**回滚 = 从备份恢复**，`re0auth -migrate-down`

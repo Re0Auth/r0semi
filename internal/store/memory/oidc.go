@@ -366,7 +366,12 @@ func (s *OIDCStore) CreateAuthRequest(_ context.Context, req *oidc.AuthRequest, 
 	s.authRequests[id] = a
 	s.authRequestExpiry[id] = s.now().Add(s.requestTTL)
 	s.requestBySubject.add(a.Subject, id)
-	return a, nil
+	// Hand back a copy, like AuthRequestByID/AuthRequestByCode: the stored record
+	// is mutated under s.mu by CompleteLogin/SetAuthTime, so returning the same
+	// pointer let a caller's write race those and change the store (the -race
+	// report in the audit). A copy-on-return keeps the write path as disciplined as
+	// the read path.
+	return cloneAuthRequest(a), nil
 }
 
 // AuthRequestByID implements op.Storage.
@@ -536,10 +541,21 @@ func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) 
 	if !ok || !s.now().Before(r.expiresAt) {
 		return nil, errors.New("memory: invalid refresh token")
 	}
-	return &oidcstore.RefreshRequest{
+	// Copy every slice and the *time.Time: Scopes was already copied, but AMR,
+	// Audience and AuthTime aliased the stored record, so a caller's write reached
+	// the store and kept applying on every later refresh (verified finding).
+	// Postgres is unaffected — it scans into fresh values.
+	out := &oidcstore.RefreshRequest{
 		IDHash: r.idHash, ClientID: r.clientID, Subject: r.subject,
-		Scopes: append([]string(nil), r.scopes...), AMR: r.amr, Audience: r.audience, AuthTime: r.authTime,
-	}, nil
+		Scopes: append([]string(nil), r.scopes...),
+		AMR:    append([]string(nil), r.amr...),
+	}
+	out.Audience = append([]string(nil), r.audience...)
+	if r.authTime != nil {
+		at := *r.authTime
+		out.AuthTime = &at
+	}
+	return out, nil
 }
 
 // TerminateSession implements op.Storage.

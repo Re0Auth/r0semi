@@ -112,52 +112,55 @@ func TestVerifyGateAndServingSourceAreIndependent(t *testing.T) {
 	}
 }
 
-// TestVerifyConsentPlaneNamesASourceTheReadDoesNotNeed is the crux the audit
-// never checked: what the consent screen tells the user, versus what the data
-// plane will actually do.
-func TestVerifyConsentPlaneNamesASourceTheReadDoesNotNeed(t *testing.T) {
+// TestVerifyConsentPlaneAndDataPlaneAgree (FIXED) is the crux the audit never
+// checked: what the consent screen tells the user, versus what the data plane
+// will actually do.
+//
+// Was: the consent plane keyed "satisfied" on the SCOPE ("a source declaring
+// phigros.profile.read is connected") while the data plane keys servability on
+// the RESOURCE NAME ("any connected source declaring resource `profile`"). With
+// two sources declaring `profile` under different scopes, the consent screen
+// prompted for a binding the read did not need, and stayed silent for the scope
+// the read would actually use.
+//
+// MissingBindings now uses candidates()' criterion, so the two agree: the read is
+// already servable through the connected source and the prompt reports nothing
+// missing.
+func TestVerifyConsentPlaneAndDataPlaneAgree(t *testing.T) {
 	rig := newTwoSourceRig(t, federation.StatusActive, federation.StatusActive,
 		"phigros.profile.read", "phigros.community.read", "b")
 	ctx := context.Background()
 
-	// What the consent screen asks for when the downstream requests source a's scope.
-	reqs, err := rig.svc.MissingBindings(ctx, "usr_1", []string{rig.scopeA})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("MissingBindings(for %q) = %+v", rig.scopeA, reqs)
-	for _, r := range reqs {
-		t.Logf("  consent screen says: connect %q (%s) to serve %v", r.Source, r.DisplayName, r.Scopes)
-	}
-	if len(reqs) == 0 || reqs[0].Source != "a" {
-		t.Fatalf("fixture: expected a binding prompt for source a, got %+v", reqs)
-	}
-
-	// What the read actually does, with source a NOT bound.
+	// What the read does, with source a NOT bound: served by b.
 	res, err := rig.svc.Fetch(ctx, federation.FetchRequest{User: "usr_1", Game: "phigros", Resource: "profile"})
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	t.Logf("the same read, with source a unbound, is served by %q: %s", res.Source, res.Data)
+	if res.Source != "b" {
+		t.Fatalf("fixture: expected source b to serve, got %q", res.Source)
+	}
+	t.Logf("the read is served by %q", res.Source)
 
-	// And for the community scope the data plane will actually use, the consent
-	// screen reports nothing missing at all.
-	reqs2, err := rig.svc.MissingBindings(ctx, "usr_1", []string{rig.scopeB})
-	if err != nil {
+	// Neither scope prompts: the resource the read needs is already servable via
+	// the connected source, so no binding is missing.
+	for _, scope := range []string{rig.scopeA, rig.scopeB} {
+		reqs, err := rig.svc.MissingBindings(ctx, "usr_1", []string{scope})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("MissingBindings(for %q) = %+v", scope, reqs)
+		if len(reqs) != 0 {
+			t.Errorf("the consent plane prompts for a binding the read does not need (scope %q): %+v", scope, reqs)
+		}
+	}
+
+	// Anti-vacuity: a user with no bindings must still be prompted — the resource
+	// is not servable, so the agreement above is not "MissingBindings always
+	// returns nothing".
+	if reqs, err := rig.svc.MissingBindings(ctx, "usr_unbound", []string{rig.scopeA}); err != nil {
 		t.Fatal(err)
-	}
-	t.Logf("MissingBindings(for %q) = %+v (the source that will serve it is already bound)", rig.scopeB, reqs2)
-	if len(reqs2) != 0 {
-		t.Errorf("fixture: %q should already be servable through the connected source", rig.scopeB)
-	}
-
-	// The two planes therefore disagree: the advisory plane's model is
-	// "a scope is servable when a source declaring THAT SCOPE is connected", the
-	// enforcement plane's model is "a resource is servable when any source
-	// declaring THAT RESOURCE NAME is connected".
-	if len(reqs) > 0 && len(reqs2) == 0 {
-		t.Logf("consent plane and data plane disagree: one prompts for a source the read does not need, " +
-			"the other serves from a source the prompt never names")
+	} else if len(reqs) == 0 {
+		t.Errorf("with no binding at all, the resource is unservable but the consent plane reports nothing missing")
 	}
 }
 

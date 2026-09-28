@@ -123,6 +123,18 @@ type envOptions struct {
 	// clock is filled with a test-controlled clock when now is set, so a probe can
 	// advance it.
 	clock *testClock
+	// sessionUser, when non-nil, wires a Sessions lookup that reports that account
+	// as signed in. nil leaves Sessions unwired (no session, ever) — which is the
+	// fail-closed shape prompt=none must handle.
+	sessionUser *string
+}
+
+// probeSessions is a SessionLookup with a fixed answer, so a probe controls
+// "is this browser signed in" without a real session store.
+type probeSessions struct{ user string }
+
+func (p probeSessions) User(context.Context) (string, bool) {
+	return p.user, p.user != ""
 }
 
 // testClock is a clock a probe can move, so an access token's expiry can be
@@ -212,6 +224,11 @@ func newEnv(t *testing.T, opts envOptions) env {
 		scopes = append(scopes, d.Scope.String())
 	}
 
+	var sessionLookup oidchttp.SessionLookup
+	if opts.sessionUser != nil {
+		sessionLookup = probeSessions{user: *opts.sessionUser}
+	}
+
 	handler, err := oidchttp.New(oidchttp.Config{
 		Issuer:               opts.issuer,
 		Storage:              store,
@@ -223,6 +240,7 @@ func newEnv(t *testing.T, opts envOptions) env {
 		Registry:             oauth.DefaultRegistry(),
 		Consent:              store,
 		IntrospectionClients: opts.introspectionClients,
+		Sessions:             sessionLookup,
 	})
 	if err != nil {
 		t.Fatal(err)

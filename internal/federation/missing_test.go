@@ -137,3 +137,39 @@ func TestMissingBindingsGroupsScopesBySource(t *testing.T) {
 		t.Fatalf("scopes = %v, want both", reqs[0].Scopes)
 	}
 }
+
+// "Satisfied" uses the data plane's resource-name criterion, not the scope
+// string. Two sources declare the same resource name under different scopes; the
+// account is bound to the one whose scope is NOT requested. The read is served by
+// the bound source, so nothing is missing — keying on the scope alone would
+// instead prompt for a binding the read does not need.
+func TestMissingBindingsSatisfiedByResourceNameNotScope(t *testing.T) {
+	reg, err := NewRegistry(
+		sourceWith("a-src", StatusActive, Resource{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: profileScope}),
+		sourceWith("b-src", StatusActive, Resource{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: scoreScope}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := bindAll(t, "upstream-token", "b-src")
+	svc := mustService(t, Config{Registry: reg, Doer: nopDoer{}, BaseURL: "https://re0auth.test"}, b)
+
+	// The requested scope belongs to a-src, which is NOT bound; but the read for
+	// resource `profile` is served by b-src, which is.
+	reqs, err := svc.MissingBindings(context.Background(), "usr_1", []string{profileScope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 0 {
+		t.Fatalf("requirements = %+v, want none: the read is servable through the bound source", reqs)
+	}
+
+	// Anti-vacuity: an unbound account is prompted.
+	reqs, err = svc.MissingBindings(context.Background(), "usr_2", []string{profileScope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) == 0 {
+		t.Fatal("an unbound account was not prompted, so the agreement above is vacuous")
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
@@ -236,7 +237,17 @@ type Server struct {
 	auditLog audit.Logger
 	// compressor negotiates and applies the response content coding.
 	compressor *compress.Compressor
+	// draining is set when shutdown has begun. /readyz answers 503 while it is set,
+	// so the orchestrator stops routing new requests here before the listener
+	// closes — closing the connection-refused window a rolling update otherwise
+	// has between SIGTERM and endpoint removal.
+	draining atomic.Bool
 }
+
+// BeginDraining marks the instance as shutting down: /readyz starts answering 503
+// so the orchestrator removes it from rotation while in-flight work finishes. It
+// is idempotent.
+func (s *Server) BeginDraining() { s.draining.Store(true) }
 
 // New validates cfg and returns a Server.
 func New(cfg Config) (*Server, error) {
