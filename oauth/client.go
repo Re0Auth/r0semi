@@ -157,12 +157,23 @@ func RestoreClientWithStatus(id, name string, typ ClientType, status ClientStatu
 
 // AllowsRedirect reports whether uri is an exact registered redirect URI.
 func (c Client) AllowsRedirect(uri string) bool {
+	return c.RegisteredRedirect(uri) != ""
+}
+
+// RegisteredRedirect returns the registered redirect URI that equals uri, or ""
+// when the client has none. It is AllowsRedirect plus the value, for the callers
+// that then redirect: what a redirect target is built from must be the URI the
+// client registered, not the string the request carried. The two are equal — that
+// is what the check means — but only one of them is a value this server chose, and
+// a reader (or a taint analyser, gosecurity:S5146) cannot tell an echoed request
+// value from an attacker-chosen destination by looking at the variable alone.
+func (c Client) RegisteredRedirect(uri string) string {
 	for _, r := range c.RedirectURIs {
 		if r == uri {
-			return true
+			return r
 		}
 	}
-	return false
+	return ""
 }
 
 // forbiddenRedirectSchemes are schemes a redirect must never target. Each one

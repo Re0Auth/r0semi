@@ -949,3 +949,82 @@ func TestAdversarialRevokedGrantDoesNotRedeemAPendingCode(t *testing.T) {
 		t.Fatalf("status = %d, want 400 invalid_grant: %v", status, tokens)
 	}
 }
+
+// The authorize redirect must send the browser to the URI the CLIENT registered,
+// never to the string the request carried. validateAuthorize resolves the target
+// through Client.RegisteredRedirect — an exact match — so:
+//
+//   - an unregistered redirect_uri is a 400 with no Location at all (it may not
+//     steer the browser, not even somewhere harmless), and
+//   - a registered one reaches the redirect the finding names, which lands on the
+//     registered URI byte-for-byte.
+//
+// This pins gosecurity:S5146. The guard (AllowsRedirect) was already correct; what
+// it read as an open redirect was that the value the redirect was built from was
+// still the request's own string. Resolving it from the registry is the fix, and
+// the near-misses below are why an exact match is the property worth asserting.
+func TestAdversarialRedirectTargetComesFromTheRegistry(t *testing.T) {
+	f := newFixture(t)
+
+	authorize := func(redirectURI string, withPKCE bool) *http.Response {
+		t.Helper()
+		q := url.Values{
+			"response_type":         {"code"},
+			"client_id":             {f.webID},
+			"redirect_uri":          {redirectURI},
+			"scope":                 {"account.id"},
+			"state":                 {"st"},
+			"code_challenge_method": {"S256"},
+		}
+		if withPKCE {
+			q.Set("code_challenge", strings.Repeat("c", 43))
+		}
+		return get(t, noRedirect, f.server.URL+"/oauth/authorize?"+q.Encode())
+	}
+
+	// Not one of these is the client's registered https://client.example/cb. Each
+	// must be refused before any redirect exists, so there is nothing to follow.
+	for _, evil := range []string{
+		"https://evil.example/cb",                // an entirely different host
+		"https://client.example/cb.evil.example", // the registered host as a prefix
+		"https://client.example.evil.example/cb", // the registered host as a suffix
+		"https://client.example/cb?x=1",          // the registered URI plus a query
+		"http://client.example/cb",               // the right URI, the wrong scheme
+		"//evil.example/cb",                      // scheme-relative
+		"javascript:alert(1)",                    // a scheme that is never a target
+	} {
+		resp := authorize(evil, true)
+		body := adversaryBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("unregistered redirect_uri %q = %d, want 400: %s", evil, resp.StatusCode, body)
+		}
+		if loc := resp.Header.Get("Location"); loc != "" {
+			t.Fatalf("unregistered redirect_uri %q produced Location %q", evil, loc)
+		}
+		if !strings.Contains(string(body), "redirect_uri") {
+			t.Fatalf("refusal for %q does not name redirect_uri: %s", evil, body)
+		}
+	}
+
+	// The registered URI reaches the sink this finding points at. Missing PKCE is
+	// the shortest honest path there, and it MUST redirect — so the assertion is
+	// that it lands on the registered URI and carries the OAuth error, proving the
+	// value used was the registry's, not a request string the guard happened to
+	// wave through.
+	resp := authorize("https://client.example/cb", false)
+	body := adversaryBody(t, resp)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("authorize without PKCE = %d, want 302: %s", resp.StatusCode, body)
+	}
+	loc := resp.Header.Get("Location")
+	parsed, err := url.Parse(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Scheme != "https" || parsed.Host != "client.example" || parsed.Path != "/cb" {
+		t.Fatalf("redirect landed on %q, want the registered https://client.example/cb", loc)
+	}
+	if parsed.Query().Get("error") != "invalid_request" {
+		t.Fatalf("the PKCE refusal was not delivered through the redirect: %s", loc)
+	}
+}

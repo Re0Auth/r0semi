@@ -865,8 +865,15 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client", "unknown client")
 		return true
 	}
-	redirectURI := q.Get("redirect_uri")
-	if redirectURI == "" || !client.AllowsRedirect(redirectURI) {
+	// The redirect target is resolved FROM THE CLIENT: RegisteredRedirect is an
+	// exact match, so it returns the request's own string whenever it is a
+	// registered URI and "" otherwise. Taking the value the other way — echoing
+	// q.Get("redirect_uri") after AllowsRedirect said yes — is provably the same
+	// string, but it leaves the redirect target looking like request input, which
+	// is what gosecurity:S5146 read as an open redirect. A value the client
+	// registry chose is the one this server can defend.
+	redirectURI := client.RegisteredRedirect(q.Get("redirect_uri"))
+	if redirectURI == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "the redirect_uri is not registered for this client")
 		return true
 	}

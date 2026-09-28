@@ -85,3 +85,36 @@ func TestRestoreClientDoesNotRevalidateRedirectURIs(t *testing.T) {
 		t.Fatal("the restored client lost its redirect URI")
 	}
 }
+
+// RegisteredRedirect is the value half of AllowsRedirect, and the difference is
+// the point: a caller that redirects must send the URI the client registered, not
+// the string the request carried. The two are equal whenever the check passes, so
+// the property to pin is what a NEAR-miss resolves to — nothing, never the closest
+// entry — because an exact match is the only thing that may reach a Location.
+func TestRegisteredRedirectReturnsOnlyAnExactMatch(t *testing.T) {
+	c, err := NewClient("cli", "App", ClientPublic, "",
+		[]string{"https://app.example/cb", "https://app.example/other"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, uri := range []string{"https://app.example/cb", "https://app.example/other"} {
+		if got := c.RegisteredRedirect(uri); got != uri {
+			t.Fatalf("RegisteredRedirect(%q) = %q, want the registered URI", uri, got)
+		}
+	}
+
+	for _, near := range []string{
+		"https://app.example/cb/",           // a trailing slash
+		"https://APP.example/cb",            // different case
+		"https://app.example/cb?x=1",        // an appended query
+		"https://app.example/",              // a prefix of a registered URI
+		"https://app.example/cb/../../evil", // resolves elsewhere
+		"javascript:alert(1)",
+		"",
+	} {
+		if got := c.RegisteredRedirect(near); got != "" {
+			t.Errorf("RegisteredRedirect(%q) = %q, want \"\" — only an exact match may be used", near, got)
+		}
+	}
+}
