@@ -76,12 +76,16 @@ func TestCheckReportsTheBudgetAndTheWait(t *testing.T) {
 }
 
 // A caller that varies its key must not be able to grow the map without bound.
+//
+// The bound is kept by refusing to track more keys, not by dropping live ones: the
+// keys beyond the cap share their shard's overflow bucket, so they spend a shared
+// budget instead of a fresh one. See TestACapacitySprayCannotBuyQuota.
 func TestEvictionCapsTrackedKeys(t *testing.T) {
 	l := New(1, 1, WithMaxKeys(64), WithTTL(time.Minute))
 
 	for i := 0; i < 500; i++ {
 		l.Allow(string(rune('A' + i%26)))
-		if size := l.size(); size > 64 {
+		if size := l.Size(); size > 64 {
 			t.Fatalf("tracked %d keys, cap is 64", size)
 		}
 	}

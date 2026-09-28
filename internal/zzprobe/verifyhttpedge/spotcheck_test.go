@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Re0Auth/r0semi/internal/httpapi"
 )
 
 // TestV_SpotCheckForwardingHeaders is one of the verifier's spot-checks of the
@@ -14,8 +16,12 @@ import (
 // and nothing else). A false negative there would be the most expensive kind of
 // error, because it would mean a caller CAN choose its bucket through a header the
 // report says is ignored.
+//
+// The control now runs in the only shape where the header is read at all: the
+// deployment has declared `client_addr_header = "x-forwarded-for"`. The default
+// reads no header, and that is asserted alongside.
 func TestV_SpotCheckForwardingHeaders(t *testing.T) {
-	h := zzServer(t, "10.0.0.0/8").Handler()
+	h := zzServerMode(t, httpapi.ClientAddrXForwardedFor, "10.0.0.0/8").Handler()
 	const peer = "10.1.2.3:5555"
 
 	send := func(headers map[string]string) int {
@@ -29,13 +35,30 @@ func TestV_SpotCheckForwardingHeaders(t *testing.T) {
 		return rec.Code
 	}
 
-	// Control: with a trust list, X-Forwarded-For IS the bucket key, so a second
-	// request with a different value is admitted.
+	// Control: with a trust list AND a declared header, X-Forwarded-For IS the
+	// bucket key, so a second request with a different value is admitted.
 	if got := send(map[string]string{"X-Forwarded-For": "198.51.100.1"}); got == http.StatusTooManyRequests {
 		t.Fatalf("control: the first request was already refused (%d)", got)
 	}
 	if got := send(map[string]string{"X-Forwarded-For": "198.51.100.2"}); got == http.StatusTooManyRequests {
 		t.Errorf("control failed: X-Forwarded-For did not move the key (%d)", got)
+	}
+
+	// The same deployment WITHOUT the declaration: the header moves nothing.
+	plain := zzServer(t, "10.0.0.0/8").Handler()
+	plainSend := func(v string) int {
+		req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+		req.RemoteAddr = peer
+		req.Header.Set("X-Forwarded-For", v)
+		rec := httptest.NewRecorder()
+		plain.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if first := plainSend("198.51.100.1"); first == http.StatusTooManyRequests {
+		t.Fatalf("control: the first request was already refused (%d)", first)
+	}
+	if second := plainSend("198.51.100.2"); second != http.StatusTooManyRequests {
+		t.Errorf("an undeclared X-Forwarded-For moved the bucket key: second request answered %d, want 429", second)
 	}
 
 	// The claim under test: no other header moves it. Two requests, same peer,
@@ -57,7 +80,7 @@ func TestV_SpotCheckForwardingHeaders(t *testing.T) {
 			t.Errorf("%s moved the bucket key: second request answered %d, want 429", hdr, second)
 		}
 	}
-	t.Logf("only X-Forwarded-For moved the key; 9 other client-address headers did not")
+	t.Logf("only a DECLARED X-Forwarded-For moved the key; 9 other client-address headers did not")
 }
 
 // TestV_SpotCheckBodyLimitPerPlane is the spot-check of "probed but not broken"

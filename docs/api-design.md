@@ -150,11 +150,25 @@ GET /v1/games/phigros/scores?limit=50&cursor=<opaque>
 [operations-decision.md](./operations-decision.md)（ADR-0006）。并发的硬上限是另一个开关：
 `server.max_in_flight` / `RE0AUTH_MAX_IN_FLIGHT`，打满时按平面返回 503 + `Retry-After: 1`。
 
-**地址怎么算**（`server.trusted_proxies` / `RE0AUTH_TRUSTED_PROXIES`）：默认取**对端地址**，
-`X-Forwarded-For` 一律忽略——否则调用方自填一个头就能自选分桶，限流形同虚设。只有当对端落在
-配置的**可信代理**网络里时才读该头，并从**右往左**跳过可信代理，取第一个不可信的地址（最右侧那条是
-离我们最近的代理写下的，左侧是它被告知的）。头里出现无法解析的条目则整条链都不信、退回对端地址。
-列表为空是默认，也是没有反代时的正确答案；列表过宽等于把选择权又交回调用方。
+**地址怎么算**（两个开关，缺一不可）：默认取**对端地址**，`X-Forwarded-For` 一律忽略——
+否则调用方自填一个头就能自选分桶，限流形同虚设。
+
+- `server.trusted_proxies` / `RE0AUTH_TRUSTED_PROXIES` 说**谁有权替客户端说话**：列表为空是默认，
+  也是没有反代时的正确答案；列表过宽等于把选择权交回调用方。
+- `server.client_addr_header` / `RE0AUTH_CLIENT_ADDR_HEADER` 说**那个代理写的是哪个头**，默认
+  `none`（不读任何头）。置为 `x-forwarded-for` 是一个**断言**：你的最近一跳反代会
+  **覆盖**（`proxy_set_header X-Forwarded-For $remote_addr;`）或**追加**
+  （`$proxy_add_x_forwarded_for`）该头。**逐字转发调用方自带的 XFF 会让分桶键由调用方决定**，
+  而请求里没有任何东西能区分这两种代理——这正是默认不读头、且该值必须显式声明的原因。
+  配置了它却没有 `trusted_proxies` 会**拒绝启动**（那样它永远不生效，看起来却像生效了）。
+
+读到该头时只取**最右侧一条**：每条转发都会追加自己看到的地址，所以最右侧是我们最近一跳写下的，
+它左侧全部是该跳被告知的内容——也就是调用方自己写的文本。因此：
+
+- 最右侧那条落在 `trusted_proxies` 里（k8s SNAT、服务网格、内部 LB 都会这样），或无法解析 ⇒
+  **退回对端地址**。更粗但真实，绝不会是调用方写的值。
+- 「从右往左跳过可信代理，取第一个不可信地址」的旧做法已删除：它在上述两种常见形态下都会
+  返回一个**调用方写下的**地址，而「全是可信代理」那一支返回的是**最左**一条，按定义就是调用方写的。
 
 ### 2.8 可观测
 每个响应带 `X-Request-Id`；problem 回带 `request_id`。请求携带的 W3C `traceparent` 会被解析，

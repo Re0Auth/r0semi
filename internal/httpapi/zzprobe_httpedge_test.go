@@ -427,47 +427,91 @@ func zzSeedsFor(n int, plane, target string) []string {
 // configured 鈥?with no wait, since the refill interval here is 1000 seconds.
 //
 // The walk counts how many requests a single TCP peer is actually allowed before
-// the first refusal.
+// the first refusal, in each deployment shape.
+//
+// Shape matters, and the shapes are now explicit:
+//
+//   - A trust list alone no longer means "read the header" — the caller cannot
+//     choose a key even against a deployment that trusted its proxy.
+//   - A DECLARED header from a proxy that APPENDS (the shape the config asks for)
+//     puts the real client's address rightmost, so rotating the entries to its
+//     left changes nothing: the leftmost entries are the caller's own text.
+//   - The one shape that is still caller-chosen is a declared header in front of a
+//     proxy that forwards the caller's header VERBATIM. Nothing can detect that
+//     from a request, which is why the declaration exists and why the default does
+//     not read the header at all. It is logged, not asserted: it is the residual an
+//     operator creates by declaring something their proxy does not do.
 func TestZZProbeRateLimitKeySpaceIsUncapped(t *testing.T) {
-	limited, err := New(zzProbeConfig(t, func(c *Config) {
-		c.Limiter = ratelimit.New(zzNoRefill, 1)
-		c.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler := limited.Handler()
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
 
-	// Control first: one address, one bucket, one token.
-	if got := zzCallWithXFF(t, handler, "203.0.113.9"); got != http.StatusUnauthorized {
-		t.Fatalf("control: first request = %d, want 401", got)
-	}
-	if got := zzCallWithXFF(t, handler, "203.0.113.9"); got != http.StatusTooManyRequests {
-		t.Fatalf("control: second request from one address = %d, want 429; the limiter is not wired, so nothing below proves anything", got)
-	}
-
-	// Now rotate the address, one request each.
-	const budget = 20000
-	admitted, refused := 0, 0
-	for i := 0; i < budget; i++ {
-		xff := fmt.Sprintf("198.18.%d.%d", i/250, i%250+1)
-		switch got := zzCallWithXFF(t, handler, xff); got {
-		case http.StatusUnauthorized:
-			admitted++
-		case http.StatusTooManyRequests:
-			refused++
-		default:
-			t.Fatalf("unexpected status %d", got)
+	walk := func(t *testing.T, mode ClientAddrHeader, shape func(i int) string) (admitted, refused int) {
+		t.Helper()
+		limited, err := New(zzProbeConfig(t, func(c *Config) {
+			c.Limiter = ratelimit.New(zzNoRefill, 1)
+			c.TrustedProxies = trusted
+			c.ClientAddrHeader = mode
+		}))
+		if err != nil {
+			t.Fatal(err)
 		}
+		handler := limited.Handler()
+
+		// Control first: one address, one bucket, one token.
+		if got := zzCallWithXFF(t, handler, shape(0)); got != http.StatusUnauthorized {
+			t.Fatalf("control: first request = %d, want 401", got)
+		}
+		if got := zzCallWithXFF(t, handler, shape(0)); got != http.StatusTooManyRequests {
+			t.Fatalf("control: second request from one address = %d, want 429; the limiter is not wired, so nothing below proves anything", got)
+		}
+
+		const budget = 2000
+		for i := 0; i < budget; i++ {
+			switch got := zzCallWithXFF(t, handler, shape(i)); got {
+			case http.StatusUnauthorized:
+				admitted++
+			case http.StatusTooManyRequests:
+				refused++
+			default:
+				t.Fatalf("unexpected status %d", got)
+			}
+		}
+		return admitted, refused
 	}
-	t.Logf("one peer, %d distinct X-Forwarded-For values, rate=%.3f/s: admitted=%d refused=%d",
-		budget, zzNoRefill, admitted, refused)
-	// The configured policy is one request, then nothing for 1000 seconds. Even
-	// allowing for the key cap, thousands of admissions is not a rate limit.
-	if admitted > 1000 {
-		t.Errorf("a single client address obtained %d requests against a limiter configured for one per %v: the bucket key is caller-chosen, so the rate limit does not bound anything",
-			admitted, 1/zzNoRefill)
-	}
+
+	// The configured policy is one request, then nothing for 1000 seconds.
+	const tolerable = 1
+
+	t.Run("no declared header", func(t *testing.T) {
+		admitted, refused := walk(t, ClientAddrPeer, func(i int) string {
+			return fmt.Sprintf("198.18.%d.%d", i/250, i%250+1)
+		})
+		t.Logf("trust list, no declared header: admitted=%d refused=%d", admitted, refused)
+		if admitted > tolerable {
+			t.Errorf("a single client address obtained %d requests against a limiter configured for one per %v: "+
+				"the bucket key is caller-chosen", admitted, 1/zzNoRefill)
+		}
+	})
+
+	t.Run("declared header, appending proxy", func(t *testing.T) {
+		// The proxy appends what it saw, so the RIGHTMOST entry is the real client
+		// and everything the caller wrote sits to its left.
+		admitted, refused := walk(t, ClientAddrXForwardedFor, func(i int) string {
+			return fmt.Sprintf("198.18.%d.%d, 203.0.113.9", i/250, i%250+1)
+		})
+		t.Logf("declared header, appending proxy: admitted=%d refused=%d", admitted, refused)
+		if admitted > tolerable {
+			t.Errorf("rotating the entries to the LEFT of the one our proxy appended bought %d requests: "+
+				"the bucket key is still caller-chosen", admitted)
+		}
+	})
+
+	t.Run("declared header, verbatim proxy (residual)", func(t *testing.T) {
+		admitted, refused := walk(t, ClientAddrXForwardedFor, func(i int) string {
+			return fmt.Sprintf("198.18.%d.%d", i/250, i%250+1)
+		})
+		t.Logf("declared header, proxy that forwards the caller's header verbatim: admitted=%d refused=%d — "+
+			"this is the residual a wrong declaration creates, and why the default reads no header", admitted, refused)
+	})
 }
 
 func zzCallWithXFF(t *testing.T, h http.Handler, xff string) int {
@@ -482,23 +526,29 @@ func zzCallWithXFF(t *testing.T, h http.Handler, xff string) int {
 
 // TestZZProbeRateLimitSprayResetsAnHonestClientsBucket is the other half of the
 // same mechanism, and it is the half that does not need the attacker to profit
-// directly: filling a shard evicts *any* bucket the bounded eviction sample
-// yields, including one belonging to an unrelated client. That client's spent
-// budget is discarded and its next request starts from a full burst.
+// directly: filling a shard used to evict ANY bucket the bounded eviction sample
+// yielded, including one belonging to an unrelated client, whose spent budget was
+// then discarded and whose next request started from a full burst.
 //
-// It is measured over several independent trials, because the eviction scan takes a
-// bounded random sample and one round can miss. A probe that reported the outcome
-// of a single round would be reporting its own luck.
+// The guard is now that no live bucket is ever discarded: the arrival is served
+// from the shard's shared overflow bucket instead. It is measured over several
+// independent trials, because the reclaim scan takes a bounded random sample and
+// one round can miss — a probe that reported the outcome of a single round would be
+// reporting its own luck.
 func TestZZProbeRateLimitSprayResetsAnHonestClientsBucket(t *testing.T) {
 	const plane = "business"
 	const trials = 20
 	resets := 0
+	trusted := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
 	for trial := 0; trial < trials; trial++ {
 		victim := fmt.Sprintf("203.0.113.%d", 20+trial)
 
 		limited, err := New(zzProbeConfig(t, func(c *Config) {
 			c.Limiter = ratelimit.New(zzNoRefill, 1)
-			c.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+			c.TrustedProxies = trusted
+			// The spray needs keys of its own to fill a shard, so the header is
+			// declared; the victim's key must survive regardless.
+			c.ClientAddrHeader = ClientAddrXForwardedFor
 		}))
 		if err != nil {
 			t.Fatal(err)
@@ -529,78 +579,116 @@ func TestZZProbeRateLimitSprayResetsAnHonestClientsBucket(t *testing.T) {
 	}
 	t.Logf("%d/%d trials: another client's key spray discarded the victim's exhausted bucket and served it as if it had spent nothing",
 		resets, trials)
-	if resets == 0 {
-		t.Errorf("no reset observed in %d trials; the eviction path never reached an unrelated client's bucket", trials)
+	if resets != 0 {
+		t.Errorf("%d/%d trials refunded an unrelated client's spent budget: a key spray must not reset anybody's limit",
+			resets, trials)
 	}
 }
 
-// TestZZProbeRateLimitIsFailClosedUnderAKeySpray is the guard that does hold: with
-// no trust list 鈥?the default 鈥?the header is not consulted at all, so an
-// untrusted peer cannot buy a bucket by inventing an address.
+// TestZZProbeRateLimitIsFailClosedUnderAKeySpray is the guard that does hold, and
+// the shape the fix added: a hop inside the trust list — a node address after SNAT,
+// a service mesh, an internal load balancer — makes the header unusable, so the
+// peer is the key and varying the header buys nothing.
 func TestZZProbeRateLimitIsFailClosedUnderAKeySpray(t *testing.T) {
-	limited, err := New(zzProbeConfig(t, func(c *Config) {
-		c.Limiter = ratelimit.New(zzNoRefill, 1)
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler := limited.Handler()
-	codes := map[int]int{}
-	for i := 0; i < 50; i++ {
-		req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
-		req.RemoteAddr = "203.0.113.77:1234"
-		req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i))
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-		codes[rec.Code]++
-	}
-	t.Logf("untrusted peer varying X-Forwarded-For: %v", codes)
-	if codes[http.StatusUnauthorized] > 1 {
-		t.Errorf("an untrusted peer escaped its bucket by varying X-Forwarded-For: %d requests admitted", codes[http.StatusUnauthorized])
-	}
+	t.Run("no trust list", func(t *testing.T) {
+		limited, err := New(zzProbeConfig(t, func(c *Config) {
+			c.Limiter = ratelimit.New(zzNoRefill, 1)
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler := limited.Handler()
+		codes := map[int]int{}
+		for i := 0; i < 50; i++ {
+			req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+			req.RemoteAddr = "203.0.113.77:1234"
+			req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			codes[rec.Code]++
+		}
+		t.Logf("untrusted peer varying X-Forwarded-For: %v", codes)
+		if codes[http.StatusUnauthorized] > 1 {
+			t.Errorf("an untrusted peer escaped its bucket by varying X-Forwarded-For: %d requests admitted", codes[http.StatusUnauthorized])
+		}
+	})
+
+	t.Run("declared header, appended hop inside the trust list", func(t *testing.T) {
+		limited, err := New(zzProbeConfig(t, func(c *Config) {
+			c.Limiter = ratelimit.New(zzNoRefill, 1)
+			c.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+			c.ClientAddrHeader = ClientAddrXForwardedFor
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler := limited.Handler()
+		codes := map[int]int{}
+		for i := 0; i < 50; i++ {
+			// The proxy appended its own address, which is inside the trust list —
+			// the walk used to step past it to the caller's entry.
+			got := zzCallWithXFF(t, handler, fmt.Sprintf("198.51.100.%d, 10.9.9.9", i))
+			codes[got]++
+		}
+		t.Logf("appended hop inside the trust list: %v", codes)
+		if codes[http.StatusUnauthorized] > 1 {
+			t.Errorf("a caller bought %d buckets by rotating the entry to the left of our own proxy's: "+
+				"the bucket key is caller-chosen", codes[http.StatusUnauthorized])
+		}
+	})
 }
 
 // TestZZProbeClientAddrIgnoresOtherForwardingHeaders checks the headers RFC 7239
-// defines and the de-facto ones, which clientAddr does not read: only a spoofed
-// X-Forwarded-For should be ignored without a trust list, and with one it should
-// be the only header that counts.
+// defines and the de-facto ones, which clientAddr does not read. Only
+// X-Forwarded-For can ever move the attribution, and only when the deployment
+// declared it.
 func TestZZProbeClientAddrIgnoresOtherForwardingHeaders(t *testing.T) {
+	const peer = "203.0.113.7"
+	// 203.0.113.0/24 contains the peer, and 198.51.100.0/24 does not.
+	trusted := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}
+
 	type tc struct {
-		name    string
+		name string
+		// headers is what the request carries.
 		headers map[string]string
-		want    string
+		// wantTrusted is the attribution from a trusted peer with the header
+		// declared: only a readable, untrusted rightmost entry changes it.
+		wantTrusted string
 	}
 	cases := []tc{
-		{"X-Real-IP", map[string]string{"X-Real-IP": "198.51.100.9"}, "203.0.113.7"},
-		{"Forwarded", map[string]string{"Forwarded": "for=198.51.100.9"}, "203.0.113.7"},
-		{"X-Forwarded-Host", map[string]string{"X-Forwarded-Host": "evil.example"}, "203.0.113.7"},
-		{"X-Client-IP", map[string]string{"X-Client-IP": "198.51.100.9"}, "203.0.113.7"},
-		{"CF-Connecting-IP", map[string]string{"CF-Connecting-IP": "198.51.100.9"}, "203.0.113.7"},
-		{"XFF unknown", map[string]string{"X-Forwarded-For": "unknown"}, "203.0.113.7"},
-		{"XFF with port", map[string]string{"X-Forwarded-For": "198.51.100.9:4444"}, "203.0.113.7"},
-		{"XFF whitespace", map[string]string{"X-Forwarded-For": "  198.51.100.9  "}, "203.0.113.7"},
-		{"XFF ipv6", map[string]string{"X-Forwarded-For": "[2001:db8::1]"}, "203.0.113.7"},
+		{"X-Real-IP", map[string]string{"X-Real-IP": "198.51.100.9"}, peer},
+		{"Forwarded", map[string]string{"Forwarded": "for=198.51.100.9"}, peer},
+		{"X-Forwarded-Host", map[string]string{"X-Forwarded-Host": "evil.example"}, peer},
+		{"X-Client-IP", map[string]string{"X-Client-IP": "198.51.100.9"}, peer},
+		{"CF-Connecting-IP", map[string]string{"CF-Connecting-IP": "198.51.100.9"}, peer},
+		{"XFF unknown", map[string]string{"X-Forwarded-For": "unknown"}, peer},
+		{"XFF with port", map[string]string{"X-Forwarded-For": "198.51.100.9:4444"}, peer},
+		{"XFF whitespace", map[string]string{"X-Forwarded-For": "  198.51.100.9  "}, "198.51.100.9"},
+		{"XFF ipv6 bracketed", map[string]string{"X-Forwarded-For": "[2001:db8::1]"}, peer},
+		{"XFF trusted hop", map[string]string{"X-Forwarded-For": "198.51.100.9, 203.0.113.5"}, peer},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
-			req.RemoteAddr = "203.0.113.7:5555"
+			req.RemoteAddr = peer + ":5555"
 			for k, v := range c.headers {
 				req.Header.Set(k, v)
 			}
-			// Untrusted peer: only the peer address may be used.
-			if got := clientAddr(req, nil); got != c.want {
-				t.Errorf("untrusted: clientAddr = %q, want %q", got, c.want)
-			}
-			// Trusted peer, the same headers: still only X-Forwarded-For counts.
-			trusted := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}
-			got := clientAddr(req, trusted)
-			if _, isXFF := c.headers["X-Forwarded-For"]; !isXFF {
-				if got != "203.0.113.7" && got != c.want {
-					t.Errorf("trusted peer: clientAddr = %q; a non-XFF header changed the attribution", got)
+			// Untrusted peer: only the peer address may be used, in either mode.
+			for _, mode := range []ClientAddrHeader{ClientAddrPeer, ClientAddrXForwardedFor} {
+				if got := clientAddr(req, nil, mode); got != peer {
+					t.Errorf("untrusted peer, mode %v: clientAddr = %q, want %q", mode, got, peer)
 				}
 			}
-			t.Logf("%s: untrusted=%q trusted=%q", c.name, clientAddr(req, nil), got)
+			// A trusted peer with no declaration: still the peer.
+			if got := clientAddr(req, trusted, ClientAddrPeer); got != peer {
+				t.Errorf("trusted peer, no declared header: clientAddr = %q, want %q", got, peer)
+			}
+			// A trusted peer WITH the declaration: only X-Forwarded-For counts, and
+			// only when its rightmost entry is readable and not itself trusted.
+			if got := clientAddr(req, trusted, ClientAddrXForwardedFor); got != c.wantTrusted {
+				t.Errorf("trusted peer, declared header: clientAddr = %q, want %q", got, c.wantTrusted)
+			}
 		})
 	}
 }

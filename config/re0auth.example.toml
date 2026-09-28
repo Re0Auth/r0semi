@@ -72,14 +72,38 @@ max_upstream_buffer_bytes = 67108864
 # request to a client. **Leave this empty unless Re0Auth sits behind your own
 # reverse proxy.** Empty means the peer address is the client, and a fabricated
 # X-Forwarded-For is ignored — which is what stops a caller from choosing its own
-# rate-limit bucket. When set, the chain is walked from the right, past the
-# addresses listed here, to the first one that is not: those are your proxies.
-# Entries are CIDRs, or bare addresses (treated as a single host). A malformed
-# entry refuses startup rather than being skipped.
+# rate-limit bucket.
+#
+# This list says WHO may speak for a client. It does not say that the header is
+# worth reading — that is client_addr_header below, and neither switch is enough on
+# its own. Entries are CIDRs, or bare addresses (treated as a single host). A
+# malformed entry refuses startup rather than being skipped. Never list a network a
+# client can be inside: that hands the bucket key back to the caller.
 #
 #   trusted_proxies = ["10.0.0.0/8", "127.0.0.1/32"]
 # Environment override: RE0AUTH_TRUSTED_PROXIES="10.0.0.0/8,127.0.0.1/32"
 trusted_proxies = []
+
+# Which header the nearest reverse proxy WRITES with the client address. "none" —
+# the default — reads no header at all: the peer address is the client.
+#
+# Set "x-forwarded-for" ONLY when your nearest proxy OVERWRITES or APPENDS to that
+# header, i.e. its config contains one of
+#
+#   proxy_set_header X-Forwarded-For $remote_addr;          # overwrite
+#   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;  # append
+#
+# **A proxy that forwards the caller's own value verbatim (nginx does this by
+# default) makes the bucket key caller-chosen**: nothing in a request can tell the
+# two behaviours apart, so this setting is a statement about your deployment, not a
+# guess the server can make. Only the RIGHTMOST entry is read, and only from a peer
+# listed in trusted_proxies; a rightmost entry that is itself inside that list (a
+# node address after SNAT, a mesh, an internal LB) falls back to the peer address.
+#
+# It requires a non-empty trusted_proxies and is refused without one.
+#
+# Environment override: RE0AUTH_CLIENT_ADDR_HEADER="x-forwarded-for"
+client_addr_header = "none"
 
 # The operational surface: Prometheus metrics (/metrics) and the Go runtime's
 # profiling endpoints (/debug/pprof/). Empty — the default — serves neither.

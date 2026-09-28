@@ -32,7 +32,16 @@ data:
     # caps "in flight x body size", because every other endpoint holds hundreds of
     # bytes per request.
     max_upstream_buffer_bytes = 67108864 # 64 MiB: a quarter of the 512Mi limit
-    trusted_proxies  = ["10.0.0.0/8"]
+    # The ingress (see ingress.yaml) is the nearest proxy. Ingress-nginx appends
+    # the address it saw to X-Forwarded-For, and the guard in
+    # internal/zzprobe/deploy/artifacts_test.go keeps it from being told to trust an
+    # incoming X-Forwarded-For (`use-forwarded-headers` / `forwarded-for-header` are
+    # refused there) — so the rightmost entry is the real client and per-client
+    # buckets are correct. A proxy that forwards the caller's own header verbatim
+    # would make the bucket key caller-chosen; declaring the header is this
+    # deployment's assertion that its ingress does not.
+    client_addr_header = "x-forwarded-for"
+    trusted_proxies    = ["10.0.0.0/8"]
 
     [storage]
     driver  = "postgres"

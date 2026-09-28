@@ -418,14 +418,19 @@ func (s *Server) withInFlightLimit(next http.Handler) http.Handler {
 	})
 }
 
-// It delegates to clientAddr, which is the peer address unless the peer is a
-// configured trusted proxy — in which case the proxy's X-Forwarded-For is
-// believed as far as the first hop we do not trust. Without a trust list a
-// caller would pick its own bucket by choosing the header value; with one that
-// is too broad, the same. The list is the deployment's statement of which
-// addresses in front of it are its own.
+// It delegates to clientAddr, which is the peer address unless the deployment has
+// declared BOTH that the peer is one of its own reverse proxies and which header
+// that proxy writes. Only then is the header read, and only its rightmost entry.
+//
+// The trust list alone used to be enough, and that was wrong in a way no config
+// could express: a proxy that forwards the caller's own X-Forwarded-For verbatim
+// (nginx's default) makes every entry caller-written, and a chain whose appended
+// hop is itself inside the list (SNAT, a mesh) makes the walk step past the real
+// client. A caller who varies its own header then varies its bucket key, which is
+// the whole of the rate limit. Both facts are properties of the deployment, not of
+// the request, so the deployment states them: `server.client_addr_header`.
 func (s *Server) clientKey(r *http.Request) string {
-	return clientAddr(r, s.trustedProxies)
+	return clientAddr(r, s.trustedProxies, s.clientAddrHeader)
 }
 
 // clientKeyOf returns the client key withRequestContext derived for this request.

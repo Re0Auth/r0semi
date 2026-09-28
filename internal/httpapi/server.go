@@ -78,8 +78,14 @@ type Config struct {
 	// proxy and uses the peer address, which is the correct answer for a
 	// deployment with nothing in front of it. Set it only to the addresses of
 	// your own reverse proxies; a prefix that is too broad lets clients choose
-	// their own rate-limit bucket.
+	// their own rate-limit bucket. It is consulted only when ClientAddrHeader is
+	// set: a trust list alone is not a statement that the header is trustworthy.
 	TrustedProxies []netip.Prefix
+	// ClientAddrHeader names the header the deployment's nearest reverse proxy
+	// writes with the client address. The zero value (ClientAddrPeer) reads no
+	// header and uses the peer address. See ClientAddrHeader for what setting it
+	// asserts about the proxy; `server.client_addr_header` is the config key.
+	ClientAddrHeader ClientAddrHeader
 	// Secure declares that this issuer is reached over https. It gates the HSTS
 	// header only; it is the same deployment fact that makes the session cookie
 	// Secure, so a deployment sets both from one switch (`server.cookie_secure`).
@@ -197,8 +203,11 @@ type Server struct {
 	metrics      *observability.Metrics
 	frontend     fs.FS
 	// trustedProxies is the parsed form of Config.TrustedProxies, consulted by
-	// clientAddr when deriving the limiter key.
+	// clientAddr when deriving the limiter key — and only when clientAddrHeader
+	// says a header is to be read at all.
 	trustedProxies []netip.Prefix
+	// clientAddrHeader is Config.ClientAddrHeader: which header names the client.
+	clientAddrHeader ClientAddrHeader
 	// oidc is the protocol plane; introspector, grants and devices are the
 	// OP-backed business-plane seams.
 	oidc         http.Handler
@@ -282,23 +291,24 @@ func New(cfg Config) (*Server, error) {
 		adminAllowed[a] = true
 	}
 	srv := &Server{
-		issuer:         strings.TrimRight(cfg.Issuer, "/"),
-		resource:       strings.TrimRight(cfg.Resource, "/"),
-		errorBase:      strings.TrimRight(cfg.ErrorBase, "/"),
-		scopes:         cfg.Scopes,
-		sessions:       cfg.Sessions,
-		accounts:       cfg.Accounts,
-		auth:           cfg.Auth,
-		authInteract:   cfg.Authorization,
-		consent:        cfg.ConsentPath,
-		federate:       cfg.Federation,
-		limiter:        cfg.Limiter,
-		maxInFlight:    cfg.MaxInFlight,
-		secure:         cfg.Secure,
-		ready:          cfg.Ready,
-		metrics:        cfg.Metrics,
-		frontend:       cfg.Frontend,
-		trustedProxies: cfg.TrustedProxies,
+		issuer:           strings.TrimRight(cfg.Issuer, "/"),
+		resource:         strings.TrimRight(cfg.Resource, "/"),
+		errorBase:        strings.TrimRight(cfg.ErrorBase, "/"),
+		scopes:           cfg.Scopes,
+		sessions:         cfg.Sessions,
+		accounts:         cfg.Accounts,
+		auth:             cfg.Auth,
+		authInteract:     cfg.Authorization,
+		consent:          cfg.ConsentPath,
+		federate:         cfg.Federation,
+		limiter:          cfg.Limiter,
+		maxInFlight:      cfg.MaxInFlight,
+		secure:           cfg.Secure,
+		ready:            cfg.Ready,
+		metrics:          cfg.Metrics,
+		frontend:         cfg.Frontend,
+		trustedProxies:   cfg.TrustedProxies,
+		clientAddrHeader: cfg.ClientAddrHeader,
 		// Wrapped once, here, so every protocol-plane mount is covered by the same
 		// recoverer: a panic in the provider must answer as an OAuth error, not as a
 		// closed connection.

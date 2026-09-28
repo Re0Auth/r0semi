@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/Re0Auth/r0semi/internal/httpapi"
 )
 
 // zzCallHandler is the raw form: one request, one peer, one header chain.
@@ -26,11 +28,19 @@ func zzCallHandler(t *testing.T, h http.Handler, peer, method, target string, xf
 // severity: under which shapes of the received X-Forwarded-For is the rate-limit
 // bucket key chosen by the caller?
 //
-// The walk in clientaddr.go:62-67 goes from the right and returns the first hop
-// that is NOT in trusted_proxies. So a caller picks the key exactly when every hop
-// a trusted proxy appended is itself inside trusted_proxies (or nothing was
-// appended). This probe states each shape as a separate case, each with a control
-// showing the header really is being read in that shape.
+// The walk in clientaddr.go used to go from the right and return the first hop that
+// was NOT in trusted_proxies, so a caller picked the key exactly when every hop a
+// trusted proxy appended was itself inside trusted_proxies (or nothing was
+// appended). After P0-4 the answer is structural rather than shape-dependent:
+//
+//   - with no declared header, the header is not read at all — no shape matters;
+//   - with the header declared, only the RIGHTMOST entry is read, so a chain whose
+//     last entry is one of ours yields the peer, never a caller-written hop.
+//
+// The remaining case that a caller can still choose is a declared header in front
+// of a proxy that forwards the caller's own value verbatim; it is asserted as such,
+// because the setting is a statement about a proxy that nothing in a request can
+// verify.
 //
 // The limiter is one token with no refill, so an admission count above the control
 // means distinct bucket keys.
@@ -72,22 +82,26 @@ func TestV_XFFChainShapeDecidesTheKey(t *testing.T) {
 		}
 	})
 
-	t.Run("trusted peer, ONLY the client's own header (verbatim forwarding)", func(t *testing.T) {
+	t.Run("trusted peer, NO declared header: rotating the header buys nothing", func(t *testing.T) {
+		// The trust list alone is not a statement that the header is trustworthy,
+		// so the peer is the key and every rotation lands in one bucket.
 		h := zzServer(t, "10.0.0.0/8").Handler()
 		admitted, control := run(t, h, "10.1.2.3:5555", func(i int) []string {
 			return []string{fmt.Sprintf("198.51.100.%d", i+1)}
 		})
-		t.Logf("trusted peer, client-supplied XFF only: admitted=%d/%d controlSecondRequest429=%v", admitted, spin, control)
+		t.Logf("trusted peer, no declared header, rotating XFF: admitted=%d/%d controlSecondRequest429=%v",
+			admitted, spin, control)
 		if !control {
 			t.Fatalf("control failed: the same header value was not a single bucket")
 		}
-		if admitted != spin {
-			t.Errorf("expected every rotation to be admitted (caller-chosen key); got %d/%d", admitted, spin)
+		if admitted != 0 {
+			t.Errorf("rotating X-Forwarded-For bought %d requests without the header being declared: "+
+				"the bucket key is caller-chosen", admitted)
 		}
 	})
 
-	t.Run("trusted peer, proxy APPENDED the public client (the safe shape)", func(t *testing.T) {
-		srv := zzServer(t, "10.0.0.0/8")
+	t.Run("trusted peer, declared header, proxy APPENDED the public client (the safe shape)", func(t *testing.T) {
+		srv := zzServerMode(t, httpapi.ClientAddrXForwardedFor, "10.0.0.0/8")
 		h := srv.Handler()
 		admitted, control := run(t, h, "10.1.2.3:5555", func(i int) []string {
 			return []string{fmt.Sprintf("198.51.100.%d, 203.0.113.9", i+1)}
@@ -107,8 +121,8 @@ func TestV_XFFChainShapeDecidesTheKey(t *testing.T) {
 		}
 	})
 
-	t.Run("trusted peer, proxy APPENDED a hop inside the trust list", func(t *testing.T) {
-		h := zzServer(t, "10.0.0.0/8").Handler()
+	t.Run("trusted peer, declared header, proxy APPENDED a hop inside the trust list", func(t *testing.T) {
+		h := zzServerMode(t, httpapi.ClientAddrXForwardedFor, "10.0.0.0/8").Handler()
 		// What a chain looks like when the address the last proxy appended is one
 		// of our own networks: a k8s Service with externalTrafficPolicy=Cluster
 		// SNATs the client to the node IP, a service mesh or internal LB appends
@@ -120,8 +134,30 @@ func TestV_XFFChainShapeDecidesTheKey(t *testing.T) {
 		if !control {
 			t.Fatalf("control failed: an identical chain was not a single bucket")
 		}
+		if admitted != 0 {
+			t.Errorf("the walk stepped past our own proxy's entry to a caller-written one: %d admissions", admitted)
+		}
+	})
+
+	t.Run("trusted peer, declared header, VERBATIM forwarding (the operator's residual)", func(t *testing.T) {
+		// The declared setting asserts the nearest proxy rewrites or appends the
+		// header. When it instead forwards the caller's own value verbatim — nginx
+		// redefines only Host and Connection by default — the rightmost entry IS
+		// the caller's text, and rotating it buys a bucket per request. Nothing in
+		// a request can detect that, which is why the default reads no header:
+		// this case asserts the residual rather than denying it.
+		h := zzServerMode(t, httpapi.ClientAddrXForwardedFor, "10.0.0.0/8").Handler()
+		admitted, control := run(t, h, "10.1.2.3:5555", func(i int) []string {
+			return []string{fmt.Sprintf("198.51.100.%d", i+1)}
+		})
+		t.Logf("trusted peer, verbatim forwarding, rotating XFF: admitted=%d/%d controlSecondRequest429=%v",
+			admitted, spin, control)
+		if !control {
+			t.Fatalf("control failed: the same header value was not a single bucket")
+		}
 		if admitted != spin {
-			t.Errorf("expected every rotation to be admitted here too; got %d/%d", admitted, spin)
+			t.Errorf("expected the residual to admit every rotation (%d), got %d: the probe no longer "+
+				"demonstrates what the default protects against", spin, admitted)
 		}
 	})
 }

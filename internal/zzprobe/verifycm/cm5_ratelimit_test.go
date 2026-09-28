@@ -8,16 +8,18 @@ import (
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 )
 
-// CM-5 quantification. The audited probe proves the mechanism with
-// WithMaxKeys(shardCount), i.e. ONE slot per shard — a configuration no deployment
-// has. This asks the question that decides the severity: with the shipped default
-// (maxKeys = 10_000, i.e. 625 keys per shard), how many distinct keys must an
-// attacker create before anybody's budget can be reset, and how many victims does
-// one forced insertion take?
+// CM-5 quantification, asserted as the property the rewrite provides. The audited
+// probe proves the old mechanism with WithMaxKeys(shardCount), i.e. ONE slot per
+// shard — a configuration no deployment has. This asks the question that decides
+// the severity: with the shipped default (maxKeys = 10_000, i.e. 625 keys per
+// shard), how many distinct keys must a caller create before anybody's budget can
+// be reset?
 //
-// evictLocked's logic does not consult the rate or the burst at all, so the probe
-// uses burst 1 / rate ~0 to make "exhausted" deterministic and cheap; only maxKeys
-// (the default) is under test.
+// The answer is now "none, ever": an insertion at capacity that cannot reclaim a
+// bucket the caller provably loses nothing by drops NOTHING, and the newcomer
+// shares the shard's overflow bucket. The rate and the burst are irrelevant to
+// that decision, so the probe uses burst 1 / rate ~0 to make "exhausted"
+// deterministic and cheap; only maxKeys (the default) is under test.
 
 const (
 	shardCount     = 16
@@ -77,14 +79,15 @@ func refunded(t *testing.T, l *ratelimit.Limiter, keys []string) []string {
 	return out
 }
 
-func TestCM5AtTheShippedCapEvictionNeedsHundredsOfKeysInOneShard(t *testing.T) {
+func TestCM5AtTheShippedCapNoInsertionCanResetAnotherKeysBudget(t *testing.T) {
 	l := ratelimit.New(0.001, 1) // burst 1: "exhausted" is one extra call; maxKeys is the default
 
-	// exactly perShard keys in one shard, plus one more to force the eviction
+	// exactly perShard keys in one shard, plus one more to force the insertion at
+	// capacity
 	keys := keysInShard(0, perShard+1, "fill")
 	full, outsider := keys[:perShard], keys[perShard]
 
-	// Below capacity nothing can be evicted: fill perShard-1 and spend them.
+	// Below capacity nothing can be reclaimed: fill perShard-1 and spend them.
 	exhaustAll(t, l, full[:perShard-1])
 	last := full[perShard-1]
 	if !l.Allow(last) {
@@ -94,41 +97,44 @@ func TestCM5AtTheShippedCapEvictionNeedsHundredsOfKeysInOneShard(t *testing.T) {
 		t.Fatal("the last key was admitted twice with burst 1")
 	}
 	if got := refunded(t, l, full[:perShard-1]); len(got) != 0 {
-		t.Errorf("%d keys below the cap were refunded by an insertion that did not need to evict: %v", len(got), got)
+		t.Errorf("%d keys below the cap were refunded by an insertion that did not need to reclaim: %v", len(got), got)
 	}
 
-	// At capacity: every bucket in the shard is live (lastSeen = now), so
-	// evictLocked has no idle bucket to prefer and deletes one of them.
-	l.Allow(outsider)
+	// At capacity: every bucket in the shard is live (lastSeen = now) and, at this
+	// rate, none of them is reclaimable — so the outsider must share the overflow
+	// bucket rather than displace anyone.
+	if !l.Check(outsider).Shared {
+		t.Errorf("the outsider was tracked at capacity: the overflow path is gone")
+	}
 
 	victims := refunded(t, l, full)
 	t.Logf("with the shipped default cap (%d keys/shard) one insertion at capacity reset the budget of %d of the %d "+
-		"previously-exhausted keys in that shard; the victim is the first entry of a random %d-entry sample, so "+
-		"which key is a lottery. Anyone has to hold %d live keys in ONE shard (out of %d tracked keys) before any "+
-		"of this can happen, and the count above exceeds 1 only because re-admitting an evicted key is itself an "+
-		"insertion at capacity, which evicts the next victim in turn",
-		perShard, len(victims), len(full), 64, perShard, defaultMaxKeys)
-	if len(victims) == 0 {
-		t.Errorf("no key was refunded by an insertion at capacity: the probe did not reach evictLocked")
+		"previously-exhausted keys in that shard; the newcomer now shares the shard's overflow bucket instead, so the "+
+		"count is zero at every capacity and no key spray can refund anybody",
+		perShard, len(victims), len(full))
+	if len(victims) != 0 {
+		t.Errorf("%d keys were refunded by an insertion at capacity: a key spray still resets budgets", len(victims))
 	}
-	// The point of the cap: a handful of keys are affected, not the shard.
-	if len(victims) > perShard/10 {
-		t.Errorf("one insertion at capacity refunded %d of %d keys; that is not the bounded cascade the cap implies",
-			len(victims), perShard)
+	if got := l.Size(); got != perShard {
+		t.Errorf("tracked keys = %d, want %d: the table grew at its cap", got, perShard)
 	}
 }
 
-// The direction of the defect, which decides whether it is a security finding: a
-// bucket is a *limit*, never a grant. Deleting one can only hand its owner a fresh
-// burst — it can never deny anybody anything. So eviction loosens the limiter for a
-// victim; it does not help an attacker, who needs no eviction at all: a per-key
-// limiter is bypassed by using fresh keys, which is true at any capacity.
-func TestCM5EvictionCanOnlyLoosenAndKeyRotationNeedsNoEviction(t *testing.T) {
+// The direction of the old defect, which decided its severity: a bucket is a
+// *limit*, never a grant. Deleting one could only hand its owner a fresh burst — it
+// could never deny anybody anything. The caller who varies its key never needed
+// eviction at all: a per-key limiter is bypassed by using fresh keys, which is true
+// at any capacity, and that is what the HTTP layer's key derivation now prevents
+// (see the P0-4 probes in internal/httpapi and internal/zzprobe/verifyhttpedge).
+//
+// This case pins the boundary: below the table's cap, fresh keys are still admitted
+// (the limiter is a limiter, not a whitelist); once a shard is full, every further
+// key shares ONE bucket, so the spray is bounded by that bucket's burst instead of
+// by one burst per invented key.
+func TestCM5KeyRotationPaysOnlyUntilTheTableIsFull(t *testing.T) {
 	l := ratelimit.New(50, 100) // the shipped default
 
-	// A caller that varies its key is never rate-limited by a per-key limiter,
-	// whether or not eviction ever runs: 1000 fresh keys are 1000 full bursts well
-	// below the 10 000-key cap, so no eviction is involved at all.
+	// 1000 fresh keys are 1000 full bursts well below the 10 000-key cap.
 	const n = 1_000
 	admitted := 0
 	for i := 0; i < n; i++ {
@@ -139,6 +145,37 @@ func TestCM5EvictionCanOnlyLoosenAndKeyRotationNeedsNoEviction(t *testing.T) {
 	if admitted != n {
 		t.Errorf("only %d of %d fresh keys were admitted; the probe's premise is wrong", admitted, n)
 	}
-	t.Logf("%d/%d fresh keys admitted with the shipped default limiter and no eviction involved: "+
-		"key rotation bypasses a per-key limiter on its own, so eviction is not what weakens it", admitted, n)
+	t.Logf("%d/%d fresh keys admitted with the shipped default limiter, well below the %d-key cap",
+		admitted, n, defaultMaxKeys)
+
+	// One shard, filled to its cap: WithMaxKeys(shardCount) puts one slot in it.
+	const burst = 100
+	small := ratelimit.New(0.001, burst, ratelimit.WithMaxKeys(shardCount))
+	slot := keysInShard(0, 1, "slot")[0]
+	if !small.Allow(slot) {
+		t.Fatal("the shard's single slot was refused")
+	}
+	spray := keysInShard(0, 500, "rot")
+	fromShared, shared := 0, true
+	for _, k := range spray {
+		v := small.Check(k)
+		if v.Allowed {
+			fromShared++
+		}
+		if !v.Shared {
+			shared = false
+		}
+	}
+	if !shared {
+		t.Errorf("a fresh key was tracked in a full shard: an insertion at capacity created a bucket again")
+	}
+	t.Logf("one shard at its cap: %d of %d rotated keys admitted, all from ONE shared bucket of burst %d",
+		fromShared, len(spray), burst)
+	if fromShared == 0 {
+		t.Error("the shared bucket admitted nothing; the probe is vacuous")
+	}
+	if fromShared > burst {
+		t.Errorf("the rotation was admitted %d times against one shared burst of %d: each key still buys its own budget",
+			fromShared, burst)
+	}
 }

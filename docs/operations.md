@@ -42,6 +42,41 @@ curl -fsS https://auth.example.com/healthz
 curl -fsS https://auth.example.com/readyz
 ```
 
+### 反向代理的要求（限流分桶键）
+
+限流器按**客户端地址**分桶。那个地址来自对端，或来自一个**你的反代写下的**头——两者都不是
+调用方能决定的事，而请求里没有任何东西能证明这一点。所以这两件必须由部署声明，缺一不可：
+
+```toml
+trusted_proxies    = ["10.0.0.0/8"]     # 谁有权替客户端说话
+client_addr_header = "x-forwarded-for"  # 那个代理写的是哪个头
+```
+
+- 反代**必须覆盖或追加** XFF，二者都是正确的写法：
+
+  ```nginx
+  proxy_set_header X-Forwarded-For $remote_addr;                 # 覆盖
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # 追加
+  ```
+
+  **逐字转发调用方自带的 XFF（nginx 的默认行为）会让分桶键由调用方决定**，限流形同虚设。
+  判据不是「追加还是覆盖」，而是「**追加的那一跳是否也在信任网内**」——第 3 条。
+- `trusted_proxies` 只能写你自己的代理地址，**绝不能包含客户端可能位于的网络**。
+  写 `0.0.0.0/0` 等于关闭这套判据（此时最右侧一跳必然落在信任网内，服务会退回对端地址，
+  于是所有客户端共用一跳代理的桶——安全但粗糙）。
+- **`externalTrafficPolicy: Cluster` / 服务网格 / 内部 LB 会让「最右侧一跳」变成信任网内的地址**
+  （节点 IP、网格边车），此时服务按上面的规则**退回对端地址**——也就是那一跳代理的地址。
+  后果是**该代理后面的所有客户端共用一个桶**：这是安全方向的退化（可用性问题），不是越权。
+  要恢复按客户端分桶，三选一：改用 `externalTrafficPolicy: Local`、上 PROXY protocol、
+  或让最近一跳写入的地址不在 `trusted_proxies` 里。
+- `client_addr_header` 只读**最右侧一条**，且要求 `trusted_proxies` 非空（否则拒绝启动）。
+  两者都配好之后，「每客户端一个桶」才成立；只配 `trusted_proxies` 时，一个代理后面的所有
+  客户端共用一个桶。
+
+改动这两个值之前先做一次实测：从两个不同的外部地址各发一次请求，看访问日志里的 `client=`
+是否分别是这两个地址。**如果两个地址写成同一个，说明声明与代理的实际行为不符**——
+先修代理，再改配置。
+
 ## 备份与恢复
 
 数据库与密钥是**两份**备份，缺一不可：没有 KEK，转储里的每条 vault 记录都打不开。

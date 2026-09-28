@@ -16,6 +16,7 @@ import (
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/config"
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/internal/httpapi"
 	"github.com/Re0Auth/r0semi/internal/store/postgres"
 )
 
@@ -97,6 +98,18 @@ type serverSection struct {
 	// when attributing a request to a client. Empty means none: the peer address
 	// is the client. Set it only to your own reverse proxies' addresses.
 	TrustedProxies []string `toml:"trusted_proxies"`
+	// ClientAddrHeader is the header the deployment's nearest reverse proxy writes
+	// with the client address. "none" — the default — reads no header and uses the
+	// peer address: the only safe answer when the proxy forwards the caller's own
+	// X-Forwarded-For verbatim, and nothing in a request can prove which behaviour
+	// the proxy has. "x-forwarded-for" asserts that the nearest proxy OVERWRITES
+	// (`proxy_set_header X-Forwarded-For $remote_addr;`) or APPENDS to
+	// (`$proxy_add_x_forwarded_for`) that header, and is what turns the rate limiter
+	// from per-proxy into per-client. It requires a non-empty trusted_proxies and is
+	// refused without one, because it could never take effect then.
+	//
+	// Environment override: RE0AUTH_CLIENT_ADDR_HEADER="x-forwarded-for"
+	ClientAddrHeader string `toml:"client_addr_header"`
 	// InternalAddr is where the operational surface is served: Prometheus metrics
 	// and the Go runtime's profiling endpoints. Empty disables it entirely — the
 	// default, because profiling endpoints belong on a private network and never
@@ -250,6 +263,9 @@ type settings struct {
 	// TrustedProxies are the networks whose X-Forwarded-For is believed when
 	// resolving the client address. Empty means no proxy is trusted.
 	TrustedProxies []netip.Prefix
+	// ClientAddrHeader is which header names the client, if the deployment declared
+	// one. ClientAddrPeer — the zero value — reads no header at all.
+	ClientAddrHeader httpapi.ClientAddrHeader
 	// AllowPrivateUpstreams permits outbound calls to loopback, link-local and
 	// private addresses. False (the default) refuses them at dial time, so a
 	// source registration or a discovery document cannot aim this process at an
@@ -535,6 +551,29 @@ func loadConfig(path string) (settings, error) {
 	cfg.TrustedProxies, err = parseTrustedProxies(proxyValues)
 	if err != nil {
 		return settings{}, err
+	}
+
+	// Which header the nearest proxy writes, if any. The trust list alone is not a
+	// statement that a header is trustworthy: a proxy that forwards the caller's own
+	// X-Forwarded-For verbatim leaves every entry caller-written, and a parser cannot
+	// tell that apart from a rewritten one. So the deployment says which header it
+	// writes, and "none" is the default.
+	headerValue := f.Server.ClientAddrHeader
+	if raw := strings.TrimSpace(os.Getenv("RE0AUTH_CLIENT_ADDR_HEADER")); raw != "" {
+		headerValue = raw
+	}
+	cfg.ClientAddrHeader, err = httpapi.ParseClientAddrHeader(headerValue)
+	if err != nil {
+		return settings{}, fmt.Errorf("server.client_addr_header %w", err)
+	}
+	if cfg.ClientAddrHeader != httpapi.ClientAddrPeer && len(cfg.TrustedProxies) == 0 {
+		// Fail closed rather than accept a setting that can never take effect: with
+		// no trusted proxy the header is never read, so the configuration would look
+		// applied and silently do nothing — which is how a deployment ends up
+		// believing it has per-client budgets when every client shares one.
+		return settings{}, errors.New(
+			"server.client_addr_header = \"x-forwarded-for\" requires server.trusted_proxies: " +
+				"without a trusted proxy the header is never read, so the setting would look applied and do nothing")
 	}
 
 	// Outbound address policy. The environment overrides the file, like every

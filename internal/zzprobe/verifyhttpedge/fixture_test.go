@@ -48,27 +48,36 @@ func (stubDevices) DecideDeviceAuthorization(context.Context, string, string, bo
 }
 
 // zzServer builds a real httpapi.Server with a limiter of one token and no
-// refill, and the given trust list.
+// refill, the given trust list, and NO declared client-address header — the
+// default, under which no header is read at all.
 func zzServer(t *testing.T, trusted ...string) *httpapi.Server {
 	t.Helper()
-	return zzNew(t, true, false, trusted...)
+	return zzNew(t, true, httpapi.ClientAddrPeer, trusted...)
+}
+
+// zzServerMode is zzServer with the deployment's declared header. The distinction
+// is the whole of P0-4: a trust list says who may speak, the declaration says what
+// they write, and only both together make X-Forwarded-For readable.
+func zzServerMode(t *testing.T, mode httpapi.ClientAddrHeader, trusted ...string) *httpapi.Server {
+	t.Helper()
+	return zzNew(t, true, mode, trusted...)
 }
 
 // zzServerNoLimit is the same server with no limiter at all, so a walk sees the
 // ROUTER's answer instead of the limiter's.
 func zzServerNoLimit(t *testing.T, trusted ...string) *httpapi.Server {
 	t.Helper()
-	return zzNew(t, false, false, trusted...)
+	return zzNew(t, false, httpapi.ClientAddrPeer, trusted...)
 }
 
 // zzServerNoLimitReal is served over a real TCP listener, so a dot-segment path is
 // what an actual client can send.
 func zzServerNoLimitReal(t *testing.T, trusted ...string) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(zzNew(t, false, false, trusted...).Handler())
+	return httptest.NewServer(zzNew(t, false, httpapi.ClientAddrPeer, trusted...).Handler())
 }
 
-func zzNew(t *testing.T, limit, _ bool, trusted ...string) *httpapi.Server {
+func zzNew(t *testing.T, limit bool, mode httpapi.ClientAddrHeader, trusted ...string) *httpapi.Server {
 	t.Helper()
 	var prefixes []netip.Prefix
 	for _, c := range trusted {
@@ -85,6 +94,7 @@ func zzNew(t *testing.T, limit, _ bool, trusted ...string) *httpapi.Server {
 		GrantStore:        stubGrants{},
 		DeviceStore:       stubDevices{},
 		TrustedProxies:    prefixes,
+		ClientAddrHeader:  mode,
 	}
 	if limit {
 		cfg.Limiter = ratelimit.New(zzNoRefill, 1)

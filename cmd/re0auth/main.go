@@ -506,6 +506,10 @@ func run() error {
 		// Which peers may speak for the client through X-Forwarded-For. Empty
 		// means none, so the peer address is the client.
 		TrustedProxies: cfg.TrustedProxies,
+		// And which header the nearest proxy writes, if the deployment declared
+		// one. The trust list says who may speak; this says what they write, and
+		// neither is enough on its own. "none" keeps the peer address.
+		ClientAddrHeader: cfg.ClientAddrHeader,
 		// One switch for "this issuer is https": Secure cookies and HSTS.
 		Secure: cfg.CookieSecure,
 		// Readiness is "can this instance reach what it needs to serve". With a

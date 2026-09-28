@@ -43,16 +43,18 @@ func keysInShard(shard, n int, tag string) []string {
 	return out
 }
 
-// TestV_CapacityEvictionDiscardsALiveBucket is the deterministic form of HE-1's
-// second half. With WithMaxKeys(16) each shard holds one key, so inserting a
-// second key in the same shard MUST evict the first — there is nowhere else to
-// put it. The question is what happens to a bucket whose caller has just spent its
-// last token: this probe shows it is dropped and re-created full.
+// TestV_CapacityDoesNotDiscardALiveBucket is the deterministic form of HE-1's
+// second half, asserted as the property that must hold. With WithMaxKeys(16) each
+// shard holds one key, so a second key in the same shard cannot be tracked — the
+// old code dropped the first one and re-created it full on its next request.
+//
+// The fix is fail-closed: the intruder shares the shard's overflow bucket, the
+// victim's spent budget is untouched, and the table does not grow.
 //
 // (The audited probe proves the same mechanism at the SHIPPED capacity, 625 per
-// shard, where it is probabilistic. This is the same code path with the
+// shard, where it was probabilistic. This is the same code path with the
 // probability removed.)
-func TestV_CapacityEvictionDiscardsALiveBucket(t *testing.T) {
+func TestV_CapacityDoesNotDiscardALiveBucket(t *testing.T) {
 	l := ratelimit.New(0.001, 1, ratelimit.WithMaxKeys(16))
 	keys := keysInShard(0, 2, "evict")
 	victim, intruder := keys[0], keys[1]
@@ -63,48 +65,86 @@ func TestV_CapacityEvictionDiscardsALiveBucket(t *testing.T) {
 	if l.Allow(victim) {
 		t.Fatalf("the victim's bucket was not exhausted by its second request; nothing below is measurable")
 	}
-	if !l.Allow(intruder) {
-		t.Fatalf("the second key in the shard was refused on its first request")
+	if got := l.Size(); got != 1 {
+		t.Fatalf("tracked keys = %d, want 1", got)
 	}
+
+	intrusion := l.Check(intruder)
+	if !intrusion.Shared {
+		t.Errorf("the intruder was given a bucket of its own at capacity: %+v", intrusion)
+	}
+
 	again := l.Allow(victim)
 	t.Logf("maxKeys=16 (1 per shard): victim exhausted, then an unrelated key inserted, then victim again -> admitted=%v", again)
-	if !again {
-		t.Errorf("the victim's spent bucket survived an insertion at capacity; the eviction path changed")
+	if again {
+		t.Errorf("the victim's spent bucket was discarded by an insertion at capacity: its budget was refunded")
+	}
+	if got := l.Size(); got != 1 {
+		t.Errorf("tracked keys = %d, want 1: a live bucket was dropped for the intruder", got)
 	}
 }
 
-// TestV_EvictionPrefersAnIdleBucketToALiveOne checks the direction the report
-// describes but does not test: at capacity, the scan prefers a bucket past its TTL,
-// so a LIVE bucket is only discarded when no idle one is in the sample.
-func TestV_EvictionPrefersAnIdleBucketToALiveOne(t *testing.T) {
-	l := ratelimit.New(0.001, 1, ratelimit.WithMaxKeys(32), ratelimit.WithTTL(50*time.Millisecond))
-	keys := keysInShard(0, 3, "idle")
-	idle, live, newcomer := keys[0], keys[1], keys[2]
+// TestV_ReclaimOnlyDropsBucketsThatLoseNothing pins the condition the rewrite
+// introduced, at both ends: a bucket may be reclaimed only when its owner's next
+// request would be admitted with a full bucket either way.
+//
+//   - Fast refill (100/s with burst 1: an empty bucket is full again in 10 ms) and
+//     a 50 ms TTL: an idle key is reclaimable, so the map still self-cleans.
+//   - Slow refill (0.001/s: 1000 s to refill) with the same TTL: nothing is
+//     reclaimable — a bucket idle for 80 ms still holds 0.08 of the token its owner
+//     is owed — so the newcomer shares the overflow bucket and nobody is refunded.
+func TestV_ReclaimOnlyDropsBucketsThatLoseNothing(t *testing.T) {
+	t.Run("fast refill: an idle bucket is reclaimed, and its owner loses nothing", func(t *testing.T) {
+		// WithMaxKeys(16): ONE slot per shard, so the newcomer can only be tracked by
+		// reclaiming the idle one.
+		l := ratelimit.New(100, 1, ratelimit.WithMaxKeys(16), ratelimit.WithTTL(50*time.Millisecond))
+		keys := keysInShard(0, 2, "idle")
+		idle, newcomer := keys[0], keys[1]
 
-	if !l.Allow(idle) {
-		t.Fatalf("first key refused")
-	}
-	time.Sleep(80 * time.Millisecond) // the idle key is now past the TTL
-	if !l.Allow(live) || l.Allow(live) {
-		t.Fatalf("the live key could not be exhausted")
-	}
-	if !l.Allow(newcomer) {
-		t.Fatalf("the newcomer was refused at capacity")
-	}
-	if l.Allow(live) {
-		t.Errorf("an IDLE bucket was available but the live, exhausted bucket was discarded instead")
-	}
-	if !l.Allow(idle) {
-		t.Errorf("the idle bucket was not the one discarded (it still answers): the scan did not prefer it")
-	}
-	t.Logf("at capacity with one idle and one live bucket: the idle one was discarded, the exhausted one stayed exhausted")
+		if !l.Allow(idle) {
+			t.Fatalf("first key refused")
+		}
+		time.Sleep(80 * time.Millisecond) // past both the TTL and the refill window
+		if !l.Allow(newcomer) {
+			t.Fatalf("the newcomer was refused at capacity")
+		}
+		if got := l.Size(); got != 1 {
+			t.Errorf("tracked keys = %d, want 1: the reclaimable idle bucket was not reclaimed", got)
+		}
+		if !l.Allow(idle) {
+			t.Errorf("the reclaimed key was refused: reclaiming it refunded nothing, so it must be admitted")
+		}
+	})
+
+	t.Run("slow refill: nothing is reclaimable, so a live bucket survives", func(t *testing.T) {
+		l := ratelimit.New(0.001, 1, ratelimit.WithMaxKeys(32), ratelimit.WithTTL(50*time.Millisecond))
+		keys := keysInShard(0, 3, "slow")
+		idle, live, newcomer := keys[0], keys[1], keys[2]
+
+		if !l.Allow(idle) {
+			t.Fatalf("first key refused")
+		}
+		time.Sleep(80 * time.Millisecond) // past the TTL, but nowhere near a refill
+		if !l.Allow(live) || l.Allow(live) {
+			t.Fatalf("the live key could not be exhausted")
+		}
+		if !l.Allow(newcomer) {
+			t.Fatalf("the newcomer was refused at capacity")
+		}
+		if l.Allow(live) {
+			t.Errorf("the live, exhausted bucket was discarded: its owner's spent budget came back")
+		}
+		if got := l.Size(); got != 2 {
+			t.Errorf("tracked keys = %d, want 2: an unreclaimable bucket was dropped", got)
+		}
+	})
 }
 
-// TestV_WithNoIdleBucketALiveOneIsDeleted is the fallback branch: when none of the
-// scanned entries is past its TTL, one live bucket is deleted anyway. Exactly one
-// of two exhausted keys therefore comes back to life — and nothing in the limiter
-// reports it.
-func TestV_WithNoIdleBucketALiveOneIsDeleted(t *testing.T) {
+// TestV_WithNoReclaimableBucketTheArrivalIsShared is the branch that replaced the
+// live-bucket deletion: when nothing in the scanned sample may be dropped, the
+// newcomer shares its shard's overflow bucket — so TWO exhausted keys stay
+// exhausted, and the arrival is served from a bucket that is not theirs.
+func TestV_WithNoReclaimableBucketTheArrivalIsShared(t *testing.T) {
 	l := ratelimit.New(0.001, 1, ratelimit.WithMaxKeys(32))
 	keys := keysInShard(0, 3, "fallback")
 	a, b, c := keys[0], keys[1], keys[2]
@@ -117,8 +157,8 @@ func TestV_WithNoIdleBucketALiveOneIsDeleted(t *testing.T) {
 			t.Fatalf("%q was not exhausted", k)
 		}
 	}
-	if !l.Allow(c) {
-		t.Fatalf("the third key was refused at capacity")
+	if !l.Check(c).Shared {
+		t.Errorf("the third key was tracked even though the shard is full and nothing is reclaimable")
 	}
 	revived := 0
 	for _, k := range []string{a, b} {
@@ -126,8 +166,11 @@ func TestV_WithNoIdleBucketALiveOneIsDeleted(t *testing.T) {
 			revived++
 		}
 	}
-	t.Logf("no idle candidate: %d of 2 exhausted buckets were silently replaced by full ones", revived)
-	if revived != 1 {
-		t.Errorf("expected exactly one live bucket to be discarded, got %d", revived)
+	t.Logf("no reclaimable candidate: %d of 2 exhausted buckets came back to life", revived)
+	if revived != 0 {
+		t.Errorf("expected no live bucket to be discarded, got %d revived", revived)
+	}
+	if got := l.Size(); got != 2 {
+		t.Errorf("tracked keys = %d, want 2", got)
 	}
 }
