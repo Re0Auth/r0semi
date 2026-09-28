@@ -130,46 +130,43 @@ func TestAnAuditSinkThatReadsTheStoreDeadlocksUnderTheLock(t *testing.T) {
 	}
 }
 
-// --- Finding CM-2: the request context is dropped on some audit paths ---
+// --- CM-2: every audit path forwards the request context ---
 
 type ctxMarker struct{}
 
-// CreateAccessToken and the two device-decision methods pass
-// context.Background() to the audit sink, while CreateAccessAndRefreshTokens
-// passes the caller's context. The control below (the refresh path) proves the
-// probe sees a real context when one is forwarded, so the zero-value answer on the
-// other paths is the store's choice and not the probe's.
-func TestSomeAuditPathsDropTheRequestContext(t *testing.T) {
+// CreateAccessToken and the two device-decision methods used to pass
+// context.Background() to the audit sink while CreateAccessAndRefreshTokens passed
+// the caller's context, so those three records lost the request's values, deadline
+// and cancellation. All four forward it now. The refresh path is the control: a
+// probe that stopped reaching the sink fails on it rather than passing vacuously.
+func TestEveryAuditPathForwardsTheRequestContext(t *testing.T) {
 	log := &recordingAudit{}
 	st := newProbeStore(t, log)
 	ctx := context.WithValue(context.Background(), ctxMarker{}, "marker")
 	ctx, cancel := context.WithCancel(ctx)
 	cancel() // the caller is already gone
 
-	// Control: the refresh path forwards the request's context, cancellation and
-	// all.
+	assertForwarded := func(t *testing.T, what string) {
+		t.Helper()
+		got := log.last()
+		if got == nil || log.count() == 0 {
+			t.Fatalf("%s recorded nothing; the probe is not reaching the audit sink", what)
+		}
+		if got.Value(ctxMarker{}) != "marker" || !errors.Is(got.Err(), context.Canceled) {
+			t.Errorf("%s did not forward the request context: value=%v err=%v",
+				what, got.Value(ctxMarker{}), got.Err())
+		}
+	}
+
 	if _, _, _, err := st.CreateAccessAndRefreshTokens(ctx, tokenRequest("usr_1", "account.id"), ""); err != nil {
 		t.Fatal(err)
 	}
-	control := log.last()
-	if control == nil || log.count() == 0 {
-		t.Fatal("the refresh path recorded nothing; the probe is not reaching the audit sink")
-	}
-	if control.Value(ctxMarker{}) != "marker" || !errors.Is(control.Err(), context.Canceled) {
-		t.Fatalf("the refresh path did not forward the request context: value=%v err=%v",
-			control.Value(ctxMarker{}), control.Err())
-	}
+	assertForwarded(t, "CreateAccessAndRefreshTokens (control)")
 
-	// Finding: these do not forward it — the record is written with a fresh
-	// context.Background(), so the caller's cancellation and deadline are gone.
-	// Each assertion below FAILS on the code as found.
 	if _, _, err := st.CreateAccessToken(ctx, tokenRequest("usr_1", "account.id")); err != nil {
 		t.Fatal(err)
 	}
-	if got := log.last(); got.Value(ctxMarker{}) != "marker" || !errors.Is(got.Err(), context.Canceled) {
-		t.Errorf("CreateAccessToken did not forward the request context: value=%v err=%v",
-			got.Value(ctxMarker{}), got.Err())
-	}
+	assertForwarded(t, "CreateAccessToken")
 
 	if err := st.StoreDeviceAuthorization(ctx, probeClientID, "device-code-4", "GGGG-HHHH",
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
@@ -178,15 +175,10 @@ func TestSomeAuditPathsDropTheRequestContext(t *testing.T) {
 	if err := st.ApproveDevice(ctx, "GGGG-HHHH", "usr_1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := log.last(); got.Value(ctxMarker{}) != "marker" || !errors.Is(got.Err(), context.Canceled) {
-		t.Errorf("ApproveDevice did not forward the request context: value=%v err=%v",
-			got.Value(ctxMarker{}), got.Err())
-	}
+	assertForwarded(t, "ApproveDevice")
+
 	if err := st.DenyDevice(ctx, "GGGG-HHHH"); err != nil {
 		t.Fatal(err)
 	}
-	if got := log.last(); got.Value(ctxMarker{}) != "marker" || !errors.Is(got.Err(), context.Canceled) {
-		t.Errorf("DenyDevice did not forward the request context: value=%v err=%v",
-			got.Value(ctxMarker{}), got.Err())
-	}
+	assertForwarded(t, "DenyDevice")
 }

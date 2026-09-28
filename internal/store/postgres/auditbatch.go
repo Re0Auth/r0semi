@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -44,6 +45,18 @@ const (
 	// rather than being refused, because refusing would fail the operation the
 	// audit is a precondition of.
 	auditQueueDepth = 512
+	// auditDrainTimeout bounds how long shutdown may spend writing queued rows.
+	// Each batch is bounded by auditBatchTimeout, but the NUMBER of batches is not:
+	// a full queue is 512 rows, or eight 5-second batches, which stacks ~40s on top
+	// of the HTTP drain and outlasts the pod's terminationGracePeriodSeconds. This
+	// budget makes the drain finish; rows still queued when it expires are refused
+	// rather than left waiting on a writer that has returned.
+	auditDrainTimeout = 30 * time.Second
+)
+
+var (
+	errAuditClosed       = errors.New("postgres: audit: the log is closed")
+	errAuditDrainExpired = errors.New("postgres: audit: the shutdown drain budget expired before this record was written")
 )
 
 // auditBatchItem is one queued row and the channel its caller waits on.
@@ -108,15 +121,28 @@ func (b *auditBatcher) enqueue(ctx context.Context, row auditRow) error {
 	closed := b.closed
 	b.mu.Unlock()
 	if closed {
-		return errors.New("postgres: audit: the log is closed")
+		return errAuditClosed
 	}
 
 	select {
 	case b.queue <- item:
 	case <-b.stop:
-		return errors.New("postgres: audit: the log is closed")
+		return errAuditClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+
+	// The queue send and Close can interleave: Close closes stop, the writer drains
+	// what is already queued and returns, and a send that raced with that drain can
+	// land after it — leaving the caller waiting on a writer that has gone
+	// ("accepted but never answered"). Re-check stop once the row is queued: if it
+	// closed in that window the row is refused instead of hanging the caller. A send
+	// that happened before stop closed is safe either way — it is in the queue
+	// before the drain starts, so the drain writes it.
+	select {
+	case <-b.stop:
+		return errAuditClosed
+	default:
 	}
 
 	select {
@@ -136,28 +162,45 @@ func (b *auditBatcher) run() {
 			b.drain()
 			return
 		case item := <-b.queue:
-			b.flush(item)
+			b.flush(item, auditBatchTimeout)
 		}
 	}
 }
 
 // drain writes every row already queued, in order, and returns when the queue is
-// empty. It runs during shutdown: a queued row is a caller waiting, and dropping
-// it would turn a graceful stop into a lost audit record.
+// empty or the shutdown budget runs out. It runs during shutdown: a queued row is a
+// caller waiting, and dropping it would turn a graceful stop into a lost audit
+// record — so the budget is generous, and only the rows still queued when it expires
+// are refused, with a log line that says how many. Without a budget the number of
+// batches is unbounded (each is up to auditBatchTimeout) and shutdown could outlast
+// the pod's terminationGracePeriodSeconds, which is a SIGKILL and loses far more.
 func (b *auditBatcher) drain() {
+	deadline := time.Now().Add(auditDrainTimeout)
+	refused := 0
 	for {
 		select {
 		case item := <-b.queue:
-			b.flush(item)
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				item.done <- errAuditDrainExpired
+				refused++
+				continue
+			}
+			b.flush(item, remaining)
 		default:
+			if refused > 0 {
+				slog.Error("audit: shutdown drain budget expired with records still queued",
+					"refused", refused, "budget", auditDrainTimeout.String())
+			}
 			return
 		}
 	}
 }
 
 // flush writes first plus whatever else is waiting, in one transaction, and
-// answers every caller in the batch.
-func (b *auditBatcher) flush(first *auditBatchItem) {
+// answers every caller in the batch. budget bounds the transaction and is the
+// smaller of the batch timeout and whatever shutdown has left.
+func (b *auditBatcher) flush(first *auditBatchItem, budget time.Duration) {
 	batch := make([]*auditBatchItem, 0, auditMaxBatch)
 	batch = append(batch, first)
 
@@ -183,8 +226,11 @@ gather:
 	}
 
 	// Detached from the callers' cancellation, bounded by this batch's own
-	// deadline: see auditBatchTimeout.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(first.ctx), auditBatchTimeout)
+	// deadline: see auditBatchTimeout and auditDrainTimeout.
+	if budget <= 0 || budget > auditBatchTimeout {
+		budget = auditBatchTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(first.ctx), budget)
 	err := b.appendFn(ctx, rows)
 	cancel()
 

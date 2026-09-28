@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -119,14 +120,22 @@ func hashValue(v string) string {
 
 func clientIDOf(request op.TokenRequest) string { return oidcstore.ClientIDOf(request) }
 
+// record writes one OP audit event. A failure is logged, not swallowed: the token
+// or device decision has already happened, so refusing now would not undo it, but
+// an audit record that vanishes without a trace is the one outcome this project
+// does not accept. Same direction as the memory store and the operator plane (log
+// and proceed); the subject is not logged, only the pseudonymised event carries it.
 func (s *OIDCStore) record(ctx context.Context, action, subject, clientID, outcome string) {
 	if s.audit == nil {
 		return
 	}
-	_ = s.audit.Record(ctx, audit.Event{
+	if err := s.audit.Record(ctx, audit.Event{
 		Action: action, Subject: subject, Provider: "oidc", Outcome: outcome,
 		Detail: map[string]string{"client_id": clientID},
-	})
+	}); err != nil {
+		slog.Error("oidc audit record failed",
+			"action", action, "client_id", clientID, "outcome", outcome, "err", err)
+	}
 }
 
 // --- op.AuthStorage ---

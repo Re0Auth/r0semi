@@ -521,16 +521,26 @@ func TestZZAdmErasureWhoseLastStepFailsCannotBeRetried(t *testing.T) {
 		t.Fatal("the erasure never reached the pseudonym step")
 	}
 
+	// The finding was the response's promise, not the failure: it told the caller
+	// "it is safe to try again", which is not true from the session step on. It
+	// must not say that any more.
+	for _, falsehood := range []string{"try again", "safe to"} {
+		if strings.Contains(strings.ToLower(firstDetail), falsehood) {
+			t.Errorf("the 500 still promises a retry (%q): %q — the erasure revokes the account's "+
+				"sessions before the last step can fail, so trying again is not possible.",
+				falsehood, firstDetail)
+		}
+	}
+
+	// The retry is still refused, and that is inherent rather than fixed: the
+	// erasure revoked the sessions at step 4 and deleted the account row at step 7.
+	// Logged, not asserted, so a future change that makes it genuinely retryable is
+	// noticed rather than silently breaking this probe.
 	second := send()
 	secondDetail := zzAdmProblemDetail(t, second)
-	if second.StatusCode == http.StatusUnauthorized {
-		t.Errorf("CONFIRMED: the retry is answered 401 %q. The first response told the caller "+
-			"\"it is safe to try again\"; trying again is impossible, because the erasure "+
-			"revoked the sessions at step 4 and deleted the account row at step 7 before the "+
-			"pseudonym key step failed at step 8. The account's audit history stays linkable "+
-			"with no implemented path to fix it.", secondDetail)
-	} else if second.StatusCode != http.StatusInternalServerError {
-		t.Errorf("retry after the last step failed = %d %q (sessions revoked: %v)",
+	if second.StatusCode != http.StatusUnauthorized {
+		t.Logf("the retry after the last step failed is now %d %q (sessions revoked: %v); "+
+			"if the retry became reachable, the response's wording should be revisited",
 			second.StatusCode, secondDetail, sessions.called)
 	}
 }

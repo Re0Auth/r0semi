@@ -3,6 +3,7 @@ package httpapi
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -97,6 +98,16 @@ func (s *Server) handleExportAccount(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Bindings = s.bindingViews(bindings)
 	}
+
+	// The export leaves the service with a complete copy of one account's personal
+	// data, so it is recorded: the account is the subject (a live one, so the sink
+	// can pseudonymise it), and the counts describe the shape without carrying any
+	// of the data.
+	s.recordAudit(ctx, "account.export", string(user), map[string]string{
+		"identities": strconv.Itoa(len(out.Identities)),
+		"bindings":   strconv.Itoa(len(out.Bindings)),
+		"grants":     strconv.Itoa(len(out.Grants)),
+	})
 
 	// The filename names the account, so two exports from one browser do not
 	// overwrite each other ambiguously.

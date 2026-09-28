@@ -53,10 +53,14 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.deleter.DeleteAccount(r.Context(), user, user)
 	if err != nil {
-		// The stores are idempotent, so a failure is retryable and the message
-		// says so rather than implying the account is in an unknown state.
+		// Do NOT promise a retry. The stores are idempotent, but this endpoint is
+		// session-scoped and the erasure revokes the account's sessions early, so a
+		// failure from that step on cannot be retried from here — the earlier text
+		// ("it is safe to try again") was not true for every step. Say what is:
+		// the erasure is idempotent where it ran, some data may already be gone,
+		// and the audit log carries the step that stopped.
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error",
-			"the account could not be erased; it is safe to try again")
+			"the account could not be fully erased; part of it may already be gone, and the audit log records the step that failed")
 		return
 	}
 	s.metrics.ObserveRevocation(observability.RevocationErasure)
@@ -64,8 +68,11 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 	// The session is gone as of the erasure, so destroy the cookie for this
 	// response: without this the browser keeps a cookie pointing at a row that no
-	// longer exists. SignOut also clears the session→subject index entry.
-	if err := s.sessions.SignOut(r.Context()); err != nil {
+	// longer exists. EndSession, not SignOut: the erasure has already destroyed the
+	// account's pseudonym key, and an auth.logout event carrying the raw subject
+	// would make the audit sink mint a fresh key and re-link the account the
+	// erasure just unlinked (the erasure's own `account.delete` is the record).
+	if err := s.sessions.EndSession(r.Context()); err != nil {
 		// The erasure succeeded; only the local cookie cleanup failed. The session
 		// row is already deleted by the erasure itself, so the practical effect is
 		// nil, and turning the whole request into a 500 would tell the caller the

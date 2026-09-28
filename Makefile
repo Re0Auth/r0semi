@@ -8,7 +8,7 @@
 # So `make` is how you get a *complete* binary, and `go build` is how you get one
 # that is honest about being incomplete.
 
-.PHONY: all web build test bench perf check lint load e2e play visual dist sbom npm-licenses checksums release docker clean bundle
+.PHONY: all web build test bench perf check lint load e2e play visual dist sbom npm-attribution checksums release docker clean bundle
 
 all: web build
 
@@ -212,21 +212,21 @@ sbom: dist
 #
 # It reads the INSTALLED tree, so it needs the frontend dependencies; `dist` (and
 # therefore `web`) has already run by the time this does.
-npm-licenses: dist
+npm-attribution: dist
 	@command -v node >/dev/null 2>&1 || { \
 		echo "node is required to list the npm licences; run this where the frontend can be installed"; \
 		exit 1; }
-	cd web && pnpm licenses list --json > "../dist/re0auth_$${VERSION}_npm-licenses.json"
-	@test -s "dist/re0auth_$${VERSION}_npm-licenses.json" || { echo "refusing to ship an empty npm licence list"; exit 1; }
-	@echo "npm licences: dist/re0auth_$${VERSION}_npm-licenses.json"
+	cd web && pnpm licenses list --json > "../dist/re0auth_$${VERSION}_npm-attribution.json"
+	@test -s "dist/re0auth_$${VERSION}_npm-attribution.json" || { echo "refusing to ship an empty npm licence list"; exit 1; }
+	@echo "npm licences: dist/re0auth_$${VERSION}_npm-attribution.json"
 
 # Requires sha256sum (coreutils) or shasum (macOS), and zip for the Windows
 # archives. CI runs on ubuntu-latest, where all three exist; a Windows checkout
 # can build the project but not cut a release.
-checksums: sbom npm-licenses
+checksums: sbom npm-attribution
 	@cd dist && $(SHA256) re0auth_$${VERSION}_* > SHA256SUMS && echo "checksums: $$(wc -l < SHA256SUMS) file(s)"
 
-release: dist sbom npm-licenses checksums
+release: dist sbom npm-attribution checksums
 
 # Container image. There is no registry and no push here: this builds the image
 # from the same source the release archives come from, for a deployment to tag

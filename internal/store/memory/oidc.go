@@ -13,6 +13,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -310,14 +311,26 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 	}, nil
 }
 
+// record writes one OP audit event. A failure is logged, not returned and not
+// swallowed: the token or the device decision has already happened, so refusing
+// now would not undo it — but an audit record that vanishes without a trace is
+// the one outcome this project does not accept. The direction is the operator
+// plane's (log and proceed), not the vault's (withhold the emission), because
+// nothing irreversible is gated on this line.
+//
+// The subject is deliberately not logged: a raw `usr_…` belongs in the event
+// field the sink pseudonymises, not in a log line that outlives the key.
 func (s *OIDCStore) record(ctx context.Context, action, subject, clientID, outcome string) {
 	if s.audit == nil {
 		return
 	}
-	_ = s.audit.Record(ctx, audit.Event{
+	if err := s.audit.Record(ctx, audit.Event{
 		Action: action, Subject: subject, Provider: "oidc", Outcome: outcome,
 		Detail: map[string]string{"client_id": clientID},
-	})
+	}); err != nil {
+		slog.Error("oidc audit record failed",
+			"action", action, "client_id", clientID, "outcome", outcome, "err", err)
+	}
 }
 
 func codeChallenge(challenge, method string) *oidc.CodeChallenge {
@@ -418,7 +431,7 @@ func (s *OIDCStore) DeleteAuthRequest(_ context.Context, id string) error {
 }
 
 // CreateAccessToken implements op.Storage.
-func (s *OIDCStore) CreateAccessToken(_ context.Context, request op.TokenRequest) (string, time.Time, error) {
+func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenRequest) (string, time.Time, error) {
 	id, err := oidcstore.RandomValue()
 	if err != nil {
 		return "", time.Time{}, err
@@ -433,7 +446,7 @@ func (s *OIDCStore) CreateAccessToken(_ context.Context, request op.TokenRequest
 	s.mu.Lock()
 	s.putAccessLocked(oauth.TokenHash(id), t)
 	s.mu.Unlock()
-	s.record(context.Background(), "oidc.token", request.GetSubject(), t.clientID, audit.OutcomeOK)
+	s.record(ctx, "oidc.token", request.GetSubject(), t.clientID, audit.OutcomeOK)
 	return id, expires, nil
 }
 
@@ -1016,7 +1029,7 @@ func (s *OIDCStore) DeviceByUserCode(_ context.Context, userCode string) (*op.De
 // a decision cannot land on a code that is already decided or expired — the
 // postgres store carries the same predicate in its UPDATE (see C3-3 in
 // docs/security-audit-3.md).
-func (s *OIDCStore) ApproveDevice(_ context.Context, userCode, subject string, scopes []string) error {
+func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string, scopes []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h, ok := s.userCodes[normalizeUserCode(userCode)]
@@ -1034,7 +1047,7 @@ func (s *OIDCStore) ApproveDevice(_ context.Context, userCode, subject string, s
 		d.scopes = append([]string(nil), scopes...)
 	}
 	s.devices[h] = d
-	s.record(context.Background(), "oidc.device.approve", subject, d.clientID, audit.OutcomeOK)
+	s.record(ctx, "oidc.device.approve", subject, d.clientID, audit.OutcomeOK)
 	return nil
 }
 
@@ -1042,7 +1055,7 @@ func (s *OIDCStore) ApproveDevice(_ context.Context, userCode, subject string, s
 //
 // A denial only requires that none is recorded yet: `done` is deliberately not
 // consulted, so denying still outranks an approval whichever write lands second.
-func (s *OIDCStore) DenyDevice(_ context.Context, userCode string) error {
+func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h, ok := s.userCodes[normalizeUserCode(userCode)]
@@ -1055,7 +1068,7 @@ func (s *OIDCStore) DenyDevice(_ context.Context, userCode string) error {
 	}
 	d.denied = true
 	s.devices[h] = d
-	s.record(context.Background(), "oidc.device.deny", "", d.clientID, audit.OutcomeDenied)
+	s.record(ctx, "oidc.device.deny", "", d.clientID, audit.OutcomeDenied)
 	return nil
 }
 

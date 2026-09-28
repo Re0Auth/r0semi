@@ -20,7 +20,7 @@
   Trivy（`--exit-code 1`）扫过之后才用 `buildx imagetools` 把 `latest` 指到那个 digest，预发布 tag
   不产生 `latest`；同一 job **补传 `VERSION` build-arg**，镜像里的 `-version` 与启动日志不再报 `dev`。
   `deploy/k8s/base/deployment.yaml` 的基线镜像由 `:latest` 改为钉住的 tag。运行镜像（scratch）
-  现在 `COPY LICENSE NOTICE`；发布增加 npm 许可清单（`make npm-licenses` 产出，随 `SHA256SUMS`
+  现在 `COPY LICENSE NOTICE`；发布增加 npm 许可清单（`make npm-attribution` 产出，随 `SHA256SUMS`
   一起发布），补上 NOTICE 只覆盖 Go 模块的那一半。Dockerfile 的 CA bundle 改为在构建阶段 `cp -L`
   解引用后再 COPY，避免符号链接在 scratch 里悬空导致出站 TLS 全挂。
 

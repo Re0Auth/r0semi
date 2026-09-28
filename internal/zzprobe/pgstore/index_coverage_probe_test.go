@@ -146,10 +146,10 @@ var singleColumnPredicates = []predicate{
 	{"oauth_access_tokens", "client_id", "oauth.go:292 revokeMatching with a client-only filter"},
 	{"oauth_refresh_tokens", "client_id", "oauth.go:292 revokeMatching with a client-only filter"},
 	{"oauth_codes", "client_id", "oauth.go:242 RevokeTokens (legacy): DELETE FROM oauth_codes + filter"},
-	{"oauth_device_authorizations", "client_id", "oidc.go:995 revokeMatching-style filter on the legacy table"},
 
 	// --- OP state ---
 	{"oidc_auth_requests", "expires_at", "sweep.go:61 DELETE ... WHERE expires_at < $1"},
+	{"oidc_auth_requests", "client_id", "oidc.go:1037 revokePendingAuthorizations: DELETE FROM oidc_auth_requests + client-only filter (V-1: the report named a phantom legacy-table predicate; this is the real one, on the current engine's table)"},
 	{"oidc_codes", "request_id", "oidc.go:260 DeleteAuthRequest: WHERE request_id = $1"},
 	{"oidc_codes", "expires_at", "sweep.go:61"},
 	{"oidc_access_tokens", "id_hash", "oidc.go:441 RevokeToken: WHERE id_hash = $1"},
@@ -183,8 +183,8 @@ func TestEverySingleColumnPredicateHasALeadingIndex(t *testing.T) {
 	if seen < 25 {
 		t.Fatalf("the schema parser found only %d leading index columns; it is not reading the migrations", seen)
 	}
-	if leading["oauth_codes"]["client_id"] {
-		t.Fatal("oauth_codes.client_id now has a leading index; update the inventory rather than trusting this run")
+	if leading["oauth_device_authorizations"]["user_code"] {
+		t.Fatal("oauth_device_authorizations.user_code now has a leading index; update the inventory rather than trusting this run")
 	}
 	if !leading["sessions"]["token_hash"] {
 		t.Fatal("the parser does not see sessions.token_hash's primary key; it is not reading PRIMARY KEY clauses")
@@ -214,15 +214,12 @@ func TestEverySingleColumnPredicateHasALeadingIndex(t *testing.T) {
 func TestKnownUnindexedPredicatesAreStillUnindexed(t *testing.T) {
 	leading := indexLeadingCols(t)
 
+	// Migration 0022 indexed the four live client_id predicates — the three legacy
+	// tables plus oidc_auth_requests — so they are gone from this list. The phantom
+	// oauth_device_authorizations.client_id entry is gone too: no Go statement
+	// filters that table by client_id (V-2 — it was an empty guard). What remains is
+	// the one real, non-indexable predicate.
 	known := []struct{ table, column, why string }{
-		{"oauth_codes", "client_id",
-			"admin client-scoped revocation + the `client` Kill Switch: DELETE FROM oauth_codes WHERE client_id = $1 scans every unredeemed code (0012 indexed subject and expires_at; client_id was not)"},
-		{"oauth_device_authorizations", "client_id",
-			"the legacy table has no client_id index, so a client-scoped revocation scans it"},
-		{"oauth_access_tokens", "client_id",
-			"the legacy token table: 0012/0021 added client_id indexes to the oidc_* pair only"},
-		{"oauth_refresh_tokens", "client_id",
-			"same, for the legacy refresh table"},
 		{"oauth_device_authorizations", "user_code",
 			"the legacy table's lookup index is an expression index (upper(replace(...))), so only a canonicalised comparison can use it"},
 	}

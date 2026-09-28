@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/hex"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +12,24 @@ import (
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/observability"
 )
+
+// recordAudit writes one event this layer owns. A write failure is logged, not
+// returned: the action already happened, and a 500 over a missing audit line
+// would report a completed action as failed.
+func (s *Server) recordAudit(ctx context.Context, action, subject string, detail map[string]string) {
+	if s.auditLog == nil {
+		return
+	}
+	if err := s.auditLog.Record(ctx, audit.Event{
+		Time:    time.Now().UTC(),
+		Action:  action,
+		Subject: subject,
+		Outcome: audit.OutcomeOK,
+		Detail:  detail,
+	}); err != nil {
+		slog.Error("audit record failed", "action", action, "err", err)
+	}
+}
 
 // auditEntryView is one audit record as an operator sees it.
 type auditEntryView struct {
@@ -102,6 +122,20 @@ func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read the audit log")
 		return
+	}
+
+	// Opening this window is itself auditable: it is the widest read of personal
+	// data the service offers, and before this nothing recorded that it happened.
+	// The subject is the OPERATOR (a live account), never the queried subject — a
+	// raw id in the record for a subject whose pseudonym key was destroyed would
+	// make the sink mint a fresh key and re-link the erased account. The filters
+	// are recorded as shapes, not values.
+	if caller, ok := s.sessions.User(r.Context()); ok {
+		s.recordAudit(r.Context(), "admin.audit.read", string(caller), map[string]string{
+			"subject_filter": strconv.FormatBool(q.Subject != ""),
+			"action_filter":  strconv.FormatBool(q.Action != ""),
+			"entries":        strconv.Itoa(len(page.Entries)),
+		})
 	}
 
 	views := make([]auditEntryView, 0, len(page.Entries))

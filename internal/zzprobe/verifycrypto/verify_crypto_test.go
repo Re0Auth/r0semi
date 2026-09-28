@@ -454,10 +454,13 @@ func newSessionHarness(t *testing.T, store scs.Store, sink audit.Logger, subject
 	mux.HandleFunc("/out", func(w http.ResponseWriter, r *http.Request) {
 		user, ok := m.User(r.Context())
 		if !ok {
-			t.Errorf("the harness lost the session, so SignOut would not name a subject")
+			t.Errorf("the harness lost the session, so the teardown would not name a subject")
 		}
 		h.mu.Lock()
-		h.outErr = m.SignOut(r.Context())
+		// EndSession, not SignOut: the shipped erasure path tears the session down
+		// with EndSession so the raw subject never reaches the audit sink after the
+		// pseudonym key is gone.
+		h.outErr = m.EndSession(r.Context())
 		h.mu.Unlock()
 		t.Logf("SignOut saw user=%q and returned err=%v", user, h.outErr)
 		w.WriteHeader(http.StatusNoContent)
@@ -593,7 +596,15 @@ type fakeTokens struct{}
 
 func (fakeTokens) RevokeTokens(context.Context, oauth.TokenFilter) (int, error) { return 1, nil }
 
-func TestVerifyErasureUnlinksThenImmediatelyRelinks(t *testing.T) {
+// TestVerifyErasureDoesNotRelinkTheSubject was the finding that the erasure's own
+// last line undid it: the shipped handler erased the account, then called SignOut,
+// which wrote an `auth.logout` carrying the raw `usr_…` — after the pseudonym key
+// had been destroyed, so the sink minted a fresh one and re-linked exactly the
+// account the erasure had just unlinked. The handler now uses EndSession, which
+// records nothing, and the erasure's own `account.delete` is the record. The
+// assertion is inverted from the finding's form: it fails if a raw id is written
+// after the destroy.
+func TestVerifyErasureDoesNotRelinkTheSubject(t *testing.T) {
 	sink := &orderSink{}
 	subject := account.UserID("usr_erased")
 
@@ -618,7 +629,7 @@ func TestVerifyErasureUnlinksThenImmediatelyRelinks(t *testing.T) {
 	}
 	h.run(t, "/out")
 	if err := h.signOutError(); err != nil {
-		t.Fatalf("SignOut: %v", err)
+		t.Fatalf("EndSession: %v", err)
 	}
 
 	lines := sink.lines()
@@ -637,20 +648,12 @@ func TestVerifyErasureUnlinksThenImmediatelyRelinks(t *testing.T) {
 	if destroy < 0 {
 		t.Fatal("the erasure never destroyed the pseudonym key; the probe is not on the path")
 	}
-	after := -1
 	for i := destroy + 1; i < len(lines); i++ {
 		if strings.HasPrefix(lines[i], "record ") && strings.Contains(lines[i], "usr_erased") {
-			after = i
-			break
+			t.Errorf("a raw id is written to the audit sink AFTER the pseudonym key for that subject "+
+				"was destroyed (line %d): %q. The postgres sink mints a key when none exists, so this "+
+				"would undo the erasure's own last step.", i, lines[i])
+			return
 		}
 	}
-	if after < 0 {
-		t.Log("REFUTED: no audit write naming the raw id follows the destroy")
-		return
-	}
-	t.Errorf("CONFIRMED: %q is written to the audit sink AFTER the pseudonym key for that "+
-		"subject was destroyed (line %d). The postgres sink pseudonymises by minting a key "+
-		"when none exists (auditpseudo.go:115-142, measured by auditpseudo_test.go:232-244), "+
-		"so the erasure's own last step is undone by the next line of the same request.",
-		lines[after], after)
 }

@@ -172,14 +172,19 @@ func New(cfg Config) (*Deleter, error) {
 //     deleted from; destroying this key is what makes its rows unlinkable. It
 //     goes last, after the record of the deletion itself has been written.
 //
-// Every step is idempotent, so a retry after a mid-way failure is safe and is the
-// intended recovery: the error names the step that stopped, and the caller can
-// simply ask again. The audit event is written last, once the stores are clear, so
-// it can state what was removed rather than promise it; a failure to write it
-// fails the request, and because DeleteUser is idempotent the retry produces the
-// record. That is deliberately the opposite of the operator plane, which logs and
-// proceeds: here the person can retry, and an unprovable erasure is worse than a
-// failed one.
+// Every step is idempotent, so a repeat is safe *at the store level*: the error
+// names the step that stopped, and running it again re-does nothing already done.
+// The audit event is written last, once the stores are clear, so it can state what
+// was removed rather than promise it, and a failure to write it fails the request.
+//
+// The caveat, and the reason the HTTP layer no longer promises a retry: this
+// endpoint is session-scoped, and step 4 revokes the account's sessions. A failure
+// from that step on therefore cannot be retried through the endpoint — the caller
+// has no session left — even though DeleteAccount itself would be safe to re-run.
+// Making the retry real would need a retry credential that survives the erasure;
+// until then the honest answer is that an operator has to finish it. That is
+// deliberately the opposite of the operator plane, which logs and proceeds: here an
+// unprovable erasure is worse than a failed one.
 func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.UserID) (Result, error) {
 	if subject == "" {
 		return Result{}, errors.New("lifecycle: subject is required")
@@ -245,8 +250,9 @@ func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.User
 
 	// The record is written after every store is clear, so it can state the result
 	// rather than a promise. A failure to write it fails the erasure: the account
-	// row is already gone, but the caller can retry, DeleteUser is idempotent, and
-	// the retry will produce the record.
+	// row is already gone, and DeleteUser is idempotent, so a repeat of the whole
+	// call would produce the record — though see the caveat on DeleteAccount about
+	// the session the erasure revokes, which is what the endpoint's caller loses.
 	if err := d.record(ctx, actor, subject, audit.OutcomeOK, res, ""); err != nil {
 		return res, err
 	}

@@ -189,18 +189,31 @@ func (m *Manager) SignOut(ctx context.Context) error {
 	if user, ok := m.User(ctx); ok {
 		subject = string(user)
 	}
-	if m.index != nil {
-		if token := m.sessions.Token(ctx); token != "" {
-			_ = m.index.Forget(ctx, token)
-		}
-	}
-	err := m.sessions.Destroy(ctx)
+	err := m.EndSession(ctx)
 	outcome := audit.OutcomeOK
 	if err != nil {
 		outcome = audit.OutcomeError
 	}
 	recordAudit(ctx, m.auditLog, audit.Event{Action: "auth.logout", Subject: subject, Outcome: outcome})
 	return err
+}
+
+// EndSession destroys the session without recording auth.logout.
+//
+// It exists for a caller that has its own audit event: account erasure writes
+// `account.delete`, and it runs *after* the erasure destroyed the account's
+// pseudonym key. A logout event written there would carry a raw `usr_…` into a
+// sink whose key no longer exists, which mints a fresh one and re-links exactly
+// the account the erasure just made unlinkable — so the erasure path tears the
+// session down with this instead. Every other caller uses SignOut, which records
+// the event the log is for.
+func (m *Manager) EndSession(ctx context.Context) error {
+	if m.index != nil {
+		if token := m.sessions.Token(ctx); token != "" {
+			_ = m.index.Forget(ctx, token)
+		}
+	}
+	return m.sessions.Destroy(ctx)
 }
 
 // recordAudit writes one authentication event. A write failure is logged, not

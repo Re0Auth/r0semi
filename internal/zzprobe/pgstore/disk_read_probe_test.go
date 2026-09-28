@@ -99,14 +99,14 @@ func TestMigrationsDirectoryResolves(t *testing.T) {
 	}
 
 	names := migrationFiles(t)
-	if len(names) != 20 {
-		t.Errorf("found %d migration files, want 20; update the probes if a migration was added or removed "+
+	if len(names) != 21 {
+		t.Errorf("found %d migration files, want 21; update the probes if a migration was added or removed "+
 			"(names: %v)", len(names), names)
 	}
 	// The schema's own anchor: the first and last migration must be readable and
 	// non-trivial, which proves the path points at this project's migrations and
 	// not at some other directory with .sql files in it.
-	for _, want := range []string{"0001_init.sql", "0021_token_client_indexes.sql"} {
+	for _, want := range []string{"0001_init.sql", "0022_bulk_revoke_client_indexes.sql"} {
 		if !contains(names, want) {
 			t.Errorf("%s is missing from %s", want, abs)
 		}
