@@ -18,3 +18,16 @@ useDefault = true
 [[allowlists]]
 description = "Proof-of-concept output quoted in the adversarial audit reports"
 paths = ['''docs/security-audit-\d+\.md''']
+
+# The same exemption, for the fifth-round audit's artifacts that quote failing-test
+# output and carry fixture strings: three findings reports and one probe script.
+# Named individually rather than by directory, for the reason above — a
+# directory-wide exemption would also silence the next real finding in it.
+[[allowlists]]
+description = "Proof-of-concept output quoted in the fifth-round audit's artifacts"
+paths = [
+  '''docs/audit-5/findings/_fragment_kit\.md''',
+  '''docs/audit-5/findings/http-edge\.md''',
+  '''docs/audit-5/findings/protocol\.md''',
+  '''docs/audit-5/probes/verify-web/bundle-verify\.mjs''',
+]

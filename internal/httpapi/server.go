@@ -602,7 +602,7 @@ func (s *Server) Handler() http.Handler {
 	//
 	// The cost of the swap is that the limiter's 429 is no longer compressed. It
 	// never really was: the body is well under compress.DefaultMinSize.
-	var h http.Handler = s.withCanonicalPath(root)
+	h := s.withCanonicalPath(root)
 	if s.sessions != nil {
 		h = s.sessions.LoadAndSave(h)
 	}

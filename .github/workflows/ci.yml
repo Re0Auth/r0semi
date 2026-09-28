@@ -336,11 +336,12 @@ jobs:
         working-directory: web
         # `high` made this gate unable to fire: the only advisory in the tree is
         # `cookie@0.6.0` (severity low, patched in 0.7.0), a dev-only transitive of
-        # SvelteKit that is not in the shipped static output — it is the entry in
-        # web/package.json's `pnpm.audit.ignore`. At `low` the gate now fails on the
-        # next low-or-worse advisory, which is the point; the ignore keeps it from
-        # failing on the one already known to be unreachable.
-        run: pnpm audit --audit-level low
+        # SvelteKit that is not in the shipped static output. At `low` the gate now
+        # fails on the next low-or-worse advisory, which is the point; `--ignore`
+        # (pnpm >= v10.11, GHSA-based since v11) silences the one already known to
+        # be unreachable. The setting could also live in pnpm-workspace.yaml's
+        # `audit.ignore`, but a flag here keeps it next to the gate it configures.
+        run: pnpm audit --audit-level low --ignore GHSA-pxg6-pf52-xh8x
 
       # Vulnerabilities in the dependency graph that are actually reachable from
       # this code, which is what govulncheck's call-graph analysis answers and a
