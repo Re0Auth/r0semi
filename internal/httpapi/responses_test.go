@@ -2,7 +2,11 @@ package httpapi
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/Re0Auth/r0semi/internal/ratelimit"
 )
 
 // Every business-plane response is authenticated and per-person, so none of them
@@ -37,5 +41,48 @@ func TestBusinessPlaneResponsesAreNotCached(t *testing.T) {
 				t.Errorf("Cache-Control = %q, want no-store", got)
 			}
 		})
+	}
+}
+
+// The 200 endpoints above are not the whole business plane. The limiter's 429 and
+// the body limit's 413 are written by middlewares that sit OUTSIDE the /v1 sub-mux,
+// so the plane wrapper never sees them and the directive has to come from
+// writeProblem itself. Before that, the guard above passed while every refusal on
+// the plane went out cacheable.
+func TestBusinessPlaneRejectionsAreNotCached(t *testing.T) {
+	cfg := newFullConfig(t)
+	cfg.Limiter = ratelimit.New(0.001, 1)
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	do := func(peer, method, target string, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.RemoteAddr = peer
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 429: one token per peer, never refilled.
+	peer := "203.0.113.7:1234"
+	do(peer, http.MethodGet, "/v1/me", "")
+	rec := do(peer, http.MethodGet, "/v1/me", "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second /v1/me = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("business 429 Cache-Control = %q, want no-store", got)
+	}
+
+	// 413: over oauth.MaxFormBytes, from a peer whose bucket is still full.
+	big := strings.Repeat("x", 100<<10)
+	rec = do("203.0.113.8:1234", http.MethodPost, "/v1/me", big)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized /v1/me = %d, want 413", rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("business 413 Cache-Control = %q, want no-store", got)
 	}
 }

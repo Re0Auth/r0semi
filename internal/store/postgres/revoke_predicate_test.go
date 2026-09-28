@@ -24,12 +24,21 @@ func indexLeadsWith(lists []string, col string) bool {
 // the operator's suspend / delete-client action and the `client` Kill Switch filter
 // by client_id alone. The (subject, client_id) indexes do not help a predicate on
 // client_id by itself, so it needs its own leading-column index.
+//
+// The list is every table a client_id-only predicate deletes from, not just the
+// OIDC engine's two: revokeMatching reaches the three legacy oauth_* tables and
+// revokePendingAuthorizations reaches oidc_auth_requests, so a fix that only
+// indexed the current engine's token tables (0021) left the rest scanning.
 func TestClientScopedRevokeIsIndexed(t *testing.T) {
 	indexed := migrationIndexes(t)
-	for _, table := range []string{"oidc_access_tokens", "oidc_refresh_tokens"} {
+	for _, table := range []string{
+		"oidc_access_tokens", "oidc_refresh_tokens",
+		"oauth_access_tokens", "oauth_refresh_tokens", "oauth_codes",
+		"oidc_auth_requests",
+	} {
 		if !indexLeadsWith(indexed[table], "client_id") {
 			t.Errorf("%s has no index with client_id as its leading column: the client-scoped "+
-				"revocation scans the table (add a migration like 0021_token_client_indexes.sql)", table)
+				"revocation scans the table (add a migration like 0022_bulk_revoke_client_indexes.sql)", table)
 		}
 	}
 }

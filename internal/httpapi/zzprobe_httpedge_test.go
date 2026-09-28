@@ -250,7 +250,7 @@ func TestZZProbeMrtEquivalentsAreAntiVacuous(t *testing.T) {
 		}
 	})
 
-	t.Run("an escaped path answers problem+json but skips the plane wrapper", func(t *testing.T) {
+	t.Run("an escaped path answers problem+json with the same directive", func(t *testing.T) {
 		// Control: the canonical path goes through businessPlane(), so it carries
 		// both headers the plane promises.
 		canonical := httptest.NewRecorder()
@@ -271,18 +271,19 @@ func TestZZProbeMrtEquivalentsAreAntiVacuous(t *testing.T) {
 		if escaped.Code != http.StatusNotFound {
 			t.Fatalf("/v1%%2Fnope = %d, want 404", escaped.Code)
 		}
-		// Same plane, same status, same body shape — and the directive is missing.
+		// Same plane, same status, same body shape, same directive: HE-4 is fixed by
+		// setting no-store in writeProblem itself, so the wrapper is no longer the
+		// only place the rule lives. These assertions fail if the two spellings
+		// diverge again.
 		if ct := escaped.Header().Get("Content-Type"); ct != "application/problem+json" {
 			t.Errorf("/v1%%2Fnope Content-Type = %q, want problem+json (the plane shape is right)", ct)
 		}
-		if escaped.Header().Get("Cache-Control") == canonical.Header().Get("Cache-Control") {
-			t.Errorf("the two spellings agree on Cache-Control (%q): either the wrapper now covers both, "+
-				"or this probe stopped reaching the difference",
-				canonical.Header().Get("Cache-Control"))
-		} else {
-			t.Logf("escaped  /v1%%2Fnope   -> %d %q Cache-Control=%q (canonical had %q)",
-				escaped.Code, escaped.Header().Get("Content-Type"),
+		if escaped.Header().Get("Cache-Control") != canonical.Header().Get("Cache-Control") {
+			t.Errorf("the two spellings disagree on Cache-Control: escaped=%q canonical=%q (HE-4 regressed)",
 				escaped.Header().Get("Cache-Control"), canonical.Header().Get("Cache-Control"))
+		}
+		if got := escaped.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("/v1%%2Fnope Cache-Control = %q, want no-store", got)
 		}
 	})
 

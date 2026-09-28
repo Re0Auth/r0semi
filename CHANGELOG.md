@@ -8,6 +8,25 @@
 
 ## Unreleased
 
+- **撤销索引补齐（迁移 `0022`）**：迁移 `0021` 只给 OIDC 引擎的 `oidc_access_tokens` / `oidc_refresh_tokens`
+  补了 `client_id` 前导索引，而按 `client_id` 单独过滤的批量撤销还有四处：`revokeMatching` 触及的三张
+  legacy `oauth_access_tokens` / `oauth_refresh_tokens` / `oauth_codes`，以及 `revokePendingAuthorizations`
+  触及的当前引擎表 `oidc_auth_requests`。新迁移在启动时自动执行；影响面是撤销与应急响应端点，
+  不是签发热路径。
+
+- **`/.well-known/*` 的两份发现文档纳入动词矩阵**：它们在提供方的 `ServeHTTP` 里走单独一条分支，
+  此前不查 `endpointMethods`，因此任意动词都回 `200` 与完整文档。现在与其它协议端点一致：只收
+  `GET`/`HEAD`，其余动词回 `405` 的 OAuth 错误体。
+
+- **业务面的失败响应补齐 `Cache-Control: no-store`**：此前该指令只在 `/v1` 子 mux 的包装器与确认
+  `200` 的写路径上；限流 `429`、体限 `413`、在途上限 `503` 由子 mux 之外的中件写出，从未带上它。
+  现在由 `writeProblem` 自身设置，与协议面一致，也覆盖编码路径上的 `404`。
+
+- **跨平面的非规范拼写改为 `404`，而不是 `307`**：`/v1/../oauth/token` 这类路径会被 `ServeMux`
+  清洗后重定向进另一个平面（`/oauth/token`），而该重定向由路由器写出、不带任何平面的形状，限流与
+  指标却按原路径归类。现在这类拼写在其**原**平面的形状里被拒（`404`），不再发生跨平面跳转；同平面的
+  清洗（如 `/v1//me`）与尾斜杠行为不变。
+
 - **源从配置移除后，名下绑定现在可以被用户断开**：`Unbind` 此前在读取绑定**之前**就对未知源返回
   `ErrUnknownSource`，于是 `DELETE /v1/bindings/{game}/{source}` 回 404，而 `GET /v1/bindings`
   仍带着 `configured:false` 列出这条绑定并声称「仍可断开」——那条上游令牌与其 vault 密文只能靠运维

@@ -163,6 +163,11 @@ func TestZZProbeRawUpstream401BodyIsNotForwarded(t *testing.T) {
 
 // A kill-switch request from a non-admin must not be actionable, and must not
 // even confirm the operator plane exists.
+//
+// The documented answer with no admin allowlist is 404, not 401: docs/admin.md
+// §"面" says the plane is not mounted at all, and a non-admin gets `404 not_found`
+// "with no difference from a path that does not exist". The earlier expectation of
+// 401 was the probe contradicting both the doc and the handler.
 func TestZZProbeKillSwitchRequiresAnOperator(t *testing.T) {
 	// No admin allowlist configured at all: the plane is not mounted.
 	base, at := zzOneSourceHTTP(t, "application/json", `{}`, http.StatusOK)
@@ -178,7 +183,13 @@ func TestZZProbeKillSwitchRequiresAnOperator(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	t.Logf("POST /v1/admin/kill_switch with only a bearer token, no admin plane => %d %s",
 		resp.StatusCode, body)
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("an unauthenticated kill switch was answered %d, want the documented 401", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("an unauthenticated kill switch was answered %d, want the documented 404 "+
+			"(the plane is not mounted)", resp.StatusCode)
+	}
+	// The answer must not advertise the plane: it has to be indistinguishable from
+	// a path that does not exist.
+	if !strings.Contains(string(body), "not_found") {
+		t.Errorf("kill-switch refusal does not read as a plain not_found problem: %s", body)
 	}
 }

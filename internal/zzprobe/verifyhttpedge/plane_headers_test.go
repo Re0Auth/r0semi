@@ -61,8 +61,17 @@ func TestV_BusinessPlaneDirectiveIsNotAttachedToThePlane(t *testing.T) {
 	if escaped.code != http.StatusNotFound {
 		t.Fatalf("the escaped spelling answered %d, not the 404 this probe is about", escaped.code)
 	}
-	if escaped.cache == canonical.cache {
-		t.Errorf("the escaped spelling now carries the same directive (%q): HE-4 is fixed or this probe stopped reaching it", escaped.cache)
+	// HE-4 is fixed: the directive belongs to writeProblem itself now, so the
+	// escaped spelling carries the same directive as the canonical one. This
+	// assertion is inverted from the finding's original form — it fails if the two
+	// spellings differ again, which is what a regression would look like.
+	if escaped.cache != canonical.cache {
+		t.Errorf("the escaped spelling carries Cache-Control=%q but the canonical one carries %q: "+
+			"HE-4 regressed (the directive is no longer set by writeProblem itself)",
+			escaped.cache, canonical.cache)
+	}
+	if escaped.cache != "no-store" {
+		t.Errorf("the escaped business 404 Cache-Control = %q, want no-store", escaped.cache)
 	}
 
 	// What the escaped 404's body contains: the decoded path, which is

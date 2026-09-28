@@ -58,6 +58,12 @@ func problemTitle(code string) string {
 
 // writeProblem renders an RFC 9457 problem+json response with the stable code,
 // a documentation type URI, and the request id.
+//
+// It sets no-store itself rather than relying on the plane wrapper. The wrapper
+// only covers the /v1 sub-mux, so every business-plane refusal written from
+// outside it — the limiter's 429, the body limit's 413, the in-flight 503, a
+// router-cleaned 404 — went out with no cache directive. The rule is per
+// response, and every response on this plane is authenticated and per-person.
 func (s *Server) writeProblem(w http.ResponseWriter, r *http.Request, status int, code, detail string, opts ...func(*problem)) {
 	p := problem{
 		Type:      s.errorBase + "/" + code,
@@ -72,6 +78,7 @@ func (s *Server) writeProblem(w http.ResponseWriter, r *http.Request, status int
 		opt(&p)
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(p)
 }

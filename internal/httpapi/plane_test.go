@@ -323,6 +323,69 @@ func TestBrowserPlaneNeverAnswersWithAPlaneError(t *testing.T) {
 	})
 }
 
+// TestDiscoveryDocumentsRefuseUnlistedMethods is the mux-level half of the protocol
+// verb matrix. The two discovery documents are reached by a branch that does not go
+// through the /oauth method policy, so they were the one part of the protocol plane
+// the walks above could not reach — the walk derived from endpointMethods visited
+// only what the table listed, and the documents were not in it. Every verb answered
+// 200 with the full document. They are GET-only metadata reads.
+func TestDiscoveryDocumentsRefuseUnlistedMethods(t *testing.T) {
+	handler := newFullEnv(t).Handler()
+	for _, path := range []string{
+		"/.well-known/openid-configuration",
+		"/.well-known/oauth-authorization-server",
+	} {
+		for _, verb := range []string{
+			http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions,
+		} {
+			t.Run(verb+" "+path, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(verb, path, nil))
+				if rec.Code != http.StatusMethodNotAllowed {
+					t.Fatalf("%s %s = %d, want 405", verb, path, rec.Code)
+				}
+				assertOAuthPlane(t, rec)
+			})
+		}
+	}
+}
+
+// TestNonCanonicalPathNeverRedirectsAcrossPlanes pins the answer to the router's
+// path cleaning. The walks above are derived from specRoutes, so they visit
+// canonical patterns only and could not reach a spelling whose *cleaned* form lands
+// in another plane — which is exactly how `/v1/../oauth/token -> 307 /oauth/token`
+// survived: the request addressed to the business plane was answered by a redirect
+// into the protocol plane, and no guard looked at non-canonical spellings.
+func TestNonCanonicalPathNeverRedirectsAcrossPlanes(t *testing.T) {
+	handler := newFullEnv(t).Handler()
+	cases := []struct {
+		target string
+		plane  string
+	}{
+		{"/v1/../oauth/token", "business"},
+		{"/oauth/../v1/me", "protocol"},
+		{"/.well-known/../v1/me", "protocol"},
+	}
+	for _, c := range cases {
+		t.Run(c.target, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, c.target, nil))
+			if rec.Code >= 300 && rec.Code < 400 {
+				t.Fatalf("%s answered %d Location=%q: a spelling must not be redirected across a plane",
+					c.target, rec.Code, rec.Header().Get("Location"))
+			}
+			if rec.Code < 400 {
+				t.Fatalf("%s = %d, want a 4xx in the plane of the path as sent", c.target, rec.Code)
+			}
+			if c.plane == "protocol" {
+				assertOAuthPlane(t, rec)
+				return
+			}
+			assertProblemPlane(t, rec)
+		})
+	}
+}
+
 // assertProblemPlane checks a business-plane failure: problem+json, with a
 // machine code — and never an OAuth error object.
 func assertProblemPlane(t *testing.T, rec *httptest.ResponseRecorder) {

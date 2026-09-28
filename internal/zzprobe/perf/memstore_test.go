@@ -185,14 +185,16 @@ func TestMemStoreSweepStallsConcurrentRequests(t *testing.T) {
 			}(w)
 		}
 
-		// Let the readers settle, then run one sweep and see what it costs them.
+		// Let the readers settle, then reset the high-water mark so the window
+		// below is a fresh measurement: the assertion compares what a request paid
+		// *during* the sweep against the sweep's own duration.
 		time.Sleep(20 * time.Millisecond)
-		before := worst.Load()
+		worst.Store(0)
 		start := time.Now()
 		removed := store.SweepExpired()
 		sweep := time.Since(start)
 		time.Sleep(20 * time.Millisecond)
-		after := worst.Load()
+		worstDuring := time.Duration(worst.Load())
 		stop.Store(true)
 		wg.Wait()
 
@@ -202,11 +204,22 @@ func TestMemStoreSweepStallsConcurrentRequests(t *testing.T) {
 		if n.Load() == 0 {
 			t.Fatal("no introspection ran; the probe measured nothing")
 		}
-		t.Logf("records=%7d requests=%8d  sweep=%10s  worst_before=%10s  worst_during=%10s",
+		// The sweep holds the store's single mutex across the whole scan, so a
+		// request that needs the store while it is held waits for it. With eight
+		// readers looping continuously, the worst latency observed in this window
+		// must be at least a large fraction of the sweep. This is the assertion:
+		// without it the counter is only logged, and a probe that can only print is
+		// not a guard. It fails the moment the lock stops being held across the
+		// scan, or the readers stop contending.
+		if worstDuring < sweep/2 {
+			t.Fatalf("worst request latency during the sweep = %s but the sweep held the store mutex for "+
+				"%s: the sweep did not stall a concurrent request (is the lock still held across the scan?)",
+				worstDuring.Round(time.Microsecond), sweep.Round(time.Microsecond))
+		}
+		t.Logf("records=%7d requests=%8d  sweep=%10s  worst_during=%10s",
 			store.Counts().Records(), n.Load(),
 			sweep.Round(time.Microsecond),
-			time.Duration(before).Round(time.Microsecond),
-			time.Duration(after).Round(time.Microsecond))
+			worstDuring.Round(time.Microsecond))
 	}
 }
 

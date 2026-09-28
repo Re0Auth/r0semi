@@ -235,8 +235,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == RFC8414Path:
 		// O-1: identical content, one source. Rewrite to the OIDC document.
+		if !endpointMethods[RFC8414Path][r.Method] {
+			writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
+				"this endpoint does not accept "+r.Method)
+			return
+		}
 		h.serveDiscovery(w, r, OIDCDiscoveryPath)
 	case r.URL.Path == OIDCDiscoveryPath:
+		if !endpointMethods[OIDCDiscoveryPath][r.Method] {
+			writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
+				"this endpoint does not accept "+r.Method)
+			return
+		}
 		h.serveDiscovery(w, r, OIDCDiscoveryPath)
 	case strings.HasPrefix(r.URL.Path, "/oauth/"):
 		h.serveOAuth(w, r)
@@ -1206,6 +1216,12 @@ func duplicatedParam(values url.Values) string {
 // HEAD is listed wherever GET is, because HTTP requires it and net/http serves it
 // from the same handler. authorize, its callback and userinfo accept GET and POST
 // per their RFCs; keys is GET-only (RFC 7517 §5); the rest are POST-only.
+//
+// The two discovery documents are in the table too, and are the reason it is not
+// just "the /oauth endpoints": they are reached by a different branch in ServeHTTP
+// and so were the one pair the /oauth method policy did not cover — every verb
+// answered 200 with the full document while the CHANGELOG claimed unlisted verbs
+// answer 405. They are metadata reads, so GET (and HEAD) is the whole policy.
 var endpointMethods = map[string]map[string]bool{
 	"/" + pathAuthorize:               {http.MethodGet: true, http.MethodPost: true, http.MethodHead: true},
 	"/" + pathAuthorize + "/callback": {http.MethodGet: true, http.MethodHead: true},
@@ -1215,12 +1231,18 @@ var endpointMethods = map[string]map[string]bool{
 	"/" + pathUserinfo:                {http.MethodGet: true, http.MethodPost: true, http.MethodHead: true},
 	"/" + pathKeys:                    {http.MethodGet: true, http.MethodHead: true},
 	"/" + pathDeviceAuthz:             {http.MethodPost: true},
+	OIDCDiscoveryPath:                 {http.MethodGet: true, http.MethodHead: true},
+	RFC8414Path:                       {http.MethodGet: true, http.MethodHead: true},
 }
 
 // knownOAuthPath reports whether path is an endpoint this provider serves — and
 // therefore whether it has a method policy at all. Deriving it from
 // endpointMethods keeps "known" and "has allowed methods" from drifting apart:
 // a path in the map is both.
+//
+// It is consulted only for paths under /oauth (serveOAuth). The two discovery
+// documents are also in the table, for their method policy, but ServeHTTP reaches
+// them by their own branch before this is ever called.
 func knownOAuthPath(path string) bool {
 	_, ok := endpointMethods[path]
 	return ok

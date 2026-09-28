@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/netip"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -588,6 +589,9 @@ func (s *Server) Handler() http.Handler {
 	//	7. the body limit   -- cap what a handler can be made to read, which is a
 	//	                       different question from how often it may ask.
 	//	8. session loading  -- wraps the whole tree; /auth and /v1 both need it.
+	//	9. canonical path   -- refuse a spelling the router would redirect across
+	//	                       a plane boundary, before it can. Innermost, so the
+	//	                       limiter and the metric still see the request.
 	//
 	// The headers sit *outside* compression deliberately. The compressor can
 	// answer on its own — a client that refuses every coding gets a 406 without
@@ -598,7 +602,7 @@ func (s *Server) Handler() http.Handler {
 	//
 	// The cost of the swap is that the limiter's 429 is no longer compressed. It
 	// never really was: the body is well under compress.DefaultMinSize.
-	var h http.Handler = root
+	var h http.Handler = s.withCanonicalPath(root)
 	if s.sessions != nil {
 		h = s.sessions.LoadAndSave(h)
 	}
@@ -690,6 +694,39 @@ func (s *Server) businessPlane() http.Handler {
 func withNoStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withCanonicalPath refuses a request whose path would be cleaned into a different
+// plane, in the plane of the path as sent.
+//
+// Go's ServeMux cleans `.`/`..`/doubled-slash segments by answering a 307 to the
+// cleaned path, and that redirect is written by the router before any handler, so
+// it carries none of this service's plane shapes. When the cleaned path stays in
+// its own namespace that is only a curiosity; when it crosses the boundary
+// (`/v1/../oauth/token` cleans to `/oauth/token`) the request the caller addressed
+// to one plane is answered by a redirect into another, while the limiter and the
+// metric label still classify it by the path as sent. Refusing the spelling keeps
+// every response on the plane contract and removes the cross-plane hop; a client
+// assembles a canonical URL by hand.
+//
+// Only the crossing spelling is refused. A same-plane clean (`/v1//me`) still gets
+// the router's redirect, and a trailing slash is left alone so a subtree mount like
+// the app shell is not turned into a 404.
+func (s *Server) withCanonicalPath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cleaned := path.Clean(r.URL.Path); cleaned != r.URL.Path && planeOf(cleaned) != planeOf(r.URL.Path) {
+			switch planeOf(r.URL.Path) {
+			case planeProtocol:
+				writeOAuthError(w, r, http.StatusNotFound, "invalid_request", "unknown OAuth endpoint")
+			case planeBusiness:
+				s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown resource")
+			default:
+				http.Error(w, "not found", http.StatusNotFound)
+			}
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
