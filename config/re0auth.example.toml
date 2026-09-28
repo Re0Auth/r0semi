@@ -84,6 +84,15 @@ max_upstream_buffer_bytes = 67108864
 # Environment override: RE0AUTH_TRUSTED_PROXIES="10.0.0.0/8,127.0.0.1/32"
 trusted_proxies = []
 
+# A universal prefix (0.0.0.0/0 or ::/0) is REFUSED unless acknowledged here: it
+# trusts every peer, so the rightmost hop is always "inside" the list and the
+# bucket key becomes caller-chosen again — the one value that turns the setting
+# into a no-op. Set this only if you really mean it (the same shape as
+# expose_internal). Never needed with a correct list.
+#
+# Environment override: RE0AUTH_TRUSTED_PROXIES_ANY=true
+# trusted_proxies_any = true
+
 # Which header the nearest reverse proxy WRITES with the client address. "none" —
 # the default — reads no header at all: the peer address is the client.
 #
@@ -143,11 +152,13 @@ expose_internal = false
 introspection_clients = []
 
 [storage]
-# "postgres" or "memory". Omit the whole section to use memory (nothing survives
-# a restart; the server says so at startup). **Either way the authorization engine
-# is the OpenID Provider** (ADR-0001 P4b); a DSN only moves the OP's state from
-# memory to Postgres.
+# "postgres" or "memory". Omitted entirely: a DATABASE_URL in the environment
+# selects postgres (the README quickstart shape), and with no DSN either the
+# server runs in memory and says so at startup. **Either way the authorization
+# engine is the OpenID Provider** (ADR-0001 P4b); a DSN only moves the OP's state
+# from memory to Postgres.
 driver = "postgres"
+# Environment override for the driver: RE0AUTH_STORAGE_DRIVER="memory"
 # The variable holding the connection string, never the DSN itself.
 dsn_env = "DATABASE_URL"
 
@@ -345,7 +356,9 @@ client_secret_env = "GOOGLE_CLIENT_SECRET"
 # display_name = "Next Phi Backend"
 # issuer       = "https://api.next-phi.example"
 # # "revocable" (scoped, revocable) or "long_lived" (a master key). Declaring it
-# # honestly is what lets Re0Auth describe the source accurately.
+# # honestly is what lets Re0Auth describe the source accurately. Omitted means
+# # "revocable"; any other value is refused at startup (a typo read as revocable
+# # would report an unrevocable source as "revoked upstream").
 # token_class  = "revocable"
 # # active | degraded | retired
 # status       = "active"

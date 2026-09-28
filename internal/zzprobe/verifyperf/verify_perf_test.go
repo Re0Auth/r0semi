@@ -379,7 +379,7 @@ func pkce(verifier string) string {
 func rawSource(rawBase string) federation.Source {
 	return federation.Source{
 		Game: verifyGame, Name: verifySource, DisplayName: "Phigros (official)",
-		Issuer: "https://upstream.example", TokenClass: "bearer", RawBase: rawBase,
+		Issuer: "https://upstream.example", TokenClass: "revocable", RawBase: rawBase,
 		Resources: []federation.Resource{{Name: verifyResource, Schema: "phigros.score/1", Scope: verifyScope}},
 	}
 }

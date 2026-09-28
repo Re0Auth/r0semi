@@ -581,6 +581,27 @@ func TestServeUntilSignalClosesHungConnectionsAfterTimeout(t *testing.T) {
 	}
 }
 
+// A universal trusted-proxies prefix makes the whole setting a no-op (every peer
+// is trusted, so the rightmost hop is always "inside" the list), so it needs an
+// explicit acknowledgement — the same shape as expose_internal. A narrow list is
+// unaffected.
+func TestUniversalTrustedPrefixNeedsAcknowledgement(t *testing.T) {
+	wide, err := parseTrustedProxies([]string{"0.0.0.0/0", "::/0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasUniversalPrefix(wide) {
+		t.Fatalf("hasUniversalPrefix missed a universal prefix in %v", wide)
+	}
+	narrow, err := parseTrustedProxies([]string{"10.0.0.0/8", "127.0.0.1/32"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasUniversalPrefix(narrow) {
+		t.Fatalf("hasUniversalPrefix flagged a narrow list %v", narrow)
+	}
+}
+
 // Trusted proxies accept CIDRs and bare addresses, and a malformed entry is an
 // error rather than a silent skip: a typo that quietly trusted nobody — or, if
 // it were handled differently, everybody — is exactly the kind of setting that
@@ -607,10 +628,10 @@ func TestParseTrustedProxies(t *testing.T) {
 // unsigned durable chain would be a control that only looks like one, and the
 // in-memory log has nothing for a key to protect.
 //
-// Durability is chosen by the config file's storage driver, not by DATABASE_URL
-// alone: with no driver named, the store defaults to memory and the DSN is
-// deliberately ignored. So the test writes a real config rather than setting an
-// environment variable that would be silently overridden.
+// Durability is chosen by the storage driver — the file's [storage] driver, the
+// RE0AUTH_STORAGE_DRIVER environment override, or a DATABASE_URL that implies
+// postgres when neither names one. This writes a real config with an explicit
+// driver rather than relying on that inference.
 func TestAuditKeyIsRequiredOnlyWhenDurable(t *testing.T) {
 	valid := base64.StdEncoding.EncodeToString(make([]byte, 32))
 
@@ -673,6 +694,81 @@ func TestAuditKeyIsRequiredOnlyWhenDurable(t *testing.T) {
 		}
 		if cfg.AuditKey != nil {
 			t.Errorf("memory mode resolved an audit key: %v", cfg.AuditKey)
+		}
+	})
+}
+
+// The storage driver is selectable three ways (file > environment > inference from
+// DATABASE_URL), and the resolved reason is recorded so the startup warning can
+// name the actual cause rather than a fixed "no DATABASE_URL".
+func TestStorageDriverResolution(t *testing.T) {
+	base := func() {
+		t.Setenv("RE0AUTH_ISSUER", "https://re0auth.test")
+		t.Setenv("RE0AUTH_COOKIE_SECURE", "true")
+		t.Setenv("RE0AUTH_KEK", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+		t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+		t.Setenv("RE0AUTH_AUDIT_KEY", "")
+		t.Setenv("RE0AUTH_STORAGE_DRIVER", "")
+		t.Setenv("RE0AUTH_TRUSTED_PROXIES", "")
+	}
+	emptyFile := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "re0auth.toml")
+		if err := os.WriteFile(path, []byte("[server]\nissuer = \"https://re0auth.test\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("no DSN and no driver is memory, with the real reason", func(t *testing.T) {
+		base()
+		t.Setenv("DATABASE_URL", "")
+		cfg, err := loadConfig(emptyFile(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.StorageDriver != "memory" {
+			t.Fatalf("driver = %q, want memory", cfg.StorageDriver)
+		}
+		if !strings.Contains(cfg.StorageReason, "no DATABASE_URL") {
+			t.Fatalf("reason = %q, want the no-DSN cause", cfg.StorageReason)
+		}
+	})
+
+	t.Run("DATABASE_URL alone selects postgres", func(t *testing.T) {
+		base()
+		t.Setenv("DATABASE_URL", "postgres://localhost/r0semi")
+		t.Setenv("RE0AUTH_AUDIT_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+		cfg, err := loadConfig(emptyFile(t))
+		if err != nil {
+			t.Fatalf("DATABASE_URL alone was refused: %v", err)
+		}
+		if cfg.StorageDriver != "postgres" || cfg.DatabaseURL == "" {
+			t.Fatalf("driver = %q url = %q, want postgres with the DSN", cfg.StorageDriver, cfg.DatabaseURL)
+		}
+	})
+
+	t.Run("RE0AUTH_STORAGE_DRIVER forces memory over a DSN", func(t *testing.T) {
+		base()
+		t.Setenv("DATABASE_URL", "postgres://localhost/r0semi")
+		t.Setenv("RE0AUTH_STORAGE_DRIVER", "memory")
+		cfg, err := loadConfig(emptyFile(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.StorageDriver != "memory" {
+			t.Fatalf("driver = %q, want memory", cfg.StorageDriver)
+		}
+		if !strings.Contains(cfg.StorageReason, "storage.driver is memory") {
+			t.Fatalf("reason = %q, want the explicit-driver cause", cfg.StorageReason)
+		}
+	})
+
+	t.Run("an invented driver is refused", func(t *testing.T) {
+		base()
+		t.Setenv("RE0AUTH_STORAGE_DRIVER", "mysql")
+		if _, err := loadConfig(emptyFile(t)); err == nil {
+			t.Fatal("an invented storage driver was accepted")
 		}
 	})
 }

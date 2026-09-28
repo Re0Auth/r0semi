@@ -162,6 +162,22 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 		if s.Status == "" {
 			s.Status = StatusActive
 		}
+		// token_class is the operator's honest declaration of what the source can
+		// do, and unbind.go reads it as "long_lived means cannot revoke per client,
+		// everything else means it can". An empty value must therefore become the
+		// safe default (revocable, the common case), and an unrecognised one must be
+		// refused: a typo like "long_live" would otherwise be silently read as
+		// revocable, and Re0Auth would report "revoked upstream" for a source that
+		// never could. Validation lives here, at the registry, so the composition
+		// root and the conformance suite cannot disagree about what is valid.
+		switch s.TokenClass {
+		case "":
+			s.TokenClass = tokenClassRevocable
+		case tokenClassRevocable, tokenClassLongLived:
+		default:
+			return nil, fmt.Errorf("federation: source %s: token_class %q must be %q or %q",
+				k, s.TokenClass, tokenClassRevocable, tokenClassLongLived)
+		}
 		s.RawBase = strings.TrimRight(s.RawBase, "/")
 		if s.RawBase != "" {
 			if err := validateRawBase(s.RawBase); err != nil {

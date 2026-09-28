@@ -9,3 +9,4 @@ namespace: re0auth
 resources:
   - pvc.yaml
   - cronjob.yaml
+  - networkpolicy.yaml

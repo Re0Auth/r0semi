@@ -389,50 +389,42 @@ func mustCode(t *testing.T, url string) int {
 // CS-3
 // ---------------------------------------------------------------------------
 
-// CS3-V1: a real process starts with trusted_proxies = ["0.0.0.0/0"], with no
-// warning of any kind, and the startup log does not mention the list.
-func TestV_RealProcessAcceptsATrustEverythingProxyList(t *testing.T) {
+// CS3-V1 (FIXED): the real process now REFUSES a universal trusted-proxies list
+// unless it is explicitly acknowledged, and the acknowledgement makes it start.
+func TestV_RealProcessRefusesATrustEverythingProxyList(t *testing.T) {
 	dir := t.TempDir()
 	port := freePort(t)
 	cfg := fmt.Sprintf("[server]\nissuer = \"http://127.0.0.1:%d\"\naddr = \"127.0.0.1:%d\"\n"+
 		"cookie_secure = false\ntrusted_proxies = [\"0.0.0.0/0\", \"::/0\"]\n", port, port)
-	p := startServer(t, dir, baseEnv(), "-config", writeConfig(t, dir, cfg))
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	p.waitServing(base)
-	log := p.log()
-	t.Logf("trusted_proxies=[\"0.0.0.0/0\",\"::/0\"] was accepted by the real loader and the " +
-		"process serves normally")
-	t.Logf("full startup log (%d bytes):\n%s", len(log), log)
-	for _, field := range []string{"trusted_proxies", "0.0.0.0/0"} {
-		if strings.Contains(log, field) {
-			t.Logf("the startup log DOES mention %q", field)
-		} else {
-			t.Logf("the startup log never mentions %q", field)
-		}
+	path := writeConfig(t, dir, cfg)
+
+	// Without the acknowledgement the process exits non-zero and names the reason.
+	code, out := runToExit(t, dir, baseEnv(), "-config", path)
+	t.Logf("without the acknowledgement: exit %d: %s", code, strings.TrimSpace(out))
+	if code == 0 {
+		t.Errorf("trusted_proxies=[0.0.0.0/0, ::/0] was accepted with no acknowledgement; " +
+			"it makes the whole setting a no-op and must be refused")
 	}
-	// The forged header really is believed by the real process: the access log's
-	// client field (INFO level on a business route) carries the caller's value.
-	req, _ := http.NewRequest(http.MethodGet, base+"/v1/me", nil)
-	req.Header.Set("X-Forwarded-For", "203.0.113.77")
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
-	if err != nil {
-		t.Fatal(err)
+	if !strings.Contains(out, "trusted_proxies") {
+		t.Errorf("the refusal does not name trusted_proxies: %s", out)
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	for _, l := range linesWith(p.log(), "path=/v1/me") {
-		t.Logf("access log line: %s", l)
-	}
+
+	// Acknowledgement is the escape hatch, and it is what the control proves works.
+	env := baseEnv()
+	env["RE0AUTH_TRUSTED_PROXIES_ANY"] = "true"
+	p := startServer(t, dir, env, "-config", path)
+	p.waitServing(fmt.Sprintf("http://127.0.0.1:%d", port))
+	t.Logf("with RE0AUTH_TRUSTED_PROXIES_ANY=true the process serves normally")
 }
 
 // ---------------------------------------------------------------------------
 // CS-4
 // ---------------------------------------------------------------------------
 
-// CS4-V1: the real binary starts with a mistyped or absent token_class, and
-// refuses a mistyped value in a neighbouring enum. The control is what makes
-// the first half evidence rather than a claim about a code path nobody reached.
-func TestV_RealProcessAcceptsAMistypedTokenClass(t *testing.T) {
+// CS4-V1 (FIXED): the real binary now REFUSES a mistyped or invented token_class
+// and defaults an absent one to revocable. The control (another enum in the same
+// file) still refuses, so the loader is shown to police its own values.
+func TestV_RealProcessRefusesAMistypedTokenClass(t *testing.T) {
 	source := func(tokenClass string) string {
 		return "[[sources]]\ngame = \"phigros\"\nsource = \"next-phi\"\n" +
 			"display_name = \"Next Phi\"\nissuer = \"https://api.next-phi.example\"\n" +
@@ -441,20 +433,32 @@ func TestV_RealProcessAcceptsAMistypedTokenClass(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		field string
+		ok    bool
 	}{
-		{"a typo of long_lived", "token_class = \"long_live\"\n"},
-		{"the value omitted", ""},
-		{"an invented third value", "token_class = \"session\"\n"},
+		{"a typo of long_lived", "token_class = \"long_live\"\n", false},
+		{"the value omitted", "", true},
+		{"an invented third value", "token_class = \"session\"\n", false},
+		{"the wrong case", "token_class = \"Revocable\"\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			port := freePort(t)
 			cfg := fmt.Sprintf("[server]\nissuer = \"http://127.0.0.1:%d\"\naddr = \"127.0.0.1:%d\"\n"+
 				"cookie_secure = false\n", port, port) + source(tc.field)
-			p := startServer(t, dir, baseEnv(), "-config", writeConfig(t, dir, cfg))
-			p.waitServing(fmt.Sprintf("http://127.0.0.1:%d", port))
-			t.Logf("the real server started with %s: the value reaches federation.Source "+
-				"unchecked, and unbind.go treats everything that is not \"long_lived\" as revocable", tc.name)
+			path := writeConfig(t, dir, cfg)
+
+			if tc.ok {
+				p := startServer(t, dir, baseEnv(), "-config", path)
+				p.waitServing(fmt.Sprintf("http://127.0.0.1:%d", port))
+				t.Logf("the real server started with %s, defaulting to revocable", tc.name)
+				return
+			}
+			code, out := runToExit(t, dir, baseEnv(), "-config", path)
+			t.Logf("with %s: exit %d: %s", tc.name, code, strings.TrimSpace(out))
+			if code == 0 {
+				t.Errorf("the real server started with %s; unbind.go treats everything that is "+
+					"not \"long_lived\" as revocable, so this would misreport an unrevocable source", tc.name)
+			}
 		})
 	}
 
@@ -473,56 +477,59 @@ func TestV_RealProcessAcceptsAMistypedTokenClass(t *testing.T) {
 // CS-5
 // ---------------------------------------------------------------------------
 
-// CS5-V1: a real process with DATABASE_URL set and no [storage] section runs in
-// memory and warns with because="no DATABASE_URL". The exact log line is printed
-// so it can be quoted rather than paraphrased.
-func TestV_RealProcessDatabaseURLAloneStaysInMemory(t *testing.T) {
+// CS5-V1 (FIXED): DATABASE_URL alone is now a statement that the deployment wants
+// to be durable, so the process no longer silently runs in memory; and when memory
+// IS chosen explicitly the warning names the actual cause rather than a fixed
+// because="no DATABASE_URL".
+func TestV_RealProcessDatabaseURLAloneIsNoLongerSilentlyMemory(t *testing.T) {
+	// Part 1: DATABASE_URL alone (no [storage]) must NOT fall back to memory. The
+	// DSN names an unreachable host, so the honest outcomes are "connect and run"
+	// or "fail loudly" — never "serve in memory".
 	dir := t.TempDir()
 	port := freePort(t)
 	env := baseEnv()
-	env["DATABASE_URL"] = "postgres://user:pass@db.internal:5432/re0auth?sslmode=disable"
+	env["DATABASE_URL"] = "postgres://user:pass@db.invalid:5432/re0auth?sslmode=disable"
+	env["RE0AUTH_AUDIT_KEY"] = probeKEK // durable means the chain key is mandatory; set it so the failure is the connection
 	env["RE0AUTH_ADDR"] = fmt.Sprintf("127.0.0.1:%d", port)
 	env["RE0AUTH_ISSUER"] = fmt.Sprintf("http://127.0.0.1:%d", port)
-	// No -config and no RE0AUTH_CONFIG: the process's directory has no
-	// config/re0auth.toml, so this is the environment-only deployment.
-	p := startServer(t, dir, env)
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
-	p.waitServing(base)
 
-	if c, _ := get(t, base+"/readyz"); c != http.StatusOK {
-		t.Errorf("/readyz = %d, want 200 (memory mode has no dependency to check)", c)
+	code, out := runToExit(t, dir, env)
+	t.Logf("DATABASE_URL alone -> exit %d:\n%s", code, strings.TrimSpace(out))
+	if strings.Contains(out, "storage is in-memory") {
+		t.Errorf("DATABASE_URL was set and the process still ran in memory: DATABASE_URL alone must " +
+			"select the durable driver, not silently fall back")
 	}
+	if code == 0 {
+		t.Errorf("the process reached a serving state with an unreachable DSN; it should fail loudly")
+	}
+
+	// Part 2: an explicit driver=memory is honoured, and the warning states the real
+	// cause (not "no DATABASE_URL", which would be a lie when the variable is set).
+	dir2 := t.TempDir()
+	port2 := freePort(t)
+	env2 := baseEnv()
+	env2["DATABASE_URL"] = "postgres://user:pass@db.internal:5432/re0auth?sslmode=disable"
+	env2["RE0AUTH_STORAGE_DRIVER"] = "memory"
+	env2["RE0AUTH_ADDR"] = fmt.Sprintf("127.0.0.1:%d", port2)
+	env2["RE0AUTH_ISSUER"] = fmt.Sprintf("http://127.0.0.1:%d", port2)
+	p := startServer(t, dir2, env2)
+	p.waitServing(fmt.Sprintf("http://127.0.0.1:%d", port2))
+
 	log := p.log()
 	var warn string
 	for _, l := range linesWith(log, "storage is in-memory") {
 		warn = l
 	}
 	if warn == "" {
-		t.Fatalf("no in-memory warning in the log:\n%s", log)
+		t.Fatalf("no in-memory warning despite storage.driver=memory:\n%s", log)
 	}
-	t.Logf("DATABASE_URL was set to postgres://user:pass@db.internal:5432/re0auth?sslmode=disable "+
-		"and the process printed:\n  %s", strings.TrimSpace(warn))
-	if !strings.Contains(warn, `because="no DATABASE_URL"`) {
-		t.Errorf("the warning does not carry the because= field the report quotes: %q", warn)
+	t.Logf("with storage.driver=memory and DATABASE_URL set, the process printed:\n  %s", strings.TrimSpace(warn))
+	if strings.Contains(warn, `because="no DATABASE_URL"`) {
+		t.Errorf("the warning blames a variable that is set: %q", warn)
 	}
-	if !strings.Contains(log, "audit log is in-memory") {
-		t.Errorf("expected the in-memory audit sink warning too:\n%s", log)
+	if !strings.Contains(warn, "storage.driver is memory") {
+		t.Errorf("the warning does not name the real cause: %q", warn)
 	}
-	t.Logf("the same run also printed: %s",
-		strings.TrimSpace(strings.Join(linesWith(log, "audit log is in-memory"), "; ")))
-	for _, l := range linesWith(log, "storage ready") {
-		t.Logf("storage ready line: %s", l)
-	}
-	if len(linesWith(log, "storage ready")) > 0 {
-		t.Errorf("the process claims durable storage: %s", log)
-	}
-	for _, needle := range []string{"audit chain head anchored", "audit chain verified"} {
-		if strings.Contains(log, needle) {
-			t.Errorf("an audit-chain control ran in memory mode: %q", needle)
-		}
-	}
-	t.Logf("no audit-chain line appears in the log of this in-memory run (%d lines total)",
-		len(strings.Split(strings.TrimSpace(log), "\n")))
 }
 
 // CS5-V3: the README's quickstart copies config/re0auth.example.toml and then
@@ -584,10 +591,11 @@ func TestV_ShippedExampleConfigRefusesToStartWithoutDatabaseURL(t *testing.T) {
 	}
 }
 
-// CS5-V2: the control — the same DATABASE_URL with `[storage] driver` set does
-// reach Postgres (and fails there, not on the driver), plus the environment-only
-// deployment cannot become durable even when it sets a plausible variable name.
-func TestV_RealProcessStorageDriverComesFromTheFileOnly(t *testing.T) {
+// CS5-V2 (FIXED): RE0AUTH_STORAGE_DRIVER now exists and selects the driver, and a
+// DATABASE_URL with no [storage] section now reaches the durable path (failing at
+// the connection, not silently falling back to memory).
+func TestV_RealProcessStorageDriverIsSelectableFromTheEnvironment(t *testing.T) {
+	// Control: [storage] driver = postgres reaches Postgres and fails there.
 	dir := t.TempDir()
 	env := baseEnv()
 	env["DATABASE_URL"] = "postgres://user:pass@db.internal:5432/re0auth?sslmode=disable"
@@ -604,46 +612,42 @@ func TestV_RealProcessStorageDriverComesFromTheFileOnly(t *testing.T) {
 	if strings.Contains(out, "storage is in-memory") {
 		t.Errorf("the control stayed in memory despite [storage] driver = postgres")
 	}
-	if !strings.Contains(out, "storage") && !strings.Contains(out, "AUDIT_KEY") {
-		t.Errorf("the failure does not show the durable path was selected:\n%s", out)
-	}
 
-	// The same variable with no [storage] does not even get that far: there is no
-	// audit-key requirement, which is the mark of the memory path.
+	// The environment variable now selects the driver with no [storage] section.
+	// DATABASE_URL alone reaches the durable path — it fails at the connection, and
+	// the audit-key requirement (the mark of a durable deployment) is enforced.
 	dir1 := t.TempDir()
 	port1 := freePort(t)
 	env1 := baseEnv()
 	env1["DATABASE_URL"] = "postgres://user:pass@db.internal:5432/re0auth?sslmode=disable"
+	env1["RE0AUTH_STORAGE_DRIVER"] = "postgres"
+	env1["RE0AUTH_AUDIT_KEY"] = probeKEK
 	env1["RE0AUTH_ADDR"] = fmt.Sprintf("127.0.0.1:%d", port1)
 	env1["RE0AUTH_ISSUER"] = fmt.Sprintf("http://127.0.0.1:%d", port1)
-	p1 := startServer(t, dir1, env1, "-config", writeConfig(t, dir1,
-		fmt.Sprintf("[server]\nissuer = \"http://127.0.0.1:%d\"\naddr = \"127.0.0.1:%d\"\n"+
-			"cookie_secure = false\n", port1, port1)))
-	p1.waitServing(fmt.Sprintf("http://127.0.0.1:%d", port1))
-	out1 := p1.log()
-	if !strings.Contains(out1, "storage is in-memory") {
-		t.Errorf("without [storage] the process was not in memory:\n%s", out1)
+	code1, out1 := runToExit(t, dir1, env1)
+	t.Logf("with DATABASE_URL and RE0AUTH_STORAGE_DRIVER=postgres: exit %d: %s",
+		code1, strings.TrimSpace(out1))
+	if strings.Contains(out1, "storage is in-memory") {
+		t.Errorf("RE0AUTH_STORAGE_DRIVER=postgres had no effect; the process is in memory:\n%s", out1)
 	}
-	t.Logf("without [storage], the same DATABASE_URL and NO audit key started fine and printed: %s",
-		strings.TrimSpace(strings.Join(linesWith(out1, "because="), " ")))
 
-	// Variant: a plausible variable name does not exist, so setting it changes
-	// nothing and the deployment stays in memory.
+	// And it can force memory even when a DATABASE_URL is present.
 	dir2 := t.TempDir()
 	port := freePort(t)
 	env2 := baseEnv()
 	env2["DATABASE_URL"] = "postgres://user:pass@db.internal:5432/re0auth?sslmode=disable"
-	env2["RE0AUTH_STORAGE_DRIVER"] = "postgres"
+	env2["RE0AUTH_STORAGE_DRIVER"] = "memory"
 	env2["RE0AUTH_ADDR"] = fmt.Sprintf("127.0.0.1:%d", port)
 	env2["RE0AUTH_ISSUER"] = fmt.Sprintf("http://127.0.0.1:%d", port)
 	p := startServer(t, dir2, env2)
 	p.waitServing(fmt.Sprintf("http://127.0.0.1:%d", port))
 	log := p.log()
 	if !strings.Contains(log, "storage is in-memory") {
-		t.Fatalf("RE0AUTH_STORAGE_DRIVER appears to have had an effect:\n%s", log)
+		t.Fatalf("RE0AUTH_STORAGE_DRIVER=memory did not force memory:\n%s", log)
 	}
-	t.Logf("with DATABASE_URL AND RE0AUTH_STORAGE_DRIVER=postgres set, the real process is still "+
-		"in-memory: %s", strings.TrimSpace(strings.Join(linesWith(log, "storage is in-memory"), " ")))
+	if strings.Contains(log, `because="no DATABASE_URL"`) {
+		t.Errorf("the warning blames a variable that is set:\n%s", log)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +667,7 @@ cookie_secure = false
 rate_limit = 0
 max_in_flight = 0
 trusted_proxies = ["0.0.0.0/0"]
+trusted_proxies_any = true
 internal_addr = "127.0.0.1:%d"
 introspection_clients = ["wide_open_resource_server"]
 

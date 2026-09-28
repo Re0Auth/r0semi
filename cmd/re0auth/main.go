@@ -207,7 +207,10 @@ type storage struct {
 	// sessions -- and reports how many. Nil when there is nothing to sweep.
 	sweep   func(context.Context) (int64, error)
 	durable bool
-	close   func()
+	// reason explains why memory mode was chosen, for the startup warning, so it
+	// states the actual cause instead of a fixed because="no DATABASE_URL".
+	reason string
+	close  func()
 }
 
 // buildLimiter returns the per-address limiter, or nil when the deployment
@@ -878,6 +881,7 @@ func openStorage(ctx context.Context, cfg settings, metrics *observability.Metri
 				return int64(bindFlows.SweepExpired()), nil
 			},
 			durable: false,
+			reason:  cfg.StorageReason,
 			close:   func() {},
 		}
 		return store, nil
@@ -903,7 +907,8 @@ func openStorage(ctx context.Context, cfg settings, metrics *observability.Metri
 		db.Close()
 		return storage{}, err
 	}
-	slog.Info("storage ready", "driver", "postgres", "migrated", true)
+	// reportDurability announces "storage ready" for the durable case, so this line
+	// is not repeated here.
 	sessions := db.Sessions()
 	return storage{
 		db:          db,
@@ -945,11 +950,12 @@ const persistentPorts = "accounts, clients, " +
 
 // reportDurability states plainly what survives a restart. Silence here would
 // read as "everything is durable", which is the one thing this project must not
-// imply.
+// imply. The reason is the actual cause the loader recorded, not a fixed string:
+// it used to blame "no DATABASE_URL" even when that variable was set.
 func reportDurability(store storage) {
 	if !store.durable {
 		slog.Warn("storage is in-memory: a restart loses sessions, bindings and pending requests",
-			"because", "no DATABASE_URL")
+			"driver", "memory", "because", store.reason)
 		return
 	}
 	slog.Info("storage ready", "driver", "postgres", "persistent_ports", persistentPorts)

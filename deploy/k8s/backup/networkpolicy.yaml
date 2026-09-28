@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: re0auth-backup
+  namespace: re0auth
+spec:
+  # Selects ONLY the dump pod (its own label, not the app's). Without this the
+  # backup pod is unselected by every policy: on a default-deny cluster it cannot
+  # reach Postgres, and because a failed CronJob is silent, the backups would stop
+  # without a signal. It is a separate policy from the app's on purpose — the app's
+  # grants no egress the dump needs, and the dump needs no ingress at all.
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: re0auth-backup }
+  policyTypes: [Egress]
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Postgres in-cluster. Change the namespace selector if the database lives
+    # elsewhere (a managed DB is reached by IP and needs an ipBlock rule instead).
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: postgres }
+      ports:
+        - { protocol: TCP, port: 5432 }

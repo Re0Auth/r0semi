@@ -21,8 +21,18 @@ spec:
     spec:
       backoffLimit: 2
       template:
+        metadata:
+          # Its OWN label, distinct from the app's selector: the dump pod must be
+          # selected by the backup NetworkPolicy (networkpolicy.yaml), which grants
+          # it egress to Postgres, and must NOT be selected by the app's policy
+          # (which grants it nothing it needs). A pod with no labels is selected by
+          # neither, so on a default-deny cluster every dump fails silently.
+          labels: { app.kubernetes.io/name: re0auth-backup }
         spec:
           restartPolicy: Never
+          # The container holds the database DSN; a ServiceAccount token nothing
+          # reads is a credential in the same blast radius for no reason.
+          automountServiceAccountToken: false
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532

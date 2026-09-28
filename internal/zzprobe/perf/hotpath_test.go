@@ -281,7 +281,7 @@ func newProbeEnvWithBudget(tb testing.TB, doer httpclient.Doer, maxBufferedBytes
 	registry, err := federation.NewRegistry(federation.Source{
 		Game: probeGame, Name: probeSource, DisplayName: "Phigros (official)",
 		Issuer:     "https://upstream.example",
-		TokenClass: "bearer",
+		TokenClass: "revocable",
 		RawBase:    "https://upstream.example/api/v1",
 		Resources: []federation.Resource{
 			{Name: probeResource, Schema: "phigros.score/1", Scope: probeScope},

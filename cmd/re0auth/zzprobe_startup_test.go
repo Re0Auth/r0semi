@@ -169,37 +169,59 @@ func TestProbeTwoListenersOnOnePort(t *testing.T) {
 
 // CS-3 probe: a trusted-proxy list that trusts the whole internet is accepted.
 //
-// The list decides whether a caller's X-Forwarded-For is believed, which is what
-// keeps a client from choosing its own rate-limit bucket. The loader refuses a
-// malformed entry precisely so a typo cannot leave the setting unapplied; 0.0.0.0/0
-// is not malformed, it is the value that makes the setting vacuous.
-func TestProbeTrustedProxiesAcceptAUniversalPrefix(t *testing.T) {
-	// Control: a malformed entry is refused.
+// (FIXED) The loader now refuses a universal prefix unless it is explicitly
+// acknowledged. The list decides whether a caller's X-Forwarded-For is believed,
+// which is what keeps a client from choosing its own rate-limit bucket; 0.0.0.0/0
+// is not malformed, it is the value that makes the setting vacuous, so it needs
+// the same acknowledgement as expose_internal.
+func TestProbeUniversalTrustedPrefixNeedsAcknowledgement(t *testing.T) {
+	// Control: a malformed entry is still refused.
 	if _, err := parseTrustedProxies([]string{"not-a-network"}); err == nil {
 		t.Fatal("control failed: a malformed entry was accepted")
 	}
 
+	// parseTrustedProxies itself stays permissive — the gate is one level up, at
+	// loadConfig, where the acknowledgement lives.
 	got, err := parseTrustedProxies([]string{"0.0.0.0/0", "::/0"})
 	if err != nil {
-		t.Fatalf("a universal prefix was refused: %v", err)
+		t.Fatalf("parseTrustedProxies refused a universal prefix: %v", err)
 	}
-	t.Logf("trusted_proxies = %v: every peer is a trusted proxy, so every caller's "+
-		"X-Forwarded-For is believed and the per-address limiter is caller-chosen", got)
-	if len(got) != 2 {
-		t.Fatalf("parsed %d prefixes, want 2", len(got))
+	if !hasUniversalPrefix(got) {
+		t.Fatalf("hasUniversalPrefix did not see the universal prefix in %v", got)
+	}
+	// A narrow list is not universal, so it is unaffected.
+	narrow, _ := parseTrustedProxies([]string{"10.0.0.0/8", "127.0.0.1/32"})
+	if hasUniversalPrefix(narrow) {
+		t.Fatalf("hasUniversalPrefix flagged a narrow list %v", narrow)
+	}
+
+	probeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "re0auth.toml")
+	body := "[server]\nissuer = \"https://re0auth.test\"\ntrusted_proxies = [\"0.0.0.0/0\"]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without the acknowledgement the process refuses to start.
+	if _, err := loadConfig(path); err == nil {
+		t.Error("trusted_proxies = [0.0.0.0/0] was accepted with no acknowledgement; " +
+			"it makes the whole setting a no-op and must be refused")
+	}
+
+	// With it, the configuration loads.
+	t.Setenv("RE0AUTH_TRUSTED_PROXIES_ANY", "true")
+	if _, err := loadConfig(path); err != nil {
+		t.Errorf("the acknowledgement did not permit a universal prefix: %v", err)
 	}
 }
 
-// CS-4 probe: token_class is neither validated nor defaulted, while its
-// neighbours in the same table are.
+// (FIXED) token_class is validated and defaulted at the registry, so a typo can
+// no longer be silently read as revocable.
 //
-// The loader refuses an unknown storage driver, an unknown storage field, a
-// malformed duration and a malformed CIDR. It accepts a token_class that is not
-// one of the two documented values, and it accepts its absence — and both spell
-// as "revocable" at the only place the value is read
-// (internal/federation/unbind.go:74), which is the answer that makes Re0Auth
-// attempt an upstream revocation it cannot verify.
-func TestProbeTokenClassIsNeitherValidatedNorDefaulted(t *testing.T) {
+// The loader refuses an unknown storage driver, a malformed duration and a
+// malformed CIDR; token_class is now policed the same way.
+func TestProbeTokenClassIsValidatedAndDefaulted(t *testing.T) {
 	// Control: the neighbouring enum in the same struct IS handled — an unknown
 	// storage.driver is refused — so this loader does police its own values.
 	probeEnv(t)
@@ -214,26 +236,30 @@ func TestProbeTokenClassIsNeitherValidatedNorDefaulted(t *testing.T) {
 		t.Fatal("control failed: an unknown storage.driver was accepted")
 	}
 
-	for _, tc := range []struct {
-		name       string
-		tokenClass string
-	}{
-		{"a typo of long_lived", "long_live"},
-		{"a typo of revocable", "Revocable"},
-		{"omitted entirely", ""},
-		{"an invented third value", "session"},
-	} {
+	// Valid values (and the empty default) load, and empty becomes revocable.
+	for _, ok := range []string{"revocable", "long_lived", ""} {
 		var cfg settings
-		err := loadSources(&cfg, []sourceSection{{
+		if err := loadSources(&cfg, []sourceSection{{
 			Game: "phigros", Source: "next-phi", Issuer: "https://api.example",
-			TokenClass: tc.tokenClass,
-		}})
-		if err != nil {
-			t.Logf("%s: refused (%v)", tc.name, err)
+			TokenClass: ok,
+		}}); err != nil {
+			t.Errorf("token_class %q was refused: %v", ok, err)
 			continue
 		}
-		t.Logf("%s: accepted with TokenClass=%q, which unbind.go:74 reads as 'not long_lived' "+
-			"and therefore as revocable", tc.name, cfg.sources[0].TokenClass)
+		if ok == "" && cfg.sources[0].TokenClass != "revocable" {
+			t.Errorf("empty token_class stayed %q, want revocable (the safe default)", cfg.sources[0].TokenClass)
+		}
+	}
+
+	// A typo, the wrong case, and an invented value are all refused.
+	for _, bad := range []string{"long_live", "Revocable", "session"} {
+		var cfg settings
+		if err := loadSources(&cfg, []sourceSection{{
+			Game: "phigros", Source: "next-phi", Issuer: "https://api.example",
+			TokenClass: bad,
+		}}); err == nil {
+			t.Errorf("token_class %q was accepted; it would be read as revocable and misreported", bad)
+		}
 	}
 }
 
@@ -256,6 +282,7 @@ func TestProbeStartupLogOmitsEverySecuritySwitch(t *testing.T) {
 	t.Setenv("RE0AUTH_INTERNAL_EXPOSE", "true")
 	t.Setenv("RE0AUTH_ALLOW_PRIVATE_UPSTREAMS", "true")
 	t.Setenv("RE0AUTH_TRUSTED_PROXIES", "0.0.0.0/0")
+	t.Setenv("RE0AUTH_TRUSTED_PROXIES_ANY", "true")
 	t.Setenv("RE0AUTH_RATE_LIMIT", "0")
 	t.Setenv("RE0AUTH_MAX_IN_FLIGHT", "0")
 	t.Setenv("RE0AUTH_INTROSPECTION_CLIENTS", "wide_open_resource_server")
@@ -285,7 +312,7 @@ func TestProbeStartupLogOmitsEverySecuritySwitch(t *testing.T) {
 	out := buf.String()
 	// Anti-vacuous: the startup path really did log, and really did see the
 	// settings this probe configured.
-	for _, want := range []string{"configuration file", "in-memory", "key rotation complete"} {
+	for _, want := range []string{"configuration file", "in-memory", "key rotation run finished"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("the startup log never said %q, so this probe observed nothing:\n%s", want, out)
 		}
@@ -472,7 +499,7 @@ client_secret_env = "PROBE_SOURCE_SECRET"
 		addr    string
 		reached string
 	}{
-		{"the vault path", true, "127.0.0.1:0", "key rotation complete"},
+		{"the vault path", true, "127.0.0.1:0", "key rotation run finished"},
 		{"the serving path", false, "not-an-address", "registered downstream client"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -494,81 +521,57 @@ client_secret_env = "PROBE_SOURCE_SECRET"
 	}
 }
 
-// CS-9 probe: DATABASE_URL alone does not make the deployment durable, and the
-// warning that reports it names the wrong cause.
+// CS-9 probe (FIXED): DATABASE_URL alone now makes the deployment durable, and the
+// warning names the real cause.
 //
-// The driver comes from the config file only. `[storage]` absent means memory, and
-// memory mode then clears DatabaseURL — so the one variable SECURITY.md,
-// README.md's quickstart and every deployment guide name as "the way to be
-// durable" is deliberately ignored. There is no environment variable that selects
-// the driver at all, so an environment-only deployment cannot be durable.
-//
-// The startup warning is the only signal, and it reports `because="no DATABASE_URL"`
-// while DATABASE_URL is set — which sends the operator to check the variable they
-// just set (and which is provably present in this process).
-func TestProbeDatabaseURLAloneStaysInMemoryAndTheWarningBlamesIt(t *testing.T) {
+// Before: an environment-only deployment that set DATABASE_URL (the variable every
+// doc names as "the way to be durable") still ran in memory — the driver came from
+// the file only — and warned `because="no DATABASE_URL"` while the variable was
+// set. Now DATABASE_URL alone selects postgres, RE0AUTH_STORAGE_DRIVER exists, and
+// the warning states the actual reason.
+func TestProbeDatabaseURLAloneSelectsDurable(t *testing.T) {
 	probeEnv(t)
 	t.Setenv("RE0AUTH_ADDR", "not-an-address")
 	// Present, non-empty, and reachable-looking: the variable the docs name.
 	t.Setenv("DATABASE_URL", "postgres://user:pass@db.internal:5432/re0auth?sslmode=disable")
+	// Durable now that DATABASE_URL selects the driver, so the chain key is
+	// mandatory — the very fact this probe is asserting.
+	t.Setenv("RE0AUTH_AUDIT_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
 
 	dir := t.TempDir()
-	// A config with no [storage] section at all — which the example file calls the
-	// way to ask for memory, and which rule 2 of that file encourages by saying
-	// every field has a default.
+	// A config with no [storage] section at all.
 	path := filepath.Join(dir, "re0auth.toml")
 	if err := os.WriteFile(path, []byte("[server]\nissuer = \"https://re0auth.test\"\n"), 0o600); err != nil {
 		t.Fatal(err)
-	}
-
-	// Control: the same config WITH [storage] does reach Postgres — it fails on the
-	// connection rather than on the driver, which is what proves the driver is what
-	// decides.
-	withStorage := filepath.Join(dir, "with-storage.toml")
-	if err := os.WriteFile(withStorage, []byte("[server]\nissuer = \"https://re0auth.test\"\n"+
-		"[storage]\ndriver = \"postgres\"\ndsn_env = \"DATABASE_URL\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("RE0AUTH_AUDIT_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
-	if _, err := loadConfig(withStorage); err == nil {
-		t.Log("control: a config WITH [storage] accepted DATABASE_URL and moved on to opening the pool")
-	} else {
-		t.Fatalf("control failed: [storage] driver = postgres did not take effect: %v", err)
 	}
 
 	cfg, err := loadConfig(path)
 	if err != nil {
 		t.Fatalf("loadConfig = %v", err)
 	}
-	if cfg.DatabaseURL != "" {
-		t.Fatalf("DatabaseURL = %q, want it cleared by the memory driver", cfg.DatabaseURL)
+	if cfg.StorageDriver != "postgres" {
+		t.Errorf("driver = %q with DATABASE_URL set, want postgres: the environment-only deployment must be able to be durable", cfg.StorageDriver)
 	}
-	if cfg.AuditKey != nil {
-		t.Fatal("an audit key was resolved for a memory deployment, so this probe is not observing the memory path")
-	}
-	t.Logf("DATABASE_URL=%q is set in this process, and loadConfig cleared it: the deployment is in-memory",
-		os.Getenv("DATABASE_URL"))
-	if os.Getenv("DATABASE_URL") == "" {
-		t.Fatal("the probe's own environment is wrong: DATABASE_URL is empty")
+	if cfg.DatabaseURL == "" {
+		t.Error("DatabaseURL was cleared despite being set, so the deployment is in memory")
 	}
 
-	// And the log line that reports it.
-	prevConfig, prevRotate := *configFlag, *rotateKeys
-	t.Cleanup(func() { *configFlag, *rotateKeys = prevConfig, prevRotate })
-	*configFlag, *rotateKeys = path, true
-	buf := &bytes.Buffer{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
-	defer slog.SetDefault(prev)
-	if err := run(); err != nil {
-		t.Logf("run() = %v", err)
+	// The environment variable can override it back to memory, and the reason the
+	// warning carries is the actual cause.
+	t.Setenv("RE0AUTH_STORAGE_DRIVER", "memory")
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	out := buf.String()
-	if !strings.Contains(out, `because="no DATABASE_URL"`) {
-		t.Fatalf("the warning did not carry the claim this probe is about:\n%s", out)
+	if cfg.StorageDriver != "memory" {
+		t.Errorf("RE0AUTH_STORAGE_DRIVER=memory had no effect: driver = %q", cfg.StorageDriver)
 	}
-	t.Logf("the warning on a deployment whose DATABASE_URL is set:\n%s",
-		strings.TrimSpace(strings.SplitN(out, "\n", 3)[1]))
+	if strings.Contains(cfg.StorageReason, "no DATABASE_URL") {
+		t.Errorf("the reason blames a variable that is set: %q", cfg.StorageReason)
+	}
+	if !strings.Contains(cfg.StorageReason, "storage.driver is memory") {
+		t.Errorf("the reason does not name the real cause: %q", cfg.StorageReason)
+	}
 }
 
 // CS-10 probe: the sections an operator is most likely to invent are refused, and

@@ -286,7 +286,7 @@ func TestBackupWorkloadIsSafeToLeaveRunning(t *testing.T) {
 	if err := yaml.Unmarshal(raw, &kustomization); err != nil {
 		t.Fatalf("backup kustomization does not parse: %v", err)
 	}
-	for _, want := range []string{"pvc.yaml", "cronjob.yaml"} {
+	for _, want := range []string{"pvc.yaml", "cronjob.yaml", "networkpolicy.yaml"} {
 		if !slices.Contains(kustomization.Resources, want) {
 			t.Fatalf("the backup kustomization does not list %s: %v", want, kustomization.Resources)
 		}
@@ -304,13 +304,38 @@ func TestBackupWorkloadIsSafeToLeaveRunning(t *testing.T) {
 			cron = doc
 		}
 	}
-	for _, want := range []string{"CronJob", "PersistentVolumeClaim"} {
+	for _, want := range []string{"CronJob", "PersistentVolumeClaim", "NetworkPolicy"} {
 		if !kinds[want] {
 			t.Fatalf("deploy/k8s/backup has no %s", want)
 		}
 	}
 	if cron == nil {
 		t.Fatal("no CronJob document parsed")
+	}
+
+	// The dump pod must be selected by the backup NetworkPolicy: a pod selected by
+	// none fails silently on a default-deny cluster, and a CronJob that fails
+	// reaches no metric. Its label is its own, not the app's (whose policy grants
+	// no egress the dump needs).
+	tmplMeta := nestedMap(t, cron, "spec", "jobTemplate", "spec", "template", "metadata")
+	tmplLabels, _ := tmplMeta["labels"].(map[string]any)
+	backupName, _ := tmplLabels["app.kubernetes.io/name"].(string)
+	if backupName != "re0auth-backup" {
+		t.Fatalf("the backup pod's app.kubernetes.io/name = %q, want re0auth-backup so the backup "+
+			"NetworkPolicy selects it", backupName)
+	}
+	var backupSelected bool
+	for _, doc := range docs {
+		if kind, _ := doc["kind"].(string); kind != "NetworkPolicy" {
+			continue
+		}
+		selLabels := nestedMap(t, doc, "spec", "podSelector", "matchLabels")
+		if got, _ := selLabels["app.kubernetes.io/name"].(string); got == backupName {
+			backupSelected = true
+		}
+	}
+	if !backupSelected {
+		t.Fatal("no NetworkPolicy selects the backup pod; on a default-deny cluster every dump fails silently")
 	}
 
 	jobSpec := nestedMap(t, cron, "spec")
@@ -324,6 +349,10 @@ func TestBackupWorkloadIsSafeToLeaveRunning(t *testing.T) {
 	}
 
 	podSpec := nestedMap(t, cron, "spec", "jobTemplate", "spec", "template", "spec")
+	// The DSN-bearing container does not mount a token it never reads.
+	if v, ok := podSpec["automountServiceAccountToken"].(bool); !ok || v {
+		t.Error("the backup pod mounts a ServiceAccount token inside the container that holds the database DSN")
+	}
 	if podSecurity, ok := podSpec["securityContext"].(map[string]any); !ok || podSecurity["runAsNonRoot"] != true {
 		t.Fatalf("backup pod is not runAsNonRoot: %v", podSpec["securityContext"])
 	}

@@ -62,8 +62,10 @@ client_addr_header = "x-forwarded-for"  # 那个代理写的是哪个头
   **逐字转发调用方自带的 XFF（nginx 的默认行为）会让分桶键由调用方决定**，限流形同虚设。
   判据不是「追加还是覆盖」，而是「**追加的那一跳是否也在信任网内**」——第 3 条。
 - `trusted_proxies` 只能写你自己的代理地址，**绝不能包含客户端可能位于的网络**。
-  写 `0.0.0.0/0` 等于关闭这套判据（此时最右侧一跳必然落在信任网内，服务会退回对端地址，
-  于是所有客户端共用一跳代理的桶——安全但粗糙）。
+  写 `0.0.0.0/0` / `::/0` 等于关闭这套判据（此时最右侧一跳必然落在信任网内，服务会退回对端地址，
+  于是分桶键又回到调用方手里）——所以**这两个通配值现在被拒绝启动**，要使用必须显式承认
+  `server.trusted_proxies_any = true`（`RE0AUTH_TRUSTED_PROXIES_ANY=true`），与 `expose_internal`
+  同一形状。
 - **`externalTrafficPolicy: Cluster` / 服务网格 / 内部 LB 会让「最右侧一跳」变成信任网内的地址**
   （节点 IP、网格边车），此时服务按上面的规则**退回对端地址**——也就是那一跳代理的地址。
   后果是**该代理后面的所有客户端共用一个桶**：这是安全方向的退化（可用性问题），不是越权。
@@ -110,6 +112,13 @@ kubectl apply -k deploy/k8s/backup
 - 每 15 分钟一次 `pg_dump -Fc`（对应上面的 RPO 目标）；`concurrencyPolicy: Forbid` 保证一次慢
   转储不会与下一次重叠——重叠的两个 `pg_dump` 会去抢服务正在用的连接预算。保留 7 天
   （`BACKUP_RETAIN_DAYS`），过期删除在同一作业里做。
+- **转储 Pod 带自己的标签 `app.kubernetes.io/name: re0auth-backup`，并由同目录的
+  `networkpolicy.yaml` 选中**（只放行到 Postgres 5432 与 DNS）。这条策略不是可选的：在一个
+  default-deny 的集群上，没被任何策略选中的 Pod 根本到不了 Postgres，而**失败的 CronJob 不会
+  惊动任何人**（不进服务指标、也没有"备份已停"的告警）——转储就这样静默停掉。若数据库不在
+  `postgres` 命名空间（托管库按 IP 访问），改那条策略的选择器或补 `ipBlock`。
+- 转储 Pod **不挂 ServiceAccount token**（`automountServiceAccountToken: false`）：它持有数据库
+  DSN，一个没人读的 token 只是凭空多一把凭据。
 - **这个卷不是异地。** 它和数据库在同一个集群、同一个凭据域。要满足"密钥/备份放在数据库够不到的
   地方"，还需要把卷里的内容复制到对象存储或另一个账号，或用一个已经复制的 StorageClass——
   **复制目标是部署决策**，仓库不替你选。

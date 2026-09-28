@@ -8,6 +8,32 @@
 
 ## Unreleased
 
+- **配置校验：`trusted_proxies` 通配需显式承认、`sources[].token_class` 校验并默认（P2-6 + P2-7）**：
+  `trusted_proxies` 里的 `0.0.0.0/0` / `::/0` 不扩大信任面而是**清空**它（每跳都算「信任网内」，
+  分桶键又回到调用方手里），现在被拒绝启动，要用必须显式承认 `server.trusted_proxies_any = true`
+  （`RE0AUTH_TRUSTED_PROXIES_ANY=true`），与 `expose_internal` 同形。`token_class` 此前在任何 store
+  都不被校验，`unbind.go` 只认 `long_lived`、其余一律读成可撤销 ⇒ 拼错/大写/省略都会把「不可撤销」
+  的源报成「已撤销上游」；现在在 `federation.NewRegistry` 校验：空 → `revocable`，两个真值保留，
+  其余拒绝启动。**升级影响**：写了通配 `trusted_proxies` 或错拼 `token_class` 的部署会拒绝启动。
+
+- **存储选择：`DATABASE_URL` 单独即可选 durable、`RE0AUTH_STORAGE_DRIVER` 新增、内存警告修因（P2-8）**：
+  此前 driver 只由配置文件的 `[storage]` 决定，「设了 `DATABASE_URL`、没写 `[storage]`」会静默退回内存
+  模式（审计链/锚点/自检全无），而警告还硬编码 `because="no DATABASE_URL"` —— 变量明明设了。现在：①
+  环境里给了 `DATABASE_URL` 即选 postgres（README 快速开始形态）；②新增 `RE0AUTH_STORAGE_DRIVER`（环境
+  > 文件 > 推断）；③警告按**实际原因**取值，并公布 `driver`。**升级影响**：只设 `DATABASE_URL` 的纯环境
+  部署现在会尝试连库（而不是静默内存）；要强制内存请设 `RE0AUTH_STORAGE_DRIVER=memory`。
+
+- **备份 Pod 被自己的 NetworkPolicy 选中、不再挂 SA token（P2-16）**：`deploy/k8s/backup` 的转储 Pod
+  此前**没有任何标签**，于是不被任何 NetworkPolicy 选中——default-deny 集群上每次转储都失败，而失败的
+  CronJob 无声（不进指标、无告警），备份就这么静默停掉。现在它有独立标签
+  `app.kubernetes.io/name: re0auth-backup`，由新增的 `deploy/k8s/backup/networkpolicy.yaml` 选中
+  （放行到 Postgres 5432 与 DNS），并 `automountServiceAccountToken: false`。
+
+- **SPA 的 npm 归属清单：把守卫改成断言真实机制（P2-21）**：`make npm-attribution` 早已生成
+  `dist/re0auth_<ver>_npm-attribution.json` 并接进 `checksums`/`release`，但探针断言的是「构建产物里
+  内嵌版权文本」——Svelte/SvelteKit 并不往产物里塞 MIT banner，所以那条断言永远红、且测错了对象。现在
+  探针（`internal/zzprobe/dependencies`）与 archtest 断言的是 Makefile 接线与「非空」守卫。
+
 - **备份/恢复脚本收紧（`scripts/`）**：`restore.sh` 现在 ①校验**命令行给的那个文件**（此前
   `sha256sum --check` 读的是 `.sha256` 里记录的路径——异地恢复被自己挡死，而截断件却能「校验通过」
   进入 `pg_restore`）；②`.age` 路径**先校验密文再解密**（此前该分支一行校验都不跑）；③**缺失

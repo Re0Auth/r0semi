@@ -98,6 +98,14 @@ type serverSection struct {
 	// when attributing a request to a client. Empty means none: the peer address
 	// is the client. Set it only to your own reverse proxies' addresses.
 	TrustedProxies []string `toml:"trusted_proxies"`
+	// TrustedProxiesAny acknowledges a universal prefix in TrustedProxies. A
+	// 0.0.0.0/0 or ::/0 entry trusts every peer, which makes the list a no-op (the
+	// rightmost hop is always "inside" it) and hands the bucket key back to the
+	// caller. The default refuses it; this is the one escape hatch, on the same
+	// terms as expose_internal.
+	//
+	// Environment override: RE0AUTH_TRUSTED_PROXIES_ANY=true
+	TrustedProxiesAny bool `toml:"trusted_proxies_any"`
 	// ClientAddrHeader is the header the deployment's nearest reverse proxy writes
 	// with the client address. "none" — the default — reads no header and uses the
 	// peer address: the only safe answer when the proxy forwards the caller's own
@@ -239,8 +247,16 @@ type settings struct {
 	Addr        string
 	Issuer      string
 	DatabaseURL string
-	KEK         []byte
-	KEKID       string
+	// StorageDriver is the resolved driver: "postgres" or "memory". It is what the
+	// startup log announces, so an operator can see which one won rather than
+	// infer it from a warning.
+	StorageDriver string
+	// StorageReason explains why the in-memory driver was chosen, for the startup
+	// warning. Empty when durable. It replaced a fixed because="no DATABASE_URL",
+	// which was printed even when DATABASE_URL was set.
+	StorageReason string
+	KEK           []byte
+	KEKID         string
 	// AuditKey authenticates the durable audit record chain. It is required
 	// whenever the audit log is durable: an unsigned chain is not tamper-evidence.
 	AuditKey []byte
@@ -552,6 +568,26 @@ func loadConfig(path string) (settings, error) {
 	if err != nil {
 		return settings{}, err
 	}
+	// A universal prefix (0.0.0.0/0, ::/0) does not widen the trust list, it
+	// EMPTIES it: with every peer trusted, the rightmost entry is always inside
+	// the list, so the service falls back to the peer address on every request and
+	// the bucket key becomes caller-chosen again. It is the one value that turns
+	// the setting into a no-op, and it needs the same explicit acknowledgement as
+	// expose_internal and allow_private_addresses — a list that is wide by accident
+	// is the failure this project refuses everywhere else.
+	if hasUniversalPrefix(cfg.TrustedProxies) {
+		ack, err := config.Bool("RE0AUTH_TRUSTED_PROXIES_ANY", f.Server.TrustedProxiesAny)
+		if err != nil {
+			return settings{}, err
+		}
+		if !ack {
+			return settings{}, errors.New(
+				"server.trusted_proxies contains a universal prefix (0.0.0.0/0 or ::/0), which trusts every " +
+					"peer and makes the setting a no-op: the bucket key becomes caller-chosen again. Name the " +
+					"actual proxy networks, or acknowledge it with server.trusted_proxies_any = true " +
+					"(RE0AUTH_TRUSTED_PROXIES_ANY=true)")
+		}
+	}
 
 	// Which header the nearest proxy writes, if any. The trust list alone is not a
 	// statement that a header is trustworthy: a proxy that forwards the caller's own
@@ -625,21 +661,33 @@ func loadConfig(path string) (settings, error) {
 		}
 	}
 
-	// Storage. An explicit driver wins; otherwise a named DSN means postgres.
-	driver := f.Storage.Driver
-	if driver == "" {
-		if f.Storage.DSNEnv != "" {
+	// Storage. An explicit driver wins; a named DSN means postgres; and a
+	// DATABASE_URL in the environment is itself a statement that the deployment
+	// wants to be durable — a deployment that only sets the variable (the README
+	// quickstart shape) must not silently run in memory.
+	//
+	// The reason is recorded on the settings so reportDurability can say WHY, rather
+	// than the fixed because="no DATABASE_URL" it used to print even when the
+	// variable was set.
+	driver := config.FirstNonEmpty(strings.TrimSpace(os.Getenv("RE0AUTH_STORAGE_DRIVER")), f.Storage.Driver)
+	switch driver {
+	case "":
+		if f.Storage.DSNEnv != "" || cfg.DatabaseURL != "" {
 			driver = "postgres"
 		} else {
 			driver = "memory"
+			cfg.StorageReason = "no DATABASE_URL is configured"
 		}
-	}
-	switch driver {
 	case "memory":
-		cfg.DatabaseURL = ""
+		driver = "memory"
+		cfg.StorageReason = "storage.driver is memory"
 	case "postgres":
 		if cfg.DatabaseURL == "" {
-			dsn, err := config.Secret(f.Storage.DSNEnv, "storage.dsn_env")
+			dsnEnv := f.Storage.DSNEnv
+			if dsnEnv == "" {
+				dsnEnv = "DATABASE_URL"
+			}
+			dsn, err := config.Secret(dsnEnv, "storage.dsn_env")
 			if err != nil {
 				return settings{}, err
 			}
@@ -648,6 +696,10 @@ func loadConfig(path string) (settings, error) {
 	default:
 		return settings{}, fmt.Errorf("storage.driver %q must be \"memory\" or \"postgres\"", driver)
 	}
+	if driver == "memory" {
+		cfg.DatabaseURL = ""
+	}
+	cfg.StorageDriver = driver
 
 	// The connection pool. Resolved even in memory mode, where nothing uses it, so
 	// a typo is reported now rather than on the day a deployment grows a database.
@@ -865,10 +917,16 @@ func loadSources(cfg *settings, sections []sourceSection) error {
 		cfg.sources = append(cfg.sources, source)
 	}
 	// The registry is the authority on what a valid source looks like, so its
-	// validation is the source of truth rather than a duplicate here.
-	if _, err := federation.NewRegistry(cfg.sources...); err != nil {
+	// validation is the source of truth rather than a duplicate here. It also
+	// NORMALIZES (an empty token_class becomes revocable, an empty status active),
+	// so cfg.sources is rebuilt from it: keeping the pre-validation copies would
+	// leave the composition root holding the un-normalized values the registry
+	// already fixed.
+	reg, err := federation.NewRegistry(cfg.sources...)
+	if err != nil {
 		return fmt.Errorf("sources: %w", err)
 	}
+	cfg.sources = reg.AllSources()
 	return nil
 }
 
@@ -945,6 +1003,18 @@ func internalAddrIsLocal(addr string) bool {
 		return false
 	}
 	return ip.IsLoopback()
+}
+
+// hasUniversalPrefix reports whether the parsed list contains a prefix that
+// matches every address (0.0.0.0/0 or ::/0). Such a prefix is what turns the
+// trust list into a no-op, so it is checked separately from "how wide is wide".
+func hasUniversalPrefix(prefixes []netip.Prefix) bool {
+	for _, p := range prefixes {
+		if p.Bits() == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // parseTrustedProxies parses CIDR prefixes, and bare addresses as single-host

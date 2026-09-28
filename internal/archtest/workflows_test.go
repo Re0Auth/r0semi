@@ -13,6 +13,33 @@ import (
 // fullSHA matches the pin form a remote `uses:` must carry: a 40-hex commit.
 var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// TestReleaseShipsNpmAttribution keeps the Makefile wiring that carries the SPA's
+// npm licence listing into every release. NOTICE covers the Go module graph only,
+// and the Svelte/SvelteKit runtime ships inside the binary, so the listing is what
+// satisfies those packages' MIT/ISC notice requirement. The file must be built by
+// `release` and covered by `checksums`, or it is generated and then dropped.
+func TestReleaseShipsNpmAttribution(t *testing.T) {
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mkStr := string(mk)
+	for _, need := range []string{
+		"npm-attribution:",
+		"pnpm licenses list --json",
+		"checksums: sbom npm-attribution",
+		"release: dist sbom npm-attribution checksums",
+	} {
+		if !strings.Contains(mkStr, need) {
+			t.Errorf("the Makefile no longer has %q: the SPA's npm licence listing would not reach a release", need)
+		}
+	}
+}
+
 // TestWorkflowActionsArePinnedToFullSHAs makes the SHA-pinning rule a check rather
 // than a comment.
 //

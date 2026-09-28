@@ -275,3 +275,40 @@ func TestRegistryRejectsBadSources(t *testing.T) {
 		t.Fatal("unexpected sources for an unknown game")
 	}
 }
+
+// token_class is the operator's honest declaration of what the source can do;
+// unbind.go reads "long_lived" as "cannot revoke per client" and everything else
+// as "can". So an empty value must default to revocable and an unrecognised one
+// must be refused — a typo read as revocable makes Re0Auth report "revoked
+// upstream" for a source that never could.
+func TestRegistryValidatesTokenClass(t *testing.T) {
+	// Empty becomes the safe default.
+	reg, err := NewRegistry(Source{Game: game, Name: sourceName, Issuer: "https://x"})
+	if err != nil {
+		t.Fatalf("a source with no token_class was refused: %v", err)
+	}
+	got, _ := reg.Get(game, sourceName)
+	if got.TokenClass != tokenClassRevocable {
+		t.Fatalf("empty token_class stayed %q, want %q (the safe default)", got.TokenClass, tokenClassRevocable)
+	}
+
+	// The two real values are kept.
+	for _, class := range []string{tokenClassRevocable, tokenClassLongLived} {
+		reg, err := NewRegistry(Source{Game: game, Name: sourceName, Issuer: "https://x", TokenClass: class})
+		if err != nil {
+			t.Fatalf("token_class %q was refused: %v", class, err)
+		}
+		got, _ := reg.Get(game, sourceName)
+		if got.TokenClass != class {
+			t.Fatalf("token_class %q became %q", class, got.TokenClass)
+		}
+	}
+
+	// A typo, the wrong case, and an invented value are all refused rather than
+	// silently treated as revocable.
+	for _, bad := range []string{"long_live", "Revocable", "REVOCABLE", "session", "master"} {
+		if _, err := NewRegistry(Source{Game: game, Name: sourceName, Issuer: "https://x", TokenClass: bad}); err == nil {
+			t.Errorf("token_class %q was accepted; it would be read as revocable and misreported", bad)
+		}
+	}
+}

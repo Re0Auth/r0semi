@@ -27,8 +27,19 @@ const (
 	RevocationNothingToDo UpstreamRevocation = "nothing"
 )
 
-// tokenClassLongLived marks a source credential that cannot be revoked per client.
-const tokenClassLongLived = "long_lived"
+// tokenClassRevocable and tokenClassLongLived are the two values a source may
+// declare for token_class (docs/upstream-protocol.md §6). They mirror
+// upstreamkit.TokenRevocable / TokenLongLived; the string values must stay equal
+// to those, because the same declaration travels between the two.
+//
+// They are validated at registry construction. Before that, an unknown value —
+// a typo, a missing one, or the wrong case — fell through to "not long_lived"
+// and was therefore treated as revocable, so a source that cannot revoke per
+// client got reported as "revoked upstream".
+const (
+	tokenClassRevocable = "revocable"
+	tokenClassLongLived = "long_lived"
+)
 
 // ErrCascadeUnsupported reports a source that cannot end an upstream session.
 var ErrCascadeUnsupported = errors.New("federation: the source cannot revoke the upstream session")

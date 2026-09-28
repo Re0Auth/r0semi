@@ -78,6 +78,24 @@ func dig(t *testing.T, doc map[string]any, path ...string) map[string]any {
 	return cur
 }
 
+// yamlContainsPort reports whether a NetworkPolicy's egress rules open the given
+// TCP port.
+func yamlContainsPort(policy map[string]any, want int) bool {
+	spec, _ := policy["spec"].(map[string]any)
+	rules, _ := spec["egress"].([]any)
+	for _, raw := range rules {
+		r, _ := raw.(map[string]any)
+		ports, _ := r["ports"].([]any)
+		for _, p := range ports {
+			pm, _ := p.(map[string]any)
+			if port, _ := pm["port"].(int); port == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // podLabels returns a workload's pod-template labels as a "k=v" set. path points
 // at the pod *template* (the object whose metadata carries the labels).
 func podLabels(t *testing.T, doc map[string]any, path ...string) map[string]bool {
@@ -438,13 +456,14 @@ func TestIngressHasNoAnnotationThatWouldWeakenTLSOrTrustHeaders(t *testing.T) {
 	}
 }
 
-// TestBackupWorkloadIsUnselectedAndKeepsItsServiceAccountToken documents the two
-// gaps in deploy/k8s/backup that no assertion covers yet.
+// The backup workload must be selected by a NetworkPolicy that grants it egress
+// to Postgres, must carry its OWN label (not the app's, whose policy grants no
+// egress), and must not mount a ServiceAccount token.
 //
-// It is written to pass on the current artifacts because it is *describing* them:
-// each assertion is the inverted form of the guard that should exist. Flipping
-// either one is the fix.
-func TestBackupWorkloadIsUnselectedAndKeepsItsServiceAccountToken(t *testing.T) {
+// A pod selected by no policy fails silently on a default-deny cluster — a failed
+// CronJob reaches no metric and there is no alert on backup staleness — so the
+// selection has to be a guard, not a comment.
+func TestBackupWorkloadIsSelectedByItsOwnNetworkPolicy(t *testing.T) {
 	root := repoRoot(t)
 	backup := filepath.Join(root, "deploy", "k8s", "backup")
 
@@ -457,34 +476,41 @@ func TestBackupWorkloadIsUnselectedAndKeepsItsServiceAccountToken(t *testing.T) 
 	if cron == nil {
 		t.Fatal("no CronJob")
 	}
-	podSpec := dig(t, cron, "spec", "jobTemplate", "spec", "template", "spec")
-
-	// 1. The dump pod carries no labels, so no NetworkPolicy in the repository
-	//    selects it. On a cluster with a default-deny egress policy (the thing the
-	//    base's own policy is a piece of), every run fails to reach Postgres — and
-	//    a CronJob that fails is silent: nothing about a missing dump reaches the
-	//    service's metrics, and there is no alert on backup staleness.
 	tmpl := dig(t, cron, "spec", "jobTemplate", "spec", "template")
+	podSpec, _ := tmpl["spec"].(map[string]any)
+
+	// 1. The dump pod carries its own label, and it is not the app's selector.
 	tmplMeta, _ := tmpl["metadata"].(map[string]any)
-	labels, hasLabels := tmplMeta["labels"]
-	if hasLabels {
-		t.Errorf("the backup pod now carries labels (%v); if they include the app's selector it is "+
-			"covered by the app's NetworkPolicy, which allows no egress for it — re-read that policy "+
-			"before keeping this", labels)
-	} else {
-		t.Log("GAP: the backup pod has no labels, so deploy/k8s/base/networkpolicy.yaml does not select it " +
-			"and no policy grants it egress to Postgres; a default-deny cluster makes every dump fail silently")
+	labels, _ := tmplMeta["labels"].(map[string]any)
+	name, _ := labels["app.kubernetes.io/name"].(string)
+	if name != "re0auth-backup" {
+		t.Errorf("the backup pod's app.kubernetes.io/name = %q, want re0auth-backup (its own label, so the "+
+			"backup NetworkPolicy selects it and the app's does not)", name)
 	}
 
-	// 2. It runs as the namespace's default ServiceAccount with a mounted token
-	//    that it never uses — the base hardens this for the app and archtest does
-	//    not check it for the CronJob.
-	if v, ok := podSpec["automountServiceAccountToken"].(bool); ok && !v {
-		t.Log("the backup pod already disables the ServiceAccount token mount")
-	} else {
-		t.Log("GAP: the backup pod mounts a ServiceAccount token (default true for the namespace's " +
-			"default SA) inside the container that holds the database DSN; one line " +
-			"(automountServiceAccountToken: false) removes a credential nothing reads")
+	// 2. A NetworkPolicy selects that label and grants egress to 5432.
+	var policy map[string]any
+	for _, doc := range yamlDocs(t, filepath.Join(backup, "networkpolicy.yaml")) {
+		if doc["kind"] == "NetworkPolicy" {
+			policy = doc
+		}
+	}
+	if policy == nil {
+		t.Fatal("deploy/k8s/backup has no NetworkPolicy: the dump pod would be selected by nothing and fail " +
+			"silently on a default-deny cluster")
+	}
+	selector := dig(t, policy, "spec", "podSelector", "matchLabels")
+	if got, _ := selector["app.kubernetes.io/name"].(string); got != name {
+		t.Errorf("the backup NetworkPolicy selects %q, but the pod is labeled %q", got, name)
+	}
+	if !yamlContainsPort(policy, 5432) {
+		t.Errorf("the backup NetworkPolicy grants no egress to 5432; the dump cannot reach Postgres")
+	}
+
+	// 3. The container that holds the DSN does not mount a ServiceAccount token.
+	if v, ok := podSpec["automountServiceAccountToken"].(bool); !ok || v {
+		t.Error("the backup pod mounts a ServiceAccount token inside the container that holds the database DSN; " +
+			"automountServiceAccountToken: false removes a credential nothing reads")
 	}
 }
 
