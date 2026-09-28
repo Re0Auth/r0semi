@@ -777,7 +777,13 @@ func serveUntilSignal(ctx context.Context, timeout time.Duration, endpoints ...e
 		return err
 	case <-ctx.Done():
 		slog.Info("shutdown signal received; draining in-flight requests", "timeout", timeout)
-		drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		// The drain gets its own deadline and is deliberately NOT derived from ctx:
+		// ctx is already done — that is why we are here — so a context cancelled at
+		// birth would make every Shutdown below return without draining a single
+		// request. WithoutCancel drops exactly that cancellation while keeping ctx's
+		// values (the trace ids a shutdown log line wants), which is why it, and not
+		// Background, is the right parent.
+		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		var err error
 		for _, ep := range endpoints {
