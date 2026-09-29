@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -32,6 +33,33 @@ const readinessTimeout = 2 * time.Second
 // probe already has.
 const readinessTTL = time.Second
 
+// readinessColdStartWait bounds how long a caller that races the process's
+// FIRST-ever check waits for that check before it is told "checking".
+//
+// Before any verdict exists there is nothing to answer from: reporting ready
+// would be a claim about a dependency nobody has reached (the cold-start
+// fail-open), and asserting "not ready" the instant a check that a same-host
+// ping finishes in microseconds is running would fail a probe on a race rather
+// than on the dependency. The wait is long enough to cover a dependency that
+// answers within the readiness budget but short enough to fail closed well
+// inside the orchestrator's period, and it applies ONLY while the verdict is
+// unknown; once one exists, a refresh never makes a caller wait.
+const readinessColdStartWait = 500 * time.Millisecond
+
+// readinessState is the cache's explicit verdict. "unknown" is a first-class
+// value: before the first check returns there is no verdict, and an unknown
+// verdict must never be rendered as ready.
+type readinessState uint8
+
+const (
+	// readinessUnknown means no check has produced a verdict yet.
+	readinessUnknown readinessState = iota
+	// readinessReady means the last completed check found every dependency.
+	readinessReady
+	// readinessNotReady means the last completed check found a dependency down.
+	readinessNotReady
+)
+
 // readinessCache holds the last readiness result for readinessTTL, and lets AT
 // MOST ONE check run at a time.
 //
@@ -42,12 +70,20 @@ const readinessTTL = time.Second
 // anyway. It never fails because of load — that is the ruling this endpoint's
 // exemption rests on, and a 503 caused by someone else's traffic would pull a
 // healthy instance out of rotation.
+//
+// The cache is process-wide, so its verdict is a statement about the
+// DEPENDENCIES, never about the caller that happened to trigger the check.
 type readinessCache struct {
 	mu        sync.Mutex
 	checkedAt time.Time
 	err       error
-	checked   bool
+	state     readinessState
 	running   bool
+	// settled is closed when the in-flight check finishes, so a caller that
+	// arrives during the first-ever check can wait for that one result instead
+	// of either queueing behind a fresh check or being told an unverified
+	// "ready".
+	settled chan struct{}
 }
 
 // ReadinessProbe reports whether the service can serve: a nil return means every
@@ -73,10 +109,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // there is no dependency whose loss would make this instance unable to serve.
 //
 // The check itself runs at most once per readinessTTL (see readinessCache), and a
-// caller never waits for another caller's check. What it must never do is answer
-// "not ready" because the service is busy: that is the ruling in
-// docs/operations.md, and the reason probes are exempt from the limiter and the
-// in-flight cap in the first place.
+// caller with a verdict to answer from never waits for another caller's check.
+// What it must never do is answer "not ready" because the service is busy: that is
+// the ruling in docs/operations.md, and the reason probes are exempt from the
+// limiter and the in-flight cap in the first place.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	// A draining instance is not ready, whatever its dependencies say: readiness is
 	// "may new traffic come here", and during shutdown the answer is no. This is
@@ -91,45 +127,89 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		writeProbe(w, http.StatusOK, "ok")
 		return
 	}
-	if err := s.readiness.check(r.Context(), s.ready); err != nil {
+	switch state, err := s.readiness.check(r.Context(), s.ready); state {
+	case readinessReady:
+		writeProbe(w, http.StatusOK, "ok")
+	case readinessUnknown:
+		// No verdict exists yet (a check is still running and none has ever
+		// completed). Fail closed: "checking" is not "not ready" — the body
+		// says which — but neither is it the unverified 200 the cold start
+		// used to report.
+		writeProbe(w, http.StatusServiceUnavailable, "checking")
+	default:
 		// The reason goes to the log, not the body: this endpoint is reachable
 		// without credentials, and a dependency error can name an internal host
 		// or topology an anonymous caller has no business learning.
 		slog.Debug("readiness check failed", "err", err)
 		writeProbe(w, http.StatusServiceUnavailable, "not ready")
-		return
 	}
-	writeProbe(w, http.StatusOK, "ok")
 }
 
-// check returns the readiness result, running the probe only when the cached one
+// check returns the readiness verdict, running the probe only when the cached one
 // is missing or older than readinessTTL.
 //
 // It holds the lock only around the state, never around the probe call: a slow
 // dependency must not serialize the probes that arrive while it is slow, and those
-// probes are answered from the previous result.
-func (c *readinessCache) check(ctx context.Context, probe ReadinessProbe) error {
+// probes are answered from the previous verdict.
+//
+// The probe runs on a context derived from context.WithoutCancel(ctx): this cache
+// is shared by every caller, so a caller hanging up must not be able to end the
+// check and have its cancellation recorded as the process's readiness. The
+// readinessTimeout still bounds a genuinely hung dependency. A cancellation-class
+// error is treated as "no verdict" rather than a 503, for the same reason.
+func (c *readinessCache) check(ctx context.Context, probe ReadinessProbe) (readinessState, error) {
 	c.mu.Lock()
-	fresh := c.checked && time.Since(c.checkedAt) < readinessTTL
+	fresh := c.state != readinessUnknown && time.Since(c.checkedAt) < readinessTTL
 	if fresh || c.running {
-		err := c.err
+		state, err, settled := c.state, c.err, c.settled
 		c.mu.Unlock()
-		return err
+		if state != readinessUnknown || settled == nil {
+			return state, err
+		}
+		// Cold start: a check is running and the process has never produced a
+		// verdict. There is nothing honest to answer from, so wait a short,
+		// bounded time for that one check — a same-host dependency resolves the
+		// race — and then fail closed if it has still produced nothing.
+		select {
+		case <-settled:
+		case <-time.After(readinessColdStartWait):
+		case <-ctx.Done():
+		}
+		c.mu.Lock()
+		state, err = c.state, c.err
+		c.mu.Unlock()
+		return state, err
 	}
 	c.running = true
+	c.settled = make(chan struct{})
+	settled := c.settled
 	c.mu.Unlock()
 
-	probeCtx, cancel := context.WithTimeout(ctx, readinessTimeout)
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readinessTimeout)
 	defer cancel()
 	err := probe(probeCtx)
 
 	c.mu.Lock()
+	c.running = false
+	close(settled)
+	if errors.Is(err, context.Canceled) {
+		// Not a statement about the dependency, so it must not replace the last
+		// one. The verdict stays whatever it was — ready, not-ready, or still
+		// unknown — and the caller sees that.
+		state, prevErr := c.state, c.err
+		c.mu.Unlock()
+		return state, prevErr
+	}
 	c.err = err
 	c.checkedAt = time.Now()
-	c.checked = true
-	c.running = false
+	if err == nil {
+		c.state = readinessReady
+	} else {
+		c.state = readinessNotReady
+	}
+	state, recordedErr := c.state, c.err
 	c.mu.Unlock()
-	return err
+	return state, recordedErr
 }
 
 // writeProbe writes a probe response. Probes are plain text on purpose: they are

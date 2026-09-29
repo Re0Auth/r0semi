@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
@@ -346,7 +348,7 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 		// can now hold one bucket per plane, so what it may spend in total is the
 		// configured rate times the number of planes; that is a bounded multiple of
 		// a number an operator already chose, rather than an unbounded one.
-		key := planeOf(r.URL.Path).String() + "|" + s.clientKeyOf(r)
+		key := s.bucketKey(r)
 		// One call, one lock acquisition: the verdict and the three header values
 		// come from the same read of the bucket. Asking separately (status, then
 		// allow, then the retry hint) took the limiter's process-wide lock up to
@@ -390,32 +392,101 @@ func setRateLimitHeaders(w http.ResponseWriter, v ratelimit.Verdict) {
 // bounds concurrency, which is what protects memory and database connections
 // when many slow requests arrive together. Probes are exempt for the same reason
 // the limiter exempts them, and the refusal is rendered per plane.
+//
+// The cap is shared, not owned by whoever arrives first: one (plane, client) may
+// hold at most half of it, and the other half is headroom every other client
+// draws from. A process-wide semaphore let a single address hold every slot with
+// a handful of slow-body sockets, so a denial of service against everyone else
+// was indistinguishable from load — /healthz and /readyz stayed 200 and the
+// orchestrator kept routing to the instance. The map holds only clients with a
+// request in flight, so it is bounded by maxInFlight.
 func (s *Server) withInFlightLimit(next http.Handler) http.Handler {
 	if s.maxInFlight <= 0 {
 		return next
 	}
 	sem := make(chan struct{}, s.maxInFlight)
+	perClient := s.maxInFlight / 2
+	if perClient < 1 {
+		perClient = 1
+	}
+	var (
+		mu     sync.Mutex
+		active = make(map[string]int)
+	)
+	refuse := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		switch planeOf(r.URL.Path) {
+		case planeProtocol:
+			writeOAuthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "server busy")
+		case planeBusiness:
+			s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "server busy")
+		default:
+			http.Error(w, "server busy", http.StatusServiceUnavailable)
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isProbe(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
+		key := s.bucketKey(r)
+		mu.Lock()
+		if active[key] >= perClient {
+			mu.Unlock()
+			refuse(w, r)
+			return
+		}
+		active[key]++
+		mu.Unlock()
+		release := func() {
+			mu.Lock()
+			active[key]--
+			if active[key] <= 0 {
+				delete(active, key)
+			}
+			mu.Unlock()
+		}
 		select {
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
+			defer release()
 			next.ServeHTTP(w, r)
 		default:
-			w.Header().Set("Retry-After", "1")
-			switch planeOf(r.URL.Path) {
-			case planeProtocol:
-				writeOAuthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "server busy")
-			case planeBusiness:
-				s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable", "server busy")
-			default:
-				http.Error(w, "server busy", http.StatusServiceUnavailable)
-			}
+			release()
+			refuse(w, r)
 		}
 	})
+}
+
+// bucketKey is the (plane, client) key the limiter and the in-flight cap share.
+// One helper so a request can never be counted under one identity by the rate
+// limiter and another by the concurrency cap.
+func (s *Server) bucketKey(r *http.Request) string {
+	return planeOf(r.URL.Path).String() + "|" + aggregateClientKey(s.clientKeyOf(r))
+}
+
+// aggregateClientKey coarsens an IPv6 client key to its /64.
+//
+// A single delegated IPv6 /64 is 2^64 addresses. Keying each /128 separately let
+// one host fill the whole bucket table from one prefix and leave every client the
+// limiter had not already seen sharing a drained overflow bucket — anonymous
+// denial of service against unrelated clients, silent because the probes stayed
+// green. The HTTP layer owns what a key is, so the coarsening belongs here rather
+// than in the transport-agnostic limiter. The trade is explicit and in the
+// opposite direction from a /128-per-key budget: every host inside one /64 now
+// shares one budget. A /64 is a single subscriber's allocation, which is the
+// right granularity for that trade; an operator allocating from a much wider
+// prefix accepts the same sharing.
+func aggregateClientKey(key string) string {
+	addr, err := netip.ParseAddr(key)
+	if err != nil || !addr.Is6() || addr.Is4In6() {
+		return key
+	}
+	prefix, err := addr.Prefix(64)
+	if err != nil {
+		return key
+	}
+	return prefix.String()
 }
 
 // It delegates to clientAddr, which is the peer address unless the deployment has

@@ -615,7 +615,22 @@ func (s *Server) Handler() http.Handler {
 	// never really was: the body is well under compress.DefaultMinSize.
 	h := s.withCanonicalPath(root)
 	if s.sessions != nil {
-		h = s.sessions.LoadAndSave(h)
+		// Operational probes are not part of the session plane. They are exempt
+		// from the limiter and the in-flight cap, so letting them drive a
+		// session-store round trip per request would turn the exemption itself
+		// into an amplification vector: any anonymous cookie on /readyz would be
+		// one pooled SELECT (and, for a valid cookie, a write) per request, with
+		// no budget and no concurrency cap. /healthz and /readyz reach the
+		// handlers without LoadAndSave; everything else still gets it.
+		probesOnly := h
+		withSessions := s.sessions.LoadAndSave(h)
+		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isProbe(r.URL.Path) {
+				probesOnly.ServeHTTP(w, r)
+				return
+			}
+			withSessions.ServeHTTP(w, r)
+		})
 	}
 	h = s.withBodyLimit(h)
 	h = s.withRateLimit(h)
