@@ -78,12 +78,12 @@ subjects = ["usr_01J...", "usr_01K..."]
 
 恰好一个 target：
 
-| target | 令牌 | 会话 | 客户端 | 数据源绑定 |
-|---|---|---|---|---|
-| `all` | 全部 access + refresh | **全部浏览器会话**（有持久会话时） | 不动 | **全部** |
-| `client` | 该客户端全部 | 不动 | **暂停** | 不动（绑定属于人，不属于客户端） |
-| `subject` | 该账号全部 | **该账号的全部** | 不动 | **该账号的全部** |
-| `bindings` | 不动 | 不动 | 不动 | **全部**（窄形态：只断数据、不掉登录） |
+| target | 令牌 | 会话 | 客户端 | 数据源绑定 | 在途绑定流程 |
+|---|---|---|---|---|---|
+| `all` | 全部 access + refresh | **全部浏览器会话**（有持久会话时） | 不动 | **全部** | 不动 |
+| `client` | 该客户端全部 | 不动 | **暂停** | 不动（绑定属于人，不属于客户端） | 不动 |
+| `subject` | 该账号全部 | **该账号的全部** | 不动 | **该账号的全部** | **该账号的全部** |
+| `bindings` | 不动 | 不动 | 不动 | **全部**（窄形态：只断数据、不掉登录） | 不动 |
 
 **绑定半边（D5 的另一半，已实现）**：对每条绑定 **本地一定切断**（先撕碎 vault 密文、再删绑定行），并尽源所能通知上游：
 
@@ -91,6 +91,17 @@ subjects = ["usr_01J...", "usr_01K..."]
 - 否则普通解绑：调源的 revocation endpoint（`token_class: long_lived` 的源报告为 `unsupported`，不假装成功）。
 - 源已不在配置里的**孤儿绑定**：没有源可通知，但仍会被本地清除，计为 `orphaned`。
 - 一个源失败**不会**中止其它绑定；每条绑定的结局计入 `bindings` 对象（`total`/`revoked`/`cascade`/`unsupported`/`unavailable`/`orphaned`/`failed`）。
+
+**在途绑定流程（`subject` 的第三半边）**：`subject` 目标还会清掉该账号的**在途绑定流程**（`flows_purged`），
+用的是抹除路径同一份能力（`lifecycle.FlowPurger`）。理由：一个 pending flow **是一个能在事后造出新绑定的能力**，
+它的寿命长于绑定本身——只断绑定而不清流程，等于把「已切断数据访问」交给一个还没走完的流程去推翻。
+抹除与 Kill Switch 对同一个中间状态给出同一个答案。边界：与 `subject` 的会话半边一样，内存模式（清不掉会话、
+手柄随之失效）下这条保护才真正必要；清不掉会话的部署见下面的说明。
+
+**未配置数据源的部署**：目标带绑定维度（`all` / `subject` / `bindings`）而部署没有绑定端口时，`bindings` 目标
+**fail-loud** 返回 `ErrBindingsUnavailable`（它没有别的事可做）；`all` 与 `subject` 仍要清令牌/会话，不能因缺少
+绑定端口整体拒绝，于是响应里给 `bindings_unavailable: true` 标记，`Detail` 也记 `bindings_unavailable=true`
+——事故响应者由此能区分「本部署没有绑定」与「本部署清不了绑定」，不会看到两件事长成同一个沉默。
 
 **扫描形态**（`bypass` 一个请求做完，所以它必须是有界的）：绑定**分页枚举**（keyset，键是 `(user, game, source)`，
 页大小 `KillSwitchPageSize`，默认 500），页内最多 `killSwitchWorkers`（8）条并发处理——每条都是一次 vault
@@ -111,7 +122,7 @@ subjects = ["usr_01J...", "usr_01K..."]
 
   理由：scs 会话只是一个不透明 Cookie，存储层只看到编码后的字节，没有任何“这个会话属于谁”的概念。索引因此由 Re0Auth 自己在登录时写；写失败则拒绝该会话（fail-closed），否则就会出现一个运维永远碰不到的会话。
 
-响应返回**真实数字**（`tokens_revoked` / `sessions_revoked` / `clients_suspended` / `bindings`），因为事故响应者要的是数字，不是一句“已处理”。
+响应返回**真实数字**（`tokens_revoked` / `sessions_revoked` / `clients_suspended` / `flows_purged` / `bindings`），因为事故响应者要的是数字，不是一句“已处理”。
 
 ## 5. 审计
 

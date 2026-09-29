@@ -1671,6 +1671,20 @@ components:
         tokens_revoked: { type: integer }
         sessions_revoked: { type: integer }
         clients_suspended: { type: integer }
+        flows_purged:
+          type: integer
+          description: |
+            In-flight bind flows a `subject` sweep removed. A pending flow
+            outlives the binding — completing it creates a new binding and a new
+            upstream token — so a sweep that cuts one account's bindings removes
+            it too. Always 0 for other targets.
+        bindings_unavailable:
+          type: boolean
+          description: |
+            Set when the target has a binding dimension but this deployment has
+            no binding port to sweep, so the responder can tell "no bindings
+            existed" from "this deployment cannot sweep bindings". Distinct from
+            `bindings`, which is present only when a sweep ran.
         bindings:
           description: |
             Present when a binding sweep ran. Its counts are the point: a source
@@ -1902,6 +1916,24 @@ components:
             False when this deployment's session store cannot enumerate one
             account's sessions, so the sessions were not cleared. Distinct from
             `sessions: 0`, which means they were cleared and there were none.
+        pseudonym_destroyed:
+          type: boolean
+          description: |
+            True only when the audit sink exposes pseudonym-key destruction and
+            the key was destroyed, which is what makes the account's history
+            unlinkable. False means the step did not happen — a memory-mode
+            deployment, whose log keeps no keys — rather than a silent success.
+
+    AccountErasureAuditDetail:
+      type: object
+      description: |
+        The `account.delete` audit record's detail map. Counts mirror the result;
+        the two flags exist so a skipped capability is readable rather than
+        folded into a success that says nothing about it.
+      properties:
+        session_scoped: { type: string, description: '"true" or "false", as text.' }
+        pseudonym_destroyed: { type: string, description: '"true" or "false", as text.' }
+        self: { type: string, description: Whether the account erased itself. }
 
     AccountExport:
       type: object
@@ -1982,7 +2014,7 @@ components:
         action:
           type: string
           description: |
-            e.g. `oauth.token`, `vault.use`, `admin.kill_switch`.
+            e.g. `oauth.token`, `vault.use`, `admin.kill_switch`, `oidc.consent.approve`.
         provider:
           type: string
           description: The emitting subsystem.

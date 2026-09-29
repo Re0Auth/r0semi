@@ -69,6 +69,18 @@ type Bindings interface {
 	RevokeSubjectBindings(ctx context.Context, subject string) (BindingOutcome, error)
 }
 
+// FlowPurger removes an account's in-flight bind flows. It is optional, like
+// Bindings, and is the same capability the erasure path uses
+// (lifecycle.FlowPurger): a pending flow is a capability that outlives the
+// binding, because completing it creates a new binding and a new upstream token.
+// A `subject` sweep must remove it for the same reason an erasure does.
+//
+// The subject is a plain string, not account.UserID, so this package keeps its
+// distance from the account store the way Bindings does.
+type FlowPurger interface {
+	PurgeUserFlows(ctx context.Context, subject string) (int, error)
+}
+
 // Config wires the service.
 type Config struct {
 	Clients Clients
@@ -78,6 +90,10 @@ type Config struct {
 	Sessions SessionRevoker
 	// Bindings, when set, lets the Kill Switch disconnect data sources.
 	Bindings Bindings
+	// Flows, when set, lets a `subject`-scoped Kill Switch remove the account's
+	// in-flight bind flows. Nil for a deployment with no bind-flow store; a
+	// pending flow it cannot reach is not cut.
+	Flows FlowPurger
 	// Audit is required: an operator action with no durable record is not one
 	// this project is willing to take.
 	Audit audit.Logger
@@ -143,12 +159,22 @@ type BindingOutcome struct {
 
 // Report is what the Kill Switch actually did. A number, not an assurance: the
 // whole point of the endpoint is to be able to tell an incident responder how
-// much was cut. Bindings is nil when no binding sweep ran.
+// much was cut. Bindings is nil when no binding sweep ran; BindingsUnavailable
+// says the target had a binding dimension but this deployment has no binding port
+// to sweep — so "no bindings existed" and "this deployment cannot sweep bindings"
+// never look identical. FlowsPurged counts the in-flight bind flows a `subject`
+// sweep removed.
 type Report struct {
 	TokensRevoked    int             `json:"tokens_revoked"`
 	SessionsRevoked  int64           `json:"sessions_revoked"`
 	ClientsSuspended int             `json:"clients_suspended"`
+	FlowsPurged      int             `json:"flows_purged"`
 	Bindings         *BindingOutcome `json:"bindings,omitempty"`
+	// BindingsUnavailable is set when the target includes a binding dimension but
+	// the deployment has no Bindings port. It is a field rather than an error so
+	// that `all` — which must still cut tokens and sessions — is not refused by a
+	// missing binding port, while the responder can still tell the two cases apart.
+	BindingsUnavailable bool `json:"bindings_unavailable,omitempty"`
 }
 
 type service struct {
@@ -156,6 +182,7 @@ type service struct {
 	tokens   Revoker
 	sessions SessionRevoker
 	bindings Bindings
+	flows    FlowPurger
 	audit    audit.Logger
 	now      func() time.Time
 }
@@ -178,6 +205,7 @@ func New(cfg Config) (Service, error) {
 		tokens:   cfg.Tokens,
 		sessions: cfg.Sessions,
 		bindings: cfg.Bindings,
+		flows:    cfg.Flows,
 		audit:    cfg.Audit,
 		now:      cfg.Now,
 	}, nil
@@ -342,6 +370,11 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 	// Bindings. `all` and the dedicated `bindings` target sweep the deployment;
 	// `subject` sweeps one account. `client` has no binding dimension: a binding
 	// belongs to a person, not to a client.
+	//
+	// When the target has a binding dimension but the deployment has no port, the
+	// answer is a marker, not silence: `all` must still cut tokens and sessions, so
+	// it cannot be refused, but an incident responder must be able to tell "no
+	// bindings existed" from "this deployment cannot sweep bindings".
 	if s.bindings != nil && (target.All || target.Bindings || target.Subject != "") {
 		var (
 			outcome BindingOutcome
@@ -359,6 +392,24 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 			return rep, err
 		}
 		rep.Bindings = &outcome
+	} else if target.All || target.Bindings || target.Subject != "" {
+		rep.BindingsUnavailable = true
+	}
+
+	// In-flight bind flows. Only a `subject` sweep: a pending flow is a capability
+	// that outlives the binding — completing it creates a new binding and a new
+	// upstream token — so a sweep that cuts one account's bindings must remove it,
+	// exactly as an erasure does. `all` has no per-account flow port, so it does not
+	// touch them here.
+	if target.Subject != "" && s.flows != nil {
+		purged, err := s.flows.PurgeUserFlows(ctx, target.Subject)
+		if err != nil {
+			s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, map[string]string{
+				"tokens_revoked": strconv.Itoa(rep.TokensRevoked),
+			})
+			return rep, err
+		}
+		rep.FlowsPurged = purged
 	}
 
 	s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeOK, killDetail(rep, target))
@@ -413,6 +464,12 @@ func killDetail(rep Report, target Target) map[string]string {
 		"scope":            target.scope(),
 		"tokens_revoked":   strconv.Itoa(rep.TokensRevoked),
 		"sessions_revoked": strconv.FormatInt(rep.SessionsRevoked, 10),
+	}
+	if rep.FlowsPurged != 0 {
+		detail["flows_purged"] = strconv.Itoa(rep.FlowsPurged)
+	}
+	if rep.BindingsUnavailable {
+		detail["bindings_unavailable"] = "true"
 	}
 	if rep.Bindings != nil {
 		detail["bindings_total"] = strconv.Itoa(rep.Bindings.Total)

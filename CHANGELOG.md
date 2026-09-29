@@ -8,6 +8,25 @@
 
 ## Unreleased
 
+- **Kill Switch 的绑定维度不再沉默、`subject` 清在途绑定流程（AUD-9 + AUD-8）**：无数据源的部署上，
+  `all` / `subject` 此前整段跳过绑定半边（`bindings` 字段省略）——响应者无法区分「本部署没有绑定」
+  与「本部署清不了绑定」。现在目标带绑定维度而端口缺失时报 `bindings_unavailable: true`（审计
+  `Detail` 同名）；`bindings` 目标仍 fail-loud。`subject` 目标新增清掉该账号**在途绑定流程**
+  （`flows_purged`，与抹除同一份能力）：一个 pending flow 能在事后造出新绑定 + 新上游令牌，
+  此前 Kill Switch 断了绑定却留着流程，与 erasure 对同一中间状态给出两个答案。
+  **升级影响**：响应体新增 `flows_purged` / `bindings_unavailable` 字段（新增，无破坏）。
+
+- **抹除的假名步骤如实上报 + 组合根对 durable 断言（AUD-6）**：假名 store 缺失时，抹除结果与
+  `account.delete` 审计此前都**不说**这一步被跳过——「历史已不可关联」与「这步没做」在成功里长得
+  一样。现在 `Result.PseudonymDestroyed` 与审计 `Detail[pseudonym_destroyed]` 如实记录；组合根对
+  durable 部署断言审计 sink 暴露销毁能力，缺失则拒绝启动（内存模式不受影响，其日志本就不存密钥）。
+  **升级影响**：自定义审计 sink 若不实现销毁能力，durable 部署将拒绝启动。
+
+- **同意决策（approve/deny）写入审计（AUD-3）**：「用户把账号数据授权给哪个 client、哪些 scope」是
+  这套服务最核心的授权事件，此前批准（`CompleteLogin`）与拒绝（`DeleteAuthRequest`）两个出口都不写
+  审计——被拒绝的请求完全无痕。现在两个 store（memory + postgres）各记
+  `oidc.consent.approve`（含 `client_id` 与批准的 `scopes`）/ `oidc.consent.deny`。
+
 - **配置校验：`trusted_proxies` 通配需显式承认、`sources[].token_class` 校验并默认（P2-6 + P2-7）**：
   `trusted_proxies` 里的 `0.0.0.0/0` / `::/0` 不扩大信任面而是**清空**它（每跳都算「信任网内」，
   分桶键又回到调用方手里），现在被拒绝启动，要用必须显式承认 `server.trusted_proxies_any = true`

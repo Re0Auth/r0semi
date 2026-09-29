@@ -131,6 +131,12 @@ type Result struct {
 	// into a zero, because zero sessions cleared and "could not clear any" look
 	// identical otherwise.
 	SessionScoped bool
+	// PseudonymDestroyed is true only when a PseudonymDestroyer was wired and the
+	// key destruction succeeded. It is the same shape as SessionScoped and exists
+	// for the same reason: without it, "the account's audit history is unlinkable"
+	// and "the step that delivers that promise was skipped" are indistinguishable
+	// in a result that otherwise reports success.
+	PseudonymDestroyed bool
 }
 
 // Deleter performs account erasure.
@@ -248,6 +254,13 @@ func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.User
 		return d.fail(ctx, actor, subject, "account", err, res)
 	}
 
+	// Whether the unlinkability step is configured has to be known before the
+	// record is written (below), because the record comes first and cannot be
+	// rewritten. A wired destroyer that then fails turns the whole call into an
+	// error — no success is returned — so on every path that returns nil this
+	// flag is the truth; on the failure path it is reset to false.
+	res.PseudonymDestroyed = d.cfg.Pseudonyms != nil
+
 	// The record is written after every store is clear, so it can state the result
 	// rather than a promise. A failure to write it fails the erasure: the account
 	// row is already gone, and DeleteUser is idempotent, so a repeat of the whole
@@ -263,6 +276,7 @@ func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.User
 	// — re-creating precisely the link this step exists to remove.
 	if d.cfg.Pseudonyms != nil {
 		if err := d.cfg.Pseudonyms.Destroy(ctx, string(subject)); err != nil {
+			res.PseudonymDestroyed = false
 			return res, fmt.Errorf(
 				"lifecycle: the account was erased but its audit history is still linkable: %w", err)
 		}
@@ -288,16 +302,17 @@ func (d *Deleter) record(ctx context.Context, actor, subject account.UserID, out
 	// erased itself. That is what an operator reading the log needs, and it is the
 	// only fact the raw id was carrying.
 	detail := map[string]string{
-		"bindings_revoked": strconv.Itoa(res.Bindings.Revoked),
-		"bindings_failed":  strconv.Itoa(res.Bindings.Failed),
-		"vault_removed":    strconv.Itoa(res.Vault),
-		"tokens_revoked":   strconv.Itoa(res.Tokens),
-		"sessions_revoked": strconv.FormatInt(res.Sessions, 10),
-		"flows_removed":    strconv.Itoa(res.Flows),
-		"oidc_removed":     strconv.Itoa(res.OIDC),
-		"legacy_removed":   strconv.Itoa(res.Legacy),
-		"session_scoped":   strconv.FormatBool(res.SessionScoped),
-		"self":             strconv.FormatBool(actor == subject),
+		"bindings_revoked":    strconv.Itoa(res.Bindings.Revoked),
+		"bindings_failed":     strconv.Itoa(res.Bindings.Failed),
+		"vault_removed":       strconv.Itoa(res.Vault),
+		"tokens_revoked":      strconv.Itoa(res.Tokens),
+		"sessions_revoked":    strconv.FormatInt(res.Sessions, 10),
+		"flows_removed":       strconv.Itoa(res.Flows),
+		"oidc_removed":        strconv.Itoa(res.OIDC),
+		"legacy_removed":      strconv.Itoa(res.Legacy),
+		"session_scoped":      strconv.FormatBool(res.SessionScoped),
+		"pseudonym_destroyed": strconv.FormatBool(res.PseudonymDestroyed),
+		"self":                strconv.FormatBool(actor == subject),
 	}
 	if failedAt != "" {
 		detail["failed_at"] = failedAt

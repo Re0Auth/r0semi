@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
@@ -132,6 +133,30 @@ func (s *OIDCStore) record(ctx context.Context, action, subject, clientID, outco
 	if err := s.audit.Record(ctx, audit.Event{
 		Action: action, Subject: subject, Provider: "oidc", Outcome: outcome,
 		Detail: map[string]string{"client_id": clientID},
+	}); err != nil {
+		slog.Error("oidc audit record failed",
+			"action", action, "client_id", clientID, "outcome", outcome, "err", err)
+	}
+}
+
+// recordConsent writes the audit event for a consent decision. It is separate
+// from record() because the interesting detail here is which scopes were
+// granted, not only which client was involved — that is the half the operator
+// log was missing, and it is the question "what did this account authorize".
+//
+// scopes are space-joined: the audit detail is a flat string map, and the
+// approved scope set is small and already a list on the wire.
+func (s *OIDCStore) recordConsent(ctx context.Context, action, subject, clientID string, scopes []string, outcome string) {
+	if s.audit == nil {
+		return
+	}
+	detail := map[string]string{"client_id": clientID}
+	if len(scopes) > 0 {
+		detail["scopes"] = strings.Join(scopes, " ")
+	}
+	if err := s.audit.Record(ctx, audit.Event{
+		Action: action, Subject: subject, Provider: "oidc", Outcome: outcome,
+		Detail: detail,
 	}); err != nil {
 		slog.Error("oidc audit record failed",
 			"action", action, "client_id", clientID, "outcome", outcome, "err", err)
@@ -266,13 +291,23 @@ func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Read the subject and client before deleting: a refused request leaves as
+	// much trace as an approved one, and this row is the only place the two ids
+	// live. The subject is empty for a request nobody signed in for, which is
+	// itself the honest record.
+	var subject, clientID string
+	_ = tx.QueryRow(ctx, `SELECT subject, client_id FROM oidc_auth_requests WHERE id = $1`, id).Scan(&subject, &clientID)
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_codes WHERE request_id = $1`, id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_auth_requests WHERE id = $1`, id); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.recordConsent(ctx, "oidc.consent.deny", subject, clientID, nil, audit.OutcomeDenied)
+	return nil
 }
 
 // CreateAccessToken implements op.Storage. The token ID is ours; only its hash
@@ -801,7 +836,20 @@ func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scope
 	if tag.RowsAffected() == 0 {
 		return errors.New("postgres: auth request not found")
 	}
+	// The consent decision itself is an authorization event: who granted which
+	// client which scopes, and when. The scopes recorded are the granted set,
+	// which is what the caller passed — the update above already narrowed them.
+	s.recordConsent(ctx, "oidc.consent.approve", subject, s.clientIDOfRequest(ctx, id), scopes, audit.OutcomeOK)
 	return nil
+}
+
+// clientIDOfRequest reads the client a pending authorization request belongs
+// to, for the audit record a consent decision writes. Empty when the request is
+// unknown, which is the honest value for an event about nothing.
+func (s *OIDCStore) clientIDOfRequest(ctx context.Context, id string) string {
+	var clientID string
+	_ = s.pool.QueryRow(ctx, `SELECT client_id FROM oidc_auth_requests WHERE id = $1`, id).Scan(&clientID)
+	return clientID
 }
 
 // DeviceByUserCode returns the pending device authorization for a user code.

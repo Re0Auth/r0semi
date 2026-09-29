@@ -424,6 +424,43 @@ func newAuthRequest(t *testing.T, ctx context.Context, store *OIDCStore) op.Auth
 	return ar
 }
 
+// The consent decision is the authorization event — who granted which client
+// which scopes — so both exits of it are audited. Mirrors
+// memory.TestConsentDecisionsAreAudited, which is where the probe lives.
+func TestConsentDecisionsAreAudited(t *testing.T) {
+	store, logger, ctx := oidcFixture(t)
+
+	if err := store.CompleteLogin(ctx, newAuthRequest(t, ctx, store).GetID(), "usr_1",
+		[]string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteAuthRequest(ctx, newAuthRequest(t, ctx, store).GetID()); err != nil {
+		t.Fatal(err)
+	}
+
+	var approve, deny *audit.Event
+	for _, e := range logger.Events() {
+		switch e.Action {
+		case "oidc.consent.approve":
+			approve = &e
+		case "oidc.consent.deny":
+			deny = &e
+		}
+	}
+	if approve == nil {
+		t.Fatal("the approval recorded no audit event")
+	}
+	if approve.Subject != "usr_1" || approve.Detail["client_id"] != "oidc-web" || approve.Detail["scopes"] != "account.id" {
+		t.Fatalf("approval event = %+v", *approve)
+	}
+	if deny == nil {
+		t.Fatal("the denial recorded no audit event")
+	}
+	if deny.Detail["client_id"] != "oidc-web" || deny.Outcome != audit.OutcomeDenied {
+		t.Fatalf("denial event = %+v", *deny)
+	}
+}
+
 // The client seam: our registry drives op.Client, IsScopeAllowed consults our
 // scope catalog, and client auth uses oauth.Client.Authenticate (SHA-256).
 func TestOIDCClientSeam(t *testing.T) {

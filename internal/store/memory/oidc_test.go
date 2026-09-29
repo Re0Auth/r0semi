@@ -11,6 +11,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -417,6 +418,71 @@ func TestCompleteLoginPreservesRecordedAuthTime(t *testing.T) {
 	}
 	if !done.GetAuthTime().Equal(signedIn) {
 		t.Fatalf("auth_time = %s, want the recorded sign-in time %s", done.GetAuthTime(), signedIn)
+	}
+}
+
+// The consent decision is the authorization event — who granted which client
+// which scopes — so both exits of it are audited: the approval with the granted
+// scope set, the denial with the client that was refused.
+func TestConsentDecisionsAreAudited(t *testing.T) {
+	logger := audit.NewMemoryLogger()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewOIDCStore(OIDCOptions{
+		Clients:  oauth.NewMemoryClientRegistry(),
+		Registry: oauth.DefaultRegistry(),
+		Signer:   oidcstore.NewSigner("test", key),
+		Audit:    logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	newRequest := func() string {
+		ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+			ClientID:            "cli",
+			RedirectURI:         "https://app.example/cb",
+			ResponseType:        oidc.ResponseTypeCode,
+			Scopes:              []string{"account.id"},
+			CodeChallenge:       "challenge-1234567890",
+			CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ar.GetID()
+	}
+
+	if err := store.CompleteLogin(ctx, newRequest(), "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteAuthRequest(ctx, newRequest()); err != nil {
+		t.Fatal(err)
+	}
+
+	var approve, deny *audit.Event
+	for i := range logger.Events() {
+		e := logger.Events()[i]
+		switch e.Action {
+		case "oidc.consent.approve":
+			approve = &e
+		case "oidc.consent.deny":
+			deny = &e
+		}
+	}
+	if approve == nil {
+		t.Fatal("the approval recorded no audit event")
+	}
+	if approve.Subject != "usr_1" || approve.Detail["client_id"] != "cli" || approve.Detail["scopes"] != "account.id" {
+		t.Fatalf("approval event = %+v", *approve)
+	}
+	if deny == nil {
+		t.Fatal("the denial recorded no audit event")
+	}
+	if deny.Detail["client_id"] != "cli" || deny.Outcome != audit.OutcomeDenied {
+		t.Fatalf("denial event = %+v", *deny)
 	}
 }
 

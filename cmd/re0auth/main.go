@@ -606,6 +606,7 @@ func run() error {
 			Tokens:   tokenRevoker,
 			Sessions: store.sessionRevoker,
 			Bindings: bindingRevoker{fed: federationService},
+			Flows:    flowPurger{store: store.bindFlows},
 			Audit:    logger,
 		})
 		if err != nil {
@@ -645,6 +646,17 @@ func run() error {
 	// pseudonym key would then depend on the very log it is trying to detach from.
 	// Deleting rows at the repo layer bypasses that circularity while keeping the
 	// same crypto-shredding effect — the wrapped DEK lives in the row.
+	pseudonyms := pseudonymStore(store.audit)
+	if store.durable && pseudonyms == nil {
+		// A durable sink is the one that pseudonymises subjects and holds the
+		// keys. If it does not expose the destroy capability, an erasure would
+		// report success while leaving the account's history linkable — the exact
+		// silent failure this port exists to prevent. Memory mode is exempt on
+		// purpose: its log keeps no keys, so there is nothing to destroy.
+		return die("lifecycle", errors.New(
+			"the durable audit sink does not expose pseudonym-key destruction, so account erasure "+
+				"could report success while the history stays linkable"))
+	}
 	deleter, err := lifecycle.New(lifecycle.Config{
 		Accounts: store.accounts,
 		Tokens:   tokenRevoker,
@@ -657,7 +669,7 @@ func run() error {
 		// The durable audit sink owns the subject pseudonyms, so it is what destroys
 		// the key that makes a deleted account's history linkable. It is nil in
 		// memory mode, where the log is a ring buffer that keeps no keys.
-		Pseudonyms: pseudonymStore(store.audit),
+		Pseudonyms: pseudonyms,
 		Audit:      logger,
 	})
 	if err != nil {
@@ -1486,6 +1498,16 @@ func bindingOutcome(s federation.BindingRevocationSummary) admin.BindingOutcome 
 		Orphaned:    s.Orphaned,
 		Failed:      s.Failed,
 	}
+}
+
+// flowPurger adapts the bind-flow store to the operator plane's flow port. The
+// Kill Switch takes a plain subject id, the store takes account.UserID, so the
+// conversion lives here; the capability itself is the erasure path's, which is
+// why a `subject` sweep and an erasure now agree about a pending bind flow.
+type flowPurger struct{ store federation.BindFlowStore }
+
+func (f flowPurger) PurgeUserFlows(ctx context.Context, subject string) (int, error) {
+	return f.store.PurgeUserFlows(ctx, account.UserID(subject))
 }
 
 // erasureBindings adapts the federation service to the lifecycle package's

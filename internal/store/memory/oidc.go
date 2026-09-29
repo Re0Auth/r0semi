@@ -333,6 +333,30 @@ func (s *OIDCStore) record(ctx context.Context, action, subject, clientID, outco
 	}
 }
 
+// recordConsent writes the audit event for a consent decision. It is separate
+// from record() because the interesting detail here is which scopes were
+// granted, not only which client was involved — that is the half the operator
+// log was missing, and it is the question "what did this account authorize".
+//
+// scopes are space-joined: the audit detail is a flat string map, and the
+// approved scope set is small and already a list on the wire.
+func (s *OIDCStore) recordConsent(ctx context.Context, action, subject, clientID string, scopes []string, outcome string) {
+	if s.audit == nil {
+		return
+	}
+	detail := map[string]string{"client_id": clientID}
+	if len(scopes) > 0 {
+		detail["scopes"] = strings.Join(scopes, " ")
+	}
+	if err := s.audit.Record(ctx, audit.Event{
+		Action: action, Subject: subject, Provider: "oidc", Outcome: outcome,
+		Detail: detail,
+	}); err != nil {
+		slog.Error("oidc audit record failed",
+			"action", action, "client_id", clientID, "outcome", outcome, "err", err)
+	}
+}
+
 func codeChallenge(challenge, method string) *oidc.CodeChallenge {
 	if challenge == "" {
 		return nil
@@ -423,15 +447,23 @@ func (s *OIDCStore) SaveAuthCode(_ context.Context, id, code string) error {
 }
 
 // DeleteAuthRequest implements op.Storage.
-func (s *OIDCStore) DeleteAuthRequest(_ context.Context, id string) error {
+func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	subject, clientID := "", ""
+	if a, ok := s.authRequests[id]; ok {
+		subject, clientID = a.Subject, a.ClientID
+	}
 	s.deleteRequestLocked(id)
 	for k, c := range s.codes {
 		if c.requestID == id {
 			delete(s.codes, k)
 		}
 	}
+	s.mu.Unlock()
+	// A refused request leaves as much trace as an approved one: who was asked,
+	// which client, and the answer no. The subject is empty for a request nobody
+	// signed in for, which is itself the honest record.
+	s.recordConsent(ctx, "oidc.consent.deny", subject, clientID, nil, audit.OutcomeDenied)
 	return nil
 }
 
@@ -999,11 +1031,11 @@ func (s *OIDCStore) SetAuthTime(_ context.Context, id string, at time.Time) erro
 // learns about it. Without the move, a revocation filtered by subject would look
 // at the old (empty) set and miss the request and its code entirely, and a code
 // that survives a Kill Switch is a live credential.
-func (s *OIDCStore) CompleteLogin(_ context.Context, id, subject string, scopes []string) error {
+func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scopes []string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	a, ok := s.authRequests[id]
 	if !ok {
+		s.mu.Unlock()
 		return errors.New("memory: auth request not found")
 	}
 	previous := a.Subject
@@ -1020,6 +1052,12 @@ func (s *OIDCStore) CompleteLogin(_ context.Context, id, subject string, scopes 
 		now := s.now()
 		a.AuthTime = &now
 	}
+	clientID := a.ClientID
+	approved := a.Scopes
+	s.mu.Unlock()
+	// The consent decision itself is an authorization event: who granted which
+	// client which scopes, and when. Recorded after the state change it describes.
+	s.recordConsent(ctx, "oidc.consent.approve", subject, clientID, approved, audit.OutcomeOK)
 	return nil
 }
 

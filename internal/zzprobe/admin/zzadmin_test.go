@@ -64,6 +64,18 @@ func (b zzAdmBindings) RevokeSubjectBindings(context.Context, string) (admin.Bin
 	return b.outcome, nil
 }
 
+// zzAdmFlows stands in for the bind-flow store's purge capability, recording the
+// subject it was called for.
+type zzAdmFlows struct {
+	purged  int
+	subject string
+}
+
+func (f *zzAdmFlows) PurgeUserFlows(_ context.Context, subject string) (int, error) {
+	f.subject = subject
+	return f.purged, nil
+}
+
 // ---------------------------------------------------------------------------
 // P8. The documented contract for audit detail: "Non-secret context; it never
 // holds a credential" (docs/openapi.yaml, AuditEntry.detail). The operator
@@ -132,13 +144,11 @@ func TestZZAdmRegistrationSecretNeverReachesTheAuditDetail(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// P9. A deployment with no data sources answers the Kill Switch's `all` target
-// with a report that says nothing about bindings: Report.Bindings stays nil, and
-// `bindings` is omitted from the JSON. An incident responder cannot tell "no
-// bindings existed" from "this deployment cannot sweep bindings" — while the
-// dedicated `bindings` target is refused with ErrBindingsUnavailable, precisely
-// so that a hollow zero is never returned. The two targets disagree about the
-// same fact.
+// P9. (FIXED) A deployment with no data sources now says so on the `all` target
+// too: Report.BindingsUnavailable is set, so an incident responder can tell "no
+// bindings existed" from "this deployment cannot sweep bindings". The `bindings`
+// target still refuses with ErrBindingsUnavailable, because it has nothing else
+// to do.
 // ---------------------------------------------------------------------------
 func TestZZAdmKillSwitchAllIsSilentAboutBindings(t *testing.T) {
 	ctx := context.Background()
@@ -154,30 +164,29 @@ func TestZZAdmKillSwitchAllIsSilentAboutBindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("KillSwitch(all) = %v", err)
 	}
-	if rep.Bindings == nil {
-		t.Errorf("KillSwitch(all) returned a report with no bindings outcome: the answer to "+
-			"\"were the data-source bindings cut?\" is missing entirely, while the `bindings` "+
-			"target refuses with ErrBindingsUnavailable so that it never answers a hollow zero "+
-			"(report: %+v)", rep)
+	if rep.Bindings != nil {
+		t.Errorf("KillSwitch(all) returned a bindings outcome from a deployment with no binding port: %+v", rep.Bindings)
+	}
+	if !rep.BindingsUnavailable {
+		t.Errorf("KillSwitch(all) did not mark the binding dimension unavailable: a responder cannot tell "+
+			"\"no bindings existed\" from \"this deployment cannot sweep bindings\" (report: %+v)", rep)
 	}
 
-	// The control that shows the asymmetry.
+	// The control: the dedicated target still fails loudly, since it has nothing
+	// else to do.
 	if _, err := svc.KillSwitch(ctx, "usr_operator", admin.Target{Bindings: true}); !errors.Is(err, admin.ErrBindingsUnavailable) {
 		t.Fatalf("KillSwitch(bindings) = %v, want ErrBindingsUnavailable", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// P10. The erasure purges in-flight bind flows; the Kill Switch has no way to.
+// P10. (FIXED) The Kill Switch now purges in-flight bind flows: admin.Config has
+// a flow port, and a `subject` sweep calls it, the same way an erasure does.
 //
-// lifecycle.Config has a Flows port and cmd/re0auth wires it
-// (Flows: store.bindFlows), because a pending bind flow is a capability that
-// outlives the binding: completing it creates a new binding and a new upstream
-// token. admin.Config has no such port, so a `subject`-scoped Kill Switch leaves
-// the flow in place. Whether that is exploitable depends on the deployment being
-// unable to revoke the account's sessions (which is what kills the browser
-// handle the flow is bound to) — the same memory-mode boundary the docs already
-// record — so this is filed as a hypothesis with the port asymmetry as evidence.
+// A pending bind flow is a capability that outlives the binding: completing it
+// creates a new binding and a new upstream token. The two paths used to disagree
+// about that state — the erasure removed it, the Kill Switch left it — and they
+// now agree.
 // ---------------------------------------------------------------------------
 func TestZZAdmKillSwitchHasNoFlowPurgerWhileErasureDoes(t *testing.T) {
 	fields := func(v any) map[string]string {
@@ -196,29 +205,42 @@ func TestZZAdmKillSwitchHasNoFlowPurgerWhileErasureDoes(t *testing.T) {
 	if _, ok := lifecycleFields["Flows"]; !ok {
 		t.Fatalf("lifecycle.Config has no Flows port; the premise of this probe changed: %v", lifecycleFields)
 	}
-	mentionsFlows := false
-	for name, typ := range adminFields {
-		if strings.Contains(strings.ToLower(name+typ), "flow") {
-			mentionsFlows = true
-		}
+	if _, ok := adminFields["Flows"]; !ok {
+		t.Fatalf("admin.Config has no flow port, so a `subject` Kill Switch cannot purge in-flight bind flows: %v", adminFields)
 	}
-	if !mentionsFlows {
-		t.Errorf("admin.Config cannot purge in-flight bind flows (fields: %v), while "+
-			"lifecycle.Config can: a `subject`-scoped Kill Switch cuts the account's tokens, "+
-			"sessions and bindings and leaves a pending bind flow able to recreate a binding "+
-			"afterwards. The erasure path treats the same flow as needing removal.",
-			adminFields)
+
+	// And the port is actually used: a `subject` sweep must call it with that
+	// subject, and the count must reach the report.
+	ctx := context.Background()
+	flows := &zzAdmFlows{purged: 2}
+	svc, err := admin.New(admin.Config{
+		Clients:  oauth.NewMemoryClientRegistry(),
+		Tokens:   &zzAdmRevoker{},
+		Bindings: zzAdmBindings{outcome: admin.BindingOutcome{Total: 1, Revoked: 1}},
+		Flows:    flows,
+		Audit:    &zzAdmLogger{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := svc.KillSwitch(ctx, "usr_operator", admin.Target{Subject: "usr_victim"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flows.subject != "usr_victim" {
+		t.Errorf("the flow purge ran for %q, want the swept subject", flows.subject)
+	}
+	if rep.FlowsPurged != 2 {
+		t.Errorf("Report.FlowsPurged = %d, want 2: the count must reach the responder", rep.FlowsPurged)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// P11. Erasure without a pseudonym store reports success.
-//
-// lifecycle.New accepts a Config with Pseudonyms nil, and DeleteAccount then
-// returns a nil error. In a durable deployment that is the difference between
-// "the account's audit history is unlinkable" and "it is not", and nothing here
-// can tell the two apart — the step that delivers the promise is optional and
-// unasserted.
+// P11. (FIXED) Erasure without a pseudonym store no longer reports the
+// unlinkability step as if it had happened: the result and the audit record
+// both carry `pseudonym_destroyed=false`, so a skipped step is readable instead
+// of silent. Memory mode stays legal (its log keeps no keys); the composition
+// root refuses a durable sink that does not expose the capability.
 // ---------------------------------------------------------------------------
 func TestZZAdmErasureWithoutAPseudonymStoreReportsSuccess(t *testing.T) {
 	ctx := context.Background()
@@ -234,7 +256,7 @@ func TestZZAdmErasureWithoutAPseudonymStoreReportsSuccess(t *testing.T) {
 		Tokens:   &zzAdmRevoker{},
 		Vault:    vault.NewMemoryRepo(),
 		Audit:    logger,
-		// Pseudonyms deliberately absent, as a mis-wired durable deployment would be.
+		// Pseudonyms deliberately absent, as a mis-wired deployment would be.
 	})
 	if err != nil {
 		t.Fatalf("lifecycle.New rejected a config with no pseudonym store: %v", err)
@@ -243,19 +265,18 @@ func TestZZAdmErasureWithoutAPseudonymStoreReportsSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteAccount = %v", err)
 	}
-	if len(logger.events) == 0 || logger.events[len(logger.events)-1].Action != "account.delete" {
-		t.Fatalf("no account.delete record: %v", logger.actions())
+	last := logger.events[len(logger.events)-1]
+	if last.Action != "account.delete" || last.Outcome != audit.OutcomeOK {
+		t.Fatalf("record = %s/%s, want account.delete/ok", last.Action, last.Outcome)
 	}
-	if logger.events[len(logger.events)-1].Outcome != audit.OutcomeOK {
-		t.Fatalf("outcome = %q", logger.events[len(logger.events)-1].Outcome)
+	if res.PseudonymDestroyed {
+		t.Errorf("result says pseudonym_destroyed=true with no pseudonym store wired (result %+v)", res)
 	}
-	t.Logf("erasure reported OK with no pseudonym key destroyed (result %+v)", res)
-
-	// The gap this leaves: nothing failed, so nothing tells the operator that the
-	// erased account's audit history is still linkable.
-	t.Errorf("a durable deployment whose audit sink holds pseudonym keys can erase an account "+
-		"and report success without destroying the key; neither lifecycle.New nor the result "+
-		"records that the unlinkability step was skipped (result %+v)", res)
+	if got := last.Detail["pseudonym_destroyed"]; got != "false" {
+		t.Errorf("the audit record does not say the unlinkability step was skipped: "+
+			"detail[pseudonym_destroyed] = %q, want \"false\" — without this the erasure reports "+
+			"success and nothing tells the operator the history is still linkable", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -301,18 +322,13 @@ func TestZZAdmOnlyTheOperatorIdAppearsInAdminDetail(t *testing.T) {
 // building. See findings AUD-3/AUD-4.
 
 // ---------------------------------------------------------------------------
-// P13. The consent decision leaves no audit record.
+// P13. (FIXED) The consent decision is audited, in both stores, on both exits.
 //
-// Approving a client's authorization request calls consent.CompleteLogin
-// (internal/oidchttp/oidchttp.go:1288), and denying one calls
-// DeleteAuthRequest (:1309). Neither store's record() helper is on either path:
-// the complete set of audited OP events is oidc.token, oidc.revoke,
-// oidc.grant.revoke, oidc.device.approve and oidc.device.deny. The retired
-// hand-rolled engine audits its equivalent action (oauth.authorize,
-// oauth/as.go:156) but is not the engine the composition root wires, so on the
-// production path the log answers "which client got a token for this account"
-// and not "which request this account approved, when, with which scopes" - and
-// a refused request leaves no trace at all.
+// Approving a client's authorization request calls consent.CompleteLogin;
+// denying one calls DeleteAuthRequest. Both now record `oidc.consent.approve`
+// / `oidc.consent.deny` with the client id and the approved scopes, so the log
+// answers "which request did this account approve, when, with which scopes" —
+// and a refusal leaves a trace instead of nothing.
 // ---------------------------------------------------------------------------
 func TestZZAdmConsentDecisionIsNotAudited(t *testing.T) {
 	ctx := context.Background()
@@ -344,30 +360,64 @@ func TestZZAdmConsentDecisionIsNotAudited(t *testing.T) {
 		t.Fatalf("control failed: the store recorded no device approval; actions %v", logger.actions())
 	}
 
-	// The probe: a consent decision.
-	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
-		ClientID:            "cli",
-		RedirectURI:         "https://app.example/cb",
-		ResponseType:        oidc.ResponseTypeCode,
-		Scopes:              []string{"account.id"},
-		CodeChallenge:       "challenge-1234567890",
-		CodeChallengeMethod: oidc.CodeChallengeMethodS256,
-	}, "")
-	if err != nil {
+	newRequest := func() string {
+		ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+			ClientID:            "cli",
+			RedirectURI:         "https://app.example/cb",
+			ResponseType:        oidc.ResponseTypeCode,
+			Scopes:              []string{"account.id"},
+			CodeChallenge:       "challenge-1234567890",
+			CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ar.GetID()
+	}
+
+	// The approval: an account granting client "cli" the scopes it asked for.
+	if err := store.CompleteLogin(ctx, newRequest(), "usr_victim", []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	before := len(logger.events)
-	if err := store.CompleteLogin(ctx, ar.GetID(), "usr_victim", []string{"account.id"}); err != nil {
+	approve := zzAdmFind(logger, "oidc.consent.approve")
+	if approve == nil {
+		t.Fatalf("the approval recorded no audit event: the authorization decision - the moment access "+
+			"is granted - is absent from the log that docs/openapi.yaml advertises as \"who did what\"; "+
+			"actions %v", logger.actions())
+	}
+	if approve.Subject != "usr_victim" || approve.Detail["client_id"] != "cli" {
+		t.Errorf("the approval event names the wrong parties: subject %q client %q",
+			approve.Subject, approve.Detail["client_id"])
+	}
+	if approve.Detail["scopes"] != "account.id" {
+		t.Errorf("the approval event does not say which scopes were granted: detail[scopes] = %q",
+			approve.Detail["scopes"])
+	}
+
+	// The denial: a refusal must leave as much trace as an approval.
+	if err := store.DeleteAuthRequest(ctx, newRequest()); err != nil {
 		t.Fatal(err)
 	}
-	if len(logger.events) != before {
-		t.Fatalf("the consent decision now records %v; this probe can be deleted",
-			logger.actions()[before:])
+	deny := zzAdmFind(logger, "oidc.consent.deny")
+	if deny == nil {
+		t.Fatalf("the denial recorded no audit event: a refused request leaves nothing at all; actions %v",
+			logger.actions())
 	}
-	t.Errorf("an account approving client %q for scopes %v recorded no audit event: the "+
-		"authorization decision - the moment access is granted - is absent from the log that "+
-		"docs/openapi.yaml advertises as \"who did what\", and a denied request leaves nothing "+
-		"at all (`DenyAuthorization` only deletes the request)", "cli", []string{"account.id"})
+	if deny.Detail["client_id"] != "cli" {
+		t.Errorf("the denial event names the wrong client: %q", deny.Detail["client_id"])
+	}
+	if deny.Outcome != audit.OutcomeDenied {
+		t.Errorf("the denial event outcome = %q, want denied", deny.Outcome)
+	}
+}
+
+func zzAdmFind(l *zzAdmLogger, action string) *audit.Event {
+	for i := range l.events {
+		if l.events[i].Action == action {
+			return &l.events[i]
+		}
+	}
+	return nil
 }
 
 func zzAdmHasAction(l *zzAdmLogger, action string) bool {

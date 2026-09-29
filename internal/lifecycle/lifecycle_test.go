@@ -425,3 +425,67 @@ func TestDeleteAccountWithoutPseudonymsStillWorks(t *testing.T) {
 		t.Fatalf("a nil Pseudonyms port should be fine: %v", err)
 	}
 }
+
+// TestDeleteAccountWithoutPseudonymsIsNotReportedAsDestroyed: a skipped
+// unlinkability step must be readable in the result and the audit record, not
+// folded into a success that says nothing about it.
+func TestDeleteAccountWithoutPseudonymsIsNotReportedAsDestroyed(t *testing.T) {
+	var calls []string
+	r := func() recorder { return recorder{calls: &calls} }
+	logger := audit.NewMemoryLogger()
+	d, err := New(Config{
+		Accounts: fakeAccounts{recorder: r()},
+		Tokens:   fakeTokens{recorder: r()},
+		Vault:    fakeVault{recorder: r()},
+		Audit:    logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := d.DeleteAccount(context.Background(), "usr_actor", "usr_target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PseudonymDestroyed {
+		t.Fatalf("pseudonym_destroyed = true with no pseudonym store wired (result %+v)", res)
+	}
+	events := logger.Events()
+	if len(events) != 1 || events[0].Action != "account.delete" {
+		t.Fatalf("events = %+v", events)
+	}
+	if got := events[0].Detail["pseudonym_destroyed"]; got != "false" {
+		t.Fatalf("detail[pseudonym_destroyed] = %q, want \"false\"", got)
+	}
+}
+
+// TestDeleteAccountWithPseudonymsReportsDestroyed: with the port wired and the
+// destruction succeeding, the flag is true in both the result and the record.
+func TestDeleteAccountWithPseudonymsReportsDestroyed(t *testing.T) {
+	var calls []string
+	r := func() recorder { return recorder{calls: &calls} }
+	logger := audit.NewMemoryLogger()
+	d, err := New(Config{
+		Accounts:   fakeAccounts{recorder: r()},
+		Tokens:     fakeTokens{recorder: r()},
+		Vault:      fakeVault{recorder: r()},
+		Pseudonyms: &fakePseudonyms{},
+		Audit:      logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := d.DeleteAccount(context.Background(), "usr_actor", "usr_target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.PseudonymDestroyed {
+		t.Fatalf("pseudonym_destroyed = false although the destroy ran (result %+v)", res)
+	}
+	events := logger.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %+v", events)
+	}
+	if got := events[0].Detail["pseudonym_destroyed"]; got != "true" {
+		t.Fatalf("detail[pseudonym_destroyed] = %q, want \"true\"", got)
+	}
+}

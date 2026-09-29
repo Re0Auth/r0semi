@@ -324,6 +324,16 @@ func withBindingsService(t *testing.T, bindings Bindings) (Service, *oauth.Memor
 	return svc, tokens
 }
 
+type fakeFlows struct {
+	purged  int
+	subject string
+}
+
+func (f *fakeFlows) PurgeUserFlows(_ context.Context, subject string) (int, error) {
+	f.subject = subject
+	return f.purged, nil
+}
+
 // The bindings-only target must cut bindings and nothing else: no token is
 // revoked, nobody is signed out.
 func TestKillSwitchBindingsTargetTouchesOnlyBindings(t *testing.T) {
@@ -383,5 +393,76 @@ func TestKillSwitchBindingsTargetNeedsThePort(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
 	if _, err := svc.KillSwitch(context.Background(), "usr_admin", Target{Bindings: true}); !errors.Is(err, ErrBindingsUnavailable) {
 		t.Fatalf("= %v, want ErrBindingsUnavailable", err)
+	}
+}
+
+// A target with a binding dimension on a deployment with no binding port marks
+// the dimension unavailable rather than staying silent, so `all` still cuts
+// tokens and sessions while "no bindings existed" and "cannot sweep bindings"
+// stay distinguishable.
+func TestKillSwitchAllMarksBindingsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	svc, _, tokens, _ := newTestService(t)
+	saveTokens(t, tokens, "cli_a", "usr_1")
+
+	rep, err := svc.KillSwitch(ctx, "usr_admin", Target{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.TokensRevoked == 0 {
+		t.Fatal("no tokens were revoked; this test would pass without exercising anything")
+	}
+	if rep.Bindings != nil {
+		t.Fatalf("bindings = %+v, want nil from a deployment with no binding port", rep.Bindings)
+	}
+	if !rep.BindingsUnavailable {
+		t.Fatalf("bindings_unavailable = false on a target with a binding dimension and no port: report %+v", rep)
+	}
+}
+
+// With a binding port wired, the same target reports the sweep and does not set
+// the unavailable marker — the two states are distinct.
+func TestKillSwitchAllWithBindingsIsNotUnavailable(t *testing.T) {
+	ctx := context.Background()
+	bindings := &fakeBindings{all: BindingOutcome{Total: 2, Revoked: 2}}
+	svc, tokens := withBindingsService(t, bindings)
+	saveTokens(t, tokens, "cli_a", "usr_1")
+
+	rep, err := svc.KillSwitch(ctx, "usr_admin", Target{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Bindings == nil || rep.Bindings.Total != 2 {
+		t.Fatalf("bindings = %+v, want the sweep outcome", rep.Bindings)
+	}
+	if rep.BindingsUnavailable {
+		t.Fatalf("bindings_unavailable = true even though the sweep ran: %+v", rep)
+	}
+}
+
+// A `subject` sweep removes the account's in-flight bind flows, the same
+// capability the erasure path uses, and reports the count.
+func TestKillSwitchSubjectPurgesFlows(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeFlows{purged: 3}
+	tokens := oauth.NewMemoryStore()
+	svc, err := New(Config{
+		Clients: oauth.NewMemoryClientRegistry(), Tokens: tokens,
+		Bindings: &fakeBindings{}, Flows: flows, Audit: audit.NewMemoryLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveTokens(t, tokens, "cli_a", "usr_1")
+
+	rep, err := svc.KillSwitch(ctx, "usr_admin", Target{Subject: "usr_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flows.subject != "usr_1" {
+		t.Fatalf("purged flows for %q, want usr_1", flows.subject)
+	}
+	if rep.FlowsPurged != 3 {
+		t.Fatalf("flows_purged = %d, want 3", rep.FlowsPurged)
 	}
 }
