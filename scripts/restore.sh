@@ -26,7 +26,11 @@ dump="${1:?usage: restore.sh <dump-file>}"
 # The sidecar covers the CIPHERTEXT on the encrypted path (backup.sh writes it
 # after encryption), so this runs BEFORE decryption and covers both paths.
 verify() {
-  local file="$1" sidecar="$file.sha256" want got
+  # Split deliberately: under `set -u` bash expands every right-hand side before
+  # `local` runs, so `local file="$1" sidecar="$file.sha256"` dies with
+  # `file: unbound variable` before the sidecar check below is ever reached.
+  local file="$1"
+  local sidecar="$file.sha256" want got
   if [ ! -f "$sidecar" ]; then
     echo "refusing to restore: $sidecar is missing, so nothing verifies $file" >&2
     exit 1

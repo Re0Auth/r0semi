@@ -276,9 +276,18 @@ func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.User
 	// — re-creating precisely the link this step exists to remove.
 	if d.cfg.Pseudonyms != nil {
 		if err := d.cfg.Pseudonyms.Destroy(ctx, string(subject)); err != nil {
+			// The record written above cannot be rewritten (the sink is append-only):
+			// it states the run reached the last step with the unlinkability promise
+			// intact, which the failed Destroy has just falsified. So the failure is
+			// recorded as a second, truthful account.delete — outcome=error, naming
+			// "pseudonym" as the step that stopped — instead of being swallowed. The
+			// success record is deliberately NOT moved below Destroy: recording is
+			// itself an audit event about this account, so writing it after the key is
+			// gone would make the sink mint a fresh key, re-creating the very link the
+			// destroy exists to remove (see TestDeleteAccountDestroysThePseudonymKeyLast).
 			res.PseudonymDestroyed = false
-			return res, fmt.Errorf(
-				"lifecycle: the account was erased but its audit history is still linkable: %w", err)
+			return d.fail(ctx, actor, subject, "pseudonym", fmt.Errorf(
+				"lifecycle: the account was erased but its audit history is still linkable: %w", err), res)
 		}
 	}
 	return res, nil
