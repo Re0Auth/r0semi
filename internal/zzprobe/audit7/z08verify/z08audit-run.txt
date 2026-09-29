@@ -1,0 +1,428 @@
+﻿=== RUN   TestZ08AppSourceHasNoClientSideSinkAndNeverStoresACredential
+    bundle_sinks_test.go:95: scanned 22 app source files for 10 sinks; none present in code (comments excluded)
+--- PASS: TestZ08AppSourceHasNoClientSideSinkAndNeverStoresACredential (0.00s)
+=== RUN   TestZ08BuiltBundleLoadsNoThirdPartyResource
+    bundle_sinks_test.go:192: scanned 1 CSS files and 9 shell references; nothing leaves the origin
+--- PASS: TestZ08BuiltBundleLoadsNoThirdPartyResource (0.00s)
+=== RUN   TestZ08BuiltBundleDoesNotPersistSecretsInWebStorage
+    bundle_sinks_test.go:247: 8 route chunks scanned; the API client with its timeout is present in the bundle
+--- PASS: TestZ08BuiltBundleDoesNotPersistSecretsInWebStorage (0.00s)
+=== RUN   TestZ08ConsentScreenDisplaysEveryDescribedScopeItGrantsOnce
+2026/09/30 02:03:15 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=6 bytes=401 plane=browser request_id=req_e24531da4084a359e43f647f trace_id=9f89c724679846abefe311980a3241ad client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_8e6cc64b5db37383485476a3 trace_id=72c0c6b651d57e31f667878906372e9b client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_05efbb089691123aaff58b4f trace_id=5b5a9ae051421464be261401e0b727e2 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_a014244789d810489be576d8 trace_id=13bf3552f4fdf1c48b287b320b0782e1 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/authorization_requests/Sc_TiXK1RQxk4dKw-Wu3gi4-goDUXsplWwdzCUJJtiM status=200 duration_ms=0 bytes=781 plane=business request_id=req_6a877ec5bcb7c4819d209d4d trace_id=64a7bc3d152be0b5589103b9e38b1528 client=127.0.0.1
+    consent_display_test.go:112: displayed: [account.id phigros.profile.read]
+2026/09/30 02:03:15 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_404df0fae15808649d0808f5 trace_id=32b12bfa1df1befbb72a45723628fca4 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_a1cd92939129bc5060b65e4a trace_id=91a016ffc5cda83524a4b0fd4f2e5cd4 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=POST path=/v1/authorization_requests/22mpGnjnyuzloEX73-pKd1w6jwK69ZBle-pN0gg0SF0/decision status=200 duration_ms=0 bytes=91 plane=business request_id=req_bde44477cd25e187a8605b71 trace_id=e3f5a4b4ec98cf0be14504d1a0123f97 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=346 plane=protocol request_id=req_476e1e0903e6620f8af84704 trace_id=a5dd493292df3852b28debe169478921 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=POST path=/oauth/token status=200 duration_ms=1 bytes=1241 plane=protocol request_id=req_e5efb565979df9bea9f02797 trace_id=2fcb49dd11c974423666d5f238da86bc client=127.0.0.1
+    consent_display_test.go:120: granted: [account.id phigros.profile.read openid]
+--- PASS: TestZ08ConsentScreenDisplaysEveryDescribedScopeItGrantsOnce (0.05s)
+=== RUN   TestZ08ConsentScreenCannotShowLessThanItGrantsWhenTheTwoRegistriesDiffer
+2026/09/30 02:03:15 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_501e7d2a200b43664d524388 trace_id=a024af94272fe68a2f0e5c12dc205aa6 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_1b4e7c50a43c1f9360e92831 trace_id=4f7213641ed84c9b621058b4424e5c41 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_0f6ac1bd1fac0f2c859a2138 trace_id=5b93acd8f7f84f1920c0449a5efcb9a0 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_a43df23b66c4698bbdf4b880 trace_id=9a17de070bfc44d9dc344ad5bae49e71 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/authorization_requests/M8wV00ghdNHNjMIeBdO0j-Fcav0X1T7gDR3BSBxS5tc status=200 duration_ms=0 bytes=352 plane=business request_id=req_bcdb01c70f0021fc4fed227f trace_id=d52907d5afe45ce89d42ce816cab9975 client=127.0.0.1
+    consent_display_test.go:166: displayed: [account.id]
+2026/09/30 02:03:15 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_400f5075cd4d6350e2e8f991 trace_id=e84a05da819eca7408fafdfb6abe8c21 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_b19785f86e6eecabf6ec67ef trace_id=e28a47ed2a994f68b074aa923aa5371a client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=POST path=/v1/authorization_requests/CxMDt0sfbF0iHbuJLFHdaLEFIXpJ0bKgEp5BDtVL4_Y/decision status=200 duration_ms=0 bytes=91 plane=business request_id=req_e1a2c01b8e0b3aeeea465b3f trace_id=7492050ef60ba13f0a082e293a3cca36 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=346 plane=protocol request_id=req_928f1b1a92f5b52389d29929 trace_id=b75a517dae90d9b50cb1395f0fd9a303 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=POST path=/oauth/token status=200 duration_ms=0 bytes=488 plane=protocol request_id=req_e4d87935d86fd4bb1e6b8942 trace_id=78e2097d1562f2f0c75bc49809c81083 client=127.0.0.1
+    consent_display_test.go:176: granted: [account.id z08.extra.read]
+    consent_display_test.go:186: the token carries "z08.extra.read" while the consent screen displayed [account.id]: a described scope the business plane's registry does not know is silently omitted from the screen (scopeViews() skips it) and then granted anyway when the scopes field is omitted
+--- FAIL: TestZ08ConsentScreenCannotShowLessThanItGrantsWhenTheTwoRegistriesDiffer (0.08s)
+=== RUN   TestZ08ConsentDecisionCannotWidenTheRequest
+2026/09/30 02:03:15 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=1 bytes=401 plane=browser request_id=req_fa5a1992830ad30b74347dee trace_id=deb2e6352de00a029d82fe68229a7175 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_5902b9ce6104b7347445df69 trace_id=21b50388435f03dc3e577c0c31e0a735 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_644ceea51dcf2773984906c7 trace_id=dff6fa2cecfe8fdce89ca7621366ac9b client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_50fb782cf0657a8a3052d7bb trace_id=c3a21c7283e3bdc7b7943db72f8ae097 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/authorization_requests/wFXRyb6xyo7YylPFXSXAGzE1Ctqyrpipv-h3uAIt9us status=200 duration_ms=0 bytes=352 plane=business request_id=req_677b034fb54a2b99b881c764 trace_id=b54dc4a4913c26f55a6fe9a08e4df354 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_3a5bd0d2a9537bfa8cdb5fea trace_id=327930db5527af2419d6dc7dbc0263f8 client=127.0.0.1
+2026/09/30 02:03:15 INFO request method=POST path=/v1/authorization_requests/wFXRyb6xyo7YylPFXSXAGzE1Ctqyrpipv-h3uAIt9us/decision status=400 duration_ms=0 bytes=311 plane=business request_id=req_b704f8e9d03a74ef219d900f trace_id=9a7d4ec18dc2ac664444c984b5d0f41a client=127.0.0.1
+    consent_display_test.go:212: widening decision -> 400 {"type":"https://r0semi.dev/errors/invalid_request","title":"Invalid request","status":400,"detail":"the decision cannot widen the requested scope","instance":"/v1/authorization_requests/wFXRyb6xyo7YylPFXSXAGzE1Ctqyrpipv-h3uAIt9us/decision","code":"invalid_request","request_id":"req_b704f8e9d03a74ef219d900f"}
+--- PASS: TestZ08ConsentDecisionCannotWidenTheRequest (0.12s)
+=== RUN   TestZ08EverySpecifiedWriteNeedsTheSessionCSRFToken
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_2665cbc802049336a13096c3 trace_id=821112d7ea879f51386e88ab8f9465f3 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=2 bytes=28 plane=browser request_id=req_19b9a48bdbe580d51c7f8e66 trace_id=cdb4a1ce269688b9a326f43793eacfbd client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_e054946ae8d468d1c33f96ff trace_id=cd4e6d2b69d2ccb5f5351dccb3673452 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_969c7862af6feb668ea9b6af trace_id=55cf8ab7e6033a2dadf7093fcd86b8e4 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_9b2f29eafec92097cb0cadc1 trace_id=1b9065dccfb0bb6faab788e1169c258c client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_d5529437e267dc879a5ea23e trace_id=a0748da41bf075c317ff0131e8f68584 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/grants/cli status=403 duration_ms=0 bytes=230 plane=business request_id=req_121d9cb413160febe40aca8f trace_id=a515ac3d9d373fe21dbb796d690c816b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/grants/cli status=403 duration_ms=0 bytes=230 plane=business request_id=req_6d99ddc9ea246092563b336d trace_id=d2a579d7d3d194227309c7aafc5a40d2 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/grants/cli status=204 duration_ms=0 bytes=0 plane=business request_id=req_1402a35831c7a7fead45eea5 trace_id=2c6f028c2c6177fe2e28249761c19f75 client=127.0.0.1
+    csrf_spec_test.go:174: DELETE  /v1/grants/cli                                 none=403 wrong=403 real=204
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_20ea4e7bc869aecc0d977bea trace_id=8a0157a144afba92782928b4de53e4c2 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_781fa657f4ba4becda046542 trace_id=c4768646719f2f863f2fd7660f74b5cf client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_1431e21b746fe7ffb1acdc5a trace_id=98d776d9b124b314c5193ef4b71557f4 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_4ebb851fa93b443072f293a2 trace_id=ae575551cdf2043c7d47263c6d0aef6c client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_ecf1a9dd3f26846c1dd02924 trace_id=ef98b346ce892e104da3a2ee4fab7ad2 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_84929fac488ce4e95bcc9a40 trace_id=3838a88859078c7350f5fe4e40214746 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/bindings/phigros/fake status=403 duration_ms=0 bytes=241 plane=business request_id=req_f83d5b5df8d0743420c9a9be trace_id=2c1b28d1e61ffe9b5434a024541fbe6e client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/bindings/phigros/fake status=403 duration_ms=0 bytes=241 plane=business request_id=req_621b366f7df12e695319a874 trace_id=224d065030dd59beea14bdc68e0ffe6e client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/bindings/phigros/fake status=200 duration_ms=0 bytes=23 plane=business request_id=req_00c317f1bfac82b49cc3e441 trace_id=6818829320ab2b4a5a4a87eed45a0837 client=127.0.0.1
+    csrf_spec_test.go:174: DELETE  /v1/bindings/phigros/fake                      none=403 wrong=403 real=200
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_ba806e67ad341aa700ea3afa trace_id=a3d3aaf7a043133403656e4ac8c9ee15 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_65bcc3defd8a715f0f7c5c93 trace_id=dc017d87820cda1f44b8c6d5475e3679 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_5318dba0e5fbf2ce47caccf4 trace_id=8d016e959306de3045dfcb7c46659482 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_43aa32b437e80c9cba859c97 trace_id=4cd8d792b5d5b7a51a30c96d2c5850e1 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_4dbd02b9e6cd9a75a8c9c0a4 trace_id=2451d0fe75d36edc14618691e4718083 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_527161a66f8027a96cb5697e trace_id=f5e9e8038ad45a320246584c39b6c649 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/bindings/phigros/fake/cascade_revocation status=403 duration_ms=0 bytes=260 plane=business request_id=req_a1a7db60dd0c9da142955b98 trace_id=6c1d2ee487ce846a50e1e13bed47f9b7 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/bindings/phigros/fake/cascade_revocation status=403 duration_ms=0 bytes=260 plane=business request_id=req_5376d9127a5ffb713f5d2802 trace_id=8caf5b1ca86401967f5f846ae723e2bb client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/bindings/phigros/fake/cascade_revocation status=400 duration_ms=0 bytes=320 plane=business request_id=req_324e0467ed98f1520e53245e trace_id=0bfbeb8265877560f6e31ed42e54e530 client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/bindings/phigros/fake/cascade_revocation   none=403 wrong=403 real=400
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_22c9b2001e9f78a110bcccbf trace_id=5c7150f3a0b6096a7a93e005441dacab client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_c117a6ad80f9ffd1d30e5b66 trace_id=b5383eea70a1fdcd0691b99dec41b6ca client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_caa9888f19152ca7af714b58 trace_id=9f502313ba07be08574dfeda31f241f7 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_ba4fb458efef121a862dfb10 trace_id=5a3716ecc4dade4af643ace6e685b7c3 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_302f7282455ff420dad58536 trace_id=b4d2f8c62751236b36223040b2f58960 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_38fcd0d7ba426e3e7aafbe49 trace_id=a67e52dc0ab40070cca18ccdb748376a client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/sessions/sign_out status=403 duration_ms=0 bytes=237 plane=business request_id=req_e68a421a848237294fc6f79c trace_id=1ecfccf1999bf87e29aec51378db884b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/sessions/sign_out status=403 duration_ms=0 bytes=237 plane=business request_id=req_2289f89d31b92960f182dd89 trace_id=fca06a0d48244e538392b51a3ea8de4d client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/sessions/sign_out status=204 duration_ms=0 bytes=0 plane=business request_id=req_f2ab0584aa81f1be6bd60876 trace_id=ea771202807916cd0eec1ad1f06f19b5 client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/sessions/sign_out                          none=403 wrong=403 real=204
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_1326f454bec83da3535ee447 trace_id=e300dd74f2ba42f0a307cc6722ae900a client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_cce01590bfadcd68d56b4a81 trace_id=3ee46010bfc80024e9791960f231a4c0 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_dedf4b8ecb58a6d8f6e9d901 trace_id=42ee618a0addeb01fe92a95e62ade28a client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_5487fac3a57e06a50ddbbdc2 trace_id=758d940ff91b82ee11cbf78725af2ddd client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_1c27f281e74db232269472e8 trace_id=1b1366d98b72a0e579e88672b93479ce client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_12cf4df29b1d6e8d7205b900 trace_id=4831b1aaa729b3de54469297ee792695 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/account status=403 duration_ms=0 bytes=227 plane=business request_id=req_056c4b9b2f25319daf207959 trace_id=e29816eb8a2c8bcb2e456d22c02d8402 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/account status=403 duration_ms=0 bytes=227 plane=business request_id=req_8c90ab637f12a12a4e5a8ccf trace_id=83d650aa02ff9bfe82458ec26283c097 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/account status=200 duration_ms=0 bytes=172 plane=business request_id=req_4579e87bc903f462ecba15b7 trace_id=92cd78d5544b35d6d8ed3e5afe85e5a4 client=127.0.0.1
+    csrf_spec_test.go:174: DELETE  /v1/account                                    none=403 wrong=403 real=200
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_7afb3b7bfb166329fe6532bb trace_id=32d97c9384226721172f39d3d3f9fbe4 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_6f28724e72157a43a2eb0f43 trace_id=a2a246924f1c3b7b7f3bd1ec744312ca client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_7623661ae24292a732bc1d09 trace_id=497f7e48526879ed0b34d38921890985 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_25f2047a84591132c4a661c2 trace_id=d54ad271ed113c7d7438c5bac2cdcb54 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_a98fe5437d317d1726bf33c8 trace_id=26c9af4356c78fe2b9738921e8c971e0 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_221adb28d569fc1db1e15c8a trace_id=13120d5ebc2e71d17047f028f876a3c6 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/identities/idn_z08probe status=403 duration_ms=0 bytes=243 plane=business request_id=req_6101d13f82647f80ce58f1d8 trace_id=e5d7d0162401fc4fe4d121495360d30e client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/identities/idn_z08probe status=403 duration_ms=0 bytes=243 plane=business request_id=req_e751aa379bb475c3bdcb9c83 trace_id=2070352409766837a960a3e737a68814 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/identities/idn_z08probe status=404 duration_ms=0 bytes=212 plane=business request_id=req_f3e81faba22a89020afecdbb trace_id=03d8e1a84e58b3416f0c37d453102255 client=127.0.0.1
+    csrf_spec_test.go:174: DELETE  /v1/identities/idn_z08probe                    none=403 wrong=403 real=404
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_45205834a81b6d00fec8611f trace_id=16459ad1936795b894fd7e31e9309071 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_1c48ef79980c866e40d12aa9 trace_id=8450ac1461c52c779fc1041d5c752416 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_9732428bba646297bd6f47c3 trace_id=415c89357d667f8806e3ce3fa4b4e9d8 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_f8faa8d6746fd42a788273ea trace_id=b88671daa1f25a40a8ea870a5489aee0 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_2207324aa365191db6ad3dc1 trace_id=f1f9778b324e124ee115bcc811051b8b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_94c21ab2548a055d58879d28 trace_id=c045c3ef83b38d025c3524426edc0cb5 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/authorization_requests/idn_z08probe/decision status=403 duration_ms=0 bytes=264 plane=business request_id=req_2b682f24966b3f5286b05e14 trace_id=bf1c00a71668961ce1fd0937d01b61db client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/authorization_requests/idn_z08probe/decision status=403 duration_ms=0 bytes=264 plane=business request_id=req_d9871c537e8582065ecb4d35 trace_id=3645211d5862f5acddda2a63fdf040eb client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/authorization_requests/idn_z08probe/decision status=404 duration_ms=0 bytes=246 plane=business request_id=req_dc99d0f592e497a27e204820 trace_id=22c97f7c01923db48754c9b993f28800 client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/authorization_requests/idn_z08probe/decision none=403 wrong=403 real=404
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_3bfe608aa7112d8294a85b3f trace_id=a3f6ba6a8e225ed0ec939c68b4964d99 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_d00314b06d6fdba95935a9b2 trace_id=38f7f1bb782f28bcbd1f4268bbd0ae4b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_c4734cb9975fd60661c42ae6 trace_id=81ba94ec676ec13b7f359027f04911d6 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_e137ba578eaecbb0af040a05 trace_id=62dadb2a1f1ea25ead97f00e04c34920 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_dba0f5f6445fe9781bc5e15b trace_id=45adc42e51c98e5e57c56eda93cc7ad1 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_f6959e5182e7ee2f2899fe60 trace_id=0710e292483f3abaecab2f9c9d93562e client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/device/decision status=403 duration_ms=0 bytes=235 plane=business request_id=req_ca9541012acb28154ff2a7ed trace_id=89ea7e36b9dc6a9e65555d01b139eb48 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/device/decision status=403 duration_ms=0 bytes=235 plane=business request_id=req_d4527d0cf3dee75b89ba81f8 trace_id=e73c1298c2ad67b7c726f7e6bd0e753a client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/device/decision status=404 duration_ms=0 bytes=205 plane=business request_id=req_2621054f10dba4926322169c trace_id=561162d289f7ae793769ce95d9ccfa11 client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/device/decision                            none=403 wrong=403 real=404
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_3560199429d63a1b7612e920 trace_id=1a88b6082636e701bb8e88cb12204a19 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_e16a98c9cae40ceb8106cfd0 trace_id=37f1f043929de14239ddea0f3f0d9319 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_03f4edad4cc13398b52fdcd3 trace_id=02a01e20ceacb62dc18e0b58ca14f51c client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_410ef259b66ec9f0a3496e97 trace_id=c51524cc92478d15e2ed111eb245950b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_8080fdec7107d8a71e86f341 trace_id=e602a62a34ad73477d6dde0c189463e7 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_360ff8b9e1e128ee3e318434 trace_id=85dc939542edc9d3347213badf1a725c client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients status=403 duration_ms=0 bytes=233 plane=business request_id=req_804c5e9765239ac95bbe31e2 trace_id=ffd57a8d5bd28dfd448764ee1de5bf62 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients status=403 duration_ms=0 bytes=233 plane=business request_id=req_178f29b6a8f6d5be71049e00 trace_id=7ca995a3524b5c012cf388417d99d773 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients status=400 duration_ms=0 bytes=231 plane=business request_id=req_da3660e4409b3649dcc7e1c3 trace_id=b405f90be22441522a28199d7f40f2ab client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/admin/clients                              none=403 wrong=403 real=400
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_314e25cca5202366ebfd23f8 trace_id=3241afe22d10119c915f338f743f0e3b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_47428fb2751f4fee6ddfd105 trace_id=ef10d1ab6d72e2002efbb67ead888242 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_87412639b10829183e0cb1fc trace_id=d36af3d277a267c4f31fd735024732f7 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_4667049e65f06ebe638fadd3 trace_id=6a0688a420722dc6740ff4b4fe3fd562 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_c8dd5505955fafb5be9634d0 trace_id=004aee48a8de64cca12b738994ae5792 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_a64ae3d8b70b7a3b34186c7d trace_id=a067b3bb2c0404388ca8bda5351b5a9d client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/suspend status=403 duration_ms=0 bytes=245 plane=business request_id=req_fef455be47fde7524808f13e trace_id=5c232de0a072c25f9472eca2c1cd3284 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/suspend status=403 duration_ms=0 bytes=245 plane=business request_id=req_9ebff42d7e3e3cdeccb460e6 trace_id=f4b88e5641b31c6d44633ee901ea9431 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/suspend status=204 duration_ms=0 bytes=0 plane=business request_id=req_e97ae193420a4d871b61fd52 trace_id=6b4fdb4030dcde38ca36480fd787d693 client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/admin/clients/cli/suspend                  none=403 wrong=403 real=204
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_35cf3f5f18913520cc99d26e trace_id=5c2d64b387825a45a1e1ae0f8663bc11 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_8aa702aacdfe3fa5b62f3c0f trace_id=30c00273c7942704e3614c30418cd46c client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_c1bf0b7e3b8e0e03bf0a530f trace_id=df2c00592406cd37042ee9f11f290fcc client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_77d739e9301191907f69b731 trace_id=52b0cc02139ff7c8cf8017cd45407dbc client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_adc5bbb174440cb99a619f3d trace_id=12b2123f50f8f408074a81258cb2ac2a client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_95f29b2df578643030a04cc8 trace_id=522f9aa76bf20d3cc2bfcd6ef1692f8b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/activate status=403 duration_ms=0 bytes=246 plane=business request_id=req_cbcf7f69924103321387572b trace_id=4e23ba71b5ed627868abb212164ec785 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/activate status=403 duration_ms=0 bytes=246 plane=business request_id=req_889b6803d8d596c7671313ab trace_id=f31bce2991086ca4d9e0c6252a478d57 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/activate status=204 duration_ms=0 bytes=0 plane=business request_id=req_2355b471bcfda422c38992fb trace_id=bb7d491934bd5055590f0eabf7ea0b81 client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/admin/clients/cli/activate                 none=403 wrong=403 real=204
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_5556a99ef42cc6abd528b7a8 trace_id=8f10b39c6065fb266038cf61878e0541 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_2df05bc57cc9ea295f58acb7 trace_id=a37bf1c0bd52d86aa0036d990da8c940 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_d8dda5ddc5ed42c07679addb trace_id=c3edd8ab9edd606b24837c242fc45036 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_2c289600c44af40267450f76 trace_id=f2a6a2dd68431daabffc852ab13584cc client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_af33910dea3dacf9b298ce0c trace_id=ed42f87fc4658b973b46160c850b7b05 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_d1fca1d3b3ad2c31d96d8eba trace_id=ae5cf7b4b97b877b69e59f4cbcdede7d client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/rotate_secret status=403 duration_ms=1 bytes=251 plane=business request_id=req_b871dbd7e149c987690f7789 trace_id=7836f9f5cfde6f3700466b8f963aa4aa client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/rotate_secret status=403 duration_ms=0 bytes=251 plane=business request_id=req_d6600369f562182af2059570 trace_id=b47c0f39fd5fb46c374b4fb3ccb6e8f6 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/clients/cli/rotate_secret status=409 duration_ms=0 bytes=261 plane=business request_id=req_f176fb81804e18aeaf12c24c trace_id=d367fd9127be816f3032b7ada9c4822a client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/admin/clients/cli/rotate_secret            none=403 wrong=403 real=409
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_3edad50b3d847e447a4900b3 trace_id=c0347dc925e1bfc449cd53a79f50c5bd client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_db5020d62edeaaa52370a8aa trace_id=04865869f1f676e4e8faf7d578ac0d9d client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_5cb108b6bd31839eded44437 trace_id=c9c78187b3c6e41bba1c5dcd55bfe655 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_17c4bfce6b70ea541a609283 trace_id=8cb0f76879532e9699e857a19d9c3761 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_1590e11ddfa1a5fc85d049a8 trace_id=c8d3b98735c07479adbec56470c1d8ea client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_e1247b45179a5fc6b82efd71 trace_id=c6ea63e747b310389a4af29ceeb9a0cd client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/admin/clients/cli status=403 duration_ms=0 bytes=237 plane=business request_id=req_fe33004a6426fb0b3541a694 trace_id=4fec1326b14f49a32b0d06155d973476 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/admin/clients/cli status=403 duration_ms=0 bytes=237 plane=business request_id=req_e1e95c9f453265c056b25b26 trace_id=821aa71da1a782b4bca0d2d7fdd7166d client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=DELETE path=/v1/admin/clients/cli status=204 duration_ms=0 bytes=0 plane=business request_id=req_49d2050e470eea0d0935e28a trace_id=79559d65c41d6b558626d5d01d3f8d03 client=127.0.0.1
+    csrf_spec_test.go:174: DELETE  /v1/admin/clients/cli                          none=403 wrong=403 real=204
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_732298290fbf486e9a2b19b0 trace_id=7ffb4e2d3182fcf2847e51fa1583c30e client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_8df270c85a62d5ca6927e615 trace_id=ce4beb2861f99e5b8e58bd877968654b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_e02aa5373d2e94cf1f2dbceb trace_id=897ed3fb5dc86e62c526d80519d0160b client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_56ceaa7cdfb60f670c028e72 trace_id=65192b4fef78ba783e056abf6fed2fe9 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_d30edc1dcdb1013e2d480461 trace_id=0ebee06ba77358c107671596e97fb374 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_e894604691005f5625d93450 trace_id=88644c4d6171ee329aa7b102d597938d client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/kill_switch status=403 duration_ms=0 bytes=237 plane=business request_id=req_586b1123747957ed5781b034 trace_id=e206869bdedc2b52347d2e936c19c79f client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/kill_switch status=403 duration_ms=0 bytes=237 plane=business request_id=req_5129442de4bbcda14bc66136 trace_id=d02625bb30b4dfcba19b373d6dc46164 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/v1/admin/kill_switch status=400 duration_ms=0 bytes=271 plane=business request_id=req_ce1127b801ec99288583e07b trace_id=ae1c026f1f63de0ccda7661c6a4ba96c client=127.0.0.1
+    csrf_spec_test.go:174: POST    /v1/admin/kill_switch                          none=403 wrong=403 real=400
+--- PASS: TestZ08EverySpecifiedWriteNeedsTheSessionCSRFToken (0.91s)
+=== RUN   TestZ08DeviceVerificationIsTheOneWriteThatNeedsNoToken
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_9f6ef11cb721bbd841508aed trace_id=9c553f91fc5313a52d70062a1e81f584 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_bce0cf876f0a2a997140159f trace_id=c26652970665d8e7c607818f17b8ba19 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_39b9ae84b439c6da7ae10195 trace_id=5a547ed17ea863ef4e74e9e981edf419 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=POST path=/oauth/device_authorization status=200 duration_ms=0 bytes=230 plane=protocol request_id=req_412e54a8119439468b21b351 trace_id=48bf6395fc34c469c6d1433adc73ca91 client=127.0.0.1
+2026/09/30 02:03:16 INFO request method=GET path=/v1/device/verification status=200 duration_ms=0 bytes=557 plane=business request_id=req_0455e0afc8e18dafa87f8bc3 trace_id=77561415dd51540013bba27e0a4ea342 client=127.0.0.1
+    csrf_spec_test.go:219: spec declares 1 GET operations; /v1/device/verification returns a CSRF token as documented
+--- PASS: TestZ08DeviceVerificationIsTheOneWriteThatNeedsNoToken (0.10s)
+=== RUN   TestZ08CrossSiteFormPostCannotReachAWrite
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_bbe43ce3baa9118ca802507f trace_id=b72e2930d6c9e355c5c0477003636355 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_9168987396ed02ac774fabc9 trace_id=c655538122552a3360cf18f3896bb97d client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_2ab04cb9e78016020e2fff84 trace_id=960bef9dbb7849a8bb4496535f5a820c client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_22f28d408abe980ecdff03e2 trace_id=7d002fe2ad454644ed4b0a7be7992db8 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/admin/clients status=200 duration_ms=0 bytes=317 plane=business request_id=req_de20eaed03b06899d4c97023 trace_id=8cb3e4bbfc13fbb5ea2a274340705918 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/v1/sessions/sign_out status=403 duration_ms=0 bytes=237 plane=business request_id=req_de852589b6be39b048bfce4b trace_id=be64a8b974656141a736231c2955e18b client=127.0.0.1
+    csrf_spec_test.go:235: POST /v1/sessions/sign_out        (form-encoded, no header) -> 403
+2026/09/30 02:03:17 INFO request method=POST path=/v1/admin/kill_switch status=403 duration_ms=0 bytes=237 plane=business request_id=req_7506212753e5eda27f177791 trace_id=99791112b97d5a7df804db08a1af2f71 client=127.0.0.1
+    csrf_spec_test.go:235: POST /v1/admin/kill_switch        (form-encoded, no header) -> 403
+--- PASS: TestZ08CrossSiteFormPostCannotReachAWrite (0.16s)
+=== RUN   TestZ08DeviceVerificationRequiresASession
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_27b3b2305254125555e00d1e trace_id=37aff714a368f3e7ab63c8ac6df3a729 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_69208f9aba0c1f12e3b3f9b8 trace_id=d93cb55e533fbb7886ce7b2bb00ab51b client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_02d2cd8a0a0c6589f595c023 trace_id=4859f23ce2e45dc63c3305574724c203 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/oauth/device_authorization status=200 duration_ms=0 bytes=230 plane=protocol request_id=req_bcd206db6319073a0fd1b246 trace_id=30912bda31beb6fd474979b7c18f5579 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/device/verification status=401 duration_ms=0 bytes=237 plane=business request_id=req_4f4805236866b52701eb10bd trace_id=e8d6d3cd2ce7a68731c7f16d977eba4e client=127.0.0.1
+--- PASS: TestZ08DeviceVerificationRequiresASession (0.04s)
+=== RUN   TestZ08DeviceUnknownDecisionVerbIsRefusedNotSilentlyDenied
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_11d657e66dacadb450ca4b8b trace_id=424a17d8d6df02626b78b588c22c825c client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_ad75b0735a4ce418d1686058 trace_id=6ef10ecc908e3dca0283adadd187fb4c client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_b829518a68139fd58e7daa38 trace_id=2203a1ef818b305d5982ca1b90782f02 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/oauth/device_authorization status=200 duration_ms=0 bytes=230 plane=protocol request_id=req_09229aaa5ef1db16c5dfbbbf trace_id=5f16b59f972d27e0d83818f2cfb9fdc9 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/device/verification status=200 duration_ms=0 bytes=557 plane=business request_id=req_16aeeca3c9c7ce8a571ccdec trace_id=53f99b0a53dc44f8a19aab4eb3d3e100 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_b80f53d7530293056e34c03a trace_id=d663b2a94b748c4b19be702ca78b02ad client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/v1/device/decision status=200 duration_ms=0 bytes=19 plane=business request_id=req_3fb8726dffb9fd939b2fe8fe trace_id=6908841c475faf7a8cc2c0a3ac54d411 client=127.0.0.1
+    device_browser_test.go:106: decision "" was answered 200 {"state":"denied"}
+        : an unrecognised verb is treated as a denial, so a client typo silently refuses the login and burns the code
+--- FAIL: TestZ08DeviceUnknownDecisionVerbIsRefusedNotSilentlyDenied (0.05s)
+=== RUN   TestZ08DeviceScreenDisplaysEveryDescribedScopeItGrantsOnce
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_be3e3a741aa997405607240e trace_id=bcfb6a7b5db7d2d43e8ac10c8c7ad45d client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_81b2ff24d94d11dd4801cdc1 trace_id=a36b6e987fb7253aa5fb623a4bff2f3a client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_8dab4ce5752f7e818b61ba6c trace_id=2a221b8594dc2ef30c4d1ac73a2e0cf4 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/oauth/device_authorization status=200 duration_ms=0 bytes=230 plane=protocol request_id=req_de2ca3c913866bed0caff108 trace_id=7d996e2488e58be2b69d4890a41355f1 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/device/verification status=200 duration_ms=0 bytes=557 plane=business request_id=req_a50db8b9264427a99dce3cbc trace_id=57a6144d28bf6557f1a2683e1eb3aef8 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/v1/device/decision status=200 duration_ms=0 bytes=21 plane=business request_id=req_a3bc13c945626cd9b9e1a975 trace_id=108b5a37b57577b724ce564241f01d26 client=127.0.0.1
+    device_browser_test.go:149: device display: [account.id phigros.profile.read] -> {"state":"approved"}
+--- PASS: TestZ08DeviceScreenDisplaysEveryDescribedScopeItGrantsOnce (0.04s)
+=== RUN   TestZ08DeviceCodeLoadedElsewhereCannotBeApprovedHere
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_9c13e0e5f65b4dc541fe0077 trace_id=87c32d63572f78882bd86935b13bf9e8 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_028a173d132e0cfc33c7b3fb trace_id=2aa6302c017cef2fccb7d1d5aad0fc4e client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_786be0a2060d5f4ac5a5f6de trace_id=13d5fafea33872a5d136d8040026a87d client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/oauth/device_authorization status=200 duration_ms=0 bytes=230 plane=protocol request_id=req_a1d7ef6c22b1fe9383a625dd trace_id=09a0dd43e3f3b2c919f9c94c62d52591 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/device/verification status=200 duration_ms=0 bytes=557 plane=business request_id=req_152fc2ef8ac42245f47b9faa trace_id=9e832b05037c69c142ac88a529ea6d16 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/start status=302 duration_ms=0 bytes=401 plane=browser request_id=req_f892492c7c22b42003b8e2cf trace_id=7116c5f87772aae941f92aba9f30d0ea client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/auth/z08idp/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_e574dfe6ae187eb42575dcc6 trace_id=6b99bd8ac84e8b91e8ecf7ba1db44721 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_46ecda4fadc55870fa20c0bf trace_id=eee8e521c1f0fe207c41d698faa057ad client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=408 plane=business request_id=req_5fd2d292bc03c0c53d9b0aa7 trace_id=c08bb542f8367fb67de6bd169af86094 client=127.0.0.1
+2026/09/30 02:03:17 INFO request method=POST path=/v1/device/decision status=404 duration_ms=0 bytes=205 plane=business request_id=req_2eea71e287ec105189d666ad trace_id=71ce8d17a9d01ef17a52e201054b57de client=127.0.0.1
+    device_browser_test.go:176: foreign approval -> 404 {"type":"https://r0semi.dev/errors/not_found","title":"Not found","status":404,"detail":"unknown user code","instance":"/v1/device/decision","code":"not_found","request_id":"req_2eea71e287ec105189d666ad"}
+2026/09/30 02:03:17 INFO request method=POST path=/v1/device/decision status=200 duration_ms=0 bytes=21 plane=business request_id=req_91871df501de6bac84a783db trace_id=23ad4f9a376cc1fdb8ff3e3754a96808 client=127.0.0.1
+--- PASS: TestZ08DeviceCodeLoadedElsewhereCannotBeApprovedHere (0.07s)
+=== RUN   TestZ08StaticServingSurvey
+2026/09/30 02:03:17 INFO request method=GET path=/app/ status=200 duration_ms=19 bytes=144 plane=browser request_id=req_4be2854adfbf13ad76c162d6 trace_id=e87dc835f59a5f606e6d40671f963c1d client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/                                          -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=144
+2026/09/30 02:03:17 INFO request method=GET path=/app status=307 duration_ms=0 bytes=41 plane=browser request_id=req_0a467f3b863d5c57d78dbbac trace_id=b876734c68d80595dbbfbc9c949eb956 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app                                           -> 307 ct="text/html; charset=utf-8" cc="" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=41
+2026/09/30 02:03:17 INFO request method=GET path=/app/index.html status=301 duration_ms=0 bytes=0 plane=browser request_id=req_53f4a2ad7e3bdf92d7def5d9 trace_id=d69f59e50562a790e3f077539764ea7a client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/index.html                                -> 301 ct="" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=0
+2026/09/30 02:03:17 INFO request method=GET path=/app/grants status=200 duration_ms=0 bytes=144 plane=browser request_id=req_6a91f66e8159290b1d2ec448 trace_id=bdc319a043c2498895593c1f8f3d1a96 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/grants                                    -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=144
+2026/09/30 02:03:17 INFO request method=GET path=/app/anything/at/all status=200 duration_ms=0 bytes=144 plane=browser request_id=req_76edbcb8dac31166abff0850 trace_id=4894312f03e761de74cc8fc7971a87a1 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/anything/at/all?q=1                       -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=144
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/entry/start.abc.js status=200 duration_ms=0 bytes=19 plane=browser request_id=req_adbc5e443c8e90f506d91124 trace_id=1eb3f4443140eb5aa32e8dd8da2fbfa7 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/_app/immutable/entry/start.abc.js         -> 200 ct="text/javascript; charset=utf-8" cc="public, max-age=31536000, immutable" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=19
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/entry/start.MISSING.js status=200 duration_ms=0 bytes=144 plane=browser request_id=req_5573d6add5bbde02926cd558 trace_id=4b5d11d3bd178bdc52e07f64c18eee1e client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/_app/immutable/entry/start.MISSING.js     -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=144
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/assets/0.abc.css status=200 duration_ms=0 bytes=6 plane=browser request_id=req_a44f97d183007799e085d312 trace_id=934a2cd75f894fc0aac4831b6a86484b client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/_app/immutable/assets/0.abc.css           -> 200 ct="text/css; charset=utf-8" cc="public, max-age=31536000, immutable" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=6
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/version.json status=200 duration_ms=0 bytes=15 plane=browser request_id=req_20f78d738179dbd6a8177f74 trace_id=15b9fd7b74ab9c1afd1a3a17f1516060 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/_app/version.json                         -> 200 ct="application/json" cc="" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=15
+2026/09/30 02:03:17 INFO request method=GET path=/app/favicon.svg status=200 duration_ms=0 bytes=41 plane=browser request_id=req_a7035be53c0f0c68c2397c2d trace_id=69b102e46643f8f2073d22a257acdeed client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/favicon.svg                               -> 200 ct="image/svg+xml" cc="" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=41
+2026/09/30 02:03:17 INFO request method=GET path=/app/robots.txt status=200 duration_ms=0 bytes=30 plane=browser request_id=req_8683a979e910cbe99db608b6 trace_id=5c8d5212315072173d9f2aa803c1de70 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/robots.txt                                -> 200 ct="text/plain; charset=utf-8" cc="" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=30
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_206330e344f1537dcbe3d00e trace_id=17dae9b4a6c9cee0e40bb396814fdf26 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/_app/                                     -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=144
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_300028822ab8cfe85e8cf5b9 trace_id=17140b24a268ac1c63a2ff1a4f537781 client=192.0.2.1
+    frontend_handler_test.go:91: GET     /app/_app/immutable/                           -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=144
+2026/09/30 02:03:17 INFO request method=HEAD path=/app/ status=200 duration_ms=0 bytes=0 plane=browser request_id=req_f9357836c47fe4a30565924a trace_id=92c1a96d72cdd7bd058e9a358378c62d client=192.0.2.1
+    frontend_handler_test.go:91: HEAD    /app/                                          -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=0
+2026/09/30 02:03:17 INFO request method=POST path=/app/ status=405 duration_ms=0 bytes=19 plane=browser request_id=req_92967d500cf75601414f9d5c trace_id=6565985d3cc3828a04ec082410ae662a client=192.0.2.1
+    frontend_handler_test.go:91: POST    /app/                                          -> 405 ct="text/plain; charset=utf-8" cc="" vary="Cookie" etag="" lm="" allow="GET, HEAD" csp="frame-ancestors 'none'" len=19
+2026/09/30 02:03:17 INFO request method=PUT path=/app/index.html status=405 duration_ms=0 bytes=19 plane=browser request_id=req_434a7c774a6f3492cee9b4b6 trace_id=73bb0d9c0485ced15d50685e18caa332 client=192.0.2.1
+    frontend_handler_test.go:91: PUT     /app/index.html                                -> 405 ct="text/plain; charset=utf-8" cc="" vary="Cookie" etag="" lm="" allow="GET, HEAD" csp="frame-ancestors 'none'" len=19
+2026/09/30 02:03:17 INFO request method=OPTIONS path=/app/ status=405 duration_ms=0 bytes=19 plane=browser request_id=req_eaa3687b388626297434c99b trace_id=946c15d954935773e3f0bdbfe1e0b1ce client=192.0.2.1
+    frontend_handler_test.go:91: OPTIONS /app/                                          -> 405 ct="text/plain; charset=utf-8" cc="" vary="Cookie" etag="" lm="" allow="GET, HEAD" csp="frame-ancestors 'none'" len=19
+2026/09/30 02:03:17 INFO request method=GET path=/robots.txt status=200 duration_ms=0 bytes=30 plane=browser request_id=req_45d8947cdf1e903d9a8dfca3 trace_id=adf47dc4e8eee8539c70b8f4f37e606b client=192.0.2.1
+    frontend_handler_test.go:91: GET     /robots.txt                                    -> 200 ct="text/plain; charset=utf-8" cc="public, max-age=3600" vary="Cookie" etag="" lm="" allow="" csp="frame-ancestors 'none'" len=30
+--- PASS: TestZ08StaticServingSurvey (0.07s)
+=== RUN   TestZ08TraversalMatrixSurvey
+2026/09/30 02:03:17 INFO request method=GET path=/app/../../etc/passwd status=307 duration_ms=0 bytes=47 plane=browser request_id=req_1e6221af13f16ddafc2a3994 trace_id=628d75a8ce9d9d816726de4871bebd5b client=192.0.2.1
+    frontend_handler_test.go:130: /app/../../etc/passwd                                -> 307 ct="text/html; charset=utf-8" loc="/etc/passwd" body="<a href=\"/etc/passwd\">Temporary Redirect</a>."
+2026/09/30 02:03:17 INFO request method=GET path=/app/../../etc/passwd status=400 duration_ms=0 bytes=17 plane=browser request_id=req_7029e12f4835658135f9d26f trace_id=ee3ec6fef326635d7825888ed5206450 client=192.0.2.1
+    frontend_handler_test.go:130: /app/..%2f..%2fetc/passwd                            -> 400 ct="text/plain; charset=utf-8" loc="" body="invalid URL path"
+2026/09/30 02:03:17 INFO request method=GET path=/app/../../etc/passwd status=400 duration_ms=0 bytes=17 plane=browser request_id=req_f05891d8c31b31a08dbf21a6 trace_id=540fb6dff83b863cf64032bfcace0ffe client=192.0.2.1
+    frontend_handler_test.go:130: /app/%2e%2e/%2e%2e/etc/passwd                        -> 400 ct="text/plain; charset=utf-8" loc="" body="invalid URL path"
+2026/09/30 02:03:17 INFO request method=GET path=/app/../oauth/token status=404 duration_ms=0 bytes=10 plane=browser request_id=req_09d522c873641017e21cd4c9 trace_id=d17bc08a33118d8b51fea5dbc0a7434f client=192.0.2.1
+    frontend_handler_test.go:130: /app/../oauth/token                                  -> 404 ct="text/plain; charset=utf-8" loc="" body="not found"
+2026/09/30 02:03:17 INFO request method=GET path=/app/../v1/me status=404 duration_ms=0 bytes=10 plane=browser request_id=req_4e4396583564a845a441c394 trace_id=8fd0e19a04315d5ec9195c58eb407eb7 client=192.0.2.1
+    frontend_handler_test.go:130: /app/../v1/me                                        -> 404 ct="text/plain; charset=utf-8" loc="" body="not found"
+2026/09/30 02:03:17 INFO request method=GET path=/app/../oauth/token status=404 duration_ms=0 bytes=10 plane=browser request_id=req_84d3b31393f36ade0dbc5a98 trace_id=d7fbfb99fcd5699ba116085f94a642b5 client=192.0.2.1
+    frontend_handler_test.go:130: /app/..%2Foauth/token                                -> 404 ct="text/plain; charset=utf-8" loc="" body="not found"
+2026/09/30 02:03:17 INFO request method=GET path=/app//oauth/token status=307 duration_ms=0 bytes=52 plane=browser request_id=req_38ea2d8d4b033048b068a1ec trace_id=4782e2acd22c3de1f1d4945974d33643 client=192.0.2.1
+    frontend_handler_test.go:130: /app//oauth/token                                    -> 307 ct="text/html; charset=utf-8" loc="/app/oauth/token" body="<a href=\"/app/oauth/token\">Temporary Redirect</a>."
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/../../../index.html status=307 duration_ms=0 bytes=47 plane=browser request_id=req_62c0fd0426ef1796599d75e7 trace_id=55336ea6674aa92a6922dc8b10a81d53 client=192.0.2.1
+    frontend_handler_test.go:130: /app/_app/immutable/../../../index.html              -> 307 ct="text/html; charset=utf-8" loc="/index.html" body="<a href=\"/index.html\">Temporary Redirect</a>."
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/../../../index.html status=400 duration_ms=0 bytes=17 plane=browser request_id=req_365c6c80029026b75a3c15e7 trace_id=ddf96c42d9afef5f682355f52330b74a client=192.0.2.1
+    frontend_handler_test.go:130: /app/_app/immutable/..%2f..%2f..%2findex.html        -> 400 ct="text/plain; charset=utf-8" loc="" body="invalid URL path"
+2026/09/30 02:03:17 INFO request method=GET path=/app/./././grants status=307 duration_ms=0 bytes=47 plane=browser request_id=req_55cd17443eaf7fbeca87be95 trace_id=c76565cfa95a38b58ce4fd1eb2d9c877 client=192.0.2.1
+    frontend_handler_test.go:130: /app/./././grants                                    -> 307 ct="text/html; charset=utf-8" loc="/app/grants" body="<a href=\"/app/grants\">Temporary Redirect</a>."
+2026/09/30 02:03:17 INFO request method=GET path=/application/oauth/token status=404 duration_ms=0 bytes=10 plane=browser request_id=req_200d8b138f2a59c5caacc084 trace_id=5ee9892cea6f7312469798dc7b484833 client=192.0.2.1
+    frontend_handler_test.go:130: /application/oauth/token                             -> 404 ct="text/plain; charset=utf-8" loc="" body="not found"
+2026/09/30 02:03:17 INFO request method=GET path=/app/oauth/token status=404 duration_ms=0 bytes=10 plane=browser request_id=req_a0dc12712e89def06493f0fa trace_id=0bb95e722d6302e12d66031b888ec8fb client=192.0.2.1
+    frontend_handler_test.go:130: /app%2Foauth/token                                   -> 404 ct="text/plain; charset=utf-8" loc="" body="not found"
+--- PASS: TestZ08TraversalMatrixSurvey (0.06s)
+=== RUN   TestZ08MissingImmutableAssetIsNotASilentShell
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/entry/start.DEADBEEF.js status=200 duration_ms=0 bytes=144 plane=browser request_id=req_ff3a47ce120f5ace6b4648ac trace_id=4d82e22478ec2024cbd4ee845e50fdf5 client=192.0.2.1
+    frontend_handler_test.go:146: GET a hashed asset URL that names no file answered 200 "text/html; charset=utf-8" with 144 bytes of the shell: a half-deployed or stale build is indistinguishable from a working one at the HTTP layer, and every monitor watching status codes sees success
+--- FAIL: TestZ08MissingImmutableAssetIsNotASilentShell (0.09s)
+=== RUN   TestZ08ShellIsRevalidatableWithoutRefetching
+2026/09/30 02:03:17 INFO request method=GET path=/app/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_8c270e99054721d112c3cddb trace_id=0be628fc99561e4d7cceed6cd98a2bea client=192.0.2.1
+    frontend_handler_test.go:165: the shell answers "no-cache" with neither ETag nor Last-Modified, so `no-cache` can never become a 304: every navigation and every refresh re-sends the whole document (144 bytes here)
+--- FAIL: TestZ08ShellIsRevalidatableWithoutRefetching (0.05s)
+=== RUN   TestZ08ImmutableAssetIsConditionallyFetchable
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/entry/start.abc.js status=200 duration_ms=0 bytes=19 plane=browser request_id=req_b725597ce199fff6e840bfd4 trace_id=4974938086ade9a290b392163cbeec29 client=192.0.2.1
+    frontend_handler_test.go:180: immutable asset ct="text/javascript; charset=utf-8" cc="public, max-age=31536000, immutable" etag="" lm=""
+--- PASS: TestZ08ImmutableAssetIsConditionallyFetchable (0.02s)
+=== RUN   TestZ08NonShellStaticFilesDeclareACachePolicy
+2026/09/30 02:03:17 INFO request method=GET path=/app/favicon.svg status=200 duration_ms=0 bytes=41 plane=browser request_id=req_7980d67a13687b3c1a459f44 trace_id=b41d3f0d1694275b0b79cc7ad6c8dc13 client=192.0.2.1
+    frontend_handler_test.go:197: /app/favicon.svg is served with no Cache-Control at all (ct="image/svg+xml"): the response states no freshness, so caches fall back to a heuristic and different browsers disagree
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/version.json status=200 duration_ms=0 bytes=15 plane=browser request_id=req_d1c835d17b4c1352e2c35cdf trace_id=bb48619893b0bc037307b57afc1f6fea client=192.0.2.1
+    frontend_handler_test.go:197: /app/_app/version.json is served with no Cache-Control at all (ct="application/json"): the response states no freshness, so caches fall back to a heuristic and different browsers disagree
+2026/09/30 02:03:17 INFO request method=GET path=/robots.txt status=200 duration_ms=0 bytes=30 plane=browser request_id=req_3830c941b58adfbb2d0a1c5a trace_id=ff2d07fb0928f431bb1f1c222b7afa59 client=192.0.2.1
+--- FAIL: TestZ08NonShellStaticFilesDeclareACachePolicy (0.05s)
+=== RUN   TestZ08EveryBrowserPlaneResponseCarriesTheFramingGuard
+2026/09/30 02:03:17 INFO request method=GET path=/app/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_2f299c3778b91ccf539f3b7d trace_id=b24ffd4b98de78dac419a537d867bc29 client=192.0.2.1
+2026/09/30 02:03:17 INFO request method=GET path=/app/consent status=200 duration_ms=0 bytes=144 plane=browser request_id=req_d20a339f690f481fbfae972c trace_id=84c2a48b8c78557e47d738da26855503 client=192.0.2.1
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/entry/start.MISSING.js status=200 duration_ms=0 bytes=144 plane=browser request_id=req_54c892a70c9de4c47e3836be trace_id=369d6c4a74aaef1dc1ef6cb77b556ffb client=192.0.2.1
+2026/09/30 02:03:17 INFO request method=POST path=/app/ status=405 duration_ms=0 bytes=19 plane=browser request_id=req_3574ccc257f1f2d38d35cb86 trace_id=e6edbe6bc5a6089fd48008fec615db48 client=192.0.2.1
+2026/09/30 02:03:17 INFO request method=GET path=/nope status=404 duration_ms=0 bytes=10 plane=browser request_id=req_9d8fc117c43df667d8a8486f trace_id=76346c8f36fb558df3cbb9046faeb2be client=192.0.2.1
+2026/09/30 02:03:17 INFO request method=GET path=/robots.txt status=200 duration_ms=0 bytes=30 plane=browser request_id=req_361bd6eaa2a1f51edf2e5e86 trace_id=36a01105d2ccc4ff9111f4665386dd39 client=192.0.2.1
+--- PASS: TestZ08EveryBrowserPlaneResponseCarriesTheFramingGuard (0.07s)
+=== RUN   TestZ08RangeOnTheShellCannotSpliceAssets
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/entry/start.MISSING.js status=206 duration_ms=0 bytes=10 plane=browser request_id=req_63f0fa6ef48ced5a60a15b85 trace_id=261b4e5c1441cbf6aa6021e7d96a22e2 client=192.0.2.1
+    frontend_handler_test.go:235: range over a missing asset -> 206 ct="text/html; charset=utf-8" cr="bytes 0-9/144" len=10
+    frontend_handler_test.go:238: a range request for a missing asset was answered 206 "text/html; charset=utf-8" (Content-Range "bytes 0-9/144"): the client asked for bytes of a script and got bytes of the shell
+--- FAIL: TestZ08RangeOnTheShellCannotSpliceAssets (0.05s)
+=== RUN   TestZ08WrongMethodUnderTheMountIsRefusedWithAllow
+2026/09/30 02:03:17 INFO request method=POST path=/app/ status=405 duration_ms=0 bytes=19 plane=browser request_id=req_2fae14686bc928d525a270ce trace_id=88f25ef5aee40865935e67f1a638b0f9 client=192.0.2.1
+--- PASS: TestZ08WrongMethodUnderTheMountIsRefusedWithAllow (0.06s)
+=== RUN   TestZ08DirectoryUnderTheMountIsNotListed
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_2ec6fe130082f20badcbe9fc trace_id=53d89a57a67fad2baca232f5a1a26c7a client=192.0.2.1
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_788c536d035f29689befd794 trace_id=4d6e9cdd03acad638bd84a3549bdd489 client=192.0.2.1
+2026/09/30 02:03:17 INFO request method=GET path=/app/_app/immutable/assets/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_22c74017e33bf675fdbec40b trace_id=7e0b2fe2fe6feacee95180570b63cfd2 client=192.0.2.1
+--- PASS: TestZ08DirectoryUnderTheMountIsNotListed (0.10s)
+=== RUN   TestZ08ImmutableAssetsDoNotVaryOnTheSessionCookie
+2026/09/30 02:03:18 INFO request method=GET path=/app/_app/immutable/entry/start.abc.js status=200 duration_ms=0 bytes=19 plane=browser request_id=req_ea5106c4a6baa6e12006a84d trace_id=bb53f2433522543e4aba225221b36931 client=192.0.2.1
+    frontend_handler_test.go:289: /app/_app/immutable/entry/start.abc.js is served with Cache-Control "public, max-age=31536000, immutable" and Vary "Cookie, Accept-Encoding": the session middleware adds Vary: Cookie to every response before any handler runs, so a shared cache keys a content-hashed, user-independent asset on the session cookie — the immutable directive survives only in the browser that already has it
+2026/09/30 02:03:18 INFO request method=GET path=/app/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_caf6e39395fb2025addb43a0 trace_id=8b3de02c7fe140620a9713ab76ae82f1 client=192.0.2.1
+    frontend_handler_test.go:301: shell Cache-Control="no-cache" Vary="Cookie"; asset Cache-Control="public, max-age=31536000, immutable" Vary="Cookie, Accept-Encoding"
+--- FAIL: TestZ08ImmutableAssetsDoNotVaryOnTheSessionCookie (0.05s)
+=== RUN   TestZ08StaticSurfaceCarriesNosniff
+2026/09/30 02:03:18 INFO request method=GET path=/app/ status=200 duration_ms=0 bytes=144 plane=browser request_id=req_5fcf3e743d2688737d6ba533 trace_id=6801450a64aa6164378b9b919628def4 client=192.0.2.1
+2026/09/30 02:03:18 INFO request method=GET path=/app/_app/immutable/entry/start.abc.js status=200 duration_ms=0 bytes=19 plane=browser request_id=req_40c7cc1e0fed67e3a3fc7026 trace_id=a093b85a32094ce2cbd5dd1889573ecd client=192.0.2.1
+2026/09/30 02:03:18 INFO request method=GET path=/app/_app/immutable/entry/nope.js status=200 duration_ms=0 bytes=144 plane=browser request_id=req_901df8da972d3ddfd75beb77 trace_id=4c89f9d68691811814de229413fd9d1c client=192.0.2.1
+2026/09/30 02:03:18 INFO request method=GET path=/robots.txt status=200 duration_ms=0 bytes=30 plane=browser request_id=req_cb4c1ae706ca091db256bc3c trace_id=eee63098921eba0d182f692a7cedfb32 client=192.0.2.1
+2026/09/30 02:03:18 INFO request method=GET path=/nope status=404 duration_ms=0 bytes=10 plane=browser request_id=req_3a2bfc2f624ab10a0caa14ab trace_id=ba888764e3594cfa5e2faceaa8f7aff6 client=192.0.2.1
+--- PASS: TestZ08StaticSurfaceCarriesNosniff (0.05s)
+=== RUN   TestZ08RealProcessServesTheShellWithItsOwnPolicy
+    realproc_test.go:170: GET /app/consent -> 200 ct="text/html; charset=utf-8" cc="no-cache" csp="frame-ancestors 'none'" vary="Cookie, Accept-Encoding" etag="" allow-origin=""
+    realproc_test.go:198: GET /app/_app/immutable/entry/start.DJJzSbG0.js -> 200 ct="text/javascript; charset=utf-8" cc="public, max-age=31536000, immutable" vary="Cookie, Accept-Encoding"
+    realproc_test.go:207: the composed binary serves /app/_app/immutable/entry/start.DJJzSbG0.js with Cache-Control "public, max-age=31536000, immutable" and Vary "Cookie, Accept-Encoding"
+--- FAIL: TestZ08RealProcessServesTheShellWithItsOwnPolicy (1.29s)
+=== RUN   TestZ08RealProcessAnswersAMissingAssetWithTheShell
+    realproc_test.go:217: GET a missing immutable asset -> 200 ct="text/html; charset=utf-8" cc="no-cache" vary="Cookie, Accept-Encoding" len=3304
+    realproc_test.go:221: the composed binary answers a missing hashed asset with 200 "text/html; charset=utf-8": a deployment whose assets did not ship reports success to every status-code monitor and a MIME error to the browser
+--- FAIL: TestZ08RealProcessAnswersAMissingAssetWithTheShell (0.00s)
+=== RUN   TestZ08RealProcessRangeOnAMissingAssetSplicesTheShell
+    realproc_test.go:232: range over a missing asset -> 206 ct="text/html; charset=utf-8" cr="bytes 0-15/3304" body="<!doctype html>\n"
+    realproc_test.go:236: a byte range of a script URL was answered 206 with "text/html; charset=utf-8" (Content-Range "bytes 0-15/3304"): the bytes are the shell
+--- FAIL: TestZ08RealProcessRangeOnAMissingAssetSplicesTheShell (0.00s)
+=== RUN   TestZ08RealProcessStaticSurfaceSurvey
+    realproc_test.go:269: GET     /app/                        -> 200 ct="text/html; charset=utf-8" cc="no-cache" loc="" body="<!doctype html>"
+    realproc_test.go:269: GET     /app                         -> 200 ct="text/html; charset=utf-8" cc="no-cache" loc="" body="<!doctype html>"
+    realproc_test.go:269: GET     /app/index.html              -> 200 ct="text/html; charset=utf-8" cc="no-cache" loc="" body="<!doctype html>"
+    realproc_test.go:269: GET     /app/favicon.svg             -> 200 ct="image/svg+xml" cc="" loc="" body="<!--"
+    realproc_test.go:269: GET     /robots.txt                  -> 200 ct="text/plain; charset=utf-8" cc="public, max-age=3600" loc="" body="# Re0Auth serves a consent surface, not a document."
+    realproc_test.go:269: GET     /app/robots.txt              -> 200 ct="text/plain; charset=utf-8" cc="" loc="" body="# Re0Auth serves a consent surface, not a document."
+    realproc_test.go:269: GET     /                            -> 200 ct="text/html; charset=utf-8" cc="no-cache" loc="" body="<!doctype html>"
+    realproc_test.go:269: GET     /nope                        -> 404 ct="text/plain; charset=utf-8" cc="" loc="" body="not found"
+    realproc_test.go:269: GET     /app/../oauth/token          -> 404 ct="text/plain; charset=utf-8" cc="" loc="" body="not found"
+    realproc_test.go:269: GET     /app%2Foauth%2Ftoken         -> 404 ct="text/plain; charset=utf-8" cc="" loc="" body="not found"
+    realproc_test.go:269: POST    /app/                        -> 405 ct="text/plain; charset=utf-8" cc="" loc="" body="method not allowed"
+    realproc_test.go:269: OPTIONS /oauth/token                 -> 405 ct="application/json" cc="no-store" loc="" body="{\"error\":\"invalid_request\",\"error_description\":\"this endpoint does not accept OPTIONS\"}"
+--- PASS: TestZ08RealProcessStaticSurfaceSurvey (0.00s)
+=== RUN   TestZ08RealProcessOpenRedirectSurface
+    realproc_test.go:296: /auth/z08idp/start?return_to=//evil.example          -> 404 loc="" body="unknown provider"
+    realproc_test.go:296: /auth/z08idp/start?return_to=https://evil.example/x  -> 404 loc="" body="unknown provider"
+    realproc_test.go:296: /auth/z08idp/start?return_to=/\evil.example          -> 404 loc="" body="unknown provider"
+    realproc_test.go:296: /auth/z08idp/start?return_to=/%09/evil.example       -> 404 loc="" body="unknown provider"
+    realproc_test.go:296: /bind?game=g&source=s&return_to=//evil.example       -> 401 loc="" body="sign in to bind a source"
+    realproc_test.go:296: /bind?game=g&source=s&return_to=javascript:alert(1)  -> 401 loc="" body="sign in to bind a source"
+--- PASS: TestZ08RealProcessOpenRedirectSurface (0.00s)
+=== RUN   TestZ08RealProcessSessionViewIsUncacheableAndCarriesNoCORS
+--- PASS: TestZ08RealProcessSessionViewIsUncacheableAndCarriesNoCORS (0.00s)
+=== RUN   TestZ08ServedShellMetaCSPAllowsItsOwnInlineScripts
+2026/09/30 02:03:19 INFO request method=GET path=/app/consent status=200 duration_ms=0 bytes=3304 plane=browser request_id=req_2167a2316a06a59de0b16723 trace_id=60729349b7e32d7831b1a66553dd988b client=192.0.2.1
+    shell_csp_test.go:103: meta policy: default-src 'self'; connect-src 'self'; font-src 'self'; img-src 'self' data:; object-src 'none'; script-src 'self' 'sha256-qYHY2q8tYaIrLm5/vfIDjDO1QYqtr08GLgV6gbfu6nQ='; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'none'
+    shell_csp_test.go:104: 1 inline scripts, 1 matched a script-src hash
+--- PASS: TestZ08ServedShellMetaCSPAllowsItsOwnInlineScripts (0.16s)
+=== RUN   TestZ08ServedShellMetaCSPHasTheNonNegotiableDirectives
+2026/09/30 02:03:19 INFO request method=GET path=/app/consent status=200 duration_ms=1 bytes=3304 plane=browser request_id=req_a3f8a719dbb72db2fd2e1896 trace_id=f933acac40a40451f8fde8a1287d3631 client=192.0.2.1
+--- PASS: TestZ08ServedShellMetaCSPHasTheNonNegotiableDirectives (0.14s)
+=== RUN   TestZ08ShellMetaCSPPrecedesEveryScriptItMustGovern
+2026/09/30 02:03:19 INFO request method=GET path=/app/consent status=200 duration_ms=0 bytes=3304 plane=browser request_id=req_880cf619b3a8b344fe7b18e5 trace_id=61415a1316571445538037ec26d09fcd client=192.0.2.1
+    shell_csp_test.go:169: meta policy at bytes [1061 1354], first script at 2896, </head> at 1969
+--- PASS: TestZ08ShellMetaCSPPrecedesEveryScriptItMustGovern (0.23s)
+=== RUN   TestZ08ServedShellImageSourcesExcludeThirdParties
+2026/09/30 02:03:20 INFO request method=GET path=/app/consent status=200 duration_ms=0 bytes=3304 plane=browser request_id=req_76ec63ed5e6f86fc80808f01 trace_id=484a6a79e78d48f34082972e2cc13afe client=192.0.2.1
+--- PASS: TestZ08ServedShellImageSourcesExcludeThirdParties (0.15s)
+=== RUN   TestZ08FramingGuardComesFromTheHeaderNotTheMeta
+2026/09/30 02:03:20 INFO request method=GET path=/app/consent status=200 duration_ms=0 bytes=3304 plane=browser request_id=req_bad612d438bfb5eac1cef3a0 trace_id=1221fc6c11cc3983c94ff3a699979189 client=192.0.2.1
+--- PASS: TestZ08FramingGuardComesFromTheHeaderNotTheMeta (0.06s)
+=== RUN   TestZ08ServedShellIsTheBuildOutput
+2026/09/30 02:03:20 INFO request method=GET path=/app/consent status=200 duration_ms=0 bytes=3304 plane=browser request_id=req_b97c93e9aa6638495468727b trace_id=0c6e90b240e6c35b84f14b31d7eef029 client=192.0.2.1
+--- PASS: TestZ08ServedShellIsTheBuildOutput (0.04s)
+FAIL
+FAIL	github.com/Re0Auth/r0semi/internal/zzprobe/audit7/z08frontendbrowser	4.514s
+FAIL

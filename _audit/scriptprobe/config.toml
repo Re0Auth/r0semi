@@ -1,0 +1,9 @@
+[server]
+issuer = "https://re0auth.test"
+
+[storage]
+driver = "memory"
+
+[vault]
+kek_id  = "kek-1"
+kek_env = "MY_KEK"

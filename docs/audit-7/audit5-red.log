@@ -1,0 +1,935 @@
+﻿=== RUN   TestProbeAuditLabelsAreDistinctAndUnambiguous
+--- PASS: TestProbeAuditLabelsAreDistinctAndUnambiguous (0.00s)
+=== RUN   TestProbeCanonicalTimestampPrecision
+--- PASS: TestProbeCanonicalTimestampPrecision (0.00s)
+=== RUN   TestProbeUserCodeEntropyAndAttackerBudget
+    entropy_test.go:31: search space = 20^8 = 25600000000 (34.575 bits)
+    entropy_test.go:50: one address, 60s window: 3100 attempts -> P(hit) = 1.211e-07
+    entropy_test.go:50: one address, 600s window: 30100 attempts -> P(hit) = 1.176e-06
+    entropy_test.go:60: addresses needed for a 1% chance over the full TTL: 8505 (30100 attempts each); the limiter's map is capped at 10,000 keys process-wide (internal/ratelimit)
+    entropy_test.go:66: with server.rate_limit = 0 the limiter is removed entirely: the only remaining bound is the work one guess costs (one signed-in session, one DB lookup), and a single address can then drive the full 20^8 search
+--- PASS: TestProbeUserCodeEntropyAndAttackerBudget (0.00s)
+=== RUN   TestProbeNormalizationIsTheOnlyThingThatNarrowsTheSpace
+--- PASS: TestProbeNormalizationIsTheOnlyThingThatNarrowsTheSpace (0.00s)
+=== RUN   TestProbeKEKIDSelectsOnlyAmongConfiguredKeys
+--- PASS: TestProbeKEKIDSelectsOnlyAmongConfiguredKeys (0.00s)
+=== RUN   TestProbeRotateRefusesAKEKIDItCannotUnwrap
+    kekid_test.go:142: rotation aborted at {Scanned:1 Rewrapped:0 AlreadyCurrent:0 Skipped:0}; "taptap:usr_zzz" is on "kek-1", so the retired key cannot be removed until the poison is repaired
+--- PASS: TestProbeRotateRefusesAKEKIDItCannotUnwrap (0.00s)
+=== RUN   TestProbeCompositeCryptoOverlap
+--- PASS: TestProbeCompositeCryptoOverlap (0.00s)
+=== RUN   TestProbeTokenDecryptionIsKeyOrderIndependent
+--- PASS: TestProbeTokenDecryptionIsKeyOrderIndependent (0.00s)
+=== RUN   TestProbeTokenKeyIsA256GCMDirectJWE
+    oidc_keys_test.go:169: token header (attacker-visible): {"alg":"A256GCMKW","enc":"A256GCM","iv":"1LXEStTSszbWzgh7","kid":"the-kid","tag":"JMtm3jORUA2M2CU-kSLK2Q"}
+--- PASS: TestProbeTokenKeyIsA256GCMDirectJWE (0.00s)
+=== RUN   TestProbeSignerRejectsAmbiguousKeySets
+--- PASS: TestProbeSignerRejectsAmbiguousKeySets (0.10s)
+=== RUN   TestProbeRetiredTokenKeyIDsAreNotValidatedLocally
+    oidc_keys_test.go:269: CONFIRMED: a retired token key reusing the current key id is accepted and used; ids are advisory here because CompositeCrypto tries every key. Not a vulnerability (no lookup by id happens), but it means 'id collision' is NOT rejected the way it is for signing kids (oidcstore.ValidateSigner).
+--- PASS: TestProbeRetiredTokenKeyIDsAreNotValidatedLocally (0.00s)
+=== RUN   TestProbeRotationOverwritesARecordEnrolledDuringTheRun
+    rotate_lifecycle_test.go:155: rotation preserved the concurrently written secret (the window is closed)
+--- PASS: TestProbeRotationOverwritesARecordEnrolledDuringTheRun (0.00s)
+=== RUN   TestProbeRotationPublishesPartialProgressOnFailure
+    rotate_lifecycle_test.go:251: rotation aborted after 0 records: {Scanned:2 Rewrapped:1 AlreadyCurrent:0 Skipped:0}, err=vault: rotate: persist taptap:usr_b: context deadline exceeded
+    rotate_lifecycle_test.go:280: CONFIRMED (by construction): 2 of 3 credentials are lost if the retired key is removed after a partial rotation, and -rotate-keys reports the partial run as an error only in the process's own log
+--- PASS: TestProbeRotationPublishesPartialProgressOnFailure (0.00s)
+=== RUN   TestProbeRotationDoesNotDecryptPayloads
+--- PASS: TestProbeRotationDoesNotDecryptPayloads (0.00s)
+=== RUN   TestProbeRotationIsNotAtomicAcrossRecords
+    rotate_lifecycle_test.go:426: CONFIRMED: a rotation that fails on its first write produces no audit event at all, so the operator's log cannot distinguish 'no rotation was attempted' from 'a rotation changed rows and then died'
+--- PASS: TestProbeRotationIsNotAtomicAcrossRecords (0.00s)
+=== RUN   TestProbeNoSlogCallCarriesAnAccountIdentifier
+    source_log_guard_test.go:128: an account identifier reaches the process log: internal/admin/admin.go:499 attr subject=subject
+    source_log_guard_test.go:128: an account identifier reaches the process log: internal/auth/auth.go:231 attr subject=e.Subject
+    source_log_guard_test.go:128: an account identifier reaches the process log: internal/federation/bind.go:208 attr user=string(...)
+    source_log_guard_test.go:128: an account identifier reaches the process log: internal/federation/refresh.go:155 attr user=string(...)
+    source_log_guard_test.go:128: an account identifier reaches the process log: internal/federation/refresh.go:160 attr user=string(...)
+    source_log_guard_test.go:128: an account identifier reaches the process log: internal/httpapi/account_routes.go:80 attr user=string(...)
+    source_log_guard_test.go:128: an account identifier reaches the process log: internal/httpapi/binding_routes.go:57 attr user=string(...)
+--- FAIL: TestProbeNoSlogCallCarriesAnAccountIdentifier (0.03s)
+FAIL
+FAIL	github.com/Re0Auth/r0semi/internal/zzprobe/crypto	0.605s
+=== RUN   TestProbeCircuitBreakerIsPerHost
+    httpclient_test.go:90: bad  #1 => code=500 err=<nil> (transport attempts=1)
+    httpclient_test.go:90: bad  #2 => code=500 err=<nil> (transport attempts=2)
+    httpclient_test.go:90: bad  #3 => code=500 err=<nil> (transport attempts=3)
+    httpclient_test.go:93: after tripping: bad transport attempts=3
+    httpclient_test.go:96: good #1 => code=200 err=<nil>
+    httpclient_test.go:96: good #2 => code=200 err=<nil>
+    httpclient_test.go:96: good #3 => code=200 err=<nil>
+    httpclient_test.go:103: bad after breaker: code=0 err=Get "http://bad.example/x": httpclient: circuit breaker is open; bad transport attempts 3 -> 3; good=3
+--- PASS: TestProbeCircuitBreakerIsPerHost (0.00s)
+=== RUN   TestProbeRetryAfterCapIsReal
+    httpclient_test.go:139: Retry-After: 86400 => err=<nil> after 2.0010963s, attempts=2
+--- PASS: TestProbeRetryAfterCapIsReal (2.00s)
+=== RUN   TestProbeRetryAfterJitterAndFloor
+    httpclient_test.go:173: attempt 1 -> 2 gap=1.2471397s (Retry-After said 1s; jitter 卤50% means 0.5s..1.5s)
+    httpclient_test.go:173: attempt 2 -> 3 gap=1.0913513s (Retry-After said 1s; jitter 卤50% means 0.5s..1.5s)
+--- PASS: TestProbeRetryAfterJitterAndFloor (2.34s)
+=== RUN   TestProbeBulkheadPermitWhenTheBodyIsNeverClosed
+    httpclient_test.go:219: second request settled while the first body was unread/unclosed: err=Get "http://127.0.0.1:65487": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+--- PASS: TestProbeBulkheadPermitWhenTheBodyIsNeverClosed (3.00s)
+=== RUN   TestProbeRetryBodyReplay
+    httpclient_test.go:256: GET with a body and no GetBody (= retry.go's documented non-replayable shape) => attempts=[GET GET-BODY] err=<nil>
+    httpclient_test.go:272: POST => attempts=[POST POST-BODY] err=<nil>
+    httpclient_test.go:289: GET with GetBody => attempts=[GET REPLAYABLE GET REPLAYABLE GET REPLAYABLE] err=<nil>
+--- PASS: TestProbeRetryBodyReplay (0.74s)
+=== RUN   TestProbeBulkheadSlotReturnsOnClose
+--- PASS: TestProbeBulkheadSlotReturnsOnClose (0.00s)
+=== RUN   TestProbeRetryIsNotInstalledOnTheDataPlane
+    httpclient_test.go:324: static: httpclient.Retry is constructed in exactly one place in the repository 鈥?cmd/referencesource/main.go:143 (the TapTap client). cmd/re0auth/main.go's federationClient uses NewOutboundClient only (bundled decorators: Transport, Bulkhead, CircuitBreaker) 鈥?no Retry layer.
+    httpclient_test.go:328: consequence: the data plane has no automatic retry, so docs/source-onboarding.md 搂4's '鍑虹珯杩炴帴姹?+ 骞跺彂涓婇檺锛坆ulkhead锛? 鎸囨暟閫€閬块噸璇? overstates what a source will see from Re0Auth
+--- PASS: TestProbeRetryIsNotInstalledOnTheDataPlane (0.00s)
+=== RUN   TestProbeRetryHonoursCancellationWithHostileRetryAfter
+    httpclient_test.go:354: cancelled after 500.6012ms with err=context deadline exceeded, attempts=1
+--- PASS: TestProbeRetryHonoursCancellationWithHostileRetryAfter (0.50s)
+=== RUN   TestProbeScopeGateNamesEverySourceThatCouldServe
+    lifecycle_test.go:143: the gate requires [{Source:a Scope:phigros.profile.read} {Source:b Scope:phigros.score.read}]
+    lifecycle_test.go:166: served by "b", whose scope "phigros.score.read" the gate required
+--- PASS: TestProbeScopeGateNamesEverySourceThatCouldServe (0.00s)
+=== RUN   TestProbeDegradedSourceIsServedUnderARequiredScope
+    lifecycle_test.go:189: served by "b" degraded=true data={"served_by":"b"}
+--- PASS: TestProbeDegradedSourceIsServedUnderARequiredScope (0.00s)
+=== RUN   TestProbeRefreshVaultResidueAfterRowDisappears
+    lifecycle_test.go:284: fetch err after the row vanished mid-refresh: federation: source is not bound
+    lifecycle_test.go:288: row present: false; vault secret present: true
+    lifecycle_test.go:290: the vault holds a secret whose binding row is gone: no endpoint reaches it, ListAll cannot see it, and the Kill Switch cannot ask its source (err=federation: source is not bound)
+--- FAIL: TestProbeRefreshVaultResidueAfterRowDisappears (0.00s)
+=== RUN   TestProbeUnbindOrderingAgainstTheHTTPContract
+    lifecycle_test.go:330: orphan unbind: res={Upstream:nothing UpstreamError:} err=<nil>
+2026/09/29 19:07:48 WARN upstream revocation request failed source=known err="Post \"https://api.example/oauth/revoke\": EOF"
+    lifecycle_test.go:353: configured source unbind: res={Upstream:unavailable UpstreamError:upstream_revocation_failed} err=<nil>
+--- PASS: TestProbeUnbindOrderingAgainstTheHTTPContract (1.46s)
+=== RUN   TestProbeRawPathCannotChangeTheHost
+=== RUN   TestProbeRawPathCannotChangeTheHost/..
+=== RUN   TestProbeRawPathCannotChangeTheHost/../secret
+=== RUN   TestProbeRawPathCannotChangeTheHost/a/../../secret
+=== RUN   TestProbeRawPathCannotChangeTheHost/..%2fsecret
+=== RUN   TestProbeRawPathCannotChangeTheHost/%2e%2e/secret
+=== RUN   TestProbeRawPathCannotChangeTheHost/%2e%2e%2fsecret
+=== RUN   TestProbeRawPathCannotChangeTheHost/%252e%252e%252fsecret
+=== RUN   TestProbeRawPathCannotChangeTheHost/.../secret
+=== RUN   TestProbeRawPathCannotChangeTheHost/..;/secret
+=== RUN   TestProbeRawPathCannotChangeTheHost/.%2e/secret
+=== RUN   TestProbeRawPathCannotChangeTheHost/..%5csecret
+=== RUN   TestProbeRawPathCannotChangeTheHost/..\secret
+=== RUN   TestProbeRawPathCannotChangeTheHost///evil.example/x
+    raw_test.go:168: path "//evil.example/x"               => "GET /v1/evil.example/x?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost////evil.example/x
+    raw_test.go:168: path "///evil.example/x"              => "GET /v1/evil.example/x?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost//\evil.example/x
+=== RUN   TestProbeRawPathCannotChangeTheHost/http://evil.example/x
+    raw_test.go:168: path "http://evil.example/x"          => "GET /v1/http:/evil.example/x?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/https://evil.example/x
+    raw_test.go:168: path "https://evil.example/x"         => "GET /v1/https:/evil.example/x?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/@evil.example/x
+    raw_test.go:168: path "@evil.example/x"                => "GET /v1/@evil.example/x?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/#frag
+    raw_test.go:168: path "#frag"                          => "GET /v1/" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/?a=b
+    raw_test.go:168: path "?a=b"                           => "GET /v1/?a=b?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/a?b=c
+    raw_test.go:168: path "a?b=c"                          => "GET /v1/a?b=c?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/a#b
+    raw_test.go:168: path "a#b"                            => "GET /v1/a" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/a%00b
+    raw_test.go:168: path "a%00b"                          => "GET /v1/a%00b?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/%00
+    raw_test.go:168: path "%00"                            => "GET /v1/%00?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/a%0d%0aX-Injected:%201
+    raw_test.go:168: path "a%0d%0aX-Injected:%201"         => "GET /v1/a%0d%0aX-Injected:%201?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/%2F%2Fevil.example
+    raw_test.go:168: path "%2F%2Fevil.example"             => "GET /v1/%2F%2Fevil.example?keep=1" status=200
+=== RUN   TestProbeRawPathCannotChangeTheHost/a/b/%2e%2e/%2e%2e/../../x
+--- PASS: TestProbeRawPathCannotChangeTheHost (0.01s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/.. (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/../secret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/a/../../secret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/..%2fsecret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/%2e%2e/secret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/%2e%2e%2fsecret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/%252e%252e%252fsecret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/.../secret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/..;/secret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/.%2e/secret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/..%5csecret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/..\secret (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost///evil.example/x (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost////evil.example/x (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost//\evil.example/x (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/http://evil.example/x (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/https://evil.example/x (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/@evil.example/x (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/#frag (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/?a=b (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/a?b=c (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/a#b (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/a%00b (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/%00 (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/a%0d%0aX-Injected:%201 (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/%2F%2Fevil.example (0.00s)
+    --- PASS: TestProbeRawPathCannotChangeTheHost/a/b/%2e%2e/%2e%2e/../../x (0.00s)
+=== RUN   TestProbeRawPathEncodedTraversalDepth
+    raw_test.go:189: path "%2e%2e/x"               err=federation: raw path escapes the source base upstream=[]
+    raw_test.go:189: path "%252e%252e/x"           err=federation: raw path escapes the source base upstream=[]
+    raw_test.go:189: path "%25252e%25252e/x"       err=federation: raw path escapes the source base upstream=[]
+    raw_test.go:189: path "%2525252e%2525252ex"    err=federation: raw path escapes the source base upstream=[]
+    raw_test.go:189: path "%c0%ae%c0%ae/x"         err=<nil> upstream=[GET /v1/%c0%ae%c0%ae/x]
+    raw_test.go:189: path "%ef%bc%8e%ef%bc%8e/x"   err=<nil> upstream=[GET /v1/%ef%bc%8e%ef%bc%8e/x]
+    raw_test.go:189: path "%u002e%u002e/x"         err=federation: build raw request: parse "http://127.0.0.1:49193/v1/%u002e%u002e/x": invalid URL escape "%u0" upstream=[]
+--- PASS: TestProbeRawPathEncodedTraversalDepth (0.00s)
+=== RUN   TestProbeRawResponseSizeAndStreaming
+=== RUN   TestProbeRawResponseSizeAndStreaming/huge_Content-Length
+    raw_test.go:208: Content-Length: 1e18 => err=federation: read raw src: unexpected EOF after 523.4µs
+=== RUN   TestProbeRawResponseSizeAndStreaming/endless_body
+    raw_test.go:240: endless body => err=federation: upstream response exceeds the size limit after 31.4976ms (client Timeout is 20s)
+--- PASS: TestProbeRawResponseSizeAndStreaming (0.03s)
+    --- PASS: TestProbeRawResponseSizeAndStreaming/huge_Content-Length (0.00s)
+    --- PASS: TestProbeRawResponseSizeAndStreaming/endless_body (0.03s)
+=== RUN   TestProbeRegistryAcceptsPathEscapingNames
+    raw_test.go:312: game="phigros" name="src" => ACCEPTED; sourceKey="phigros/src" redirect-derived="https://re0auth.example/auth/upstream/phigros/src/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="../evil" => ACCEPTED; sourceKey="phigros/../evil" redirect-derived="https://re0auth.example/auth/upstream/phigros/../evil/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="../.." name="src" => ACCEPTED; sourceKey="../../src" redirect-derived="https://re0auth.example/auth/upstream/../../src/callback" scope="../...profile.read"
+    raw_test.go:312: game="phigros" name="src/../other" => ACCEPTED; sourceKey="phigros/src/../other" redirect-derived="https://re0auth.example/auth/upstream/phigros/src/../other/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="src?x=1" => ACCEPTED; sourceKey="phigros/src?x=1" redirect-derived="https://re0auth.example/auth/upstream/phigros/src?x=1/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="src#f" => ACCEPTED; sourceKey="phigros/src#f" redirect-derived="https://re0auth.example/auth/upstream/phigros/src#f/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="src%2F..%2Fother" => ACCEPTED; sourceKey="phigros/src%2F..%2Fother" redirect-derived="https://re0auth.example/auth/upstream/phigros/src%2F..%2Fother/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="src\x00null" => ACCEPTED; sourceKey="phigros/src\x00null" redirect-derived="https://re0auth.example/auth/upstream/phigros/src\x00null/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="src\nnewline" => ACCEPTED; sourceKey="phigros/src\nnewline" redirect-derived="https://re0auth.example/auth/upstream/phigros/src\nnewline/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" => ACCEPTED; sourceKey="phigros/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" redirect-derived="https://re0auth.example/auth/upstream/phigros/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/callback" scope="phigros.profile.read"
+    raw_test.go:312: game="phigros" name="src with space" => ACCEPTED; sourceKey="phigros/src with space" redirect-derived="https://re0auth.example/auth/upstream/phigros/src with space/callback" scope="phigros.profile.read"
+--- PASS: TestProbeRegistryAcceptsPathEscapingNames (0.00s)
+=== RUN   TestProbeScopeInjectionFromRegistry
+    raw_test.go:336: declared resource scope ["phigros.profile.read account.id"] is used verbatim in: bindScopes, the scope gate, and the wire
+    raw_test.go:339: a resource scope carrying whitespace reaches the OAuth wire as several scopes: "phigros.profile.read account.id"
+--- FAIL: TestProbeScopeInjectionFromRegistry (0.00s)
+=== RUN   TestProbeOrphanedBindingIsListedAndRemovable
+--- PASS: TestProbeOrphanedBindingIsListedAndRemovable (0.00s)
+=== RUN   TestProbeUnbindIsASourceExistenceOracle
+    raw_test.go:420: known source, nothing bound   => <nil>
+    raw_test.go:421: unknown source, nothing bound => federation: unknown source
+    raw_test.go:430: note: GET /v1/sources is public and lists every configured source, so the oracle above reveals nothing a caller could not already read
+--- PASS: TestProbeUnbindIsASourceExistenceOracle (0.00s)
+=== RUN   TestProbeIsPublicAddressCoversEverySpecialRange
+    safeurl_test.go:94: 5 non-public addresses pass the guard:
+          ::ffff:8.8.8.8 (IPv4-mapped public — MUST stay public after Unmap) was judged PUBLIC
+          0.1.2.3 (0.0.0.0/8) was judged PUBLIC
+          0.255.255.255 (0.0.0.0/8 upper edge) was judged PUBLIC
+          192.88.99.1 (6to4 relay anycast 192.88.99/24) was judged PUBLIC
+          ::ffff:0.1.2.3 (IPv4-mapped 0/8) was judged PUBLIC
+--- FAIL: TestProbeIsPublicAddressCoversEverySpecialRange (0.00s)
+=== RUN   TestProbeDenyPrivateAddressesBlocksTheDial
+--- PASS: TestProbeDenyPrivateAddressesBlocksTheDial (0.00s)
+=== RUN   TestProbeDenyPrivateAddressRejectsEveryLocalNameLiteral
+--- PASS: TestProbeDenyPrivateAddressRejectsEveryLocalNameLiteral (0.00s)
+=== RUN   TestProbeZonedIPv6DialAddressIsJudgedNotCrashed
+    safeurl_test.go:183: netip.ParseAddr("fe80::1%eth0") => addr=fe80::1%eth0 err=<nil>
+    safeurl_test.go:185: netip.ParseAddr("fe80::1") => addr=fe80::1 err=<nil>
+--- PASS: TestProbeZonedIPv6DialAddressIsJudgedNotCrashed (0.00s)
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/identical_host
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/identical_host,_explicit_default_port
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/different_host
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/subdomain_of_the_origin
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/parent_domain
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/scheme_downgrade
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/uppercase_host
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/trailing_dot
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/percent-encoded_host_octet
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/userinfo_naming_another_host
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/userinfo,_hostile
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/different_port
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/host_suffix_trick
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/host_prefix_trick
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/empty_host_(scheme-relative)
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/IPv4_literal_instead_of_name
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/hex_IPv4_literal
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/decimal_IPv4_literal
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/trailing_whitespace
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/tab_inside_host
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/CRLF_in_Location
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/fragment_only
+=== RUN   TestProbeRedirectPolicyAgainstHostVariants/path_traversal
+--- PASS: TestProbeRedirectPolicyAgainstHostVariants (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/identical_host (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/identical_host,_explicit_default_port (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/different_host (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/subdomain_of_the_origin (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/parent_domain (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/scheme_downgrade (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/uppercase_host (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/trailing_dot (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/percent-encoded_host_octet (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/userinfo_naming_another_host (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/userinfo,_hostile (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/different_port (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/host_suffix_trick (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/host_prefix_trick (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/empty_host_(scheme-relative) (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/IPv4_literal_instead_of_name (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/hex_IPv4_literal (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/decimal_IPv4_literal (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/trailing_whitespace (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/tab_inside_host (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/CRLF_in_Location (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/fragment_only (0.00s)
+    --- PASS: TestProbeRedirectPolicyAgainstHostVariants/path_traversal (0.00s)
+=== RUN   TestProbeRedirectChainCredentialReach
+    safeurl_test.go:336: requested=[https://source.example/start https://source.example/one] auth=[{host:source.example auth:Bearer secret-token-value} {host:source.example auth:Bearer secret-token-value}] err=Get "https://evil.example/two": httpclient: refused a redirect from https://source.example to https://evil.example
+--- PASS: TestProbeRedirectChainCredentialReach (0.00s)
+=== RUN   TestProbe307ReplayOfTokenFormBody
+    safeurl_test.go:393: requested=[https://source.example/token https://source.example/token] err=Post "https://evil.example/token": httpclient: refused a redirect from https://source.example to https://evil.example
+--- PASS: TestProbe307ReplayOfTokenFormBody (0.00s)
+=== RUN   TestProbeURLHostNormalisation
+    safeurl_test.go:441: "HTTPS://Source.Example/Path"                 => scheme="https" host="Source.Example" user= path="/Path"
+    safeurl_test.go:441: "https://SOURCE.EXAMPLE/"                     => scheme="https" host="SOURCE.EXAMPLE" user= path="/"
+    safeurl_test.go:441: "https://source.example:443/"                 => scheme="https" host="source.example:443" user= path="/"
+    safeurl_test.go:441: "https://source.example./"                    => scheme="https" host="source.example." user= path="/"
+    safeurl_test.go:438: "https://%73ource.example/"                   => parse error: parse "https://%73ource.example/": invalid URL escape "%73"
+    safeurl_test.go:441: "https://source.example@evil.example/"        => scheme="https" host="evil.example" user=source.example path="/"
+    safeurl_test.go:441: "https://evil.example#@source.example"        => scheme="https" host="evil.example" user= path=""
+    safeurl_test.go:441: "https://evil.example?@source.example"        => scheme="https" host="evil.example" user= path=""
+--- PASS: TestProbeURLHostNormalisation (0.00s)
+=== RUN   TestZZProbeUpstreamBufferBudgetIsJointAndInBytes
+--- PASS: TestZZProbeUpstreamBufferBudgetIsJointAndInBytes (0.01s)
+=== RUN   TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source
+=== RUN   TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/A_one_request_cannot_outlive_the_total_deadline
+    zzprobe_p13_test.go:55: a stalled upstream ended the request after 300.199ms (deadline 300ms)
+=== RUN   TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/B_the_deadline_bounds_the_whole_candidate_loop,_not_one_call
+    zzprobe_p13_test.go:73: two stalling candidates ended after 400.6703ms (deadline 400ms)
+=== RUN   TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/C_a_permanently-401_source_trips_the_breaker
+    zzprobe_p13_test.go:118: the breaker opened after 3 upstream calls
+=== RUN   TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/D_control:_a_401_followed_by_a_success_never_opens_it
+--- PASS: TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source (0.70s)
+    --- PASS: TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/A_one_request_cannot_outlive_the_total_deadline (0.30s)
+    --- PASS: TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/B_the_deadline_bounds_the_whole_candidate_loop,_not_one_call (0.40s)
+    --- PASS: TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/C_a_permanently-401_source_trips_the_breaker (0.00s)
+    --- PASS: TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source/D_control:_a_401_followed_by_a_success_never_opens_it (0.00s)
+FAIL
+FAIL	github.com/Re0Auth/r0semi/internal/zzprobe/federation	10.887s
+=== RUN   TestA0_ControlConfidentialExchangeSucceeds
+    kit_probe_test.go:175: control OK: access=C3s4MuV2... refresh=JjtHElj_... scope="account.read"
+--- PASS: TestA0_ControlConfidentialExchangeSucceeds (0.00s)
+=== RUN   TestA1_EmptyOrWrongSecretRefused
+    kit_probe_test.go:185: empty secret for a confidential client: code=invalid_client err=oauth: invalid_client: invalid client credentials
+    kit_probe_test.go:195: wrong secret: code=invalid_client
+--- PASS: TestA1_EmptyOrWrongSecretRefused (0.00s)
+=== RUN   TestA2_FormAndBasicMayDisagree
+    kit_probe_test.go:226: Basic=conf + form=pub(wrong secret) -> 200 {"access_token":"KZpVGI3OxvThk631KgLoioF1M3xeXxQaYKsqV0o-Bts","expires_in":3600,"refresh_token":"DIJGBqwELNuumh7WhT6LgQ-d9HpcfqpLSkVJKktEbAo","scope":"account.read","token_type":"Bearer"}
+    kit_probe_test.go:231: two client identities in one request were accepted; RFC 6749 §2.3 permits exactly one
+--- FAIL: TestA2_FormAndBasicMayDisagree (0.00s)
+=== RUN   TestA3_PublicClientSecretIgnored
+    kit_probe_test.go:254: public client with a bogus secret -> 200 {"access_token":"WT7SpwmPMk1bMFVzVlfk99LuNBgR7bQ2VqhkycBsFnk","expires_in":3600,"refresh_token":"eKv_RqUbiYIQkV0AZjZr9-Z659lPgUpcqwi0Wr3-www","scope":"account.read","token_type":"Bearer"}
+    kit_probe_test.go:256: NOTE: not reported as a finding on its own -- the id is public, so the secret carries no authority either way. It is logged because the surrounding identity handling (KIT-1) is what makes an unused secret field meaningful.
+--- PASS: TestA3_PublicClientSecretIgnored (0.00s)
+=== RUN   TestA4_SuspendedClientTokensGoInactive
+    kit_probe_test.go:285: control: AuthenticateClient after suspension = oauth: invalid_client: unknown client
+    kit_probe_test.go:290: control: Refresh after suspension = oauth: invalid_client: unknown client
+    kit_probe_test.go:296: Introspect of a suspended client's access token: active=false subject= client= scopes=[]
+--- PASS: TestA4_SuspendedClientTokensGoInactive (0.00s)
+=== RUN   TestA5_DeletedClientTokensGoInactive
+    kit_probe_test.go:324: Introspect after the client row was deleted: active=false subject=
+--- PASS: TestA5_DeletedClientTokensGoInactive (0.00s)
+=== RUN   TestA6_DeleteClientLeavesTokenRows
+    kit_probe_test.go:347: token rows for the subject after ClientAdmin.Delete: 2
+    kit_probe_test.go:349: ClientAdmin.Delete left 2 token rows behind; the client is gone but its grants are not
+--- FAIL: TestA6_DeleteClientLeavesTokenRows (0.00s)
+=== RUN   TestB1_RedirectURIMatchingIsExact
+    kit_probe_test.go:393: redirect URI variant appended fragment    rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant trailing slash       rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant dotdot               rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant encoded dotdot       rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant uppercase host       rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant uppercase scheme     rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant default https port   rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant appended query       rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant userinfo             rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant percent-encoded pat  rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant double slash         rejected: oauth: invalid_request: redirect_uri is not registered
+    kit_probe_test.go:393: redirect URI variant empty                rejected: oauth: invalid_request: redirect_uri is not registered
+--- PASS: TestB1_RedirectURIMatchingIsExact (0.00s)
+=== RUN   TestB2_RegistrationRefusesDangerousRedirects
+    kit_probe_test.go:407: NewClient refused "javascript:alert(1)"         : oauth: invalid redirect URI "javascript:alert(1)": the javascript: scheme is never a redirect target
+    kit_probe_test.go:407: NewClient refused "data:text/html,x"            : oauth: invalid redirect URI "data:text/html,x": the data: scheme is never a redirect target
+    kit_probe_test.go:407: NewClient refused "file:///etc/passwd"          : oauth: invalid redirect URI "file:///etc/passwd": the file: scheme is never a redirect target
+    kit_probe_test.go:407: NewClient refused "http://example.com/cb"       : oauth: invalid redirect URI "http://example.com/cb": http is allowed only for a loopback host (RFC 8252 §7.3); use https
+    kit_probe_test.go:407: NewClient refused "https://u:p@example.com/cb"  : oauth: invalid redirect URI "https://u:p@example.com/cb": it carries userinfo, which no client needs and a phisher does
+    kit_probe_test.go:407: NewClient refused "https://example.com/cb#f"    : oauth: invalid redirect URI "https://example.com/cb#f": RFC 6749 §3.1.2 forbids a fragment
+    kit_probe_test.go:407: NewClient refused "//example.com/cb"            : oauth: invalid redirect URI "//example.com/cb": it has no scheme
+    kit_probe_test.go:407: NewClient refused "notaurl"                     : oauth: invalid redirect URI "notaurl": it has no scheme
+    kit_probe_test.go:407: NewClient refused "app:cb"                      : oauth: invalid redirect URI "app:cb": a custom scheme must be in reverse-DNS notation (RFC 8252 §7.1), e.g. com.example.app
+--- PASS: TestB2_RegistrationRefusesDangerousRedirects (0.00s)
+=== RUN   TestB3_RestoreClientSkipsRedirectValidation
+    kit_probe_test.go:437: DescribeAuthorization ACCEPTED client restored whose registered redirect is [javascript:alert(document.cookie)]
+    kit_probe_test.go:439: a restored registry row can carry a javascript: redirect URI and the authorize path honours it
+--- FAIL: TestB3_RestoreClientSkipsRedirectValidation (0.00s)
+=== RUN   TestC1_FailedExchangeConsumesTheCode
+    kit_probe_test.go:458: attacker exchange with a bad verifier: oauth: invalid_grant: PKCE verification failed
+    kit_probe_test.go:465: legitimate exchange afterwards: oauth: invalid_grant: authorization code is unknown or already used
+    kit_probe_test.go:469: a failed exchange consumed the authorization code, so knowing a code is enough to deny the legitimate client its tokens
+--- FAIL: TestC1_FailedExchangeConsumesTheCode (0.00s)
+=== RUN   TestC2_AllBindingFailuresBurnTheCode
+    kit_probe_test.go:501: wrong client     -> oauth: invalid_grant: authorization code was issued to another client ; then correct exchange -> oauth: invalid_grant: authorization code is unknown or already used
+    kit_probe_test.go:501: wrong redirect   -> oauth: invalid_grant: redirect_uri mismatch ; then correct exchange -> oauth: invalid_grant: authorization code is unknown or already used
+    kit_probe_test.go:501: wrong verifier   -> oauth: invalid_grant: PKCE verification failed ; then correct exchange -> oauth: invalid_grant: authorization code is unknown or already used
+    kit_probe_test.go:501: missing redirect -> oauth: invalid_grant: redirect_uri mismatch ; then correct exchange -> oauth: invalid_grant: authorization code is unknown or already used
+--- PASS: TestC2_AllBindingFailuresBurnTheCode (0.00s)
+=== RUN   TestC3_PKCEMethodEnforcement
+    kit_probe_test.go:518: plain at authorize: oauth: invalid_request: PKCE with S256 is required
+    kit_probe_test.go:544: verifier == challenge (the plain attack): oauth: invalid_grant: PKCE verification failed
+--- PASS: TestC3_PKCEMethodEnforcement (0.00s)
+=== RUN   TestC4_PKCEChallengeShapeIsNotValidated
+    kit_probe_test.go:580: std/url padded   ACCEPTED at authorize (describe only checks non-empty + S256)
+    kit_probe_test.go:592: std/url padded   -> the code it minted is unredeemable: oauth: invalid_grant: PKCE verification failed
+    kit_probe_test.go:580: truncated        ACCEPTED at authorize (describe only checks non-empty + S256)
+    kit_probe_test.go:592: truncated        -> the code it minted is unredeemable: oauth: invalid_grant: PKCE verification failed
+    kit_probe_test.go:580: uppercase        ACCEPTED at authorize (describe only checks non-empty + S256)
+    kit_probe_test.go:592: uppercase        -> the code it minted is unredeemable: oauth: invalid_grant: PKCE verification failed
+    kit_probe_test.go:580: one char         ACCEPTED at authorize (describe only checks non-empty + S256)
+    kit_probe_test.go:592: one char         -> the code it minted is unredeemable: oauth: invalid_grant: PKCE verification failed
+    kit_probe_test.go:576: empty            rejected at authorize: oauth: invalid_request: PKCE with S256 is required
+    kit_probe_test.go:598: a one-character code_challenge was accepted at authorize
+--- FAIL: TestC4_PKCEChallengeShapeIsNotValidated (0.00s)
+=== RUN   TestD1_ScopeSmugglingAtTheTokenEndpoint
+    kit_probe_test.go:636: plain widen          -> 400 {"error":"invalid_scope","error_description":"refresh cannot widen the granted scope"}
+    kit_probe_test.go:636: comma separated      -> 400 {"error":"invalid_scope","error_description":"refresh cannot widen the granted scope"}
+    kit_probe_test.go:636: duplicate param      -> 200 {"access_token":"OK8mdwgZZ1j0tEh0sUIbA4fsuZh56CIQXiuX7l9oPpA","expires_in":3600,"refresh_token":"k9TKcq-fKxfMUHCPjEjlMNM17NqMuK48MVVpF725blI...
+    kit_probe_test.go:636: array syntax         -> 200 {"access_token":"BnrbLM7BURI08XYlfwFFnaSAElKDwrGvYWiZLA05D2c","expires_in":3600,"refresh_token":"H6m2vLw9WxgzX6HDlJKGefCZb-n04hbPUks-yt54FLE...
+    kit_probe_test.go:636: uppercase            -> 400 {"error":"invalid_scope","error_description":"refresh cannot widen the granted scope"}
+    kit_probe_test.go:636: empty                -> 200 {"access_token":"R_-7LxWnt10L5ZJ1j5dJn6znotPhEvwib3DWLahZKHc","expires_in":3600,"refresh_token":"RTo__LydkY8Y1lj-VijsgTfOAJTt87mtBrp_SUdbCSo...
+    kit_probe_test.go:636: newline separated    -> 400 {"error":"invalid_scope","error_description":"refresh cannot widen the granted scope"}
+    kit_probe_test.go:636: tab separated        -> 400 {"error":"invalid_scope","error_description":"refresh cannot widen the granted scope"}
+    kit_probe_test.go:636: comma suffix         -> 400 {"error":"invalid_scope","error_description":"refresh cannot widen the granted scope"}
+    kit_probe_test.go:653: control refresh -> 200 {"access_token":"lYQlMge8NDfB9pUTnjC428xoSiTGNrQzGV6uIerT8ks","expires_in":3600,"refresh_token":"fyJD_hNbjsXVdhvzm-4etn2HtyZxyLd5R_VENL3PcvM...
+    kit_probe_test.go:672: scope in the query string -> 400 {"error":"unsupported_grant_type","error_description":"only authorization_code and refresh_token are supported"}
+--- PASS: TestD1_ScopeSmugglingAtTheTokenEndpoint (0.00s)
+=== RUN   TestD2_EmptyScopeRefreshKeepsTheGrant
+    kit_probe_test.go:689: refresh scopes=omitted -> scope="account.read phigros.profile.read"
+    kit_probe_test.go:701: refresh scopes=[] -> scope="account.read phigros.profile.read"
+    kit_probe_test.go:711: refresh scopes=[""] -> oauth: invalid_scope: refresh cannot widen the granted scope
+--- PASS: TestD2_EmptyScopeRefreshKeepsTheGrant (0.00s)
+=== RUN   TestD3_UnregisteredScopeRefused
+    kit_probe_test.go:731: scopes=[account.read] -> <nil>
+    kit_probe_test.go:731: scopes=[phigros.profile.read] -> oauth: invalid_scope: client is not registered for phigros.profile.read
+    kit_probe_test.go:731: scopes=[not.in.catalogue] -> oauth: invalid_scope: oauth: unknown scope "not.in.catalogue"
+    kit_probe_test.go:731: scopes=[account.read phigros.profile.read] -> oauth: invalid_scope: client is not registered for phigros.profile.read
+    kit_probe_test.go:731: scopes=[ACCOUNT.READ] -> oauth: invalid_scope: oauth: unknown scope "ACCOUNT.READ"
+--- PASS: TestD3_UnregisteredScopeRefused (0.00s)
+=== RUN   TestD4_TokenScopeIsTheCodes
+    kit_probe_test.go:748: code granted account.read only; token scope = "account.read"
+--- PASS: TestD4_TokenScopeIsTheCodes (0.00s)
+=== RUN   TestE1_CascadeRevocationRequiresAuthentication
+    kit_probe_test.go:868: anonymous POST /oauth/cascade_revocation -> 401 {"error":"invalid_client","error_description":"unknown client"}
+         (hook calls=0)
+--- PASS: TestE1_CascadeRevocationRequiresAuthentication (0.00s)
+=== RUN   TestE2_CascadeRevocationAcceptsCredentials
+    kit_probe_test.go:894: authenticated cascade -> 200
+--- PASS: TestE2_CascadeRevocationAcceptsCredentials (0.00s)
+=== RUN   TestE3_CascadeRevocationRefusesAnUnknownClient
+--- PASS: TestE3_CascadeRevocationRefusesAnUnknownClient (0.00s)
+=== RUN   TestE4_TokenEndpointRequiresClientAuth
+    kit_probe_test.go:931: token with no client identity -> 401 {"error":"invalid_client","error_description":"unknown client"}
+--- PASS: TestE4_TokenEndpointRequiresClientAuth (0.00s)
+=== RUN   TestE5_AuthorizeRejectsUnregisteredRedirect
+    kit_probe_test.go:956: authorize with an unregistered redirect -> 400 Location="" body={"error":"invalid_request","error_description":"redirect_uri is not registered"}
+--- PASS: TestE5_AuthorizeRejectsUnregisteredRedirect (0.00s)
+=== RUN   TestE6_BodyLimitVariants
+    kit_probe_test.go:979: control small body -> 401 {"error":"invalid_client","error_description":"unknown client"}
+    kit_probe_test.go:993: declared oversize (Content-Length) -> 413 {"error":"invalid_request","error_description":"request body too large"}
+    kit_probe_test.go:1008: chunked oversize (no Content-Length) -> 400 {"error":"invalid_request","error_description":"malformed form body"}
+    kit_probe_test.go:1010: a chunked oversize body got 400, want 413: the body IS capped, but the caller sees a malformed-request error instead
+    kit_probe_test.go:1031: gzip oversize (151 wire bytes) -> 400 {"error":"invalid_request","error_description":"malformed form body"}
+--- FAIL: TestE6_BodyLimitVariants (0.00s)
+=== RUN   TestE6b_BodyLimitHasNoBypass
+    kit_probe_test.go:1054: grant_type hidden past the cap -> 400 {"error":"invalid_request","error_description":"malformed form body"}
+    kit_probe_test.go:1071: control, same body under the cap -> 200 {"access_token":"X0V7PnMXYrchZ5vVgvTJAZ9pu0ymOE76a51nxcwym-c","expires_in":3600,"refresh_token":"NT4YifgPfCuJ6wXS65tpY0NYtSwSh7LbTQgoFA7Zqvk...
+--- PASS: TestE6b_BodyLimitHasNoBypass (0.00s)
+=== RUN   TestE7_DiscoveryCacheHeaders
+    kit_probe_test.go:1090: /.well-known/re0auth-upstream              200 Cache-Control="" Vary=""
+    kit_probe_test.go:1093: /.well-known/re0auth-upstream has no Cache-Control header
+    kit_probe_test.go:1090: /.well-known/oauth-authorization-server    200 Cache-Control="" Vary=""
+    kit_probe_test.go:1093: /.well-known/oauth-authorization-server has no Cache-Control header
+--- FAIL: TestE7_DiscoveryCacheHeaders (0.00s)
+=== RUN   TestE8_TokenResponseCacheHeaders
+    kit_probe_test.go:1110: token error response: 400 Cache-Control="no-store"
+--- PASS: TestE8_TokenResponseCacheHeaders (0.00s)
+=== RUN   TestE9_AuthorizeUnknownClient
+    kit_probe_test.go:1133: unknown client -> 401 Location="" body={"error":"invalid_client","error_description":"unknown client"}
+--- PASS: TestE9_AuthorizeUnknownClient (0.00s)
+=== RUN   TestE10_DataPlaneRequiresTokenAndScope
+    kit_probe_test.go:1151: /account with no token -> 401
+    kit_probe_test.go:1167: control /account with account.read -> 200 {"subject":"usr_probe_subject"}
+    kit_probe_test.go:1181: /resources/profile with an account.read-only token -> 403 {"code":"scope_not_granted","detail":"the token lacks phigros.profile.read","instance":"/resources/p...
+    kit_probe_test.go:1200: /account with a SUSPENDED client's token -> 401 {"code":"invalid_token","detail":"the access token is invalid or has expired","instance":"/account",...
+--- PASS: TestE10_DataPlaneRequiresTokenAndScope (0.00s)
+=== RUN   TestH1_AdvertisedEndpointsAreServed
+    kit_probe_test.go:1239: cascade=false: issuer="https://probe.upstream.test" authorize="https://probe.upstream.test/oauth/authorize" token="https://probe.upstream.test/oauth/token" revoke="https://probe.upstream.test/oauth/revoke" cascade="" token_class="revocable" scopes=[account.read phigros.profile.read]
+    kit_probe_test.go:1265: cascade=false metadata: map[authorization_endpoint:https://probe.upstream.test/oauth/authorize code_challenge_methods_supported:[S256] grant_types_supported:[authorization_code refresh_token] issuer:https://probe.upstream.test response_types_supported:[code] revocation_endpoint:https://probe.upstream.test/oauth/revoke scopes_supported:[account.read phigros.profile.read] token_endpoint:https://probe.upstream.test/oauth/token token_endpoint_auth_methods_supported:[client_secret_basic client_secret_post none]]
+    kit_probe_test.go:1287:   POST /oauth/authorize               -> 405
+    kit_probe_test.go:1287:   POST /oauth/token                   -> 400
+    kit_probe_test.go:1287:   POST /oauth/revoke                  -> 401
+    kit_probe_test.go:1239: cascade=true: issuer="https://probe.upstream.test" authorize="https://probe.upstream.test/oauth/authorize" token="https://probe.upstream.test/oauth/token" revoke="https://probe.upstream.test/oauth/revoke" cascade="https://probe.upstream.test/oauth/cascade_revocation" token_class="revocable" scopes=[account.read phigros.profile.read]
+    kit_probe_test.go:1265: cascade=true metadata: map[authorization_endpoint:https://probe.upstream.test/oauth/authorize code_challenge_methods_supported:[S256] grant_types_supported:[authorization_code refresh_token] issuer:https://probe.upstream.test response_types_supported:[code] revocation_endpoint:https://probe.upstream.test/oauth/revoke scopes_supported:[account.read phigros.profile.read] token_endpoint:https://probe.upstream.test/oauth/token token_endpoint_auth_methods_supported:[client_secret_basic client_secret_post none]]
+    kit_probe_test.go:1287:   POST /oauth/authorize               -> 405
+    kit_probe_test.go:1287:   POST /oauth/token                   -> 400
+    kit_probe_test.go:1287:   POST /oauth/revoke                  -> 401
+--- PASS: TestH1_AdvertisedEndpointsAreServed (0.00s)
+=== RUN   TestH2_MetadataAndDiscoveryAgreeOnCascade
+    kit_probe_test.go:1332: discovery cascade = "https://probe.upstream.test/oauth/cascade_revocation"; metadata cascade = ""
+    kit_probe_test.go:1334: metadata keys = [authorization_endpoint grant_types_supported revocation_endpoint token_endpoint token_endpoint_auth_methods_supported code_challenge_methods_supported issuer response_types_supported scopes_supported]
+--- PASS: TestH2_MetadataAndDiscoveryAgreeOnCascade (0.00s)
+=== RUN   TestF1_ConformanceDetectsAnObviousNonConformance
+    kit_probe_test.go:1403: [error] authorize.rejects_unknown_client: redirected (status 302) instead of returning an error
+    kit_probe_test.go:1403: [error] token.rejects_bad_grant: a bogus grant was accepted with status 200
+    kit_probe_test.go:1403: [skipped] cascade.absent: no cascade revocation advertised; Re0Auth will not offer it
+    kit_probe_test.go:1403: [skipped] data.skipped: no access token supplied; set Options.AccessToken to check /account and /resources
+    kit_probe_test.go:1404: errors=2 warnings=0 skipped=2
+--- PASS: TestF1_ConformanceDetectsAnObviousNonConformance (0.00s)
+=== RUN   TestF2_ConformanceIgnoresClientAuthentication
+    kit_probe_test.go:1466: [skipped] cascade.absent: no cascade revocation advertised; Re0Auth will not offer it
+    kit_probe_test.go:1466: [skipped] data.skipped: no access token supplied; set Options.AccessToken to check /account and /resources
+    kit_probe_test.go:1467: a source that authenticates nobody: errors=0 warnings=0
+    kit_probe_test.go:1482: token with no client identity at all -> 200 {"access_token":"minted-without-any-client-auth","token_type":"Bearer","expires_in":3600}
+    kit_probe_test.go:1486: a source that declares client_secret_basic and authenticates nobody passes conformance with zero errors
+--- FAIL: TestF2_ConformanceIgnoresClientAuthentication (0.00s)
+=== RUN   TestF3_ConformanceFailsAnUnauthenticatedCascade
+    kit_probe_test.go:1542: [error] cascade.requires_auth: the cascade endpoint answered 200 to an unauthenticated caller (no credentials, unknown client): it must authenticate the client before ending a session
+    kit_probe_test.go:1542: [skipped] data.skipped: no access token supplied; set Options.AccessToken to check /account and /resources
+    kit_probe_test.go:1550: the suite posted to the cascade endpoint with an unknown client id and no Basic auth, and the endpoint answered 200; a truly anonymous call was also accepted=false
+--- PASS: TestF3_ConformanceFailsAnUnauthenticatedCascade (0.00s)
+=== RUN   TestG1_RevocationOwnership
+    kit_probe_test.go:1593: unknown token                -> ""
+    kit_probe_test.go:1593: other client's access token  -> "invalid_client"
+    kit_probe_test.go:1593: other client's refresh token -> "invalid_client"
+    kit_probe_test.go:1593: own access token             -> ""
+    kit_probe_test.go:1593: own refresh token            -> ""
+    kit_probe_test.go:1593: wrong secret                 -> "invalid_client"
+    kit_probe_test.go:1601: introspect of the revoked access token: active=false
+    kit_probe_test.go:1611: introspect of the OTHER client's token after the failed revoke: active=true
+--- PASS: TestG1_RevocationOwnership (0.00s)
+=== RUN   TestG2_IntrospectLeaksSubjectAndScopes
+    kit_probe_test.go:1626: Introspect(one client's token) with no caller identity -> active=true subject="usr_probe_subject" client="conf" scopes=[account.read phigros.profile.read]
+    kit_probe_test.go:1628: NOTE: this is the kit's own /account and /resources path and is correct for it; the exposure only becomes a finding if Introspect is ever wired to an RFC 7662 endpoint
+--- PASS: TestG2_IntrospectLeaksSubjectAndScopes (0.00s)
+=== RUN   TestG3_TokenEntropy
+    kit_probe_test.go:1661: 64 pairs, 128 unique values, 0 shared 8-char prefixes
+--- PASS: TestG3_TokenEntropy (0.00s)
+=== RUN   TestG4_BasicPercentDecodingDoesNotCrossAuthenticate
+    kit_probe_test.go:1705: control: A presents "a%2Bb" -> decoded "a+b" err=<nil>
+    kit_probe_test.go:1705: control: B presents "a+b"  -> decoded "a b" err=<nil>
+    kit_probe_test.go:1721: cross:   A presents "a+b"  -> decoded "a b" err=oauth: invalid_client: invalid client credentials
+    kit_probe_test.go:1721: cross:   B presents "a%2Bb" -> decoded "a+b" err=oauth: invalid_client: invalid client credentials
+    kit_probe_test.go:1730: AuthenticateClient(A, B's secret value "a b") = oauth: invalid_client: invalid client credentials (refused, as it must be)
+    kit_probe_test.go:1735: AuthenticateClient(B, A's secret value "a+b") = oauth: invalid_client: invalid client credentials (refused, as it must be)
+    kit_probe_test.go:1745: A presents its own secret unencoded as "a+b" -> oauth: invalid_client: invalid client credentials (the '+' decodes to a space; the client must send a%2Bb)
+--- PASS: TestG4_BasicPercentDecodingDoesNotCrossAuthenticate (0.00s)
+FAIL
+FAIL	github.com/Re0Auth/r0semi/internal/zzprobe/protocol/kit	0.549s
+=== RUN   TestRPDiscoveredAuthorizationEndpointIsPinnedToTheIssuer
+    builtin_test.go:39: refused as expected: idp: authentik: discovered authorization_endpoint "https://evil.example/authorize" is not on the issuer's origin "http://127.0.0.1:65346"; set auth_url/token_url explicitly for a provider that hosts its endpoints elsewhere
+--- PASS: TestRPDiscoveredAuthorizationEndpointIsPinnedToTheIssuer (0.02s)
+=== RUN   TestRPDiscoveredTokenEndpointOnAnotherOriginIsRefused
+--- PASS: TestRPDiscoveredTokenEndpointOnAnotherOriginIsRefused (0.04s)
+=== RUN   TestRPDiscoveryWithoutAuthorizationEndpointYieldsARelativeLoginURL
+    builtin_test.go:102: the RP handed the browser a non-absolute login URL "?client_id=cid&code_challenge=hQq_P3Njx8oPYzfa8x-qHvPI5kSzHPv6Cy6RWwwfHMo&code_challenge_method=S256&nonce=nonce&redirect_uri=https%3A%2F%2Fre0auth.test%2Fauth%2Fauthentik%2Fcallback&response_type=code&scope=openid+email+profile&state=st" (discovery omitted authorization_endpoint)
+--- FAIL: TestRPDiscoveryWithoutAuthorizationEndpointYieldsARelativeLoginURL (0.11s)
+=== RUN   TestRPDefaultOutboundClientRefusesLoopbackDiscovery
+    builtin_test.go:129: refused as expected: idp: authentik: discovery failed: Get "http://127.0.0.1:65353/.well-known/openid-configuration": dial tcp 127.0.0.1:65353: httpclient: refusing to connect to 127.0.0.1:65353: 127.0.0.1 is not a public address (set upstream.allow_private_addresses to permit one)
+--- PASS: TestRPDefaultOutboundClientRefusesLoopbackDiscovery (0.00s)
+=== RUN   TestRPMicrosoftBuiltInIssuerIsRefusedAtConstruction
+    builtin_test.go:151: refused as expected: idp: microsoft: set issuer to https://login.microsoftonline.com/<tenant>/v2.0 (the built-in /common issuer cannot discover)
+--- PASS: TestRPMicrosoftBuiltInIssuerIsRefusedAtConstruction (0.00s)
+=== RUN   TestRPUserinfoRedirectToAnotherOriginIsRefused
+--- PASS: TestRPUserinfoRedirectToAnotherOriginIsRefused (0.00s)
+=== RUN   TestRPSubIsNamespacedByProvider
+--- PASS: TestRPSubIsNamespacedByProvider (0.00s)
+=== RUN   TestRPFutureIssuedAtIsAccepted
+    builtin_test.go:296: accepted a token whose iat is a year in the future: sub="rp-user-1"
+--- PASS: TestRPFutureIssuedAtIsAccepted (0.03s)
+=== RUN   TestRPConsentHandleIsUsableByItsOwnBrowser
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=5 bytes=409 plane=browser request_id=req_57a9bb0527c9b64d607562c4 trace_id=792cf17a0acdf01d8f285e4598a6cae8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_f9c80bd669caeb918bedb0e7 trace_id=c5f20f0f963f5d1e9f1f6ecc2100a1d1 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_0de45379d4fc4cb5fd07e4e5 trace_id=b1000ae41b0c996bf02a5e3b7eec758a client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/CgsVpKWmdvgcxt6EcIGI-03XQG4ji2UR3hRZec_-EEc status=200 duration_ms=0 bytes=352 plane=business request_id=req_4d87fcf9d9cccb43bd685da3 trace_id=8c7aa34624dd2b252c3d4dcdd05b1c82 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/CgsVpKWmdvgcxt6EcIGI-03XQG4ji2UR3hRZec_-EEc/decision status=200 duration_ms=0 bytes=91 plane=business request_id=req_d4d09e59567bc97d1dd41b0b trace_id=78f7e160e25dcd26d49ca7f1d101705d client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=347 plane=protocol request_id=req_651965f09209d51b0e4cfc9b trace_id=09eb09b5f91f7310e7bf0998836c4138 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/CgsVpKWmdvgcxt6EcIGI-03XQG4ji2UR3hRZec_-EEc status=404 duration_ms=0 bytes=268 plane=business request_id=req_1cff90050cf56a39394b1bb3 trace_id=ce4357d69d5e6a9ff3c58cb1c8131a0b client=127.0.0.1
+--- PASS: TestRPConsentHandleIsUsableByItsOwnBrowser (0.02s)
+=== RUN   TestRPConsentHandleFromAnotherBrowserIsRefused
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_59c07dd0d8262c4201039ccc trace_id=c71674a45628ba594fc6290c0b2ca03a client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_1d6f319553a23fdaad2d4ebc trace_id=ffbb5362a46718413a70be59276247ed client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_b9db1dea9bac9fae4702efd6 trace_id=a5451195db4d4f9cbef10c002b3f3c57 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_5eaea9a27a562b5f19856253 trace_id=baf686724ae02d639b5aab57375b54ab client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_624c521a26946d88b00ebd19 trace_id=9f26d4c15d734b1062f443ca2abac678 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/arQh-X20tty5MrZnhe8YjHejrfJENHNLdrAyxMis1_g status=404 duration_ms=0 bytes=268 plane=business request_id=req_fa78194d9983a23bdf8072e4 trace_id=fe1101890e5e408d44160cd65eb35c72 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_e06ed3373299dd7dd9344db4 trace_id=b057344c2c22b260aa3661f068c9360e client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/RZgb1T_w3ZbDOKzs0csA_i0McjqGl1ejcN-TXrVTVnU status=200 duration_ms=0 bytes=352 plane=business request_id=req_c3beebb0c835bc11b0e37be0 trace_id=04e5ea097a00bd4246f9abb243f54c73 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/arQh-X20tty5MrZnhe8YjHejrfJENHNLdrAyxMis1_g/decision status=404 duration_ms=0 bytes=277 plane=business request_id=req_0ab162236b59f55617f999d8 trace_id=0e4d60e0974d8c2f9d68c3010bc93216 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/arQh-X20tty5MrZnhe8YjHejrfJENHNLdrAyxMis1_g status=200 duration_ms=0 bytes=352 plane=business request_id=req_a15ec912125acdf5c6cd0d82 trace_id=afdf9f103273cf6792a6fb829af7627f client=127.0.0.1
+--- PASS: TestRPConsentHandleFromAnotherBrowserIsRefused (0.02s)
+=== RUN   TestRPConsentDecisionNeedsTheSessionsCSRFToken
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_1427e2735c0b5698b610d329 trace_id=0db2230b626511cb26261497a3e76c39 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_c8e3d2c5786bd3b5d1e8191e trace_id=f681e0ced133ca25626aa3ce2a60ea3f client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_5c50db571d8fe825009d8c7b trace_id=79d057d56cf98b90969df4ebf9a59c62 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/pbpE4YdhQ8D8mSlNiWOC4o4Zjgbxfq2MH889TkUFoa4/decision status=403 duration_ms=0 bytes=295 plane=business request_id=req_102527497a7de038a0648936 trace_id=b848bc0d0dad8a6df9c37fa8f65d53b8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_be46210a0bacbcb12a98555a trace_id=39c7945c6c59c4dc00f18a7d8a20ee56 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_f14d8d53c0e766b056bf3a63 trace_id=625a7573c28e26d1fcf4b31bec2f130b client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_5c075723a6e857cbbe174b3d trace_id=b2f0ef75dbba0c3a14319a32e195c2a4 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/EaqUPzOCf0XMLa5Wp61bIGyvUVT-VCBo0Zx8PhRQGWs status=200 duration_ms=0 bytes=352 plane=business request_id=req_7dfe07b25103b7208fd79459 trace_id=d3017ecd4957d94eaa601146a5099eb8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/pbpE4YdhQ8D8mSlNiWOC4o4Zjgbxfq2MH889TkUFoa4/decision status=403 duration_ms=0 bytes=295 plane=business request_id=req_dad6dcc31495e7b7a91bbfc7 trace_id=e3cd2fee2b6d7620accc42abffb19aeb client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/pbpE4YdhQ8D8mSlNiWOC4o4Zjgbxfq2MH889TkUFoa4 status=200 duration_ms=0 bytes=352 plane=business request_id=req_1f4d0c58a24f50b6e050e9c1 trace_id=0d242bbc9b20ad4a6a82a629ccd8c92e client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/pbpE4YdhQ8D8mSlNiWOC4o4Zjgbxfq2MH889TkUFoa4/decision status=200 duration_ms=0 bytes=91 plane=business request_id=req_11765bcf811c69cbd01251dd trace_id=7bedd5a6935b33730c1ec75473b833f8 client=127.0.0.1
+--- PASS: TestRPConsentDecisionNeedsTheSessionsCSRFToken (0.03s)
+=== RUN   TestRPConsentApprovalRedirectIsReplayable
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_1339202c3b6f44427d754b49 trace_id=8f095259a08a7f08a0082b63b2e00e63 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_c0f4cac6ea2a47ac2694fd4a trace_id=b6c74ccd63474b5bb2bdfb25c3082d09 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_49b29c0ca035d2c3246719be trace_id=58e87734a966c86878638253acdb8284 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/G3h68LQoWWK1_FF_wgAhHyuS2er-AjqYGBNLHlV3ggE status=200 duration_ms=0 bytes=352 plane=business request_id=req_1915b53b681233acf0b70308 trace_id=50c546b8ef63d8181e290204271eec00 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/G3h68LQoWWK1_FF_wgAhHyuS2er-AjqYGBNLHlV3ggE/decision status=200 duration_ms=0 bytes=91 plane=business request_id=req_0353773005fbe229905a94c4 trace_id=2ac22affbec1d61855455f14b679ed10 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=352 plane=protocol request_id=req_94ed67a9337c6928445d52ce trace_id=fcbc4cb17c515b8e7bba5bee63c09bdb client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=352 plane=protocol request_id=req_383bc193321b0f7e73fae1de trace_id=e2d28f958898ad7f718a41b087d46ddb client=127.0.0.1
+    consent_test.go:250: the approval redirect was replayable: two visits produced two authorization codes
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=200 duration_ms=1 bytes=472 plane=protocol request_id=req_50ec8bfd885f93361c2468e0 trace_id=d5b480bb00c1c017ef52ce98c65e881a client=127.0.0.1
+2026/09/29 19:07:38 WARN request error oidc_error.parent="memory: authorization code is unknown or expired" oidc_error.description="invalid code" oidc_error.type=invalid_grant
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=61 plane=protocol request_id=req_e95f61df83c8d2df892e316a trace_id=fe6f41307633bc4ce85bba773b330711 client=127.0.0.1
+    consent_test.go:257: first code -> 200, second code -> 400
+--- FAIL: TestRPConsentApprovalRedirectIsReplayable (0.10s)
+=== RUN   TestRPConsentDecisionConcurrency
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_f3a861fc1a4963399e6e97f3 trace_id=37349906707c8cf988c51a576c09c69f client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_5f010ff7445aeef1fe4fcc1f trace_id=c741b21e4c7d824832a2d1245c5c5df8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize status=302 duration_ms=0 bytes=82 plane=protocol request_id=req_af25f43beda1e17f0057be5f trace_id=77aee607b5bb9d6f12b73559383981a5 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs status=200 duration_ms=0 bytes=352 plane=business request_id=req_73c4045711ce9be0843e3839 trace_id=091f99f2f485648c112c87fc70debc37 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=200 duration_ms=0 bytes=91 plane=business request_id=req_4cac24404d58410d872218cf trace_id=103567e2275facccbffb7ab3537dbd05 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=200 duration_ms=0 bytes=91 plane=business request_id=req_edce6f1c087aa3f426a0c1f3 trace_id=49724afbd8da5258ec1d70430fa9867c client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=404 duration_ms=0 bytes=277 plane=business request_id=req_ecdc499536615349da0b5bf9 trace_id=f84a4af265a7232baa9971805ae80da3 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=404 duration_ms=0 bytes=277 plane=business request_id=req_23eefa570cbaa973cf2d536b trace_id=2b51612bc44937f3d0d6a9d2b56455d5 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=404 duration_ms=0 bytes=277 plane=business request_id=req_d29fb42eb66f467324d2acad trace_id=afc184fcb4002f40d464b40970b2a463 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=404 duration_ms=0 bytes=277 plane=business request_id=req_197371b2db913d1329bbd690 trace_id=e5ce383635d76ade3e764338ee2db57e client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=404 duration_ms=0 bytes=277 plane=business request_id=req_6df41f808e21659d6f84407e trace_id=3dbaff6a8c68114a1522b8000f70ad67 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=POST path=/v1/authorization_requests/JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs/decision status=404 duration_ms=0 bytes=277 plane=business request_id=req_dbd06d53827a371ed6201994 trace_id=a5bfdaa3b164258eafa505a947744485 client=127.0.0.1
+    consent_test.go:333: 2 of 8 concurrent decisions succeeded; distinct redirects=1
+    consent_test.go:335: redirect: /oauth/authorize/callback?id=JAwYPNiTlWko0Y9XfZOyu2dRaRb_YL_gJZxFY8FGgCs
+    consent_test.go:338: 2/8 decisions succeeded, 1 distinct redirects
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=347 plane=protocol request_id=req_081ed5bf65678d50f8bb232e trace_id=20f20b1c8544e41a9bbd73561ea89444 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=347 plane=protocol request_id=req_0e154dff770e0f4d13ee24eb trace_id=e4f1360bd678518d661e0fcb6699c2f5 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/authorize/callback status=302 duration_ms=0 bytes=347 plane=protocol request_id=req_a778f4c3415a96b11c0388e0 trace_id=0b55108cbeb8c06afd4b1d63230255e0 client=127.0.0.1
+    consent_test.go:357: one consent produced 3 distinct authorization codes: map[eyJhbGciOiJBMjU2R0NNS1ciLCJlbmMiOiJBMjU2R0NNIiwiaXYiOiItTmdFekpEUXotTThBLVBpIiwia2lkIjoidGVzdCIsInRhZyI6IjNLdTVMTW5rNThCYU1MVkFKQ3pBbkEifQ.FoBkvWnTXya9Ms2y0bhylqc51BjOQHdKc2hnNZWeyVU.hQmhMjLLHg8hzJwL.aaVJclAmdC_hwuip-1Q7FgKSB_h4MNmRX7QIbZIIVlUzgkIUXzgRPmtPJQ.EVdote9pSmdf5FZ_rqWaog:1 eyJhbGciOiJBMjU2R0NNS1ciLCJlbmMiOiJBMjU2R0NNIiwiaXYiOiJIaDU4S3Q2RmYyZmJMTWI0Iiwia2lkIjoidGVzdCIsInRhZyI6ImszeEttd1YtRlJJWms4NGdLSVBKLWcifQ.Ot0uNhzZa3zQEhFkwMxiBpYgp21n6ESb9Y0KhwHZm18.8BcJOe2PzzhSrMlK.oG6Wx3_wPPdt-_tKv-9oTDjIgzzxizozroP_ZPAmaGM8V3JaruEYeUhl-Q.qXoHceIHomDt3bc0pvoXkA:1 eyJhbGciOiJBMjU2R0NNS1ciLCJlbmMiOiJBMjU2R0NNIiwiaXYiOiJSX0d3cEVWa0oxdWRoYWRJIiwia2lkIjoidGVzdCIsInRhZyI6ImZLYUhXaHVVWWFnVjU4NmRETkgxRXcifQ.-5J74y6EUhqe5CM-J3W14W6-hczSocEUmdhpf9Dpkow.fiTAGHfguJl_E8ZR.2G-XLjv6L9Q_GoOZi9ej6VdHDYCJfjv8ZXXNU-NA_oyDmDjQo1Dk_w6lSQ.52ASQMW0x5Ozx9qp5r-OnA:1]
+    consent_test.go:360: code "eyJhbGciOiJBMjU2R0NNS1ciLCJlbmMiOiJBMjU2R0NNIiwiaXYiOiJSX0d3cEVWa0oxdWRoYWRJIiwia2lkIjoidGVzdCIsInRhZyI6ImZLYUhXaHVVWWFnVjU4NmRETkgxRXcifQ.-5J74y6EUhqe5CM-J3W14W6-hczSocEUmdhpf9Dpkow.fiTAGHfguJl_E8ZR.2G-XLjv6L9Q_GoOZi9ej6VdHDYCJfjv8ZXXNU-NA_oyDmDjQo1Dk_w6lSQ.52ASQMW0x5Ozx9qp5r-OnA" was delivered 1 times
+    consent_test.go:360: code "eyJhbGciOiJBMjU2R0NNS1ciLCJlbmMiOiJBMjU2R0NNIiwiaXYiOiItTmdFekpEUXotTThBLVBpIiwia2lkIjoidGVzdCIsInRhZyI6IjNLdTVMTW5rNThCYU1MVkFKQ3pBbkEifQ.FoBkvWnTXya9Ms2y0bhylqc51BjOQHdKc2hnNZWeyVU.hQmhMjLLHg8hzJwL.aaVJclAmdC_hwuip-1Q7FgKSB_h4MNmRX7QIbZIIVlUzgkIUXzgRPmtPJQ.EVdote9pSmdf5FZ_rqWaog" was delivered 1 times
+    consent_test.go:360: code "eyJhbGciOiJBMjU2R0NNS1ciLCJlbmMiOiJBMjU2R0NNIiwiaXYiOiJIaDU4S3Q2RmYyZmJMTWI0Iiwia2lkIjoidGVzdCIsInRhZyI6ImszeEttd1YtRlJJWms4NGdLSVBKLWcifQ.Ot0uNhzZa3zQEhFkwMxiBpYgp21n6ESb9Y0KhwHZm18.8BcJOe2PzzhSrMlK.oG6Wx3_wPPdt-_tKv-9oTDjIgzzxizozroP_ZPAmaGM8V3JaruEYeUhl-Q.qXoHceIHomDt3bc0pvoXkA" was delivered 1 times
+--- FAIL: TestRPConsentDecisionConcurrency (0.03s)
+=== RUN   TestRPLoginStateFromAnotherBrowserIsRefused
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_57a1746e22092a9a7cd3d1ff trace_id=35cdaa3b78c0f11d28148a6a9bb1494b client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=400 duration_ms=0 bytes=14 plane=browser request_id=req_f38fd26c5bc937fdc844d465 trace_id=65205c68e0e595cae1ff4154a6a33f1a client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=401 duration_ms=0 bytes=232 plane=business request_id=req_bb57520bd311b07ec3c060bb trace_id=202367c681865cbb19d785e2c04a6a8c client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=1 bytes=28 plane=browser request_id=req_8a96bba7499864842d389f40 trace_id=b9bdb9b198fb7de0c72b3495abab6d70 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=330 plane=business request_id=req_4a17dcef1e3b1bfa79dfd558 trace_id=eb84954e799c84a57fedba25a0e7dae7 client=127.0.0.1
+--- PASS: TestRPLoginStateFromAnotherBrowserIsRefused (0.01s)
+=== RUN   TestRPLoginStateIsSingleUse
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_fd8e4746582f62dbec64bab7 trace_id=ce0cf7d4bcedcb9b145eb95514d5f2d6 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_9326e4cfac9479c7cdd224be trace_id=a130df392029d4cbb340366d9c9b4e21 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=330 plane=business request_id=req_218a8b82f470aed849fba750 trace_id=30a9fc4485b66a5c861c05458442ab42 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=400 duration_ms=0 bytes=14 plane=browser request_id=req_80498877d03ac892805918c8 trace_id=010fe79c1f2a1bc95ec48c73890fae63 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=330 plane=business request_id=req_36a0ef81165e898c7b834c99 trace_id=b2bdbc71c2d21882f954b2c891ea3ebd client=127.0.0.1
+--- PASS: TestRPLoginStateIsSingleUse (0.09s)
+=== RUN   TestRPLoginStateIsBoundToItsProvider
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_e431822c0d6a3a0f1f9da8db trace_id=305bb238b03af3428e2735a144de4a74 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/discord/callback status=400 duration_ms=0 bytes=18 plane=browser request_id=req_333d056cadcdfabc89a82dc5 trace_id=10a2c8b421c3aea4dd1d1ec80ff073d8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=401 duration_ms=0 bytes=232 plane=business request_id=req_7754dee6b0c96c99a14646a7 trace_id=c3a7edf20a969a372e143d8950477a6e client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=400 duration_ms=0 bytes=14 plane=browser request_id=req_d724a0738160bef337d42b4c trace_id=ce6cdeb17c874fbd1ec28026332d4882 client=127.0.0.1
+    e2e_test.go:338: the refused callback consumed the pending flow: github callback = 400 loc="" body="invalid state\n"
+--- FAIL: TestRPLoginStateIsBoundToItsProvider (0.03s)
+=== RUN   TestRPLoginReturnToCannotLeaveTheOrigin
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_4e29cd0881464f89e7f2e61f trace_id=838872cd686dd37139fe68967cff5e61 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_76b3ad2fc84343aebf19d26c trace_id=ac06e3b0c3a2b18bf45fd36d1be9c637 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_ea8c1ee95766730e9896f7d5 trace_id=656989e9ec1aa10cc65660ddb9f365f9 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_1669f751e88c66405e7cd641 trace_id=965a80e4cc877420dfdbb7981e54c62f client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_97c0bc5242c7329fb46c4777 trace_id=49daa76d23c4cef913c6207a58e353ed client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_33d6c9db499c9590bd6cf349 trace_id=eacb0d40b63d12786329862c40b604f8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_b01f786b53396166f0dee424 trace_id=d405d53caa75d81570eac53d6755df81 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=44 plane=browser request_id=req_29cb1a22816c8e0cd9448261 trace_id=2982ca5f700a396d6571eea8b4076ddc client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_81f1a746ec18253109385a93 trace_id=64c81ef2e22871c8d69fda5a7815f949 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_7a29d522f68e05c5d7d33e31 trace_id=f20b490675402c6672fc283bb7adc281 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_d5315890a82bca293bc96b73 trace_id=e41422056e923716514ecb8e7f52cb13 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_ab25978a7524b91ed2339166 trace_id=5caa2672d5406ab2f2d46be2d7cf107c client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_f1203107c8c86f7a1c93c318 trace_id=706078c73941b9ddf1011fd7ff8d7456 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_13aed51856d8a19189b12fb8 trace_id=b6155912aca8cf8969ad87857ae329ee client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_06cbf1ed75e7a6730c6fa63a trace_id=d6298d828fac76bbcd66a20d91b25a7e client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_5c671780a7eab1c16c6b9223 trace_id=102481a876f65bc818222515f56c447e client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_9efe89576c136f3e3a1a290e trace_id=e13785d711c32004655220ee43705c78 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=45 plane=browser request_id=req_0e303180effa6f8f24f9672b trace_id=daa3b492f58b45f1fa05d978caf4da56 client=127.0.0.1
+--- PASS: TestRPLoginReturnToCannotLeaveTheOrigin (0.03s)
+=== RUN   TestRPLoginProviderErrorIsNotReflected
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_dbc72d91ff082472abd93ff3 trace_id=dcbe471945aa61946ef02d49b850100c client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=48 plane=browser request_id=req_3e855c3a07e67b004f8353d9 trace_id=c4815fab568f25431c16370152034c2c client=127.0.0.1
+--- PASS: TestRPLoginProviderErrorIsNotReflected (0.05s)
+=== RUN   TestRPLoginCallbackNeedsACode
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_9355350a61e26c8237b71717 trace_id=b56ab709ec862690b25cbd6512cecf9a client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=50 plane=browser request_id=req_3e27877f0eba460af7ab2de4 trace_id=5429ba2cce3e1599283a7452e767dae9 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=401 duration_ms=0 bytes=232 plane=business request_id=req_db52810addfdc4b41cdad0a3 trace_id=3cc0dc3a896fc6c686784740692176a1 client=127.0.0.1
+--- PASS: TestRPLoginCallbackNeedsACode (0.01s)
+=== RUN   TestRPLoginModeComesFromTheSessionNotTheQuery
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_1fa6a7e683a6433452ea7d39 trace_id=a0e5b91652f43d601f1acd5c95d36bd3 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_8a60666f85c48dff0bab73f1 trace_id=782948bc321ee9e98d88a40358bc18f8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=330 plane=business request_id=req_a1339fbae7a8bff61acb9580 trace_id=ab1d1d18f77f472a37976c3ff0d646e5 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_2cf26f2aa352a5950ee41c41 trace_id=c69398225419e76fea01cfa65ecb65e1 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_27e8e4647de31e80fb072072 trace_id=57daa829cd78766485c812d308d3aaac client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=453 plane=business request_id=req_6c4330ab363d003a18946cfb trace_id=60abd8930da4c9a19c59a9c6f5a2a1c8 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/identities status=200 duration_ms=0 bytes=257 plane=business request_id=req_7a6ea1eb63dd2db1eb6b7ca4 trace_id=7c9e3c8563478536e82ce89c8ac67b9b client=127.0.0.1
+--- PASS: TestRPLoginModeComesFromTheSessionNotTheQuery (0.05s)
+=== RUN   TestRPLinkModeRequiresASignIn
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=401 duration_ms=0 bytes=37 plane=browser request_id=req_d9dcd2b9c628210b3703f9bc trace_id=5e91a9ba3b6d76c5e2d4bded691d3668 client=127.0.0.1
+2026/09/29 19:07:38 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_c6e7fb8b9434a62d76548919 trace_id=b71b1ea8a8f8de1a6e7f7d31f2b624e9 client=127.0.0.1
+--- PASS: TestRPLinkModeRequiresASignIn (0.02s)
+=== RUN   TestRPLoginProviderSegmentCannotEscape
+2026/09/29 19:07:39 INFO request method=GET path=/auth/nope/start status=404 duration_ms=0 bytes=17 plane=browser request_id=req_48fa46acff427d35a6c5a3c5 trace_id=8295722a156964b556312fb32d12e8e9 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/a/b/start status=404 duration_ms=0 bytes=17 plane=browser request_id=req_bf560cfb235c3d51c89eff6d trace_id=1988ee9e8aae8ce41701ccc760baf29f client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/../../evil/start status=404 duration_ms=0 bytes=17 plane=browser request_id=req_5034be7a561bef3dac295b34 trace_id=6ff25d10910ebcae3bced5640b1d58ac client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/GitHub/start status=404 duration_ms=0 bytes=17 plane=browser request_id=req_b8a7197678f4cc82222932ba trace_id=4006925ae5aa8b4b8b83ca077e3fd779 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path="/auth/github\x00/start" status=404 duration_ms=0 bytes=17 plane=browser request_id=req_bf9f11d9d8b4e08db4d68d5a trace_id=0a6e9e7271d76e14873c76da59590b76 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/../start status=404 duration_ms=0 bytes=17 plane=browser request_id=req_3acbabd25cd6297d60b2304e trace_id=c54f90bfe7fc226985f551497c14e761 client=127.0.0.1
+--- PASS: TestRPLoginProviderSegmentCannotEscape (0.08s)
+=== RUN   TestRPLoginLeavesNoFlowValuesInTheSession
+2026/09/29 19:07:39 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_973d3b17c00c8a37a0d78783 trace_id=b70b9865b1f03861e9adb7ac9f093e86 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_9d13c842decada82d1114178 trace_id=c56061e72a59774cc0e5378566e8dcdd client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=330 plane=business request_id=req_032b046cca9ad8c1c6280431 trace_id=1c1931a5d55b521f1f3f1d3d3e7c7215 client=127.0.0.1
+    e2e_test.go:544: the completed login left flow_nonce in the session (flowKeys omits keyFlowNonce): "%\x7f\x03\x01\x02\xff\x80\x00\x01\x02\x01\bDeadline\x01\xff\x82\x00\x01\x06Values\x01\xff\x84\x00\x00\x00\x10\xff\x81\x05\x01\x01\x04Time\x01\xff\x82\x00\x00\x00'\xff\x83\x04\x01\x01\x17map[string]interface {}\x01\xff\x84\x00\x01\f\x01\x10\x00\x00\xfe\x01\t\xff\x80\x01\x0f\x01\x00\x00\x00\x0e\xe2N\xe4{\x03\xf5\a\xf0\xff\xff\x01\x04\x03usr\x06string\f&\x00$usr_caa34c0e72e3490345df77c7849bd466\tauth_time\x06string\f\x1c\x00\x1a2026-09-29T11:07:39.06639Z\nflow_nonce\x06string\f-\x00+lmMD6y_fDBWgS_yo2a3M0qg3lBpyr6709wlAR7VnKho\x04csrf\x06string\fB\x00@336c240dc632b66ec3ed6242fb6cca690db0c89c2d027ce36df542284e47c165\x00"
+--- FAIL: TestRPLoginLeavesNoFlowValuesInTheSession (0.06s)
+=== RUN   TestRPLoginControlCreatesAndReusesOneAccount
+2026/09/29 19:07:39 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_e05974fcc00b67daf1cf6b9a trace_id=9ac8c0208b51eabcef3778044f3806dd client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_bddb3cc8278a5444ef65b88d trace_id=3d7746cf1ef44cd43a8009f6813e1e96 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=330 plane=business request_id=req_b232043e66d7db92c07ce23d trace_id=2994c1b880cedc33572d4a04c29025a6 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/github/start status=302 duration_ms=0 bytes=409 plane=browser request_id=req_c80536656db57739d45d9397 trace_id=3112af4eeab8d04f5dbc30c3e6eee590 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/auth/github/callback status=303 duration_ms=0 bytes=28 plane=browser request_id=req_4a2cd3d26c2225954e41a3cf trace_id=8289dd86e67f6d272e09392b5afa9704 client=127.0.0.1
+2026/09/29 19:07:39 INFO request method=GET path=/v1/sessions/current status=200 duration_ms=0 bytes=330 plane=business request_id=req_2c4353a321a0712e10f52763 trace_id=882d70cbddb1b612bac5c8e3b3389c6c client=127.0.0.1
+--- PASS: TestRPLoginControlCreatesAndReusesOneAccount (0.03s)
+=== RUN   TestRPControlOIDCLoginSucceeds
+--- PASS: TestRPControlOIDCLoginSucceeds (0.05s)
+=== RUN   TestRPAzpNamingAnotherClientIsRejected
+    idtoken_test.go:59: control sub="rp-user-1"
+    idtoken_test.go:74: rejected as expected: idp: google: id_token azp "other-client" is not this client
+--- PASS: TestRPAzpNamingAnotherClientIsRejected (0.02s)
+=== RUN   TestRPAzpMissingWithMultipleAudiencesIsRejected
+    idtoken_test.go:94: rejected as expected: idp: google: id_token has 2 audiences but no azp
+--- PASS: TestRPAzpMissingWithMultipleAudiencesIsRejected (0.01s)
+=== RUN   TestRPAzpMismatchSingleAudienceIsRejected
+    idtoken_test.go:115: rejected as expected: idp: google: id_token azp "someone-else" is not this client
+--- PASS: TestRPAzpMismatchSingleAudienceIsRejected (0.02s)
+=== RUN   TestRPRetiredSigningKeyStopsVerifyingAfterRotation
+    idtoken_test.go:159: rejected as expected: idp: google: verify id_token: failed to verify signature: failed to verify id token signature (jwks fetches before=1 after=2)
+--- PASS: TestRPRetiredSigningKeyStopsVerifyingAfterRotation (0.10s)
+=== RUN   TestRPJWKSFailureDoesNotClearTheCache
+--- PASS: TestRPJWKSFailureDoesNotClearTheCache (0.05s)
+=== RUN   TestRPOneProvidersKeyDoesNotVerifyAtAnother
+--- PASS: TestRPOneProvidersKeyDoesNotVerifyAtAnother (0.11s)
+=== RUN   TestRPAlgNoneIsRejected
+--- PASS: TestRPAlgNoneIsRejected (0.06s)
+=== RUN   TestRPHS256WithPublishedSymmetricKeyIsRejected
+--- PASS: TestRPHS256WithPublishedSymmetricKeyIsRejected (0.06s)
+=== RUN   TestRPMissingNonceClaimIsRejected
+--- PASS: TestRPMissingNonceClaimIsRejected (0.02s)
+=== RUN   TestRPEmptyExpectedNonceIsFatal
+--- PASS: TestRPEmptyExpectedNonceIsFatal (0.01s)
+=== RUN   TestRPEmptySubjectIsRejected
+--- PASS: TestRPEmptySubjectIsRejected (0.05s)
+=== RUN   TestRPNoIDTokenDoesNotFallBackToUserinfo
+--- PASS: TestRPNoIDTokenDoesNotFallBackToUserinfo (0.04s)
+=== RUN   TestRPDiscoveryIssuerMismatchIsRejected
+--- PASS: TestRPDiscoveryIssuerMismatchIsRejected (0.04s)
+=== RUN   TestRPSendsS256PKCEAndTheMatchingVerifier
+--- PASS: TestRPSendsS256PKCEAndTheMatchingVerifier (0.06s)
+=== RUN   TestRPProviderNameIsValidatedBeforeItReachesAURL
+--- PASS: TestRPProviderNameIsValidatedBeforeItReachesAURL (0.00s)
+FAIL
+FAIL	github.com/Re0Auth/r0semi/internal/zzprobe/protocol/rp	1.664s
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body
+2026/09/29 19:07:38 WARN request error oidc_error.description="grant_type missing" oidc_error.type=invalid_request
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=6 bytes=69 plane=protocol request_id=req_0781d61bed26e0a59962eece trace_id=4c1437dd210416fe6eb6d404d8cc701a client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token json body                        -> 400 {"error":"invalid_request","error_description":"grant_type missing"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_1499164a74845531b7cdbb76 trace_id=f79b6145652e5e4ba8b46b75a0d7e6e3 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body_on_introspect
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/introspect status=401 duration_ms=0 bytes=61 plane=protocol request_id=req_74c1165a4d49284fc1894289 trace_id=993eae75554cc59325d66fbfbde8cb75 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/introspect json body on introspect          -> 401 {"error":"invalid_client","error_description":"Unauthorized"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body_on_introspect
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/introspect status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_86a1b7f62c9f821e4c7376d2 trace_id=7cce6052a85dde77a36133643ac34daf client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body_on_revoke
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/revoke status=401 duration_ms=0 bytes=71 plane=protocol request_id=req_3cdaca39b8877f8bd1d8da0e trace_id=78b54cf09192117e700552aeecda0c16 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/revoke json body on revoke              -> 401 {"error":"invalid_client","error_description":"invalid authorization"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body_on_revoke
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/revoke status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_50b340c05ccd159d0e2fae28 trace_id=e8e4e5aa8d7f9ada5ddb99f758e44c5e client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body_on_device_authorization
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/device_authorization status=400 duration_ms=0 bytes=72 plane=protocol request_id=req_7dc5f8230dcead5d0e86f80b trace_id=9df221c70bd30ec76099b65e970659b1 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/device_authorization json body on device_authorization -> 400 {"error":"invalid_request","error_description":"client_id is required"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body_on_device_authorization
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/device_authorization status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_76afc5939ed30e8a69a2ba07 trace_id=cc8255c5b81f28351a4fb3143a2501b1 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_no_content_type
+2026/09/29 19:07:38 WARN request error oidc_error.description="grant_type missing" oidc_error.type=invalid_request
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=69 plane=protocol request_id=req_548a62d5ab90dd344e1dd409 trace_id=90f93fb6523e4e9a091d05f8ab7dfc5c client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token no content type                  -> 400 {"error":"invalid_request","error_description":"grant_type missing"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_no_content_type
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_6feab202aeb0cc2cb1d1dcf5 trace_id=6d065f0894cfd1e5c5138bd33acf6e04 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_text/plain_with_a_form_body
+2026/09/29 19:07:38 WARN request error oidc_error.description="grant_type missing" oidc_error.type=invalid_request
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=69 plane=protocol request_id=req_abf740b657a489ee6cb9a0e5 trace_id=8b8f70e67a66edde1b722087d17e642c client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token text/plain with a form body      -> 400 {"error":"invalid_request","error_description":"grant_type missing"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_text/plain_with_a_form_body
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_94937094d5558481ba1ef4a5 trace_id=363792fbda0a2af9ffad959e7f1a8a27 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_multipart_without_a_boundary
+2026/09/29 19:07:38 WARN request error oidc_error.description="grant_type missing" oidc_error.type=invalid_request
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=69 plane=protocol request_id=req_6583526e5033ed779d59ca7b trace_id=8592b380b5354b0ae9d59598df65d1d9 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token multipart without a boundary     -> 400 {"error":"invalid_request","error_description":"grant_type missing"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_multipart_without_a_boundary
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_f7eaebfaf0446fdc1f9ccbd2 trace_id=8e5989ef257e5d4b666a5cb6faa36e72 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_bad_percent-encoding
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=93 plane=protocol request_id=req_aeb32e09c80125fd45a9137f trace_id=8c37a23850fb21f9678feea102587fb8 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token bad percent-encoding             -> 400 {"error":"invalid_request","error_description":"the request parameters could not be parsed"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_bad_percent-encoding
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_761e53e942f41b09a5104a8e trace_id=162043a38c550a62ea94dad1e765c4a3 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_bad_percent-encoding_on_introspect
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/introspect status=400 duration_ms=0 bytes=93 plane=protocol request_id=req_c015d49215da12388b42440e trace_id=4e1dc19e380af83e752d819f427d84c8 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/introspect bad percent-encoding on introspect -> 400 {"error":"invalid_request","error_description":"the request parameters could not be parsed"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_bad_percent-encoding_on_introspect
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/introspect status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_f0ee4edcbe53b034b467231c trace_id=4aa2e4aeeb675d5fc06e87c849b523af client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_an_empty_body
+2026/09/29 19:07:38 WARN request error oidc_error.description="grant_type missing" oidc_error.type=invalid_request
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=69 plane=protocol request_id=req_3b030596a706d24b742386e5 trace_id=845812ee3da0c9bba974473e9715a849 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token an empty body                    -> 400 {"error":"invalid_request","error_description":"grant_type missing"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_an_empty_body
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_7517f0427b65777a67145ed5 trace_id=d327c1f7b37d3f878abde744b3de10c2 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_binary_garbage
+2026/09/29 19:07:38 WARN request error oidc_error.description="grant_type missing" oidc_error.type=invalid_request
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=69 plane=protocol request_id=req_0f61fc3c46663e71c3f67db9 trace_id=d59d20d43ca63d09d047ea1a650827ce client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token binary garbage                   -> 400 {"error":"invalid_request","error_description":"grant_type missing"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_binary_garbage
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_3ec58f46a53c6391abd9c935 trace_id=004562fe18144dae7bfcfed482099dca client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_an_unknown_grant_type
+2026/09/29 19:07:38 WARN request error oidc_error.description="wat not supported" oidc_error.type=unsupported_grant_type
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=75 plane=protocol request_id=req_d1714cdf0dfc1d2e7c02ecd5 trace_id=93ed760d38b3ed41a51024fa62367770 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token an unknown grant type            -> 400 {"error":"unsupported_grant_type","error_description":"wat not supported"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_an_unknown_grant_type
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_ebb9657a5a2f9e7c67a5e363 trace_id=797faae81530c4e4dc10d6dc48001524 client=192.0.2.1
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_a_missing_grant_type
+2026/09/29 19:07:38 WARN request error oidc_error.description="grant_type missing" oidc_error.type=invalid_request
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/token status=400 duration_ms=0 bytes=69 plane=protocol request_id=req_3e6b45f85100252d96770ba5 trace_id=95f4c8367da0bdd8a72ca8683a176f28 client=192.0.2.1
+    protocol_probe_test.go:98: /oauth/token a missing grant type             -> 400 {"error":"invalid_request","error_description":"grant_type missing"} (content-type "application/json")
+=== RUN   TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_a_missing_grant_type
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_256f92237e444bfa65c1cbff trace_id=e9f4380f9e6efaf0a9ec908123a6bece client=192.0.2.1
+--- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON (0.02s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body (0.01s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body_on_introspect (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body_on_introspect (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body_on_revoke (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body_on_revoke (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_json_body_on_device_authorization (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_json_body_on_device_authorization (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_no_content_type (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_no_content_type (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_text/plain_with_a_form_body (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_text/plain_with_a_form_body (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_multipart_without_a_boundary (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_multipart_without_a_boundary (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_bad_percent-encoding (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_bad_percent-encoding (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_bad_percent-encoding_on_introspect (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_bad_percent-encoding_on_introspect (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_an_empty_body (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_an_empty_body (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_binary_garbage (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_binary_garbage (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_an_unknown_grant_type (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_an_unknown_grant_type (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/POST_a_missing_grant_type (0.00s)
+    --- PASS: TestProbePostOnlyProtocolEndpointsAlwaysAnswerOAuthJSON/PUT_a_missing_grant_type (0.00s)
+=== RUN   TestProbeProtocolEndpointsRefuseEveryUnlistedVerb
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/introspect status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_e72187f222c592d6e1c9a6ca trace_id=97f4046e4f9da0dd6a60dafe6ceda15b client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/introspect status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_ffcbb5a375da822ebc382c26 trace_id=f517887adf5ced383a66a6cd737506f4 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/introspect status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_8f9c699d93abf388cd6318b4 trace_id=063cbe0077585878f7952521398f8485 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/introspect status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_2cfa3d15418d62540f5f5dd0 trace_id=e5c925cd955e37648cad47bab6a00112 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/introspect status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_61e012451f31594e0c03f51e trace_id=f0b94fd2b261fadb64f3a415dbb05df7 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=HEAD path=/oauth/introspect status=405 duration_ms=0 bytes=85 plane=protocol request_id=req_0ae1186e3fba17531afd5ed6 trace_id=0ae74108b1a9754327f21d51a3604702 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/introspect status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_7d5df01a4ba4a04d4d9ad487 trace_id=8ae6d67a488a5e9ba6ce063efaca6b41 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/revoke status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_ae1593e5134a7d65c2cc4c76 trace_id=122232954469e9d2f02fe325ed5fe30d client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/revoke status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_8ff68cac53cde48135eaef48 trace_id=826d7ecbf380ddaa864c07e62ba45040 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/revoke status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_fbf4e7369ba65e86be8c8074 trace_id=1c5422617db489c9c438bac5bed140d9 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/revoke status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_9051e03ae3aa509fafebfca9 trace_id=fe5a4a53915a3d9862b4ae4e9d52bd79 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/revoke status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_7612aa99931223b1b19c8738 trace_id=0baff1c73fdcde9a4e6cd8840dde4df7 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=HEAD path=/oauth/revoke status=405 duration_ms=0 bytes=85 plane=protocol request_id=req_fe0c06240c3905e36179cf3d trace_id=13bb48d0f98e8494d6927ae9c31c1bfa client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/revoke status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_384bb1f9115444e90173ccd2 trace_id=3042a5feee915eeaefa962bfb4f84586 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/userinfo status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_9f948d31368ef5242cca7230 trace_id=42e18b48e16add3f94538c2ea41dced4 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/userinfo status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_8259a498b52599c314e20ec9 trace_id=1882277392d8c1985714e3b811d28eae client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/userinfo status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_e32fe8ba65872ef433df9d25 trace_id=99ab7de440f5d4240abf11790c507980 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/userinfo status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_490683c921259f62dc99c47d trace_id=09bf2dc19a553c3619b3322a383636f6 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/userinfo status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_a374d7a9a7d3c5178f4cf5b8 trace_id=e4b9c4a196de7eba5318689eb0a8a88a client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/keys status=405 duration_ms=0 bytes=85 plane=protocol request_id=req_d66fa2cc6abc66aba8cb2ed9 trace_id=0f1eb3f3041ee95e870914a1f1700311 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/keys status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_5c9994df4b6943cd8e947748 trace_id=f487e845e383f9bce537824f2b7e6bd1 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/keys status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_aceeaec28d77e20363492419 trace_id=8ab310edc1180b98288da3139a2c88aa client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/keys status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_dfa6b3d1ee6732b482afd320 trace_id=7b1387fb90be492dab1d7e39762b5f13 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/keys status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_fdc465717183b501be71b150 trace_id=8d5fef8531b2bb709178e7b054fafd3d client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/keys status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_8aacc68e73aa0c6f828015f5 trace_id=0a92d30be9adde6431ab94c52ffb6257 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/device_authorization status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_ef8c646697f8f5e719ac5c68 trace_id=938eb3ae6acf31de5227cf4d48c805a6 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/device_authorization status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_40d469e77098fdd952de3252 trace_id=85922a76f602f63a32c200700ba35b07 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/device_authorization status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_3a0eb2f44b75766ab0cfa5fa trace_id=b36a2d8566c3b9eb8d0709bb08e8c9c8 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/device_authorization status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_5f8e974f4a0de44cb7557190 trace_id=b6213fb13b08e87612261a7d3720ef98 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/device_authorization status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_9898d5e5d0da7e60bb330388 trace_id=df34088f9c8ee3a61751e9d4160e6932 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=HEAD path=/oauth/device_authorization status=405 duration_ms=0 bytes=85 plane=protocol request_id=req_0796464ef1c375fe7ccf1cc1 trace_id=41f673fcfa7f0d771e8870dd8a4217c5 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/device_authorization status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_dfca27c1bd48abc1837e0762 trace_id=76f7aadeed0dd8e38d9c6ead8fdeaa27 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/authorize status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_3280b4740f3e84de20d86183 trace_id=06c7979ad933b3ed58c5eea65328700b client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/authorize status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_832356b84f6aae7d8d2cc82d trace_id=67c4bf0aa50fadb1a6b06e93adf1de53 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/authorize status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_784cd50c3bfbfc3e38097ca9 trace_id=a4a8f974f70b83d106810ae7ec57f1fc client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/authorize status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_bcaf6d776688436f4536bf40 trace_id=e16cb6d6183f02b4af80747100846497 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/authorize status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_f733d94f2024a85397794554 trace_id=8c9a97c42a2af7937ce6def35eb67b54 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=POST path=/oauth/authorize/callback status=405 duration_ms=0 bytes=85 plane=protocol request_id=req_09660280a43b67679dcf35b0 trace_id=ea8e6e76f15ff6197f8d694be5d12b6b client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/authorize/callback status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_de0fdffff9705a356e1171e8 trace_id=51739a36a1ca2c9f89965b10a046c93f client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/authorize/callback status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_7f00996c405fbd92221fe54b trace_id=3e31ffd2e60f3db49b2a04867b1e0403 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/authorize/callback status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_24cac66245f81c0c0286add1 trace_id=09a3f431f8bb6b5979de5e21173223a9 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/authorize/callback status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_852151417e71f5e319eea7e3 trace_id=b3e5c8ed7215e5dfceb381adc64229a5 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/authorize/callback status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_9f724cf5a96b96b355e9ee7a trace_id=58070e898e5f6c21360b77a1d5bd75c8 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=GET path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_534758fa896637d91ee55a3b trace_id=88754a3aa6219e200f54d86f7e5216e9 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PUT path=/oauth/token status=405 duration_ms=0 bytes=84 plane=protocol request_id=req_b12aaf442541b3dc1f4e7c9e trace_id=134f4e809c43a04a5a13b770a65fb878 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=DELETE path=/oauth/token status=405 duration_ms=0 bytes=87 plane=protocol request_id=req_f9652f0c29c04e0f8ec5afe5 trace_id=8e3c875bcdc8649256169ec290f4c815 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=PATCH path=/oauth/token status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_f73b67542da3c7dff86507fd trace_id=2ded4a47e6e769ebde2609862cccceca client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=OPTIONS path=/oauth/token status=405 duration_ms=0 bytes=88 plane=protocol request_id=req_0ec969ad368ef81fbe05536f trace_id=8dc599253a1dc32693441816d4593e41 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=HEAD path=/oauth/token status=405 duration_ms=0 bytes=85 plane=protocol request_id=req_25c0c6a95e73f39611c00871 trace_id=5ed7370697df7e92937a3bec458049c7 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=TRACE path=/oauth/token status=405 duration_ms=0 bytes=86 plane=protocol request_id=req_aad51e75a6680d410ad1cdae trace_id=ccb59ba30c5db5bd62af520f55386387 client=192.0.2.1
+--- PASS: TestProbeProtocolEndpointsRefuseEveryUnlistedVerb (0.01s)
+=== RUN   TestProbeReadyzBypassesTheLimiterAndTheInFlightCap
+2026/09/29 19:07:38 INFO request method=GET path=/v1/me status=401 duration_ms=0 bytes=228 plane=business request_id=req_480cdbfb7207142dc33fc78f trace_id=d54cafddfd39550e9f28163e4d730d78 client=192.0.2.1
+2026/09/29 19:07:38 INFO request method=GET path=/v1/me status=429 duration_ms=0 bytes=210 plane=business request_id=req_e5758c8e93aa656ccd477c78 trace_id=dae9bfe552bdaab9ac62405fc977fb7c client=192.0.2.1
+    startup_probe_test.go:177: 8 /readyz requests were served with the rate bucket already empty
+2026/09/29 19:07:38 INFO request method=GET path=/v1/me status=503 duration_ms=0 bytes=210 plane=business request_id=req_70059e4c564538ad80e0c4c9 trace_id=3935bb27c16551728cceb3559558ac38 client=192.0.2.1
+    startup_probe_test.go:215: timed out waiting: not every /readyz reached the probe
+--- FAIL: TestProbeReadyzBypassesTheLimiterAndTheInFlightCap (5.08s)
+=== RUN   TestProbeReadyzHoldsItsCallerForTheFixedTwoSeconds
+    startup_probe_test.go:271: an anonymous /readyz is admitted with no rate-limit token, no in-flight slot, and holds its readiness check (a DB ping on a durable deployment) for 2.002s
+--- PASS: TestProbeReadyzHoldsItsCallerForTheFixedTwoSeconds (2.04s)
+=== RUN   TestProbeRecoveredPanicIsCountedOnceAndInFlightReturnsToZero
+2026/09/29 19:07:45 ERROR panic while serving plane=business method=GET path=/v1/sources panic="probe: deliberate panic"
+2026/09/29 19:07:45 INFO request method=GET path=/v1/sources status=500 duration_ms=0 bytes=209 plane=business request_id=req_09bd12517cb6331f7f69ce19 trace_id=6199699cbefc80f2ffd83cd5fca730e8 client=192.0.2.1
+--- PASS: TestProbeRecoveredPanicIsCountedOnceAndInFlightReturnsToZero (0.02s)
+=== RUN   TestProbeAttackerRequestIDCannotForgeALogLineOrAHeader
+    startup_probe_test.go:356: hostile id logged as: time=2026-09-29T19:07:45.458+08:00 level=DEBUG msg=request method=GET path=/healthz status=200 duration_ms=0 bytes=3 plane=browser request_id="req_x\nINFO server up\rX-Injected: yes\x1b[31m" trace_id=297c4ac69a8463e5f43d68eed582d7b9 client=192.0.2.1
+    startup_probe_test.go:373: a space: status=200 X-Request-Id="probe id with spaces"
+    startup_probe_test.go:373: a bare CR: status=400 X-Request-Id=""
+    startup_probe_test.go:373: an ESC: status=400 X-Request-Id=""
+--- PASS: TestProbeAttackerRequestIDCannotForgeALogLineOrAHeader (0.07s)
+=== RUN   TestProbeOperationalSurfaceIsNotOnThePublicListener
+    surface_probe_test.go:78: the public listener answers 404 for /metrics and every /debug/pprof/* path
+--- PASS: TestProbeOperationalSurfaceIsNotOnThePublicListener (0.03s)
+=== RUN   TestProbeInternalSurfaceRequestsAreNotLogged
+    surface_probe_test.go:109: a prometheus scrape and two pprof dumps produced 0 bytes of log
+--- PASS: TestProbeInternalSurfaceRequestsAreNotLogged (0.04s)
+=== RUN   TestProbeHealthEndpointsAreNoStoreAndLeakNothing
+    surface_probe_test.go:188: /readyz with a failing dependency = 200, want 503
+--- FAIL: TestProbeHealthEndpointsAreNoStoreAndLeakNothing (0.13s)
+=== RUN   TestProbeOperatorPlaneIsRefusedWithoutAnAllowlist
+    surface_probe_test.go:220: an Admin service with no allowlist is refused: httpapi: Config.Admin requires a non-empty Config.Admins
+    surface_probe_test.go:237: with Admins = ["usr_someone"], GET /v1/admin/clients without a session = 401
+--- PASS: TestProbeOperatorPlaneIsRefusedWithoutAnAllowlist (0.04s)
+FAIL
+FAIL	github.com/Re0Auth/r0semi/internal/zzprobe/startup	7.575s
+FAIL

@@ -1,0 +1,104 @@
+# 已修复（仅供溯源）
+
+> **这里不是待办。** 保留它只为了回答"这条当初为什么存在、后来被哪个 commit 收掉"。
+> 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-09-29）。
+
+### 第 7 轮
+
+- KIT-1 — 匿名 cascade 现在回 401（`TestE1_`/`TestE3_`/`TestF3_` 转绿）。
+- KIT-3 — 暂停/删除客户端的令牌现在 `active=false` 且数据面 401（`TestA4_`/`TestA5_`/`TestE10_` 转绿）。
+- CS-4 — `token_class` 现在在 `federation.go:173-180` 白名单校验。
+- CS-1 / P1-4 — `/readyz` 现在有 `readinessTTL` 成本上限（提交 `0e6b701`）。
+- 第五轮 P2-1 — OP store 两个后端的审计记录失败已改为打日志：`internal/store/postgres/oidc.go:129-140`、`internal/store/memory/oidc.go:323-334`。
+- 第五轮 P2-24 — `prompt=none` 无会话回 `login_required`、矛盾组合回 `invalid_request`，由 `internal/oidchttp/oidchttp.go:950-972` 与 `oidchttp_test.go:236-294` 钉住。
+- 第五轮 B-3 的一半 + DEP-V3 — 清单已设 `GOMEMLIMIT=384MiB`（`deploy/k8s/base/deployment.yaml:60-61`）且镜像不再用 `latest`（钉 `v0.0.0-rc.3`，`:44`）。
+- 第二轮 A2-1 — `internal/httpapi/federation_routes.go:378-385` 曾漏 `OwnerMatches`，现已补上，守卫在 `internal/httpapi/adversary_test.go:161-172`。
+- §0 基线修复（无编号）— 字节级修好未跟踪探针 `internal/store/postgres/zz_audit_keyrotation_test.go:9` 的非法 UTF-8（`E3 80 3F`→`E3 80 8D`），未删文件未改被跟踪文件，`go build`/`go vet` exit 0、默认套件 34 包全绿；归类为过程性缺陷。
+- 区02 守住（G 面）— `TestZ02RefreshReplayAndExpiry`、`TestZ02IntrospectionRefusesPublicClients`、`TestZ02RefreshCannotEscalateScope`、`TestZ02UserinfoRequiresALiveAccessToken`、`TestZ02CodeExchangeGuardsHold`、`TestZ02GrantTypeDispatchRefusesUnadvertised` 全 PASS。
+- 区04 守住（时钟面）— `TestEverySQLDatabaseClockUseIsReviewed`、`TestTheClockPolicyHasNoSecondUnjudgedDeadlineWriter` PASS，三条豁免清单守得住。
+- 区06 守住（HTTP 面）— body limit、压缩、探针端点、不计 header 上限、Slowloris 真进程均 PASS。
+- 区01 守住（第五轮回归）— 六个 `TestRegression*`（id_token sub、畸形参数、redirect_uri 变体、PKCE、码单次使用、request 参数）全 PASS。
+- 守卫（正面结论）— `internal/webui/webui.go:8-12` 包注释声明「never injects data, never templates, never rewrites the shell」，与本轮前端面绿探针一致，应保留为守卫。
+
+### 第 6 轮
+
+- （无）第 7 轮在 HEAD=`bf81b2a` 复跑第 6 轮全部红探针仍红，**第 6 轮无发现被修复**（`00-MAIN-VERIFICATION.md:20-66`）。
+- B-1 — 第五轮阻断项 id_token 缺必需 `sub`；第 6 轮实测已修（`_audit/protocol.md:206`）。
+- B-2 — id_token 可在 `/oauth/userinfo` 当 access token 用；第 6 轮实测已修（`_audit/protocol.md:207`）。
+- PROTO-1 — 不可解析 body 吞 `ParseForm` 错误绕过设备 scope 闸门；已修（`_audit/protocol.md:208`）。
+- PROTO-4 — 内省白名单含公开客户端 ⇒ 无凭据读任意 token；**主体已修**（守卫被转义绕过另记 G-5）（`_audit/protocol.md:209`）。
+- PROTO-5/6/7/9/10 — discovery 不撒谎、`prompt=none` 落地、`form_post` 拒绝带 `iss`、POST+query 拆分拒绝、userinfo 判据；均已修（`_audit/protocol.md:210-214`）。
+- P1-1/P1-2 — vault 轮换窄写/CAS（lost-update）；第 6 轮新探针验证「修对、修全」（`03-crypto-vault.md:173-193`）。
+- P2-32 — 设备路径单时钟（bf81b2a）；三处 SQL 参数化，未引入新洞（`03-crypto-vault.md:195-201`）。
+
+### 第 5 轮
+
+- P0-1 — `id_token` 两条签发路径补上 `sub` — `02dd448`
+- P0-2 — userinfo 拒绝三段式 JWS 形状 bearer、`SetUserinfoFromToken` 校验 tokenID — 同批 `02dd448`
+- P0-3 — 数据面内存按字节约束、重标 `max_in_flight` 并加 `GOMEMLIMIT` — `fb3cff3`
+- P0-4 — 分桶键不再含调用方写的值，桶表满时 fail-closed 不丢活桶 — `ce1915c`
+- P0-5 — 参数集只解析一次、scope 闸门读全部值 — `6dec6e1`
+- P0-6 — 内省白名单只接受机密客户端 — `b0df14b`
+- P1-1 — 轮转只按 CAS 重写信封，未完成轮转不再报成功 — `1076cbf`
+- P1-2 — `rotate.go` 不再整条覆盖并发入册的 stale 记录 — 同批 `1076cbf`
+- P1-3 — 数据面设总期限，401 计入熔断失败判据 — `96d76cc`
+- P1-4 — 豁免探针路径设成本上限且永不 shed（**其成本上限实现引入 22-1**） — `0e6b701`
+- P1-5 — 按真正服务这次读取的源判定资源 scope（顺带修掉 P2-18） — `5793274`
+- P2-1 — OP store 不再 `_ =` 吞审计失败，改 `slog.Error` — `5cd1690`
+- P2-2 — 改承诺：抹除失败的 500 文案不再假装可重试 — `5cd1690`
+- P2-3 — 抹除路径改用 `EndSession`，不再在假名销毁后写原始 `usr_` — `5cd1690`
+- P2-4 — 四条批量撤销谓词补前导索引（0022 迁移） — `b35f893`
+- P2-5 — `oidc_auth_requests.client_id` 补前导索引 — `b35f893`
+- P2-6 — `trusted_proxies` 的 `0.0.0.0/0`/`::/0` 需显式承认 — `e9dc23d`
+- P2-7 — `sources[].token_class` 校验枚举并给安全默认（=CS-4 转绿） — `e9dc23d`
+- P2-8 — `DATABASE_URL` 单独即选 postgres、新增 `RE0AUTH_STORAGE_DRIVER`、修正警告文案 — `e9dc23d`
+- P2-9 — `restore.sh` 校验绑定到实际入参 — `7f19637`
+- P2-10 — `.age` 加密备份路径同样执行校验 — `7f19637`
+- P2-11 — `.sha256` 缺失即拒绝（不再 fail-open） — `7f19637`
+- P2-12 — Trivy 门禁前移到 push 之前、manifest 去掉 `latest` — `7f19637`
+- P2-13 — 发布镜像补 `VERSION` build-arg — `7f19637`
+- P2-14 — 备份脚本 `umask 077`、临时目录清理、DSN 走 env — `7f19637`
+- P2-15 — runbook `[admin].allow`→`subjects`、内部监听器默认值等文档漂移 — `7f19637`
+- P2-16 — 备份 Pod 加独立标签并被 NetworkPolicy 选中 — `e9dc23d`
+- P2-17 — 同意面「已满足」判据与数据面同源（按资源名） — `f6af208`
+- P2-18 — 闸门与选源用同一状态过滤（retired 源不能再设闸门） — `5793274`
+- P2-20 — `pnpm audit` 门槛降到 low 并忽略不可达告警 — `c3c40a7`
+- P2-21 — `make npm-attribution` 生成清单并接进 checksums/release — `e9dc23d`/`7f19637`
+- P2-22 — `account.export` 与 `admin.audit.read` 各留一条审计 — `5cd1690`
+- P2-23 — 内省只广告 `client_secret_basic` — `513471d`
+- P2-24 — 实现 `prompt=none` — `f6af208`
+- P2-25 — RP 侧 JWKS 缓存加 TTL — `60de35d`
+- P2-26 — RP 侧 discovery 端点钉在 issuer 上 — `60de35d`
+- P2-27 — Kit 级联撤销端点必须先认证（=KIT-1 转绿） — `b5f01da`
+- P2-28 — `Introspect` 查 client 状态（=KIT-3 转绿） — `b5f01da`
+- P2-29 — `writeProblem` 自身设 `no-store`，覆盖编码路径 404 — `b35f893`
+- P2-30 — 业务面 429/413 补 `no-store` — `b35f893`
+- P2-31 — auditbatch 排空加 30s 总预算 — `5cd1690`
+- P2-32 — 设备路径期限改由 store 时钟裁决 — `bf81b2a`
+
+### 第 2 轮
+
+- **第二轮全族（A1-* / A2-* / A4-* / A5-* / A6-*）** — 报告自陈 15 条全部已修，每条复现测试都改写成常规套件里的守卫：`docs/security-audit-2.md:9-11`。
+- A1-1 / A1-2 / A1-3 — 预检改为方法无关；POST authorize 与设备流都不再签发未注册 scope（守卫 `TestAdversarialPostAuthorizeRejectsUnregisteredScope`、`TestAdversarialDeviceAuthorizationRefusesUnregisteredScope`）。
+- A2-1 及其邻项 — bind 回调补上 `sessions.OwnerMatches`（与 `Bound` 一起查、失败同形 400）；同批 A1-2/A1-3/A6-1/A6-2/A6-5 均已修（`docs/security-audit-2.md:17-38`）。
+- A4-1（及同批撤销缺口） — refresh token 撤销真的删行；`oauth.Revoke` 校验归属；`SweepExpired` 不再踢登录中的会话。
+- A5-1 — 抹除的审计 `Detail` 不再装 `usr_…`（改记 `self`）。
+- A5-2 — 夹具把 `audit_chain`/`audit_subject_keys` 加进 `TRUNCATE` 并重播 genesis。
+- A5-3 — 凭据列守卫改为扫整个 live schema + 一条无 DB 的静态版。
+- A5-4 — 业务平面 `writeJSON` 统一 `no-store`。
+- A6-1 — `Unbind` 区分「vault 打不开」（`RevocationUnavailable`）与「无事可做」。
+- A6-2 — refresh 改为先 CAS、赢了才写 vault。
+- A6-3 — 32 字节 hex 的 KEK/审计密钥现在被正确接受。
+- A6-5 — bind 回滚失败用 `errors.Join` 并入返回错误。
+- **第三轮全族（A3-* / B3-* / C3-*）** — CONFIRMED 的全部已修：`docs/security-audit-3.md:16`。
+- A3-1 / A3-2 — `isToken` 与设备预检改为只看路径；GET 不再绕过令牌响应契约与 scope 闸门。
+- A3-3 — `userinfo` 的 401 补 RFC 6750 Bearer challenge。
+- A3-5 — `oidchttp.New` 要求 `Clients`/`Registry` 必填，删掉 fail-open 分支。
+- A3-4 — 设备流「一个请求只能声明一个客户端身份」；**第四轮 commit `5376ca3` 修复**并留守卫（`docs/security-audit-3.md:201-207`）。
+- B3-1 / B3-2 / B3-3 — 审计链加链头见证、空页带上服务端实际应用的 limit、零值时间界一律 400。
+- C3-1 / C3-2 / C3-3 — 撤销触达已批准设备授权、`device_code` 单次使用、设备审批写路径带谓词（`done = false AND denied = false AND expires_at > now()`）。
+- 结构性（第三轮） — 平面走查改为对库无方法约束的端点逐方法各走一遍（`protocolAnyMethod`）。
+- 第三方库日志面（第四轮） — 枚举 `zitadel/oidc v3.51.3` 在这些路径上写什么，落成 `TestAdversarialProtocolErrorsDoNotLogCredentials` 与成功路径的一半（`docs/security-audit-2.md:351-358`）。
+- `oauth` 遗留引擎的设备决策丢失更新（第三轮「仍开放」） — 拆成 `RecordPoll`/`RecordDecision`，第一决定即最终（破坏性变更，见 CHANGELOG；`docs/security-audit-3.md:263-276`）。
+- KIT-1 / KIT-3 — 已由后续修复转绿（匿名 cascade 现在 401；暂停/删除客户端的令牌现在 `active=false` 且数据面 401）：`docs/audit-7/findings/22-audit5-red-reconciliation.md:70`。
+- A-FE-9 — 残余（`architecture.md:12` 声称「构建产物可复现」与实际不符）已消除：该行现在明确写「**注意"可复现"不是当前成立的性质**」并说明所需前置条件（`docs/architecture.md:12-14`）。
