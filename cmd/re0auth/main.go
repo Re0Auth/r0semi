@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
@@ -1577,19 +1578,10 @@ func auditVerifier(l audit.Logger) chainVerifier {
 	return nil
 }
 
-// seedClient registers the first-party downstream client if it is not already
-// present. Re-running the process must not fail, so an existing registration is
-// left untouched rather than overwritten.
-func seedClient(ctx context.Context, clients oauth.ClientRegistry, cfg settings) error {
-	_, err := clients.Get(ctx, cfg.clientID)
-	switch {
-	case err == nil:
-		slog.Info("downstream client already registered", "client_id", cfg.clientID)
-		return nil
-	case !errors.Is(err, oauth.ErrClientNotFound):
-		return err
-	}
-
+// configuredClient builds the client the [client] section describes. The
+// first-time registration and the drift check below share this one shape, so a
+// field can never be validated differently in the two places.
+func configuredClient(cfg settings) (oauth.Client, error) {
 	typ := oauth.ClientPublic
 	if cfg.clientSecret != "" {
 		typ = oauth.ClientConfidential
@@ -1598,13 +1590,96 @@ func seedClient(ctx context.Context, clients oauth.ClientRegistry, cfg settings)
 	for _, s := range cfg.clientScopes {
 		scopes = append(scopes, oauth.Scope(s))
 	}
-	client, err := oauth.NewClient(cfg.clientID, cfg.clientName, typ, cfg.clientSecret, cfg.clientRedirects, scopes)
+	return oauth.NewClient(cfg.clientID, cfg.clientName, typ, cfg.clientSecret, cfg.clientRedirects, scopes)
+}
+
+// clientDrift names every way the registered client disagrees with [client].
+//
+// Redirect URIs and scopes are compared as SETS: reordering a list does not
+// change what the client may do, and refusing startup over it would be a false
+// alarm. The secret is compared by digest — the registry never holds the
+// plaintext, and neither does the message below. The display name is
+// deliberately not compared: it is cosmetic, and a rename is not a reason to
+// refuse a start.
+func clientDrift(registered, configured oauth.Client) []string {
+	var drift []string
+	if registered.Type != configured.Type {
+		drift = append(drift, fmt.Sprintf("type: registered %q, configured %q", registered.Type, configured.Type))
+	}
+	if !sameSet(registered.RedirectURIs, configured.RedirectURIs) {
+		drift = append(drift, fmt.Sprintf("redirect_uris: registered %v, configured %v",
+			registered.RedirectURIs, configured.RedirectURIs))
+	}
+	if !sameSet(registered.AllowedScopes, configured.AllowedScopes) {
+		drift = append(drift, fmt.Sprintf("scopes: registered %v, configured %v",
+			registered.AllowedScopes, configured.AllowedScopes))
+	}
+	if !bytes.Equal(registered.SecretHash(), configured.SecretHash()) {
+		drift = append(drift, "secret: the registered digest differs from the configured client secret "+
+			"(the previous secret would otherwise stay valid)")
+	}
+	return drift
+}
+
+// sameSet reports whether two slices hold the same multiset of values.
+func sameSet[T comparable](a, b []T) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[T]int, len(a))
+	for _, v := range a {
+		counts[v]++
+	}
+	for _, v := range b {
+		if counts[v] == 0 {
+			return false
+		}
+		counts[v]--
+	}
+	return true
+}
+
+// seedClient registers the first-party downstream client, or refuses to start
+// when an existing registration disagrees with the [client] section.
+//
+// Registration happens exactly once, against an empty registry. After that the
+// registry is authoritative: no code path rewrites a client's type,
+// redirect_uris or scopes, and nothing re-derives them from this file, so a
+// changed [client] has no route into effect. Carrying on anyway is the
+// dangerous half — a rotated secret_env would leave the previous secret valid,
+// a deleted redirect_uri would stay allowlisted, and a scope change would be
+// dropped. A mismatch is therefore a refusal that names every differing field;
+// the operator either reverts [client] to what was seeded, or deletes the
+// registration and restarts to re-seed it from the new configuration.
+func seedClient(ctx context.Context, clients oauth.ClientRegistry, cfg settings) error {
+	configured, err := configuredClient(cfg)
 	if err != nil {
 		return err
 	}
-	if err := clients.Create(ctx, client); err != nil {
+
+	registered, err := clients.Get(ctx, cfg.clientID)
+	switch {
+	case errors.Is(err, oauth.ErrClientNotFound):
+		if err := clients.Create(ctx, configured); err != nil {
+			return err
+		}
+		slog.Info("registered downstream client", "client_id", configured.ID, "type", configured.Type)
+		return nil
+	case err != nil:
 		return err
 	}
-	slog.Info("registered downstream client", "client_id", client.ID, "type", client.Type)
+
+	if drift := clientDrift(registered, configured); len(drift) > 0 {
+		// Logged as well as returned: the error stops the process, but the
+		// field-by-field list is what an operator greps the startup log for.
+		slog.Error("downstream client does not match the configured [client] section; refusing to start",
+			"client_id", cfg.clientID, "differences", drift)
+		return fmt.Errorf("registered downstream client %q does not match the [client] configuration: %s; "+
+			"the registry is authoritative once a client exists and startup will not rewrite it — "+
+			"revert the [client] section to the registered values, or delete the registered client and restart to re-seed",
+			cfg.clientID, strings.Join(drift, "; "))
+	}
+	slog.Info("downstream client already registered and matches the configured [client] section",
+		"client_id", cfg.clientID)
 	return nil
 }

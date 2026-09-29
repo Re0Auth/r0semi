@@ -47,11 +47,21 @@ const (
 	auditQueueDepth = 512
 	// auditDrainTimeout bounds how long shutdown may spend writing queued rows.
 	// Each batch is bounded by auditBatchTimeout, but the NUMBER of batches is not:
-	// a full queue is 512 rows, or eight 5-second batches, which stacks ~40s on top
-	// of the HTTP drain and outlasts the pod's terminationGracePeriodSeconds. This
-	// budget makes the drain finish; rows still queued when it expires are refused
-	// rather than left waiting on a writer that has returned.
-	auditDrainTimeout = 30 * time.Second
+	// a full queue is 512 rows, or eight 5-second batches. The drain does not run
+	// in parallel with the HTTP drain — it starts after it, which itself starts
+	// after the endpoint-removal wait — so this budget has to fit inside what the
+	// pod's grace period leaves over:
+	//
+	//	terminationGracePeriodSeconds (45s)
+	//	  - endpointRemovalWait  (5s)
+	//	  - shutdownTimeout      (30s)
+	//	  = 10s
+	//
+	// A budget larger than that is spent SIGKILLed before it expires, and the
+	// refusal path below never runs. 10s is deliberately smaller than the eight
+	// batches a full queue would need: rows still queued when it expires are
+	// refused rather than left waiting on a writer that has returned.
+	auditDrainTimeout = 10 * time.Second
 )
 
 var (

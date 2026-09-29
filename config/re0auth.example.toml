@@ -258,7 +258,12 @@ kek_id = "kek-1"
 # kek_env = "RE0AUTH_KEK_OLD"
 
 [client]
-# The first-party downstream client, seeded on startup if absent.
+# The first-party downstream client, seeded on startup if absent. Once a client
+# exists, the registry is authoritative and startup will NOT rewrite it: if any
+# of type, redirect_uris, scopes or the secret below differs from the registered
+# client, the process refuses to start and names every differing field. Revert
+# this section to the seeded values, or delete the registered client and restart
+# to re-seed it.
 id   = "cli"
 name = "First-party client"
 # Omit secret_env for a public client (desktop, CLI, SPA); set it for a
