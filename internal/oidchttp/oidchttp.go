@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -978,6 +979,25 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 			return true
 		}
 	}
+	// OIDC Core §3.1.2.1: `max_age=N` asks the OP to re-authenticate when the
+	// browser's last authentication is more than N seconds old. The judgement
+	// itself is made where the session's auth_time and the request meet — the
+	// login boundary (CompleteLogin) — because the store is what holds both.
+	// What is checked here is the shape: a value that is not a non-negative
+	// integer has no bound to enforce, and must not be answered as if the
+	// request had asked for nothing.
+	if raw := strings.TrimSpace(q.Get("max_age")); raw != "" {
+		if _, err := strconv.ParseUint(raw, 10, 64); err != nil {
+			params := map[string]string{
+				"error":             "invalid_request",
+				"error_description": "max_age must be a non-negative integer",
+				"state":             q.Get("state"),
+				"iss":               h.issuerFor(r),
+			}
+			http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+			return true
+		}
+	}
 	// OAuth 2.1 requires PKCE on every authorization code request, confidential
 	// clients included. The engine only demands it of a public client, so the
 	// requirement is enforced here rather than left to the library. The failure is
@@ -1060,9 +1080,22 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 	// claims two identities is malformed, and answering it by picking a side is
 	// exactly how the mismatch stayed invisible.
 	formClientID := strings.TrimSpace(form.Get("client_id"))
-	basicClientID, _, hasBasic := r.BasicAuth()
-	basicClientID = strings.TrimSpace(basicClientID)
-	if hasBasic && formClientID != "" && formClientID != basicClientID {
+	basicID, basicSecret, hasBasic := r.BasicAuth()
+	basicID = strings.TrimSpace(basicID)
+	if hasBasic {
+		// The library decodes the Basic username with url.QueryUnescape before
+		// it looks the client up (pkg/op/client.go ClientBasicAuth). Comparing
+		// the raw bytes with the form's id — and looking the raw bytes up —
+		// would check one identity while the library records another.
+		decoded, err := url.QueryUnescape(basicID)
+		if err != nil {
+			writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
+				"malformed client credentials")
+			return true
+		}
+		basicID = decoded
+	}
+	if hasBasic && formClientID != "" && formClientID != basicID {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
 			"client_id does not match the authenticated client")
 		return true
@@ -1071,7 +1104,7 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 	if hasBasic {
 		// A confidential client authenticates with HTTP Basic instead of naming
 		// itself in the body, and the library bills the Basic identity.
-		clientID = basicClientID
+		clientID = basicID
 	}
 	if clientID == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "client_id is required")
@@ -1080,6 +1113,21 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 	client, err := h.clients.Get(r.Context(), clientID)
 	if err != nil {
 		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client", "unknown client")
+		return true
+	}
+	// RFC 8628 §3.1 applies RFC 6749 §3.2.1's client-authentication
+	// requirements to this endpoint, and the library does not enforce them: its
+	// ParseDeviceCodeRequest discards the `authenticated` bit ClientIDFromRequest
+	// returns and keeps the unauthenticated form client_id
+	// (pkg/op/device.go), so this project's AuthorizeClientIDSecret is never
+	// reached. Without this check an anonymous caller mints a device
+	// authorization naming any confidential client, and the verification page
+	// then presents that client's registered name to whoever follows the
+	// user_code. A public client keeps the "none" method — that is the device
+	// grant's purpose — so only a confidential client is asked for a secret.
+	if client.Type == oauth.ClientConfidential && !deviceClientAuthenticated(form, client, hasBasic, basicSecret) {
+		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
+			"a confidential client must authenticate at the device authorization endpoint")
 		return true
 	}
 	// Every value of `scope`: see validateAuthorize.
@@ -1096,6 +1144,21 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 	return false
 }
 
+// deviceClientAuthenticated reports whether the request carries a secret the
+// named confidential client accepts. It mirrors the token endpoint's shape:
+// HTTP Basic, or the client_secret_post body the discovery document advertises
+// (AuthMethodPost). A public client never reaches this call.
+func deviceClientAuthenticated(form url.Values, client oauth.Client, hasBasic bool, basicSecret string) bool {
+	if hasBasic {
+		return client.Authenticate(basicSecret)
+	}
+	secret := form.Get("client_secret")
+	if secret == "" {
+		return false
+	}
+	return client.Authenticate(secret)
+}
+
 // refuseIntrospectionByANonConfidentialClient refuses an introspection caller whose
 // client has no secret to authenticate with.
 //
@@ -1105,20 +1168,63 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 // because the check it makes — "return nil, i.e. authenticated, for a client that
 // keeps no secret" — is right for the token endpoint and wrong here.
 func (h *Handler) refuseIntrospectionByANonConfidentialClient(w http.ResponseWriter, r *http.Request, form url.Values) bool {
-	id, _, _ := r.BasicAuth()
-	if strings.TrimSpace(id) == "" {
+	// An assertion is not an identity this endpoint accepts. RFC 7662 §2.1
+	// authenticates the protected resource with its own credentials, this OP
+	// supports HTTP Basic only (P2-23) and the library's introspection path
+	// verifies Basic only. Reading a `client_assertion` here and deciding
+	// "looks confidential, let the library decide" would move the decision onto
+	// a path the deployment never advertised, so it is refused explicitly.
+	if strings.TrimSpace(form.Get("client_assertion")) != "" {
+		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
+			"introspection requires a confidential client authenticating with HTTP Basic")
+		return true
+	}
+	id, hasBasic := basicClientID(r)
+	if !hasBasic {
 		id = strings.TrimSpace(form.Get("client_id"))
 	}
 	if id == "" {
+		// Nothing to resolve. The library answers 401 for a missing credential
+		// with the same shape this writer produces, so deferring changes nothing.
 		return false
 	}
 	c, err := h.clients.Get(r.Context(), id)
-	if err != nil || c.Type == oauth.ClientConfidential {
-		return false
+	if err != nil {
+		// Unknown is refused HERE, not deferred to the library. The library
+		// resolves the Basic username with url.QueryUnescape (pkg/op/client.go
+		// ClientBasicAuth), so a raw per-cent escape read differently on the two
+		// sides: the guard looked up "z02-d%65vice-…" (not found → allow) while
+		// the library authenticated "z02-device-…". Reading the decoded id is the
+		// fix; refusing the unknown id is what makes the two readings agree.
+		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client", "unknown client")
+		return true
 	}
-	writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
-		"introspection requires a confidential client")
-	return true
+	if c.Type != oauth.ClientConfidential {
+		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
+			"introspection requires a confidential client")
+		return true
+	}
+	return false
+}
+
+// basicClientID resolves the HTTP Basic username the way the library does:
+// url.QueryUnescape, exactly as pkg/op/client.go ClientBasicAuth decodes it.
+// Reading the raw header instead was how a percent-encoded public client id
+// passed this guard. The second return reports whether a Basic header was
+// present at all, so callers can keep the "Basic wins over the form field"
+// precedence the library uses.
+func basicClientID(r *http.Request) (id string, present bool) {
+	raw, _, ok := r.BasicAuth()
+	if !ok {
+		return "", false
+	}
+	decoded, err := url.QueryUnescape(strings.TrimSpace(raw))
+	if err != nil {
+		// The library fails the same decode and refuses the request, so an empty
+		// id here is the fail-closed reading of an undecodable credential.
+		return "", true
+	}
+	return decoded, true
 }
 
 // bearerOf resolves the bearer credential a request carries the way the library's
@@ -1187,8 +1293,8 @@ func writeOAuthJSONError(w http.ResponseWriter, status int, code, description st
 // it is handed the parameter set serveOAuth parsed rather than reading the request
 // a second time.
 func callerClientID(r *http.Request, form url.Values) string {
-	if id, _, ok := r.BasicAuth(); ok {
-		return strings.TrimSpace(id)
+	if id, ok := basicClientID(r); ok {
+		return id
 	}
 	return strings.TrimSpace(form.Get("client_id"))
 }

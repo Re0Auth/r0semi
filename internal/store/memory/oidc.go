@@ -386,6 +386,11 @@ func (s *OIDCStore) CreateAuthRequest(_ context.Context, req *oidc.AuthRequest, 
 		Scopes: append([]string(nil), req.Scopes...), State: req.State, Nonce: req.Nonce,
 		CodeChallenge: codeChallenge(challenge, method),
 		Subject:       userID,
+		// The library normalizes the freshness requirement before this call
+		// (prompt=login becomes MaxAge=0), so it is recorded verbatim rather
+		// than re-derived from the wire parameters.
+		Prompt: append([]string(nil), req.Prompt...),
+		MaxAge: cloneMaxAge(req.MaxAge),
 	}
 	s.authRequests[id] = a
 	s.authRequestExpiry[id] = s.now().Add(s.requestTTL)
@@ -435,7 +440,19 @@ func (s *OIDCStore) AuthRequestByCode(_ context.Context, code string) (op.AuthRe
 func cloneAuthRequest(a *oidcstore.AuthRequest) *oidcstore.AuthRequest {
 	out := *a
 	out.Scopes = append([]string(nil), a.Scopes...)
+	out.Prompt = append([]string(nil), a.Prompt...)
+	out.MaxAge = cloneMaxAge(a.MaxAge)
 	return &out
+}
+
+// cloneMaxAge copies the pointed-to value, so a caller writing through one
+// request's MaxAge cannot reach the stored record or another copy of it.
+func cloneMaxAge(in *uint) *uint {
+	if in == nil {
+		return nil
+	}
+	v := *in
+	return &v
 }
 
 // SaveAuthCode implements op.Storage.
@@ -1047,9 +1064,12 @@ func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scope
 		s.requestBySubject.add(subject, id)
 	}
 	// Preserve the session's real authentication time when the login hook set it;
-	// only fall back to the decision time when it did not.
-	if a.AuthTime == nil {
-		now := s.now()
+	// only fall back to the decision time when it did not. A request that asked
+	// for a fresh authentication (`prompt=login` or an elapsed `max_age`) is the
+	// exception: the recorded time is exactly what it asked not to accept, so
+	// completing the interactive decision is the re-authentication and the
+	// id_token must carry that moment, not the stale session's.
+	if now := s.now(); a.RequiresReauthentication(now) || a.AuthTime == nil {
 		a.AuthTime = &now
 	}
 	clientID := a.ClientID

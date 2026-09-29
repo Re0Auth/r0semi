@@ -205,6 +205,35 @@ type AuthRequest struct {
 	Subject       string
 	IsDone        bool
 	AuthTime      *time.Time
+	// Prompt and MaxAge carry the request's freshness requirement across the
+	// storage boundary. op.AuthRequest exposes neither, so before these fields
+	// existed the requirement was parsed by the library and then dropped: a
+	// `prompt=login` or `max_age=N` request was indistinguishable from an
+	// ordinary one by the time the login hook recorded the session's auth_time
+	// and the id_token carried it. They are the values the library itself
+	// normalized (pkg/op/ValidateAuthReqPrompt: prompt=login ⇒ MaxAge=0), so the
+	// decision does not re-parse the request.
+	Prompt []string
+	MaxAge *uint // seconds; nil when the request did not ask for freshness
+}
+
+// RequiresReauthentication reports whether the recorded authentication is too
+// old for what this request asked for. `prompt=login` always requires a fresh
+// authentication; `max_age=N` requires one once the recorded auth_time is more
+// than N seconds old (OIDC Core §3.1.2.1). An unknown auth_time cannot prove
+// freshness, so it fails closed to requiring reauthentication.
+func (a *AuthRequest) RequiresReauthentication(now time.Time) bool {
+	if slices.Contains(a.Prompt, oidc.PromptLogin) {
+		return true
+	}
+	if a.MaxAge == nil {
+		return false
+	}
+	at := a.GetAuthTime()
+	if at.IsZero() {
+		return true
+	}
+	return now.Sub(at) > time.Duration(*a.MaxAge)*time.Second
 }
 
 func (a *AuthRequest) GetID() string                         { return a.ID }

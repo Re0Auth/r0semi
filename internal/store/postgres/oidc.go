@@ -181,10 +181,15 @@ func (s *OIDCStore) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO oidc_auth_requests
 			(id, client_id, redirect_uri, response_type, response_mode, scopes, state, nonce,
-			 code_challenge, code_challenge_method, subject, done, created_at, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13)`,
+			 code_challenge, code_challenge_method, subject, done, created_at, expires_at,
+			 prompt, max_age_seconds)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13,$14,$15)`,
 		id, req.ClientID, req.RedirectURI, string(req.ResponseType), string(req.ResponseMode),
 		oidcstore.NonNil([]string(req.Scopes)), req.State, req.Nonce, challenge, method, userID, now, now.Add(s.requestTTL),
+		// The library normalizes the freshness requirement before this call
+		// (pkg/op/ValidateAuthReqPrompt: prompt=login ⇒ MaxAge=0), so the
+		// normalized pair is stored verbatim rather than re-derived here.
+		oidcstore.NonNil([]string(req.Prompt)), maxAgeSeconds(req.MaxAge),
 	); err != nil {
 		return nil, fmt.Errorf("postgres: create auth request: %w", err)
 	}
@@ -194,7 +199,40 @@ func (s *OIDCStore) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest
 		Scopes: append([]string(nil), req.Scopes...), State: req.State, Nonce: req.Nonce,
 		CodeChallenge: codeChallenge(req.CodeChallenge, method),
 		Subject:       userID,
+		Prompt:        append([]string(nil), req.Prompt...),
+		MaxAge:        cloneMaxAge(req.MaxAge),
 	}, nil
+}
+
+// maxAgeSeconds renders the library's *uint max_age as the nullable integer the
+// column stores: nil stays NULL ("no freshness bound was requested").
+func maxAgeSeconds(in *uint) *int {
+	if in == nil {
+		return nil
+	}
+	v := int(*in)
+	return &v
+}
+
+// maxAgeFromSeconds converts the stored nullable integer back to the *uint the
+// library speaks. A negative value cannot be produced by this package; it is
+// treated as absent rather than trusted.
+func maxAgeFromSeconds(in *int) *uint {
+	if in == nil || *in < 0 {
+		return nil
+	}
+	v := uint(*in)
+	return &v
+}
+
+// cloneMaxAge copies the pointed-to value so a caller's write through one
+// request cannot reach the stored record or a returned copy of it.
+func cloneMaxAge(in *uint) *uint {
+	if in == nil {
+		return nil
+	}
+	v := *in
+	return &v
 }
 
 func codeChallenge(challenge, method string) *oidc.CodeChallenge {
@@ -208,7 +246,8 @@ func codeChallenge(challenge, method string) *oidc.CodeChallenge {
 func (s *OIDCStore) AuthRequestByID(ctx context.Context, id string) (op.AuthRequest, error) {
 	return s.scanAuthRequest(ctx, `
 		SELECT id, client_id, redirect_uri, response_type, response_mode, scopes, state, nonce,
-		       code_challenge, code_challenge_method, subject, done, auth_time
+		       code_challenge, code_challenge_method, subject, done, auth_time,
+		       prompt, max_age_seconds
 		  FROM oidc_auth_requests WHERE id = $1`, id)
 }
 
@@ -236,14 +275,17 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 		challenge string
 		method    string
 		authTime  *time.Time
+		maxAge    *int
 	)
 	if err := tx.QueryRow(ctx, `
 		DELETE FROM oidc_auth_requests
 		 WHERE id = $1
 		RETURNING id, client_id, redirect_uri, response_type, response_mode, scopes, state, nonce,
-		          code_challenge, code_challenge_method, subject, done, auth_time`, requestID).Scan(
+		          code_challenge, code_challenge_method, subject, done, auth_time,
+		          prompt, max_age_seconds`, requestID).Scan(
 		&a.ID, &a.ClientID, &a.RedirectURI, &a.ResponseType, &a.ResponseMode, &a.Scopes,
 		&a.State, &a.Nonce, &challenge, &method, &a.Subject, &a.IsDone, &authTime,
+		&a.Prompt, &maxAge,
 	); err != nil {
 		return nil, errors.New("postgres: auth request not found")
 	}
@@ -252,6 +294,7 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 	}
 	a.CodeChallenge = codeChallenge(challenge, method)
 	a.AuthTime = authTime
+	a.MaxAge = maxAgeFromSeconds(maxAge)
 	return &a, nil
 }
 
@@ -261,15 +304,18 @@ func (s *OIDCStore) scanAuthRequest(ctx context.Context, query string, args ...a
 		challenge string
 		method    string
 		authTime  *time.Time
+		maxAge    *int
 	)
 	if err := s.pool.QueryRow(ctx, query, args...).Scan(
 		&a.ID, &a.ClientID, &a.RedirectURI, &a.ResponseType, &a.ResponseMode, &a.Scopes,
 		&a.State, &a.Nonce, &challenge, &method, &a.Subject, &a.IsDone, &authTime,
+		&a.Prompt, &maxAge,
 	); err != nil {
 		return nil, fmt.Errorf("postgres: auth request: %w", err)
 	}
 	a.CodeChallenge = codeChallenge(challenge, method)
 	a.AuthTime = authTime
+	a.MaxAge = maxAgeFromSeconds(maxAge)
 	return &a, nil
 }
 
@@ -828,16 +874,44 @@ func (s *OIDCStore) SetAuthTime(ctx context.Context, id string, at time.Time) er
 // CompleteLogin attaches the subject and the approved (possibly narrowed)
 // scopes to a pending authorization request. It is what the consent screen
 // calls before the callback.
+//
+// A request that asked for a fresh authentication (`prompt=login` or an
+// elapsed `max_age`) must not carry the session's old auth_time into the
+// id_token: the recorded time is exactly what it asked not to accept, so the
+// interactive decision completes the re-authentication and stamps its moment.
+// The judgement runs on the store clock, not the database's now().
 func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scopes []string) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE oidc_auth_requests
-		   SET subject = $2, scopes = $3, done = true, auth_time = COALESCE(auth_time, now())
-		 WHERE id = $1`, id, subject, oidcstore.NonNil(scopes))
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: complete login: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		prompt   []string
+		maxAge   *int
+		authTime *time.Time
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT prompt, max_age_seconds, auth_time
+		  FROM oidc_auth_requests
+		 WHERE id = $1
+		 FOR UPDATE`, id).Scan(&prompt, &maxAge, &authTime); err != nil {
 		return errors.New("postgres: auth request not found")
+	}
+	now := s.now()
+	req := oidcstore.AuthRequest{Prompt: prompt, MaxAge: maxAgeFromSeconds(maxAge), AuthTime: authTime}
+	if req.RequiresReauthentication(now) || authTime == nil {
+		authTime = &now
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE oidc_auth_requests
+		   SET subject = $2, scopes = $3, done = true, auth_time = $4
+		 WHERE id = $1`, id, subject, oidcstore.NonNil(scopes), authTime); err != nil {
+		return fmt.Errorf("postgres: complete login: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: complete login: %w", err)
 	}
 	// The consent decision itself is an authorization event: who granted which
 	// client which scopes, and when. The scopes recorded are the granted set,
