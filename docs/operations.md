@@ -178,6 +178,16 @@ kubectl apply -k deploy/k8s/backup
     **`httpapi.readinessTTL`（1s）内的一次检查结果**作答，同一时刻最多只跑一个检查，其余请求
     直接拿到上一次的结果——**不排队、不因为负载回 503**。没有这一条时，每个匿名请求就是一次
     占用连接池的数据库往返，「报告连接池状态的端点」反而成了打满它的手段。
+    - 探针路径**跳过会话中间件**：`isProbe` 的豁免必须同样跳过 `sessions.LoadAndSave`，
+      否则任意匿名 Cookie 就让每一次 `/healthz`、`/readyz` 都变成一次会话存储往返
+      （有效 Cookie 还会因 `IdleTimeout` 触发写），而这条路径既无限流也无并发上限。
+      准确口径是：**就绪检查每副本每秒最多一次数据库往返；探针请求本身不触碰会话存储。**
+    - 就绪结论是**显式三态**（未知 / 就绪 / 不就绪）。未知（进程启动后首个检查尚未返回）一律
+      **fail-closed**：503 `checking`，绝不回答未经验证的 200。检查跑在**不派生自调用方
+      context** 的 `context.WithoutCancel` + `readinessTimeout` 上——缓存是全进程的，某个匿名
+      连接挂断从来不是依赖的结论，取消类错误不写缓存、也不顶掉已有结论。首个检查仍在途中时，
+      抢跑的请求最多等 `httpapi.readinessColdStartWait`（500ms）取那个结论，否则回 503；
+      一旦已有结论，刷新期间一律回答上一次的结论，不排队。
   代价说清楚：就绪结论最多**旧 1 秒**（依赖掉了之后可能多报一秒 ready）。出厂 manifest 的
   `readinessProbe.periodSeconds` 是 5，`failureThreshold` 是 3，所以真实 kubelet 看到的每一次
   都仍是刚查过的；而它换来的是每个副本**每秒最多一次**数据库往返，而不是按请求数增长。
@@ -206,7 +216,8 @@ kubectl apply -k deploy/k8s/backup
 - 访问日志含 `request_id`、`trace_id`、plane 与客户端地址；**不记录 query string**。
   请求携带的 `traceparent` 会被采纳，否则生成一个，便于跨日志关联。
 - 限流：429 带 `Retry-After`，所有带限流的响应带 `RateLimit-Limit/Remaining/Reset`；
-  并发打满时 503 带 `Retry-After: 1`。
+  并发打满时 503 带 `Retry-After: 1`。桶键是（平面, 客户端地址），**IPv6 地址归并到 /64**；
+  `max_in_flight` 另按（平面, 客户端）分摊**份额**（上限的一半），单个地址占不满全部槽位。
 - 常见现象：
   - `/readyz` 503 → Postgres 不可达或连接池耗尽；先看 `DATABASE_URL` 与数据库负载。
   - 大量 429 → 调整 `server.rate_limit` / `rate_limit_burst`，或检查是否有客户端刷接口。
@@ -281,10 +292,12 @@ curl -fsS -H "Cookie: ..." https://auth.example.com/v1/admin/audit/verify
 2. 在 staging 跑一次恢复演练到新版本；
 3. 滚动更新（PDB 保证至少一个可用副本），观察 `/readyz`、错误率与 429/503；
    **关停顺序**：收到 SIGTERM 后，进程先把 `/readyz` 翻成 503，等 **`endpointRemovalWait`（5s）**
-   让编排系统把本实例摘出轮转，再开始 **`shutdownTimeout`（30s）** 的排空——所以
-   `terminationGracePeriodSeconds` 必须 ≥ 35s（出厂 45s）。这三处的量级由
-   `TestGracefulShutdownWindowsAgree` 交叉校验。等待放在**进程内**而非 `preStop`：scratch 镜像
-   没有 `/bin/sleep` 可跑。
+   让编排系统把本实例摘出轮转，再开始 **`shutdownTimeout`（30s）** 的排空，最后才排空审计批次队列
+   （**`auditDrainTimeout`（10s）**）。三段是**串行**的（审计排空在 HTTP 排空之后，不是并行），
+   合计 5 + 30 + 10 = 45s，所以 `terminationGracePeriodSeconds` 必须 ≥ 45s（出厂 45s）——小于
+   这个总数，审计排空的「过期拒绝」路径会在 SIGKILL 之前跑不完，在途审计行静默丢失。这四处的
+   量级由 `TestGracefulShutdownWindowsAgree` 交叉校验。等待放在**进程内**而非 `preStop`：scratch
+   镜像没有 `/bin/sleep` 可跑。
 4. 数据库迁移在启动时执行，多实例由 advisory lock 串行化；迁移前先做一次备份。
    迁移的兼容性规则与回滚策略见 [migration-decision.md](./migration-decision.md)（ADR-0008）：
    同一版本只做加法，破坏性变更延后一版；**回滚 = 从备份恢复**，`re0auth -migrate-down`
