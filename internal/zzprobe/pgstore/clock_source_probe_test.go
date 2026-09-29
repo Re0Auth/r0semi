@@ -54,7 +54,13 @@ func scanDatabaseNow(t *testing.T) []databaseNowOccurrence {
 	t.Helper()
 	var out []databaseNowOccurrence
 
-	mustHave := map[string]int{"oidc.go": 3, "sessions.go": 1}
+	// The floor is the number of REVIEWED, deliberate now() uses left in the
+	// shipped code: CompleteLogin's COALESCE(auth_time, now()) display fallback
+	// in oidc.go, and the relative interval comparison in sessions.go. The device
+	// path used to carry three more; they are store-clock parameters now, so a
+	// scanner finding fewer than these two is broken, and finding MORE is the
+	// finding the test below reports.
+	mustHave := map[string]int{"oidc.go": 1, "sessions.go": 1}
 	for _, f := range []string{"oidc.go", "oauth.go", "sessions.go"} {
 		body, err := os.ReadFile(filepath.Join(adapterDir, f))
 		if err != nil {
@@ -123,15 +129,15 @@ func scanSourceForSQLNow(file, src string) []databaseNowOccurrence {
 // `auth_time` on oidc_devices/oauth_device_authorizations — must use the store
 // clock (a $n parameter written from s.now()), never the database's now().
 //
-// It FAILS on the shipped code, and the failure names the statements. The other
-// half of the divergence is that internal/store/memory's device path judges all
-// four deadlines with s.now() (memory/oidc.go:783-784, :986, :991), so the two
-// backends answer "is this device code still valid" differently whenever the two
-// clocks disagree.
+// It PASSES since P2-32: the three device statements (the poll write's
+// last_poll, ApproveDevice's expires_at predicate and auth_time stamp) take the
+// store clock as a parameter, matching internal/store/memory's device path, so
+// the two backends answer "is this device code still valid" the same way. The
+// other reviewed now() uses are enumerated in the control test below.
 func TestDevicePathsJudgeExpiryWithTheDatabaseClock(t *testing.T) {
 	occurrences := scanDatabaseNow(t)
 	if len(occurrences) == 0 {
-		t.Fatal("found no now() inside any SQL literal; the scanner is broken (oidc.go has several)")
+		t.Fatal("found no now() inside any SQL literal; the scanner is broken (oidc.go has the COALESCE)")
 	}
 
 	// Statements that touch a device deadline and use the database clock. Each is
@@ -159,8 +165,6 @@ func TestDevicePathsJudgeExpiryWithTheDatabaseClock(t *testing.T) {
 //
 // The reviewed set, and why each is acceptable:
 //
-//	oidc.go  ApproveDevice's `expires_at > now()`      NOT ACCEPTABLE — see the test above
-//	oidc.go  GetDeviceAuthorizatonState's `last_poll`  NOT ACCEPTABLE — same
 //	oidc.go  CompleteLogin's `COALESCE(auth_time, now())`  a display-only fallback for
 //	         "when did the human authenticate", written once if the caller did not set it;
 //	         no deadline decision reads it
@@ -168,21 +172,19 @@ func TestDevicePathsJudgeExpiryWithTheDatabaseClock(t *testing.T) {
 //	         comparisons happen in the service (oauth/device.go:285-293), on the store clock
 //	sessions.go SweepExpired's `now() - $1::interval`  a RELATIVE comparison, so the two
 //	         clocks cancel; the same reasoning the method's own comment gives
+//
+// The device path's three (ApproveDevice's expires_at > now() and auth_time = now(),
+// GetDeviceAuthorizatonState's last_poll) were the finding; they are store-clock
+// parameters now (P2-32), matching internal/store/memory's device path.
 func TestOnlyReviewedStatementsUseDatabaseNow(t *testing.T) {
 	occurrences := scanDatabaseNow(t)
-	if len(occurrences) < 3 {
+	if len(occurrences) < 2 {
 		t.Fatalf("found only %d now() in SQL; the scanner is broken", len(occurrences))
 	}
 	unreviewed := 0
 	for _, o := range occurrences {
 		where := o.file + ":" + strconv.Itoa(o.line)
 		switch {
-		case strings.Contains(o.stmt, "UPDATE oidc_devices"),
-			strings.Contains(o.stmt, "SET last_poll = now()"),
-			strings.Contains(o.stmt, "last_poll IS NULL OR last_poll <="),
-			strings.Contains(o.stmt, "expires_at > now()"),
-			strings.Contains(o.stmt, "make_interval"):
-			t.Logf("REVIEWED (device path, called out as a violation in the test above): %s %s", where, o.stmt)
 		case strings.Contains(o.stmt, "COALESCE(auth_time, now())"):
 			t.Logf("REVIEWED (display-only auth_time fallback): %s %s", where, o.stmt)
 		case strings.Contains(o.stmt, "now() - $1::interval"):

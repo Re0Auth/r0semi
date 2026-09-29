@@ -8,6 +8,13 @@
 
 ## Unreleased
 
+- **设备路径的期限改由 store 时钟裁决（P2-32）**：postgres 适配器的三条设备 SQL
+  （poll 节流的 `last_poll`、`ApproveDevice` 的 `expires_at` 谓词与 `auth_time` 戳）
+  此前用数据库 `now()` 裁决/写入进程写的期限——两个后端对「这个设备码还有效吗」给出不同答案
+  （UI 说有效、审批被拒且报「码不存在」）。现在三处全改为 `$n` 参数 ← `s.now()`，
+  与内存后端及 `sweep.go` 的既定形态一致。**升级影响**：无 schema/配置变化；
+  `COALESCE(auth_time, now())` 展示性回退与 `sessions.go` 的相对区间比较（两钟相消）按原裁定保留。
+
 - **Kill Switch 的绑定维度不再沉默、`subject` 清在途绑定流程（AUD-9 + AUD-8）**：无数据源的部署上，
   `all` / `subject` 此前整段跳过绑定半边（`bindings` 字段省略）——响应者无法区分「本部署没有绑定」
   与「本部署清不了绑定」。现在目标带绑定维度而端口缺失时报 `bindings_unavailable: true`（审计

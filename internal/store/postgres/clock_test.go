@@ -99,6 +99,70 @@ func TestDeadlinesAreJudgedByTheClockThatWroteThem(t *testing.T) {
 	}
 }
 
+// TestDeviceDeadlinesAreJudgedByTheClockThatWroteThem is the device-authorization
+// half of the policy above: the poll throttle's interval, the approval's
+// expires_at predicate and its auth_time stamp are all process-side facts, so
+// the store clock decides them (P2-32; the memory backend already did).
+//
+// The same skew fixture applies, with the premise asserted for each deadline:
+// the database's own clock calls the device code expired while the writer
+// still considers it live, so each check below is discriminating.
+func TestDeviceDeadlinesAreJudgedByTheClockThatWroteThem(t *testing.T) {
+	const skew = -2 * time.Hour
+	storeClock := func() time.Time { return time.Now().Add(skew).UTC() }
+
+	db := openTestDBWith(t, DefaultPoolOptions(), WithClock(storeClock))
+	ctx := context.Background()
+	oidc, _, _ := oidcFixtureOn(t, db)
+
+	// The deadline is written from the store clock, so the writer still
+	// considers the code live for an hour; the database calls it two hours
+	// gone. `expires` is what StoreDeviceAuthorization's caller passes, so it
+	// must be a store-clock value for the fixture to mean anything.
+	expires := storeClock().Add(time.Hour)
+	if err := oidc.StoreDeviceAuthorization(ctx, "oidc-device", "clock-device-code", "CLCK-2345",
+		expires, []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if !premiseExpiredByTheDatabase(t, db,
+		`SELECT expires_at < now() FROM oidc_devices WHERE client_id = 'oidc-device'`) {
+		t.Fatal("the fixture is not skewed: the database still considers the device code live")
+	}
+
+	// --- the poll: the throttle's interval must be judged by the store clock ---
+	st, err := oidc.GetDeviceAuthorizatonState(ctx, "oidc-device", "clock-device-code")
+	if err != nil {
+		t.Fatalf("a first poll of a code its writer still considers live was refused: %v", err)
+	}
+	if st.Done || st.Denied {
+		t.Fatalf("the poll answered a decision nobody made: %+v", st)
+	}
+	// A second poll inside the advertised interval is slow_down, and that
+	// judgement too must come from the store clock: the last_poll the first
+	// poll wrote is a store-clock value, so the database's now() would call it
+	// long past due and answer a second poll instead of throttling it.
+	if _, err := oidc.GetDeviceAuthorizatonState(ctx, "oidc-device", "clock-device-code"); err != context.DeadlineExceeded {
+		t.Fatalf("second poll inside the interval = %v, want slow_down (context.DeadlineExceeded)", err)
+	}
+
+	// --- the approval: expires_at judged by the writer's clock, auth_time
+	// stamped with it ---
+	if err := oidc.ApproveDevice(ctx, "CLCK-2345", "usr_1", []string{"account.id"}); err != nil {
+		t.Fatalf("approving a code its writer still considers live was refused: %v", err)
+	}
+	st, err = oidc.DeviceByUserCode(ctx, "CLCK-2345")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Done {
+		t.Fatal("the approval did not land")
+	}
+	if want := storeClock(); st.AuthTime.Before(want) || st.AuthTime.Sub(want) > time.Second {
+		t.Fatalf("auth_time = %s, want the store clock (%s): a database-clock stamp would run "+
+			"two hours ahead of when the human actually decided", st.AuthTime, want)
+	}
+}
+
 // premiseExpiredByTheDatabase asserts the fixture really is skewed: the row is
 // expired as far as Postgres's own clock is concerned, so a database-clock
 // comparison would refuse it and every check above would be discriminating.

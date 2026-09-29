@@ -766,13 +766,16 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 	// RFC 8628 §3.5: a client polling faster than the advertised interval is told
 	// to slow down. The library maps context.DeadlineExceeded to that error. The
 	// UPDATE is the claim on this poll: a concurrent second poll blocks, then sees
-	// the new last_poll and updates nothing.
+	// the new last_poll and updates nothing. One store-clock value both writes
+	// the deadline and judges it — the single-clock policy; the database's now()
+	// would make the interval a race between two clocks.
+	now := s.now()
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oidc_devices
-		   SET last_poll = now()
+		   SET last_poll = $4
 		 WHERE device_code_hash = $1 AND client_id = $2 AND done = false AND denied = false
-		   AND (last_poll IS NULL OR last_poll <= now() - make_interval(secs => $3))`,
-		hashValue(deviceCode), clientID, oidcstore.DefaultDevicePollInterval.Seconds())
+		   AND (last_poll IS NULL OR last_poll <= $4 - make_interval(secs => $3))`,
+		hashValue(deviceCode), clientID, oidcstore.DefaultDevicePollInterval.Seconds(), now)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: record device poll: %w", err)
 	}
@@ -868,12 +871,18 @@ func (s *OIDCStore) DeviceByUserCode(ctx context.Context, userCode string) (*op.
 // have no payoff, and it is closed here anyway, because a decision that lands on
 // a code somebody else already decided should be refused where it lands.
 func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string, scopes []string) error {
-	const pending = `done = false AND denied = false AND expires_at > now()`
-	q := `UPDATE oidc_devices SET done = true, subject = $2, auth_time = now()
+	// The store clock decides the deadline and stamps the auth time: both are
+	// process-side facts this store wrote (the deadline by the caller of
+	// StoreDeviceAuthorization, the auth time here), and judging either with the
+	// database's now() is the two-clock mix the single-clock policy exists to
+	// remove. The memory backend already uses its store clock on the same two.
+	now := s.now()
+	const pending = `done = false AND denied = false AND expires_at > $3`
+	q := `UPDATE oidc_devices SET done = true, subject = $2, auth_time = $3
 	       WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending
-	args := []any{userCode, subject}
+	args := []any{userCode, subject, now}
 	if scopes != nil {
-		q = `UPDATE oidc_devices SET done = true, subject = $2, auth_time = now(), scopes = $3
+		q = `UPDATE oidc_devices SET done = true, subject = $2, auth_time = $3, scopes = $4
 		      WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending
 		args = append(args, scopes)
 	}

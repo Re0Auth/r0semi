@@ -243,7 +243,7 @@
 | **P2-29** | 编码路径下的业务面 404 **绕过 `/v1` 层的 `no-store` 与 panic 恢复器**；复核指出根因不是「路由器边界」而是 `writeProblem` 自身不设 `no-store` | `internal/httpapi/server.go`、`responses.go` | V（独立复现；panic 半输入不可达） | 把 `no-store` 放进 `writeProblem` 本身 |
 | **P2-30** | 业务面的 **429/413 同样缺 `no-store`**，而唯一守卫只走 7 个 200 端点 | `internal/httpapi/middleware.go` | V（复核新发现） | 同上 |
 | **P2-31** | `drain` 时审计批次排空**无总时间上界**（k8s manifest 的 45 s 只算了 HTTP 的 30 s） | `cmd/re0auth/main.go`、`internal/store/postgres/auditbatch.go` | V（读；无 DB） | 给排空阶段单独预算 |
-| **P2-32** | 设备路径用**数据库的 `now()`** 判 `expires_at`/`last_poll`，而内存后端与 Go 读路径用 store 时钟 ⇒ 同一个 `expires_at` 被两个时钟裁决（UI 说有效、审批被拒且文案说码不存在） | `internal/store/postgres/oidc.go:771` vs `:1083` | V（复核降为**低**：同机部署共享内核墙钟，方向在安全一侧） | 统一时钟来源 |
+| **P2-32** | **已修（`636a074` 后）**：设备路径曾用**数据库的 `now()`** 判 `expires_at`/`last_poll`，而内存后端与 Go 读路径用 store 时钟 ⇒ 同一个 `expires_at` 被两个时钟裁决（UI 说有效、审批被拒且文案说码不存在） | `internal/store/postgres/oidc.go:771` vs `:1083` | V（复核降为**低**：同机部署共享内核墙钟，方向在安全一侧）；探针已转绿，`clock_test.go` 补设备三段（CI 权威） | 统一时钟来源（poll 写、`ApproveDevice` 的 `pending` 与 `auth_time` 全改 `$n` 参数 ← `s.now()`） |
 | **P2-33** | `Dockerfile:60` 从构建阶段 `COPY` Alpine 的 CA bundle；**若是符号链接**则 scratch 里成悬空链接 ⇒ 全部出站 TLS 失败（失败点是**首次登录**） | `Dockerfile:60` | **HYPOTHESIS**（无 Docker 既不能证实也不能证伪） | `docker run` 一行确认；修法：构建阶段先 `cp` 解引用 |
 
 ---
@@ -504,8 +504,8 @@ go test -tags audit5 -count=1 ./internal/zzprobe/...  # 红 —— 这就是证�
 但留在默认套件里会让 `go test ./...` 与 CI 立刻变红，挡住所有其它改动。
 加标签后默认套件**恢复全绿**，一条证据都没删，一个标志就能跑全部对抗用例。
 
-**当前为红的探针（即缺陷仍在）**：PROTO 区 8 条、admin 区 4 条、concurrency 区 3 条、
-crypto 区 2 条、dependencies 区 3 条、federation 区 4+3 条、pgstore 区 2 条。修好一处就绿一条。
+**当前为红的探针（即缺陷仍在）**：kit 区 8 条、rp 区 5 条、federation 区 3 条、startup 区 2 条、
+crypto 区 1 条（admin 区 4 条、pgstore 区已随修复转绿）。修好一处就绿一条。
 
 **回退方式**：探针全部是**未跟踪**的新文件（`git status` 里以 `??` 出现）。
 要彻底移除，删掉 `internal/zzprobe/`、各包内的 `zzprobe_*_test.go` / `zz_probe_test.go`
