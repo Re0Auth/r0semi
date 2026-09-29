@@ -307,11 +307,11 @@ func TestZ13VDockerignoreLeavesGitIgnoredSecretsInTheBuildContext(t *testing.T) 
 }
 
 // ---------------------------------------------------------------------------
-// NEW Z13V-2: restore.sh's verifier cannot run at all under its own
-// `set -euo pipefail`. Its first line expands `$file` before `local` assigns it.
+// Z13V-2: the CHECKED-IN restore.sh verifier runs under its own
+// `set -euo pipefail` and its guards hold.
 // ---------------------------------------------------------------------------
 
-func TestZ13VRestoreScriptVerifierAbortsBeforeItVerifies(t *testing.T) {
+func TestZ13VRestoreScriptVerifierRunsAndVerifies(t *testing.T) {
 	root := repoRoot(t)
 	bin := bashPath(t)
 	work := t.TempDir()
@@ -319,19 +319,8 @@ func TestZ13VRestoreScriptVerifierAbortsBeforeItVerifies(t *testing.T) {
 	writeStub(t, filepath.Join(stubDir, "psql"), "#!/bin/sh\necho \"${STUB_TABLES:-0}\"\n")
 	writeStub(t, filepath.Join(stubDir, "pg_restore"), "#!/bin/sh\necho \"STUB pg_restore: $*\" >&2\nexit 0\n")
 
-	// A corrected copy of the very same script, so the only difference under test
-	// is the one line. Nothing in the checkout is touched.
-	src := readFile(t, root, "scripts", "restore.sh")
-	const badLine = `  local file="$1" sidecar="$file.sha256" want got`
-	const goodLine = "  local file=\"$1\"\n  local sidecar=\"$file.sha256\" want got"
-	if !strings.Contains(src, badLine) {
-		t.Fatalf("restore.sh no longer carries the single-`local` line; re-read this probe")
-	}
-	fixed := filepath.Join(work, "restore-fixed.sh")
-	if err := os.WriteFile(fixed, []byte(strings.Replace(src, badLine, goodLine, 1)), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
+	// The real script (no copy, no patched variant): valid input must verify the
+	// sidecar and complete, and each of the three guards must still refuse.
 	body := `
 set -u
 export PATH="$STUBDIR:/usr/bin:/bin"
@@ -340,69 +329,61 @@ d=$(mktemp -d)
 printf 'dump-bytes-one' > "$d/big.dump"
 sha256sum "$d/big.dump" > "$d/big.dump.sha256"
 
-# (0) the exact construct, isolated
-( set -euo pipefail
-  f() { local s="$1" t="$s.sha256"; printf 'LOCALPROBE=[%s]\n' "$t"; }
-  f /tmp/x ) 2>/tmp/local.err; echo "LOCALPROBE_EXIT=$? LOCALPROBE_ERR=$(tr '\n' '|' < /tmp/local.err)"
-
-# (1) the script as checked in
+# (1) valid dump + sidecar
 DATABASE_URL=postgres://x STUB_TABLES=0 bash scripts/restore.sh "$d/big.dump" >/tmp/r1.log 2>&1
 echo "R1_EXIT=$?"; echo "R1_MSG=$(tr '\n' '|' < /tmp/r1.log)"
 
-# (2) the same script with that one line split
-DATABASE_URL=postgres://x STUB_TABLES=0 bash "$FIXED" "$d/big.dump" >/tmp/r2.log 2>&1
+# (2) missing sidecar
+d2=$(mktemp -d); printf 'dump-bytes-one' > "$d2/big.dump"; printf 'other' > "$d2/other.dump"
+DATABASE_URL=postgres://x STUB_TABLES=0 bash scripts/restore.sh "$d2/big.dump" >/tmp/r2.log 2>&1
 echo "R2_EXIT=$?"; echo "R2_MSG=$(tr '\n' '|' < /tmp/r2.log)"
 
-# (3) the guards, against the corrected copy
-d2=$(mktemp -d); printf 'dump-bytes-one' > "$d2/big.dump"; printf 'other' > "$d2/other.dump"
-DATABASE_URL=postgres://x STUB_TABLES=0 bash "$FIXED" "$d2/big.dump" >/tmp/r3.log 2>&1
-echo "R3_EXIT=$?"; echo "R3_MSG=$(tr '\n' '|' < /tmp/r3.log)"
+# (3) sidecar whose digest is another file's
 sha256sum "$d2/other.dump" | sed "s#other.dump#big.dump#" > "$d2/big.dump.sha256"
-DATABASE_URL=postgres://x STUB_TABLES=0 bash "$FIXED" "$d2/big.dump" >/tmp/r4.log 2>&1
-echo "R4_EXIT=$?"; echo "R4_MSG=$(tr '\n' '|' < /tmp/r4.log)"
+DATABASE_URL=postgres://x STUB_TABLES=0 bash scripts/restore.sh "$d2/big.dump" >/tmp/r3.log 2>&1
+echo "R3_EXIT=$?"; echo "R3_MSG=$(tr '\n' '|' < /tmp/r3.log)"
+
+# (4) valid sidecar, non-empty target
 sha256sum "$d2/big.dump" > "$d2/big.dump.sha256"
-DATABASE_URL=postgres://x STUB_TABLES=3 bash "$FIXED" "$d2/big.dump" >/tmp/r5.log 2>&1
-echo "R5_EXIT=$?"; echo "R5_MSG=$(tr '\n' '|' < /tmp/r5.log)"
+DATABASE_URL=postgres://x STUB_TABLES=3 bash scripts/restore.sh "$d2/big.dump" >/tmp/r4.log 2>&1
+echo "R4_EXIT=$?"; echo "R4_MSG=$(tr '\n' '|' < /tmp/r4.log)"
 `
 	out, errb, code := runBashScript(t, bin, body, []string{
 		"ROOT=" + bashPathOf(root),
 		"STUBDIR=" + bashPathOf(stubDir),
-		"FIXED=" + bashPathOf(fixed),
 	})
 	if code != 0 {
 		t.Fatalf("the harness itself failed (exit %d):\n%s\n%s", code, out, errb)
 	}
 	got := kv(out)
 
-	// Control: the corrected copy reaches pg_restore and completes, so the
-	// harness exercises the script and the failure below is that one line.
-	if got["R2_EXIT"] != "0" || !strings.Contains(got["R2_MSG"], "restore complete") ||
-		!strings.Contains(got["R2_MSG"], "checksum verified") {
-		t.Fatalf("control: the corrected copy did not complete (%v)\n%s", got, out)
+	// Control: the checked-in script verifies the sidecar, reaches the
+	// (stubbed) pg_restore and completes. Under the old single-`local` bug it
+	// aborted with `file: unbound variable` before any of this.
+	if got["R1_EXIT"] != "0" {
+		t.Fatalf("scripts/restore.sh exited %s on a valid dump+sidecar, want 0: %s",
+			got["R1_EXIT"], got["R1_MSG"])
 	}
-	// Control: the guards themselves work once the verifier runs.
-	if got["R3_EXIT"] != "1" || !strings.Contains(got["R3_MSG"], "is missing") {
-		t.Errorf("restore.sh no longer refuses a dump with no sidecar: %v", got["R3_MSG"])
+	if !strings.Contains(got["R1_MSG"], "checksum verified") {
+		t.Errorf("restore.sh completed without reporting the checksum it checked: %s", got["R1_MSG"])
 	}
-	if got["R4_EXIT"] != "1" || !strings.Contains(got["R4_MSG"], "checksum mismatch") {
-		t.Errorf("restore.sh no longer refuses a sidecar naming another file: %v", got["R4_MSG"])
-	}
-	if got["R5_EXIT"] != "1" || !strings.Contains(got["R5_MSG"], "refusing to restore") {
-		t.Errorf("restore.sh no longer refuses a non-empty target: %v", got["R5_MSG"])
+	if !strings.Contains(got["R1_MSG"], "restore complete") {
+		t.Errorf("restore.sh verified the sidecar but never reached the restore: %s", got["R1_MSG"])
 	}
 
-	// The finding: the checked-in script never gets past its own verifier.
-	if got["R1_EXIT"] == "0" {
-		t.Fatalf("restore.sh now runs; the version-specific claim must be re-read (%v)", got)
+	// The three guards the verifier exists for, against the same checked-in file.
+	if got["R2_EXIT"] != "1" || !strings.Contains(got["R2_MSG"], "is missing") {
+		t.Errorf("restore.sh no longer refuses a dump with no sidecar: exit %s %s",
+			got["R2_EXIT"], got["R2_MSG"])
 	}
-	t.Errorf("scripts/restore.sh cannot restore anything on this host: `set -euo pipefail` (line 13) "+
-		"plus line 29's single-`local` form (`local file=\"$1\" sidecar=\"$file.sha256\" want got`) "+
-		"aborts with `file: unbound variable` before the checksum is ever looked at — the isolated "+
-		"construct exits %s too, and with `set -u` removed the same line silently computes the WRONG "+
-		"sidecar path (`.sha256`, not `$1.sha256`). Splitting the two assignments makes the same file "+
-		"complete (%s). The zone-13 report listed restore.sh's guards under \"探过没破\" from a "+
-		"line-by-line reading; it was never executed",
-		got["LOCALPROBE_EXIT"], got["R2_MSG"])
+	if got["R3_EXIT"] != "1" || !strings.Contains(got["R3_MSG"], "checksum mismatch") {
+		t.Errorf("restore.sh no longer refuses a sidecar naming another file: exit %s %s",
+			got["R3_EXIT"], got["R3_MSG"])
+	}
+	if got["R4_EXIT"] != "1" || !strings.Contains(got["R4_MSG"], "refusing to restore") {
+		t.Errorf("restore.sh no longer refuses a non-empty target: exit %s %s",
+			got["R4_EXIT"], got["R4_MSG"])
+	}
 }
 
 // ---------------------------------------------------------------------------

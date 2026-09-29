@@ -46,13 +46,19 @@ func deleteEvents(events []audit.Event) []audit.Event {
 // TestProbeErasureAuditRecordClaimsSuccessWhileTheHistoryStaysLinkable.
 //
 // The erasure's last step destroys the key that makes an account's audit history
-// computable. lifecycle.DeleteAccount writes its `account.delete` record *before*
-// that step — deliberately, because the record is itself about the account — and
-// the failure branch returns without writing a second one. The record that
-// survives therefore states `outcome=ok` and `pseudonym_destroyed=true` for an
-// erasure whose history is still linkable, and no row in the log names the step
-// that failed. The endpoint's own 500 tells the caller the opposite ("the audit
-// log records the step that failed").
+// computable. lifecycle.DeleteAccount writes its success `account.delete` record
+// *before* that step — deliberately, because the record is itself about the
+// account and moving it below Destroy would make the sink mint a fresh subject
+// key — and a failing Destroy must therefore not leave that success record as the
+// run's last word. The fixed failure branch writes a SECOND `account.delete` with
+// outcome=error and failed_at=pseudonym, so the LAST record for the subject tells
+// the truth about the run that returned the 500, and the endpoint's promise that
+// "the audit log records the step that failed" holds.
+//
+// The old round-6 shape failed on `len(events) != 1`: it was a finding
+// confirmation for the era when the failure branch wrote nothing. On the fixed
+// code there are deliberately TWO records on the failure path, so the guard
+// locates the last record for the subject instead of counting records.
 func TestProbeErasureAuditRecordClaimsSuccessWhileTheHistoryStaysLinkable(t *testing.T) {
 	sentinel := errors.New("pseudonym store unavailable")
 	env := newProbeEnv(t, probeOptions{Pseudonyms: failingPseudonyms{err: sentinel}})
@@ -72,25 +78,32 @@ func TestProbeErasureAuditRecordClaimsSuccessWhileTheHistoryStaysLinkable(t *tes
 	}
 
 	events := deleteEvents(env.audit.Events())
-	if len(events) != 1 {
-		t.Fatalf("the audit log has %d account.delete records, want exactly 1: %+v", len(events), events)
+	if len(events) == 0 {
+		t.Fatalf("the erasure wrote no account.delete record at all: %+v", env.audit.Events())
 	}
-	e := events[0]
-	if e.Subject != user {
-		t.Errorf("the record's subject = %q, want the erased account %q", e.Subject, user)
+	// The last record about the subject is the one that describes the run that
+	// returned the 500; the earlier success record (kept above Destroy on purpose)
+	// must not be the last word.
+	var last *audit.Event
+	for i := range events {
+		if events[i].Subject == user {
+			last = &events[i]
+		}
 	}
-	// What the log says about the run, versus what happened.
-	if e.Outcome == audit.OutcomeOK {
-		t.Errorf("the only record of this erasure reports outcome=%q although the erasure returned an error "+
-			"and the account's audit history is still linkable (detail %+v)", e.Outcome, e.Detail)
+	if last == nil {
+		t.Fatalf("no account.delete record names the erased account %q: %+v", user, events)
 	}
-	if got := e.Detail["pseudonym_destroyed"]; got == "true" {
-		t.Errorf("the record reports pseudonym_destroyed=%q for a run where the destroy failed (detail %+v)",
-			got, e.Detail)
+	if last.Outcome == audit.OutcomeOK {
+		t.Errorf("the LAST record of this erasure reports outcome=%q although the erasure returned an error "+
+			"and the account's audit history is still linkable (detail %+v)", last.Outcome, last.Detail)
 	}
-	if _, ok := e.Detail["failed_at"]; !ok {
-		t.Errorf("no record names the step that failed, and the 500 promised the audit log would (detail %+v)",
-			e.Detail)
+	if got := last.Detail["failed_at"]; got != "pseudonym" {
+		t.Errorf("the last record's failed_at = %q, want %q: the failure record must name the step that "+
+			"stopped the erasure (detail %+v)", got, "pseudonym", last.Detail)
+	}
+	if got := last.Detail["pseudonym_destroyed"]; got == "true" {
+		t.Errorf("the last record reports pseudonym_destroyed=%q for a run where the destroy failed (detail %+v)",
+			got, last.Detail)
 	}
 }
 

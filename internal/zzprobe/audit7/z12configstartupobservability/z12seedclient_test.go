@@ -1,81 +1,170 @@
 //go:build audit7
 
-// Z12-3: the seeded downstream client is created once and never reconciled.
+// Z12-3: seedClient must refuse a registration that drifts from [client].
 package z12configstartupobservability
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// overlaySeedClientTest is compiled INTO package main through `go test -overlay`.
+// seedClient is unexported package-main code, so a probe living in
+// internal/zzprobe cannot call it (and importing package main is impossible); the
+// overlay adds a throwaway _test.go to cmd/re0auth at build time without writing a
+// single file into the checkout. The test drives the production seedClient against
+// the same in-memory ClientRegistry the composition root passes.
+const overlaySeedClientTest = `package main
+
+import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
-// Z12-3: the seeded downstream client is created once and never reconciled, so a
-// later change to [client] is silently ignored.
-//
-// cmd/re0auth/main.go:1583-1591 (seedClient) asks the registry for the configured
-// id and returns as soon as it is found — "an existing registration is left
-// untouched rather than overwritten" — printing
-// `downstream client already registered`. Every [client] field is therefore
-// applied exactly once, at the first start against an empty registry.
-//
-// The probe drives the same two steps seedClient does, against the same
-// ClientRegistry interface the composition root passes (`store.clients` is
-// `oauth.NewMemoryClientRegistry()` in memory mode, `db.Clients()` otherwise), so
-// the mechanism is exercised for real rather than read: a mutated config cannot
-// change what the registry answers.
-func TestZ12SeedClientNeverReconcilesTheConfiguredClient(t *testing.T) {
+func TestOverlayZ12SeedClientDrift(t *testing.T) {
 	ctx := context.Background()
-	reg := oauth.NewMemoryClientRegistry()
 
-	// First boot: the file says public with redirect A and one scope.
-	first, err := oauth.NewClient("cli", "First-party client", oauth.ClientPublic, "",
-		[]string{"https://app.example/callback"}, []oauth.Scope{"account.id"})
+	// Control A: an empty registry receives the configured client.
+	fresh := oauth.NewMemoryClientRegistry()
+	cfg := settings{
+		clientID:        "cli",
+		clientName:      "First-party client",
+		clientRedirects: []string{"https://app.example/callback"},
+		clientScopes:    []string{"account.id"},
+	}
+	if err := seedClient(ctx, fresh, cfg); err != nil {
+		t.Fatalf("control: seeding an empty registry failed: %v", err)
+	}
+	if _, err := fresh.Get(ctx, "cli"); err != nil {
+		t.Fatalf("control: the configured client was not registered: %v", err)
+	}
+
+	// Control B: the SAME configuration, already registered, still boots.
+	if err := seedClient(ctx, fresh, cfg); err != nil {
+		t.Fatalf("control: an unchanged configuration was refused: %v", err)
+	}
+
+	// The guard: the registered client differs in every field seedClient compares
+	// (type via the secret, redirect_uris, scopes, secret digest).
+	drifted := settings{
+		clientID:        "cli",
+		clientName:      "First-party client",
+		clientSecret:    "s3cret",
+		clientRedirects: []string{"https://newapp.example/callback"},
+		clientScopes:    []string{"account.id", "phigros.profile.read"},
+	}
+	err := seedClient(ctx, fresh, drifted)
+	if err == nil {
+		t.Fatalf("seedClient accepted a registration that differs from [client] in type, redirect_uris, scopes and secret")
+	}
+	for _, field := range []string{"type", "redirect_uris", "scopes", "secret"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("the refusal does not name the differing field %q: %v", field, err)
+		}
+	}
+
+	// The registry stays authoritative: the refusal does not rewrite the client.
+	got, gerr := fresh.Get(ctx, "cli")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got.Type != oauth.ClientPublic || !got.AllowsRedirect("https://app.example/callback") {
+		t.Errorf("the drift refusal rewrote the registered client: type=%q redirects=%v",
+			got.Type, got.RedirectURIs)
+	}
+}
+`
+
+// TestZ12SeedClientRefusesADriftedRegistration is the re-derived Z12-3 guard. The
+// old probe of this name never called seedClient and ended in an unconditional
+// t.Errorf, so it could never pass once the finding was fixed. This one passes on
+// the fixed code and fails if the drift refusal is removed.
+//
+// Two layers:
+//   - a real-process control: an unchanged [client] boots through seedClient and
+//     reaches the listen stage;
+//   - a behavioural guard of the production seedClient itself, compiled into
+//     package main with `go test -overlay` (no checkout file is added or changed),
+//     because the in-memory registry cannot carry a client across process boots
+//     (each memory boot starts empty, so no second boot can present a drifted
+//     registration) and seedClient is unexported.
+func TestZ12SeedClientRefusesADriftedRegistration(t *testing.T) {
+	z12SeedClientGuard(t)
+}
+
+// TestZ12SeedClientNeverReconcilesTheConfiguredClient keeps the round-7 finding's
+// name runnable: `go test -run ^TestZ12SeedClientNeverReconcilesTheConfiguredClient$`
+// still reaches the regression guard instead of matching nothing.
+func TestZ12SeedClientNeverReconcilesTheConfiguredClient(t *testing.T) {
+	z12SeedClientGuard(t)
+}
+
+func z12SeedClientGuard(t *testing.T) {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("..", "..", "..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.Create(ctx, first); err != nil {
-		t.Fatal(err)
+
+	// Control, real process: the unchanged [client] section seeds cleanly and the
+	// run moves on to the listener (which fails by design, because
+	// RE0AUTH_ADDR is unbindable). The prefix is the production seedClient path.
+	clientTOML := serverOnly +
+		"\n[client]\nid = \"cli\"\nname = \"First-party client\"\n" +
+		"redirect_uris = [\"https://app.example/callback\"]\nscopes = [\"account.id\"]\n"
+	path := writeConfig(t, "client.toml", clientTOML)
+	boot := runBinary(t, serveEnv(), "-config", path)
+	if !strings.Contains(boot.out, "registered downstream client") {
+		t.Fatalf("the real binary never reached seedClient's registration path:\n%s", boot.out)
+	}
+	if !strings.Contains(boot.out, "stage=listen") {
+		t.Fatalf("the unchanged [client] did not reach the listen stage:\n%s", boot.out)
 	}
 
-	// Second boot: the operator makes it CONFIDENTIAL, moves the redirect, and
-	// widens the scopes.
-	second, err := oauth.NewClient("cli", "First-party client", oauth.ClientConfidential, "s3cret",
-		[]string{"https://newapp.example/callback"}, []oauth.Scope{"account.id", "phigros.profile.read"})
+	work := t.TempDir()
+	backing := filepath.Join(work, "zzprobe_overlay_seedclient_test.go")
+	if err := os.WriteFile(backing, []byte(overlaySeedClientTest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The overlay maps a path that does not exist in the checkout to the backing
+	// file above, so the package main build sees one extra test file and nothing
+	// on disk changes.
+	target := filepath.Join(root, "cmd", "re0auth", "zzprobe_overlay_seedclient_test.go")
+	blob, err := json.Marshal(map[string]any{
+		"Replace": map[string]string{filepath.ToSlash(target): backing},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	overlayPath := filepath.Join(work, "overlay.json")
+	if err := os.WriteFile(overlayPath, blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	// seedClient's exact logic: Get first, and if it is found, stop.
-	got, err := reg.Get(ctx, "cli")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "test", "-overlay", overlayPath, "-count=1", "-v",
+		"-run", "^TestOverlayZ12SeedClientDrift$", "./cmd/re0auth/")
+	cmd.Dir = root
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("the registry lost the seeded client: %v", err)
+		t.Errorf("the production seedClient does not refuse a registration that drifts from [client]: %v\n%s",
+			err, out)
+		return
 	}
-	if got.Type != oauth.ClientPublic {
-		t.Fatalf("premise wrong: the seeded client's type is %q", got.Type)
+	// A `-run` that matches nothing exits 0, so require the PASS marker: without
+	// it this guard would be green because it never ran.
+	if !strings.Contains(string(out), "--- PASS: TestOverlayZ12SeedClientDrift") {
+		t.Errorf("the overlay test did not run, so the drift guard is vacuous:\n%s", out)
 	}
-
-	// Anti-vacuous: the config the operator would write really does differ, so a
-	// reconciliation step would have something to apply.
-	if second.Type == got.Type {
-		t.Fatal("premise wrong: the two configurations do not differ in type")
-	}
-	if got.AllowsRedirect("https://newapp.example/callback") {
-		t.Fatalf("premise wrong: the stored client already accepts the new redirect URI")
-	}
-	if got.AllowsScope("phigros.profile.read") {
-		t.Fatalf("premise wrong: the stored client already allows the new scope")
-	}
-	if got.Authenticate("s3cret") {
-		t.Fatalf("premise wrong: the stored client already accepts the configured secret")
-	}
-
-	// The finding: there is no code path in the process that would change any of
-	// it, and the only startup signal is the "already registered" info line.
-	t.Errorf("the configured client is not reconciled: the deployment now asks to be "+
-		"type=%q redirect=%v scopes=%v, while the registry still answers "+
-		"type=%q redirect=%v scopes=%v. seedClient (main.go:1583-1591) returns as soon as "+
-		"Get succeeds and prints only 'downstream client already registered'",
-		second.Type, second.RedirectURIs, second.AllowedScopes,
-		got.Type, got.RedirectURIs, got.AllowedScopes)
 }

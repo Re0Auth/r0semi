@@ -1,11 +1,17 @@
 //go:build audit7
 
-// Z12-VERIFY: an independent reading of the /readyz poisoning, with a control
-// built into the same process (the shipping kubelet cadence).
+// Z12-VERIFY: independent regression guards for the /readyz caller-hangup ruling.
+//
+// The readiness cache is process-wide, so a caller that hangs up must not be able
+// to end the shared dependency check. The fix runs the check on
+// context.WithoutCancel(callerCtx) + readinessTimeout. These probes hang anonymous
+// callers up continuously and require every kubelet-shaped probe to stay 200 and
+// the dependency to see zero cancellations.
 package z12verify
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -86,15 +92,17 @@ func hangUp(t *testing.T, base string) {
 	_ = conn.Close()
 }
 
-// TestZ12VerifyReadyzStaysDownWhileKubeletKeepsProbing measures the shape the
+// TestZ12VerifyReadyzStaysUpWhileKubeletKeepsProbing measures the shape the
 // shipped manifest asks for: a probe every 5s (deploy/k8s/base/deployment.yaml
-// readinessProbe periodSeconds: 5). The dependency is healthy throughout; the
-// only unwelcome caller is one that hangs up once per TTL. If the orchestrator's
-// probe ever sees 200 again, the poisoning is self-healing and bounded to one
-// window; if it does not, the instance is held out of rotation indefinitely.
+// readinessProbe periodSeconds: 5). The dependency is healthy throughout; the only
+// unwelcome caller is one that hangs up once per TTL. Every probe must stay 200 and
+// the hang-up must not cancel the shared check. The controls are the same sequence
+// with no hang-up (every probe 200, nothing cancelled) and a genuinely down
+// dependency (still 503, so the fix did not turn /readyz into an unconditional 200).
 //
-// The control is the same sequence with no hang-up: every probe must be 200.
-func TestZ12VerifyReadyzStaysDownWhileKubeletKeepsProbing(t *testing.T) {
+// It was formerly TestZ12VerifyReadyzStaysDownWhileKubeletKeepsProbing, which
+// asserted the poisoning persisted.
+func TestZ12VerifyReadyzStaysUpWhileKubeletKeepsProbing(t *testing.T) {
 	var cancelled, probes atomic.Int64
 
 	ready := func(ctx context.Context) error {
@@ -108,7 +116,8 @@ func TestZ12VerifyReadyzStaysDownWhileKubeletKeepsProbing(t *testing.T) {
 		}
 	}
 
-	// Control: an ordinary probe every 300ms sees 200 every time.
+	// Control 1: an ordinary probe every 300ms sees 200 every time and cancels
+	// nothing.
 	ctrlSrv := readyServer(t, ready)
 	for i := 0; i < 4; i++ {
 		if code, body := getReadyz(t, ctrlSrv.URL); code != http.StatusOK {
@@ -121,6 +130,12 @@ func TestZ12VerifyReadyzStaysDownWhileKubeletKeepsProbing(t *testing.T) {
 	}
 	probes.Store(0)
 
+	// Control 2: a real dependency failure is still reported 503.
+	downSrv := readyServer(t, func(context.Context) error { return errors.New("database down") })
+	if code, body := getReadyz(t, downSrv.URL); code != http.StatusServiceUnavailable {
+		t.Fatalf("control: a down dependency answered %d %q, want 503: the guard must not be vacuous", code, body)
+	}
+
 	// Subject: one hang-up, then poll like a kubelet would.
 	ts := readyServer(t, ready)
 	if code, _ := getReadyz(t, ts.URL); code != http.StatusOK {
@@ -128,13 +143,7 @@ func TestZ12VerifyReadyzStaysDownWhileKubeletKeepsProbing(t *testing.T) {
 	}
 	time.Sleep(1100 * time.Millisecond) // let the cached success expire
 	hangUp(t, ts.URL)
-	deadline := time.Now().Add(3 * time.Second)
-	for cancelled.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if cancelled.Load() == 0 {
-		t.Fatal("the hang-up never cancelled the dependency check, so this probe cannot conclude")
-	}
+	time.Sleep(200 * time.Millisecond) // let the detached check finish
 
 	codes := make([]int, 0, 6)
 	for i := 0; i < 6; i++ {
@@ -142,35 +151,31 @@ func TestZ12VerifyReadyzStaysDownWhileKubeletKeepsProbing(t *testing.T) {
 		codes = append(codes, code)
 		time.Sleep(400 * time.Millisecond)
 	}
-	t.Logf("readyz codes after one hang-up, polled every 400ms: %v (dependency checks run: %d)",
-		codes, probes.Load())
-	ok := 0
-	for _, c := range codes {
-		if c == http.StatusOK {
-			ok++
+	t.Logf("readyz codes after one hang-up, polled every 400ms: %v (dependency checks run: %d, cancellations: %d)",
+		codes, probes.Load(), cancelled.Load())
+
+	if n := cancelled.Load(); n != 0 {
+		t.Errorf("the dependency saw its context cancelled %d time(s) after one anonymous caller hung up: the check "+
+			"runs on the caller's request context again, so a hangup ends the shared readiness check", n)
+	}
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("probe %d answered %d after a single anonymous hang-up while the dependency was healthy: the "+
+				"caller's cancellation reached the shared readiness cache", i, c)
 		}
 	}
-	if ok == len(codes) {
-		t.Errorf("the cancelled check did not poison anything: all %d probes answered 200", len(codes))
-		return
-	}
-	if ok > 0 {
-		t.Logf("the poisoning healed after %d/%d probes answered 200", len(codes)-ok, len(codes))
-		return
-	}
-	t.Errorf("every one of the %d probes %v after a single anonymous hang-up answered 503 while the "+
-		"dependency was healthy: an anonymous caller can keep a healthy instance out of rotation for "+
-		"as long as it keeps opening and closing /readyz once per readinessTTL, and the shipped probe "+
-		"cadence (periodSeconds: 5, failureThreshold: 3) removes the endpoint.", len(codes), codes)
 }
 
-// TestZ12VerifySustainedHangUpsHoldReadyzDown asks whether the one-window effect
-// can be sustained, which is the difference between "a rolling deploy shows a
-// blip" and "a healthy replica stays out of rotation". An attacker that hangs up
-// more often than readinessTTL starts every fresh check itself, so the kubelet's
-// own probe never triggers a real check — it always reads the attacker's
-// cancelled result.
-func TestZ12VerifySustainedHangUpsHoldReadyzDown(t *testing.T) {
+// TestZ12VerifySustainedHangUpsDoNotHoldReadyzDown asks whether the one-window
+// effect can be sustained — the difference between "a rolling deploy shows a blip"
+// and "a healthy replica stays out of rotation". An attacker that hangs up more
+// often than readinessTTL starts every fresh check itself; with the fix those
+// detached checks see the healthy dependency and every kubelet-shaped probe stays
+// 200 with zero cancellations.
+//
+// It was formerly TestZ12VerifySustainedHangUpsHoldReadyzDown, which asserted the
+// poison could be sustained.
+func TestZ12VerifySustainedHangUpsDoNotHoldReadyzDown(t *testing.T) {
 	var cancelled atomic.Int64
 	ready := func(ctx context.Context) error {
 		select {
@@ -203,7 +208,8 @@ func TestZ12VerifySustainedHangUpsHoldReadyzDown(t *testing.T) {
 		}
 	}()
 
-	// Three kubelet-shaped probes, 5s apart, over 11 seconds of attack.
+	// Three kubelet-shaped probes, 5s apart, over 11 seconds of attack. The
+	// dependency is healthy throughout, so every probe must stay 200.
 	time.Sleep(1200 * time.Millisecond)
 	codes := make([]int, 0, 3)
 	for i := 0; i < 3; i++ {
@@ -215,24 +221,15 @@ func TestZ12VerifySustainedHangUpsHoldReadyzDown(t *testing.T) {
 	<-done
 	t.Logf("kubelet-shaped probes during a sustained attack: %v (cancellations: %d)", codes, cancelled.Load())
 
-	ok := 0
-	for _, c := range codes {
-		if c == http.StatusOK {
-			ok++
+	if n := cancelled.Load(); n != 0 {
+		t.Errorf("the dependency saw its context cancelled %d time(s) during sustained anonymous hang-ups: the check "+
+			"runs on the caller's request context again, so one client holding a connect-and-close loop ends "+
+			"every shared readiness check", n)
+	}
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("kubelet-shaped probe %d answered %d during sustained anonymous hang-ups while the dependency "+
+				"was healthy: one anonymous client keeps the readiness cache poisoned", i, c)
 		}
-	}
-	if cancelled.Load() == 0 {
-		t.Fatal("no check was ever cancelled, so this probe observed nothing")
-	}
-	if ok == len(codes) {
-		t.Errorf("sustained hang-ups did not hold /readyz down: %v", codes)
-	} else if ok > 0 {
-		t.Logf("the attack did not hold every probe down (%d of %d answered 200); the effect is a "+
-			"one-window blip unless the attacker wins every readinessTTL race", ok, len(codes))
-	} else {
-		t.Errorf("every kubelet-shaped probe during the sustained attack answered 503 (%v) while the "+
-			"dependency was healthy: one anonymous client holding a connect-and-close loop keeps the "+
-			"readiness cache poisoned, so failureThreshold 3 x periodSeconds 5 removes the endpoint",
-			codes)
 	}
 }

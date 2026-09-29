@@ -1,145 +1,157 @@
 //go:build audit7
 
-// Z11-4: the fail-closed overflow bucket is not per client. A single IPv6 /64
-// fills every shard, and from then on EVERY caller whose key is not already in
-// the table shares one bucket per shard with all the others — so one host denies
-// login to every client it has not already seen, while tracked clients keep
-// their own budget.
+// Z11-4 regression guard: IPv6 client keys are aggregated to their /64 for
+// rate-limit buckets, so a single delegated /64 cannot fill the bucket table and
+// starve unrelated clients.
 //
-// The documented half (docs/operations-decision.md:49): "桶表满时不淘汰活桶：
-// 新键共用一个兜底桶". What is not documented is WHO ends up in it and that the
-// table can be held full by one machine: the key is `planeOf(path)|addr`
-// (internal/httpapi/middleware.go:349) and addr is a single /128
-// (internal/httpapi/clientaddr.go:70-82), so a /64 is 2^64 key spaces. Round 5's
-// recheck recorded that amplification (CM-V1) but its fix direction was "the
-// spray must buy no quota" — which the overflow bucket achieves, by converting
-// the spray into collateral starvation of unrelated clients.
+// The defect keyed every /128 separately. One host with one /64 therefore had
+// 2^64 key spaces, filled every shard from that single prefix, and from then on
+// EVERY caller the limiter had not already seen shared a drained overflow bucket —
+// anonymous denial of service against unrelated clients, silent because the probes
+// stayed green.
 //
-// The probe runs at the SHIPPED defaults (10000 keys, 16 shards, 625/shard) and
-// uses only addresses inside one /64, so it is the production shape rather than a
-// scaled-down model of it.
+// The fix lives in the HTTP layer, not in the transport-agnostic limiter:
+// `bucketKey` calls `aggregateClientKey` (internal/httpapi/middleware.go), which
+// coarsens an IPv6 client key to its /64. This guard therefore drives the REAL
+// middleware chain — with the deployment's trusted-proxy + X-Forwarded-For
+// attribution, which is the configuration in which the bucket key is exercised for
+// an arbitrary address — and varies only the /128 inside one /64. It was formerly
+// TestZ11OneIPv6Slash64DeniesEveryNewClient, which drove ratelimit.Check with raw
+// /128 strings and bypassed the layer the fix lives at.
 package zzprobe_z11resiliencedos
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
-	"strings"
 	"testing"
 
+	"github.com/Re0Auth/r0semi/internal/httpapi"
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 )
 
-// z11FillPrefix is one IPv6 /64. Every key this probe creates is inside it, so
-// the whole attack is available to a single host with a single delegated prefix.
+// z11FillPrefix is one IPv6 /64. Every address this guard creates is inside it, so
+// the whole subject is available to a single host with a single delegated prefix.
 const z11FillPrefix = "2001:db8:ff::/64"
 
 func z11Key(i int, plane string) string {
 	return plane + "|" + fmt.Sprintf("2001:db8:ff::%x", i)
 }
 
-// TestZ11OneIPv6Slash64DeniesEveryNewClient is red while the table can be filled
-// by one prefix and the overflow buckets are shared.
-func TestZ11OneIPv6Slash64DeniesEveryNewClient(t *testing.T) {
-	// Production values: the shipped limiter is ratelimit.New(50, 100) with the
-	// default 10_000-key cap (cmd/re0auth/main.go:224-229, internal/ratelimit).
-	// The rate is pinched so that a spent bucket does not refill during the
-	// probe; what the rate changes in production is only how often the attacker
-	// must come back (50/s per draining address).
+// z11ForwardingAPI mounts the real httpapi chain with X-Forwarded-For attribution,
+// which is the only configuration in which the middleware's own bucketKey (and
+// therefore its /64 aggregation) is driven for a caller-chosen address. The
+// loopback peer is declared a trusted proxy so the header is read.
+func z11ForwardingAPI(t *testing.T, l *ratelimit.Limiter) *httptest.Server {
+	t.Helper()
+	api, err := httpapi.New(httpapi.Config{
+		Issuer:            "https://re0auth.test",
+		OIDC:              stubOIDC,
+		TokenIntrospector: stubIntrospector{},
+		GrantStore:        stubGrants{},
+		DeviceStore:       stubDevices{},
+		Limiter:           l,
+		TrustedProxies:    []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
+		ClientAddrHeader:  httpapi.ClientAddrXForwardedFor,
+	})
+	if err != nil {
+		t.Fatalf("httpapi.New: %v", err)
+	}
+	srv := httptest.NewServer(api.Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// z11StatusXFF performs one business-plane request attributed to xff and returns
+// the status. On this plane an admitted request is the business 401 (no bearer),
+// and a rate-limited one is 429.
+func z11StatusXFF(t *testing.T, base, xff string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, base+"/v1/me", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Forwarded-For", xff)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/me as %s: %v", xff, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// TestZ11OneIPv6Slash64CannotFillTheBucketTable is green only while the
+// middleware's bucket key aggregates IPv6 to /64: many distinct /128 addresses in
+// one /64 share one bucket (so they cannot fill the table), and an unrelated client
+// is still served.
+func TestZ11OneIPv6Slash64CannotFillTheBucketTable(t *testing.T) {
+	// Cache-only limiter (1e-6/s): a spent bucket does not refill during the probe.
 	const (
-		probeRate  = 1e-6 // ~1e6 s to refill one token
+		probeRate  = 1e-6
 		probeBurst = 2
 	)
 	l := ratelimit.New(probeRate, probeBurst)
 
-	// Positive control: a fresh client on a fresh limiter is admitted, so a
-	// denial below is the table being full and not the limiter being broken.
-	control := ratelimit.New(probeRate, probeBurst)
-	if v := control.Check("business|198.51.100.7"); !v.Allowed {
-		t.Fatalf("the positive control was denied on an empty limiter (%+v): re-derive the probe", v)
+	// Positive control: on an unsaturated limiter the request shape is the business
+	// plane's 401, not a 429, so a 429 below is the shared bucket and not a broken
+	// chain.
+	fresh := z11ForwardingAPI(t, ratelimit.New(probeRate, probeBurst))
+	if code := z11StatusXFF(t, fresh.URL, "198.51.100.7"); code != http.StatusUnauthorized {
+		t.Fatalf("control: an unsaturated limiter answered %d, want 401: re-derive the guard", code)
 	}
 
-	// ---- one /64 fills every shard ---------------------------------------
+	srv := z11ForwardingAPI(t, l)
+
+	// Many DISTINCT /128 addresses inside ONE /64. With the /64 aggregation they
+	// are one bucket: exactly the first `probeBurst` are admitted and every later
+	// one shares its drained budget.
+	const distinct = 200
 	prefix := netip.MustParsePrefix(z11FillPrefix)
-	tracked := make([]string, 0, l.MaxKeys())
-	for i := 1; i <= 400_000 && l.Size() < l.MaxKeys(); i++ {
-		k := z11Key(i, "business")
-		before := l.Size()
-		l.Allow(k)
-		if now := l.Size(); now > before {
-			tracked = append(tracked, k)
+	admitted, denied := 0, 0
+	for i := 1; i <= distinct; i++ {
+		addr := fmt.Sprintf("2001:db8:ff::%x", i)
+		if a, err := netip.ParseAddr(addr); err != nil || !prefix.Contains(a) {
+			t.Fatalf("probe built an address outside its own /64: %q (err=%v)", addr, err)
 		}
-	}
-	if got := l.Size(); got != l.MaxKeys() {
-		t.Fatalf("could not fill the bucket table from one /64: Size=%d want %d", got, l.MaxKeys())
-	}
-	for _, k := range tracked {
-		addr := strings.TrimPrefix(k, "business|")
-		a, err := netip.ParseAddr(addr)
-		if err != nil {
-			t.Fatalf("probe built an unparseable address %q: %v", addr, err)
-		}
-		if !prefix.Contains(a) {
-			t.Fatalf("probe escaped its own /64 with %q", addr)
-		}
-	}
-	t.Logf("%d tracked keys (the whole table) created from one /64 %s", len(tracked), z11FillPrefix)
-
-	// ---- keep every shard's overflow bucket drained ----------------------
-	// These are fresh keys: the table is full, so each one lands on the overflow
-	// bucket of its shard instead of being tracked. Production needs 16 such
-	// addresses at 50 req/s each; the probe only needs one pass because the rate
-	// is pinched.
-	for i := 400_001; i <= 900_000; i++ {
-		l.Allow(z11Key(i, "business"))
-	}
-
-	// ---- what an unrelated new client gets, on every plane ---------------
-	// Different address family, different prefix, every plane: all denied,
-	// because the shard is chosen by hash and every shard is full.
-	victims := []string{
-		"business|198.51.100.7",
-		"protocol|198.51.100.7",
-		"browser|198.51.100.7",
-		"business|2001:db8:1::5", // an unrelated IPv6 client
-		"protocol|203.0.113.99",  // a different IPv4
-	}
-	denied, shared := 0, 0
-	for _, k := range victims {
-		v := l.Check(k)
-		t.Logf("%-22s allowed=%-5v shared=%-5v remaining=%d", k, v.Allowed, v.Shared, v.Remaining)
-		if !v.Allowed {
+		switch code := z11StatusXFF(t, srv.URL, addr); code {
+		case http.StatusUnauthorized:
+			admitted++
+		case http.StatusTooManyRequests:
 			denied++
-		}
-		if v.Shared {
-			shared++
+		default:
+			t.Fatalf("GET /v1/me as %s = %d: unexpected status", addr, code)
 		}
 	}
-	if denied != len(victims) {
-		t.Errorf("%d of %d brand-new clients were still admitted after one /64 filled the table: "+
-			"re-derive the probe", len(victims)-denied, len(victims))
-		return
+	if got := l.Size(); got != 1 {
+		t.Errorf("one /64 created %d tracked buckets after %d distinct /128 addresses (want 1): the "+
+			"middleware's bucket key no longer aggregates IPv6 to /64, so one prefix has 2^64 key spaces and "+
+			"can fill all %d buckets", got, distinct, l.MaxKeys())
 	}
-	if shared != len(victims) {
-		t.Errorf("a new client was denied from its OWN bucket rather than the shared overflow bucket "+
-			"(%d of %d shared): the mechanism is not the one this probe describes", shared, len(victims))
+	if admitted != probeBurst {
+		t.Errorf("%d of %d distinct /128 addresses inside one /64 were admitted, want exactly the %d-token "+
+			"burst: they are not sharing one bucket", admitted, distinct, probeBurst)
+	}
+	if denied != distinct-probeBurst {
+		t.Errorf("%d of %d distinct /128 addresses inside one /64 were denied, want %d: they are not sharing "+
+			"one bucket", denied, distinct, distinct-probeBurst)
 	}
 
-	// ---- and a client that was already tracked keeps its own budget ------
-	// This is the asymmetry that makes it a denial rather than a global outage
-	// for everybody: the attacker's own keys are the ones that survive.
-	if v := l.Check(tracked[0]); !v.Allowed || v.Shared {
-		t.Errorf("an address the attacker tracked is not exempt from the starvation (allowed=%v shared=%v): "+
-			"the probe's model of the sharing is wrong", v.Allowed, v.Shared)
-	} else {
-		t.Logf("tracked key %s still served from its own bucket (shared=%v)", tracked[0], v.Shared)
+	// An unrelated new client — a different /64 and two IPv4 addresses — is still
+	// served: the /64 filled 1 of MaxKeys buckets, so no shard is full and no
+	// overflow bucket is in use.
+	for _, xff := range []string{"2001:db8:1::5", "198.51.100.7", "203.0.113.99"} {
+		if code := z11StatusXFF(t, srv.URL, xff); code != http.StatusUnauthorized {
+			t.Errorf("an unrelated new client (%s) was answered %d after one /64 filled only 1 of %d buckets: "+
+				"the /64 is starving clients it has never seen", xff, code, l.MaxKeys())
+		} else {
+			t.Logf("unrelated client %s still served (%d)", xff, code)
+		}
 	}
-
-	t.Errorf("one host with one IPv6 /64 filled all %d tracked buckets and kept every shard's overflow bucket "+
-		"empty; every new client on every plane is then answered 429 (%d/%d denied, all shared). The fail-closed "+
-		"answer to the key spray is one shared bucket PER SHARD with no per-client share, so the spray does not "+
-		"buy quota — it buys denial of service against everyone the attacker has not already seen. Production "+
-		"sustains it with 16 addresses at 50 req/s (one per shard) while 10000 one-request-per-10-min refreshes "+
-		"hold the table full.", l.MaxKeys(), denied, len(victims))
+	t.Logf("one /64 contributed 1 tracked bucket of %d after %d distinct /128 addresses: %d admitted (burst %d), "+
+		"%d rate-limited from the same shared bucket", l.MaxKeys(), distinct, admitted, probeBurst, denied)
 }
 
 // TestZ11AtCapacityTheTableStaysBounded is the green half: the spray really does

@@ -1,26 +1,26 @@
 //go:build audit7
 
-// Z11-1: an anonymous caller's own cancellation poisons the SHARED readiness
-// result.
+// Z11-1 regression guard: an anonymous caller's own cancellation must NOT poison
+// the SHARED readiness result.
 //
-// internal/httpapi/health.go holds one readinessCache per process. Its whole
-// justification (P1-4's fix) is "probes are exempt from the limiter and the
-// in-flight cap BECAUSE the exempted work is bounded" — at most one dependency
-// check per readinessTTL, and never a 503 caused by someone else's traffic
-// (docs/operations.md: "probes answer from a bounded amount of work, and never a
-// 503 because of load").
+// internal/httpapi/health.go holds one readinessCache per process, and its whole
+// justification (P1-4's fix) is that the exempted probe work is bounded and never
+// answers 503 because of someone else's traffic (docs/operations.md: "probes answer
+// from a bounded amount of work, and never a 503 because of load").
 //
-// But `check` derives the probe's context from the REQUEST's context
-// (health.go:122: `context.WithTimeout(ctx, readinessTimeout)` where ctx is
-// r.Context()). net/http cancels a request's context when the client's
-// connection closes. So a caller that opens /readyz and hangs up while the
-// check is running makes the dependency call return context.Canceled, and that
-// error is stored as the process-wide readiness answer for the next
-// readinessTTL. Every /readyz in that window — including the kubelet's — is a
-// 503 "not ready", which pulls a healthy instance out of rotation. The attacker
-// needs no credential (probes are exempt from the limiter and the in-flight cap,
-// so no budget either) and the failure is silent: the reason goes to slog.Debug
-// (health.go:98).
+// The defect this guards against derived the dependency check from the caller's
+// request context (`context.WithTimeout(ctx, readinessTimeout)` where ctx is
+// r.Context(), which net/http cancels when the client's connection closes). A
+// caller that opened /readyz and hung up while the check ran made the dependency
+// return context.Canceled, and that error became the process-wide readiness answer
+// for the next readinessTTL — a healthy instance pulled out of rotation by one
+// unauthenticated connection per second, with no rate-limit budget spent.
+//
+// The fix runs the check on context.WithoutCancel(callerCtx) + readinessTimeout,
+// so a caller's hangup never cancels it and context.Canceled is never cached as a
+// verdict. This guard fires N anonymous connect-then-hangup requests, each with the
+// check provably running, and requires every fresh /readyz to stay 200 and the
+// dependency to have observed zero cancellations. Reverting the fix fails both.
 package zzprobe_z11resiliencedos
 
 import (
@@ -36,81 +36,81 @@ import (
 	"github.com/Re0Auth/r0semi/internal/httpapi"
 )
 
-// TestZ11CallerCancellationPoisonsTheSharedReadinessResult is red while the
-// readiness check is derived from the caller's context.
-func TestZ11CallerCancellationPoisonsTheSharedReadinessResult(t *testing.T) {
+// TestZ11CallerCancellationDoesNotPoisonReadiness is green only while the
+// readiness check is detached from the caller's context. It was formerly
+// TestZ11CallerCancellationPoisonsTheSharedReadinessResult, a finding-confirmation
+// oracle that asserted the poison; it is now the regression guard for the fix.
+func TestZ11CallerCancellationDoesNotPoisonReadiness(t *testing.T) {
 	// The stand-in for `store.db.Ping`: a real dependency call that honours the
 	// context it is given and takes a non-zero amount of time, the way a database
-	// round trip does. It reports what it saw, so the probe can print the error
-	// the process cached.
-	var calls atomic.Int64
-	var lastErr atomic.Value
+	// round trip does. It counts invocations, completions and cancellations, so the
+	// probe can prove the hang-ups ran real checks and yet cancelled none.
+	var calls, finished, cancels atomic.Int64
 	ready := func(ctx context.Context) error {
 		calls.Add(1)
+		defer finished.Add(1)
 		select {
 		case <-ctx.Done():
-			lastErr.Store(ctx.Err().Error())
+			cancels.Add(1)
 			return ctx.Err()
-		case <-time.After(300 * time.Millisecond):
-			lastErr.Store("<nil: dependency reachable>")
+		case <-time.After(200 * time.Millisecond):
 			return nil
 		}
 	}
 	srv := miniAPI(t, miniConfig{Ready: httpapi.ReadinessProbe(ready)})
 
-	// The poison: one unauthenticated GET /readyz whose connection is closed
-	// while the check is running. Nothing is read, nothing is authenticated, and
-	// no rate-limit budget is spent (probes are exempt).
+	// Positive control: with a live caller the check succeeds, so a healthy result
+	// is possible at all and the cancellations below are attributable to hangups.
+	if code, _, _ := get(t, srv.URL+"/readyz"); code != http.StatusOK {
+		t.Fatalf("control: /readyz = %d against a healthy dependency, want 200", code)
+	}
+	if n := cancels.Load(); n != 0 {
+		t.Fatalf("control: the dependency was cancelled %d time(s) with no caller hanging up", n)
+	}
+	calls.Store(0)
+	finished.Store(0)
+
+	// N anonymous connect-then-hangup requests. Each one outlives readinessTTL so
+	// it starts a check of its own, and hangs up only once that check is provably
+	// running — so each is a genuine attempt to cancel the shared check.
+	const hangups = 3
 	addr := srv.Listener.Addr().String()
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial %s: %v", addr, err)
-	}
-	if _, err := fmt.Fprintf(conn, "GET /readyz HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n"); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-	// Wait until the check is provably running before hanging up, so this is not
-	// a race with request dispatch.
-	waitUntil(t, 2*time.Second, func() bool { return calls.Load() >= 1 })
-	_ = conn.Close()
-	// Let the server notice the disconnect and the probe return.
-	waitUntil(t, 2*time.Second, func() bool {
-		v, _ := lastErr.Load().(string)
-		return v == context.Canceled.Error()
-	})
-
-	// What the kubelet would read in the next readinessTTL.
-	code := http.StatusOK
-	deadline := time.Now().Add(600 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		code, _, _ = get(t, srv.URL+"/readyz")
-		if code != http.StatusOK {
-			break
+	for i := 0; i < hangups; i++ {
+		time.Sleep(1100 * time.Millisecond) // outlive readinessTTL
+		base := calls.Load()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial %s: %v", addr, err)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cached, _ := lastErr.Load().(string)
-	t.Logf("after one anonymous connect-then-hangup on /readyz: probe invocations=%d, cached dependency result=%q, "+
-		"next /readyz (a fresh connection, no credential) = %d", calls.Load(), cached, code)
-	if code != http.StatusServiceUnavailable {
-		t.Errorf("a fresh /readyz answered %d; the caller's cancellation did not reach the shared cache. "+
-			"If this is green, the mechanism is gone — re-derive the probe.", code)
-	} else {
-		t.Errorf("an anonymous caller made the process report NOT READY (503) for every caller, including the " +
-			"orchestrator's probe: /readyz ran the dependency check on r.Context() (health.go:122), the caller hung " +
-			"up, and context.Canceled was cached as this replica's readiness for readinessTTL. One connection per " +
-			"second keeps a healthy instance out of rotation, and no rate limit applies (probes are exempt).")
+		if _, err := fmt.Fprintf(conn, "GET /readyz HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n"); err != nil {
+			_ = conn.Close()
+			t.Fatalf("write request %d: %v", i, err)
+		}
+		waitUntil(t, 2*time.Second, func() bool { return calls.Load() > base })
+		if calls.Load() <= base {
+			_ = conn.Close()
+			t.Fatalf("hangup %d never started a dependency check", i)
+		}
+		_ = conn.Close()
+		// Let the detached check finish before the next cycle, so each hangup is
+		// measured against its own check.
+		waitUntil(t, 2*time.Second, func() bool { return finished.Load() > base })
 	}
 
-	// Control: with a live caller the same check succeeds, so the 503 above was
-	// the cancellation and not a broken probe.
-	time.Sleep(1100 * time.Millisecond) // outlive readinessTTL
-	code, _, _ = get(t, srv.URL+"/readyz")
-	cached, _ = lastErr.Load().(string)
-	t.Logf("after the TTL, a live caller on a fresh connection: cached=%q, /readyz = %d", cached, code)
+	// What the kubelet would read on a fresh connection.
+	code, _, body := get(t, srv.URL+"/readyz")
+	t.Logf("after %d anonymous connect-then-hangup requests on /readyz: probe invocations=%d, "+
+		"cancellations=%d, next /readyz (fresh connection, no credential) = %d %q",
+		hangups, calls.Load(), cancels.Load(), code, body)
 	if code != http.StatusOK {
-		t.Errorf("the endpoint did not recover once the caller stayed connected: %d (cached %q). The probe cannot "+
-			"attribute the 503 above to the cancellation.", code, cached)
+		t.Errorf("a fresh /readyz answered %d (%q) after anonymous callers hung up against a healthy "+
+			"dependency: the caller's cancellation reached the shared readiness cache and replaced a healthy "+
+			"verdict for every caller, including the orchestrator's probe", code, body)
+	}
+	if n := cancels.Load(); n != 0 {
+		t.Errorf("the dependency saw its context cancelled %d time(s) although every check ran on "+
+			"context.WithoutCancel: the readiness probe is derived from the caller's request context again, "+
+			"so any anonymous connect-then-hangup can end the process-wide check", n)
 	}
 }
 

@@ -96,5 +96,15 @@ func TestZ11VHangupPoisonNeedsNoSlowDependency(t *testing.T) {
 			t.Errorf("reachability CONFIRMED for a %s dependency: %d of %d anonymous connect-then-hangup cycles left a "+
 				"fresh, credential-free /readyz at 503 for the rest of the TTL", tc.name, poisoned, rounds)
 		}
+		// The poison could still land with `poisoned == 0` if the cancellation
+		// stayed in play but the Canceled filter happened to hide it, so pin the
+		// mechanism itself: the shared check must run on context.WithoutCancel, so
+		// the dependency is never handed a context the caller's hangup cancelled.
+		if cancelled != 0 {
+			t.Errorf("the dependency observed %d cancelled context(s) for a %s dependency across %d hangup cycles, "+
+				"want 0: context.WithoutCancel is not shielding the shared readiness check from the caller's hangup, "+
+				"so a cancellation can still end the check and be recorded as the process's readiness",
+				cancelled, tc.name, rounds)
+		}
 	}
 }

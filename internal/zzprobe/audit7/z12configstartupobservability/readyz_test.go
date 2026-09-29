@@ -40,36 +40,27 @@ func (z12Devices) DecideDeviceAuthorization(context.Context, string, string, boo
 	return nil
 }
 
-// Z12-7: the readiness result is shared between callers, so one caller that hangs
-// up poisons the answer the orchestrator gets.
+// Z12-7 regression guard: the readiness result is shared between callers, and a
+// caller that hangs up must NOT poison it.
 //
-// readinessCache.check (internal/httpapi/health.go:111-133) runs the dependency
-// check on the CANCELLABLE request context of whichever caller happened to trigger
-// it:
+// The defect ran the dependency check on the CANCELLABLE request context of
+// whichever caller happened to trigger it
+// (`probeCtx, cancel := context.WithTimeout(ctx, readinessTimeout); probe(probeCtx)`,
+// internal/httpapi/health.go). net/http cancels that context when the client's
+// connection closes, so a caller that opened /readyz and hung up made the check
+// fail on the cancellation rather than on the dependency, and the result was
+// stored for readinessTTL — every probe answered from the cache inheriting it. That
+// is exactly what the endpoint's own contract forbids: "It never fails because of
+// load ... a 503 caused by someone else's traffic would pull a healthy instance out
+// of rotation."
 //
-//	probeCtx, cancel := context.WithTimeout(ctx, readinessTimeout)
-//	err := probe(probeCtx)
-//
-// and then stores that error for readinessTTL. A caller that opens /readyz and
-// hangs up cancels r.Context() (net/http cancels the request context when the
-// connection is closed), so the check fails on the cancellation — not on the
-// dependency — and every probe answered from the cache for the next second gets
-// 503. The endpoint's own contract forbids exactly this: "It never fails because
-// of load ... a 503 caused by someone else's traffic would pull a healthy instance
-// out of rotation." Probes are also exempt from the limiter and the in-flight cap,
-// so the poison costs the caller nothing.
-//
-// It is reachable in a durable deployment, where Ready is store.db.Ping
-// (cmd/re0auth/main.go:860-865) and that is pool.Ping(ctx)
-// (internal/store/postgres/postgres.go:268) — a context-aware round trip that
-// reports the cancellation. No database is needed to execute the cache's own
-// mechanism: the probe below is a ReadinessProbe driven through the real handler.
-//
-// Relation to G-11: that one is the `running` branch answering from the
-// never-written zero value (200 about an unverified dependency). This is the
-// `fresh` branch answering from a result that was cancelled, in the opposite
-// direction.
-func TestZ12ReadyzIsPoisonedByACallerThatHangsUp(t *testing.T) {
+// The fix derives the check from context.WithoutCancel(r.Context()) +
+// readinessTimeout, so a hangup ends only the caller's own response and never the
+// shared check. This guard hangs one anonymous caller up mid-check and then
+// requires (a) the dependency to have seen zero cancellations and (b) the next
+// fresh /readyz to be 200. It was formerly
+// TestZ12ReadyzIsPoisonedByACallerThatHangsUp, a finding-confirmation oracle.
+func TestZ12ReadyzSurvivesACallerThatHangsUp(t *testing.T) {
 	var cancelled atomic.Int64
 
 	// A healthy dependency that takes a moment and honours its context, which is
@@ -111,28 +102,28 @@ func TestZ12ReadyzIsPoisonedByACallerThatHangsUp(t *testing.T) {
 	// Let the cached success expire, so the next probe runs a fresh check.
 	time.Sleep(1100 * time.Millisecond)
 
-	// An anonymous caller asks for /readyz and leaves.
+	// An anonymous caller asks for /readyz and leaves mid-check.
 	hangUpReadyz(t, ts.URL)
-	deadline := time.Now().Add(3 * time.Second)
-	for cancelled.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if cancelled.Load() == 0 {
-		t.Fatal("the hang-up never cancelled the dependency check, so this probe cannot conclude")
+	// Give the detached check time to finish. If the hangup still reached it, the
+	// cancellation count below moves.
+	time.Sleep(300 * time.Millisecond)
+
+	if n := cancelled.Load(); n != 0 {
+		t.Errorf("the dependency saw its context cancelled %d time(s) after one anonymous caller hung up: the "+
+			"readiness check is derived from the caller's request context again, so a hangup ends the "+
+			"process-wide check and its result is shared with every other caller", n)
 	}
 
 	// The orchestrator's next probe — another connection, same process — must be
-	// answered about the dependency, which is healthy. It gets the cancelled
-	// caller's result instead.
+	// answered about the dependency, which is healthy.
 	code, body := getReadyz(t, ts.URL)
 	if code != http.StatusOK {
-		t.Errorf("/readyz = %d %q after one anonymous caller hung up: the shared readiness result was "+
-			"replaced by a check that failed on that caller's cancellation, and every probe answered "+
-			"from the cache for the next %s inherits it. A caller can hold this at 503 for as long as "+
-			"it keeps asking (probes are exempt from the limiter and the in-flight cap).\nURL: %s",
+		t.Errorf("/readyz = %d %q after one anonymous caller hung up while the dependency was healthy: the shared "+
+			"readiness result is not the dependency's, and every probe answered from the cache for the next %s "+
+			"inherits it (probes are exempt from the limiter and the in-flight cap).\nURL: %s",
 			code, body, time.Second, ts.URL)
 	} else {
-		t.Logf("the cancelled check did not poison the cache: /readyz = 200")
+		t.Logf("the caller's hangup did not poison the cache: /readyz = 200")
 	}
 }
 

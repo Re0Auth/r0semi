@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -75,15 +74,15 @@ func TestZ02IntrospectionRefusesPublicClients(t *testing.T) {
 	}
 }
 
-// Z02-3 (FINDING) — the P0-6 guard reads the Basic username raw while the
-// library url.QueryUnescape's it (pkg/op/client.go ClientBasicAuth), so a
-// caller that percent-encodes a character of a public client's id presents an
-// id the guard cannot resolve ("unknown", let it through) that the library
-// then authenticates as the public client. The guard's contract — "a caller
-// whose client is not confidential is refused, allowlisted or not" — is
-// bypassable; the data half still fails closed because filterIntrospection
-// keys on the raw id, so what escapes is the refusal itself (200 active=false
-// where the documented answer is 401 invalid_client).
+// Z02-3 / G-5 (regression) — the P0-6 guard used to read the Basic username raw
+// while the library url.QueryUnescape's it (pkg/op/client.go ClientBasicAuth), so
+// a caller that percent-encoded a character of a public client's id presented an
+// id the guard could not resolve ("unknown", let it through) that the library
+// then authenticated as the public client. The guard now QueryUnescapes the Basic
+// client_id before the confidential-client check (internal/oidchttp/oidchttp.go
+// basicClientID), so the escaped id is refused exactly like the plain one. The
+// legitimate-confidential and unknown-client cases are the controls that keep the
+// guard from over-reaching.
 func TestZ02IntrospectionGuardBypassedByPercentEncodedClientID(t *testing.T) {
 	e := newZoneEnv(t, zoneOptions{issuer: "https://issuer.z02"})
 	e = e.withIntrospection(t, []string{e.deviceID}) // the round-5 P0-6 shape
@@ -104,31 +103,40 @@ func TestZ02IntrospectionGuardBypassedByPercentEncodedClientID(t *testing.T) {
 		t.Fatalf("control failed: the plain public client id was not refused: %d %s", status, plainBody)
 	}
 
-	// The finding: the same public client, one character percent-encoded.
+	// The bypass is closed: the same public client, one character percent-encoded,
+	// is now resolved by the guard and refused.
 	status, respBody, out := e.introspect(t, garbage, escaped, "anything")
-	if status == http.StatusUnauthorized {
-		t.Fatalf("the escaped id was refused after all — the finding does not hold: %d %v", status, respBody)
+	if status != http.StatusUnauthorized {
+		t.Errorf("the percent-encoded public client id (Basic %q, which decodes to %q) answered %d, "+
+			"want 401: the guard must QueryUnescape the Basic client_id before the confidential-client "+
+			"check, or the library authenticates an identity the guard never inspected (%v)",
+			escaped, raw, status, respBody)
 	}
-	if status != http.StatusOK {
-		t.Fatalf("the escaped id answered %d, which the mechanism does not predict: %v", status, respBody)
+	if status == http.StatusOK && respBody["active"] == true {
+		t.Errorf("the escaped public client minted an active response: %v", respBody)
 	}
-	if respBody["active"] != false {
-		t.Errorf("the escaped id minted an active response: %v", respBody)
+	if strings.Contains(out, "usr_") || strings.Contains(out, "scope") {
+		t.Errorf("the escaped id leaked token facts: %s", out)
 	}
-	blob, _ := json.Marshal(out)
-	if strings.Contains(string(blob), "usr_") || strings.Contains(string(blob), "scope") {
-		t.Errorf("the escaped id leaked token facts: %s", blob)
-	}
-	t.Errorf("CONFIRMED: Basic id %q sent as %q is authenticated by the library as the public client "+
-		"(url.QueryUnescape), while the P0-6 guard refused to resolve it — the documented 401 invalid_client "+
-		"for a non-confidential caller is bypassable with a percent-encoded id", raw, escaped)
 
-	// And with a real foreign token the data half must still fail closed: the
-	// filter keys on the raw id, which is not the token's client.
+	// Control: a legitimate confidential client still introspects its own token.
 	tokens := asTokens(t, e.codeFlow(t, []string{"account.id", "offline_access"}))
+	status, body, ctrlRaw := e.introspect(t, tokens.AccessToken, e.webID, e.webSec)
+	if status != http.StatusOK || body["active"] != true {
+		t.Errorf("a legitimate confidential client could not introspect its own token: %d %s", status, ctrlRaw)
+	}
+
+	// Control: an unknown client is still refused, so a pass is not blanket-allow.
+	status, _, unknownRaw := e.introspect(t, garbage, "no-such-client-id", "x")
+	if status != http.StatusUnauthorized {
+		t.Errorf("an unknown client id answered %d, want 401: %s", status, unknownRaw)
+	}
+
+	// The data half never leaked; with the guard fixed the escaped caller does not
+	// even reach it.
 	status, foreignBody, _ := e.introspect(t, tokens.AccessToken, escaped, "anything")
-	if status == http.StatusOK && foreignBody["active"] == true {
-		t.Errorf("the escaped public client read another client's token facts: %v", foreignBody)
+	if status != http.StatusUnauthorized {
+		t.Errorf("the escaped public client was not refused for a foreign token: %d %v", status, foreignBody)
 	}
 }
 

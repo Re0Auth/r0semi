@@ -1,15 +1,21 @@
 //go:build audit7
 
-// Z11-V NEW FINDING: the probe exemption skips the limiter and the in-flight cap,
-// but the session middleware still runs for /healthz and /readyz. A caller that
-// sends any session cookie therefore drives one store lookup per probe request —
-// in the shipped Postgres deployment, a pooled SELECT — with no rate limit and no
-// concurrency cap at all. The readinessCache that closed CS-1/P1-4 bounds the
-// readiness dependency check, not this second per-request round trip on the same
-// exempt path.
+// Z11-V regression guard: the probe exemption must also SKIP the session
+// middleware.
 //
-// Evidence here: a counting scs.Store mounted through the REAL auth.Manager and
-// the REAL httpapi chain.
+// /healthz and /readyz are exempt from the limiter and the in-flight cap, so if
+// they were still wrapped by sessions.LoadAndSave a caller that sends any session
+// cookie could drive one session-store lookup per probe request — in the shipped
+// Postgres deployment, a pooled SELECT — with no rate limit and no concurrency cap
+// at all. server.go routes both probes around LoadAndSave; everything else still
+// loads the session.
+//
+// This guard mounts a counting scs.Store through the REAL auth.Manager and the REAL
+// httpapi chain: 20 cookie-bearing /readyz and 20 cookie-bearing /healthz requests
+// must cause 0 lookups and answer 200. The controls prove the instrument works and
+// is pinned to the cookie path: cookie-less /readyz causes 0 lookups, and /v1/me
+// with the same cookie causes exactly 1. It was formerly
+// TestZ11VProbePathStillHitsTheSessionStore, a finding-confirmation oracle.
 package zzprobe_z11verify
 
 import (
@@ -45,10 +51,10 @@ func (s *countStore) Commit(string, []byte, time.Time) error {
 
 func (s *countStore) Delete(string) error { return nil }
 
-// TestZ11VProbePathStillHitsTheSessionStore is red (t.Errorf) if a session cookie
-// on a probe request reaches the store while the probe is exempt from both
-// admission controls.
-func TestZ11VProbePathStillHitsTheSessionStore(t *testing.T) {
+// TestZ11VProbePathSkipsTheSessionStore is green only while /healthz and /readyz
+// are routed around the session middleware: cookie-bearing probes must cause no
+// store lookups.
+func TestZ11VProbePathSkipsTheSessionStore(t *testing.T) {
 	store := &countStore{}
 	sessions := auth.NewManager(auth.Options{Store: store})
 	api, err := httpapi.New(httpapi.Config{
@@ -85,6 +91,9 @@ func TestZ11VProbePathStillHitsTheSessionStore(t *testing.T) {
 	}
 	noCookie := atomic.LoadInt64(&store.find) - before
 	t.Logf("control: 5 cookie-less /readyz requests caused %d store lookups (want 0)", noCookie)
+	if noCookie != 0 {
+		t.Fatalf("control: cookie-less /readyz caused %d store lookups, want 0", noCookie)
+	}
 
 	// Control 2: the same cookie on a NON-probe path must touch the store, so the
 	// counting instrument is proven to work.
@@ -102,35 +111,34 @@ func TestZ11VProbePathStillHitsTheSessionStore(t *testing.T) {
 		t.Fatalf("the counting store is not on the path: %d lookups for a browser request", nonProbe)
 	}
 
-	// The finding: 20 probe requests with the cookie, no rate limit, no cap.
+	// The subject: 20 cookie-bearing /readyz AND 20 cookie-bearing /healthz, with
+	// the limiter at burst 1 and max_in_flight 1. Every probe must be admitted (200)
+	// and none may reach the session store.
 	before = atomic.LoadInt64(&store.find)
 	const n = 20
 	codes := map[int]int{}
-	for i := 0; i < n; i++ {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/readyz", nil)
-		req.AddCookie(cookie)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
+	for _, p := range []string{"/readyz", "/healthz"} {
+		for i := 0; i < n; i++ {
+			req, _ := http.NewRequest(http.MethodGet, srv.URL+p, nil)
+			req.AddCookie(cookie)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			codes[resp.StatusCode]++
 		}
-		_ = resp.Body.Close()
-		codes[resp.StatusCode]++
 	}
 	lookups := atomic.LoadInt64(&store.find) - before
-	t.Logf("finding: %d cookie-bearing /readyz requests (limiter burst 1, max_in_flight 1) = statuses %v, "+
-		"%d session-store lookups", n, codes, lookups)
+	t.Logf("%d cookie-bearing probe requests (20 /readyz + 20 /healthz, limiter burst 1, max_in_flight 1) = "+
+		"statuses %v, %d session-store lookups", 2*n, codes, lookups)
 
-	if codes[http.StatusTooManyRequests] > 0 || codes[http.StatusServiceUnavailable] > 0 {
-		t.Fatalf("the probe was admitted fewer than %d times (%v): the exemption is not in force, so this probe "+
-			"cannot show the amplification", n, codes)
+	if codes[http.StatusOK] != 2*n {
+		t.Errorf("cookie-bearing probe statuses %v: every probe must be admitted with 200", codes)
 	}
-	if lookups < n {
-		t.Errorf("only %d lookups for %d cookie-bearing probe requests: re-derive", lookups, n)
-		return
+	if lookups != 0 {
+		t.Errorf("%d session-store lookups for %d cookie-bearing probe requests: /healthz and /readyz are wrapped "+
+			"by sessions.LoadAndSave again, so an anonymous cookie drives a pooled SELECT per exempt probe with "+
+			"no limiter and no concurrency cap", lookups, 2*n)
 	}
-	t.Errorf("NEW: %d anonymous /readyz requests carrying one arbitrary cookie each caused %d session-store "+
-		"lookups (in the shipped Postgres deployment: a pooled SELECT from the sessions table, taking a connection "+
-		"per request) while the limiter with a single token and a single in-flight slot admitted every one of them. "+
-		"The readinessCache that answered CS-1/P1-4 bounds the readiness dependency check, not this per-request "+
-		"round trip on the same exempt path.", n, lookups)
 }

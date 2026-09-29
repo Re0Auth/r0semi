@@ -3,6 +3,7 @@
 package z02protocoltoken
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"net/http"
@@ -12,18 +13,15 @@ import (
 	"time"
 )
 
-// Z02-1 (FINDING) — `max_age` and `prompt=login` are accepted at the
-// authorize entrance and then silently dropped: neither the wrapper
-// (validateAuthorize handles only `prompt=none`) nor the stored request
-// (oidcstore.AuthRequest carries neither Prompt nor MaxAge) nor the login
-// hook (cmd/re0auth main.go:1292-1303 writes the session's ORIGINAL
-// sign-in time as auth_time, whatever the request asked) honors them. An RP
-// that asks for a fresh authentication — the step-up tool OIDC Core §3.1.2.1
-// defines with a MUST for prompt=login — receives a code and an id_token
-// whose auth_time is the stale session's, and no login_required, and no
-// re-authentication. This is the same class as the round-5 P2-24
-// (prompt=none, fixed by O-8a): neither value is in O-9's not-doing list,
-// and neither is implemented.
+// Z02-1 / G-4 (regression) — `max_age` and `prompt=login` used to be accepted at
+// the authorize entrance and then silently dropped: neither the stored request
+// (oidcstore.AuthRequest now carries Prompt/MaxAge) nor the login hook honored
+// them, so a stale session completed the flow and the id_token carried the old
+// auth_time with no login_required. The fixed code treats the freshness request as
+// the re-authentication at CompleteLogin, so the id_token's auth_time is the
+// decision time. The control keeps the probe honest: with no prompt/max_age the
+// same stale session still completes and its auth_time is the session's old
+// sign-in, so this is about the request and not a general auth_time regression.
 func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 	e := newZoneEnv(t, zoneOptions{issuer: "https://issuer.z02"})
 
@@ -33,7 +31,11 @@ func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 	// browser session, not a synthetic write.
 	stale := time.Now().UTC().Add(-2 * time.Hour)
 
-	authorize := func(extra url.Values) (*http.Response, string) {
+	// authorize sends the REAL request (including any freshness parameter) to the
+	// real endpoint. It returns the pending request id, or "" when the endpoint
+	// answered `login_required` through the redirect — also a correct answer for a
+	// freshness request that cannot be satisfied without a UI.
+	authorize := func(extra url.Values) (string, *url.URL) {
 		t.Helper()
 		q := url.Values{
 			"response_type":         {"code"},
@@ -49,8 +51,75 @@ func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 			q[k] = vs
 		}
 		resp := e.get(t, noRedirect, e.server.URL+"/oauth/authorize?"+q.Encode())
-		body := bodyOf(t, resp)
-		return resp, string(body)
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("authorize with %v = %d (%s), want a redirect", extra, resp.StatusCode, bodyOf(t, resp))
+		}
+		loc, err := url.Parse(resp.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if errParam := loc.Query().Get("error"); errParam != "" {
+			if errParam == "login_required" {
+				return "", loc
+			}
+			t.Fatalf("authorize with %v was answered with error=%q: %s", extra, errParam, loc)
+		}
+		id := loc.Query().Get("authRequestID")
+		if id == "" {
+			t.Fatalf("authorize with %v did not start the interactive flow: %s", extra, loc)
+		}
+		return id, loc
+	}
+
+	// complete records the STALE session sign-in time — exactly what a login hook
+	// driven by an existing browser session would — then completes the pending
+	// request through the real callback and token endpoint.
+	complete := func(id string) map[string]any {
+		t.Helper()
+		ctx := context.Background()
+		verifier := strings.Repeat("v", 64)
+		if err := e.store.SetAuthTime(ctx, id, stale); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.store.CompleteLogin(ctx, id, "usr_z02", []string{"openid", "account.id"}); err != nil {
+			t.Fatal(err)
+		}
+		resp := e.get(t, noRedirect, e.server.URL+"/oauth/authorize/callback?id="+url.QueryEscape(id))
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("callback status = %d: %s", resp.StatusCode, bodyOf(t, resp))
+		}
+		cb, err := url.Parse(resp.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := cb.Query().Get("code")
+		if code == "" {
+			t.Fatalf("no code in %s", cb)
+		}
+		tokens, status := e.postToken(t, e.webID, e.webSec, url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {code},
+			"redirect_uri":  {"https://client.example/cb"},
+			"code_verifier": {verifier},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("token status = %d: %v", status, tokens)
+		}
+		return tokens
+	}
+
+	authTimeOf := func(tokens map[string]any) time.Time {
+		t.Helper()
+		issued := asTokens(t, tokens)
+		if issued.IDToken == "" {
+			t.Fatal("no id_token issued although openid was requested")
+		}
+		claims := idTokenClaims(t, issued.IDToken)
+		at, ok := claims["auth_time"].(float64)
+		if !ok || at <= 0 {
+			t.Fatalf("auth_time = %v, want a number", claims["auth_time"])
+		}
+		return time.Unix(int64(at), 0).UTC()
 	}
 
 	for name, extra := range map[string]url.Values{
@@ -59,62 +128,45 @@ func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 		"max_age=0":    {"max_age": {"0"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			// The request is ACCEPTED (not refused as unsupported)…
-			resp, _ := authorize(extra)
-			if resp.StatusCode != http.StatusFound {
-				t.Fatalf("%s was refused outright (%d), which would make the finding vacuous", name, resp.StatusCode)
+			id, loc := authorize(extra)
+			if id == "" {
+				// No live session and the OP chose to say so: the request was
+				// honored in the other permitted way.
+				t.Logf("%s returned login_required (no live session): %s", name, loc)
+				return
 			}
-			loc, err := url.Parse(resp.Header.Get("Location"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if strings.Contains(loc.RawQuery, "error=") {
-				t.Fatalf("%s was answered with an error redirect: %s", name, loc)
-			}
-			if loc.Query().Get("authRequestID") == "" {
-				t.Fatalf("%s did not start the interactive flow: %s", name, loc)
-			}
-
-			// …and completes on the two-hour-old session, minting an id_token
-			// whose auth_time is that stale sign-in.
-			tokens := e.codeFlowWithAuthTime(t, e.webID, e.webSec, "https://client.example/cb",
-				[]string{"openid", "account.id"}, "usr_z02", "nonce-z02", stale)
-			issued := asTokens(t, tokens)
-			if issued.IDToken == "" {
-				t.Fatal("no id_token issued although openid was requested")
-			}
-			claims := idTokenClaims(t, issued.IDToken)
-			authTime, ok := claims["auth_time"].(float64)
-			if !ok || authTime <= 0 {
-				t.Fatalf("auth_time = %v, want a number", claims["auth_time"])
-			}
-			age := time.Since(time.Unix(int64(authTime), 0))
-			if age > time.Minute {
-				t.Errorf("CONFIRMED: %s completed on a %.0f-minute-old session — the OP neither "+
-					"re-authenticated (auth_time would be fresh) nor returned login_required; the id_token "+
-					"carries the stale auth_time and the RP's step-up request was silently ignored",
-					name, age.Minutes())
+			// The request is ACCEPTED (not refused as unsupported) and completes on
+			// the two-hour-old session, but the freshness requirement makes that
+			// completion the re-authentication: the id_token carries the decision
+			// time, not the stale sign-in.
+			at := authTimeOf(complete(id))
+			if age := time.Since(at); age > time.Minute {
+				t.Errorf("%s completed on a %.0f-minute-old session: the id_token's auth_time is the stale "+
+					"session sign-in, so the freshness request was ignored (want the decision time, or "+
+					"login_required when there is no live session)", name, age.Minutes())
 			}
 		})
 	}
 
-	// Control: without a freshness request the same stale session completes —
-	// the flow itself is sound and the finding is specifically about the
-	// ignored request.
-	tokens := e.codeFlowWithAuthTime(t, e.webID, e.webSec, "https://client.example/cb",
-		[]string{"openid", "account.id"}, "usr_z02", "nonce-z02", stale)
-	claims := idTokenClaims(t, asTokens(t, tokens).IDToken)
-	authTime, _ := claims["auth_time"].(float64)
-	if time.Since(time.Unix(int64(authTime), 0)) < time.Hour {
+	// Control: without a freshness request the same stale session completes and the
+	// id_token carries that old auth_time.
+	id, _ := authorize(nil)
+	if id == "" {
+		t.Fatal("control failed: an ordinary authorize returned login_required with no prompt")
+	}
+	controlAuth := authTimeOf(complete(id))
+	if time.Since(controlAuth) < time.Hour {
 		t.Fatalf("control failed: the recorded auth_time is fresh, so the stale-session shape does not hold")
+	}
+	if delta := controlAuth.Sub(stale); delta < -time.Minute || delta > time.Minute {
+		t.Fatalf("control failed: auth_time %s is not the session's recorded %s", controlAuth, stale)
 	}
 
 	// And prompt=none (the O-8a fix) still refuses without a session, so the
 	// finding is about login/max_age, not a general prompt regression.
-	resp, _ := authorize(url.Values{"prompt": {"none"}})
-	loc, _ := url.Parse(resp.Header.Get("Location"))
-	if resp.StatusCode != http.StatusFound || loc.Query().Get("error") != "login_required" {
-		t.Fatalf("prompt=none no longer refuses without a session: %d %s", resp.StatusCode, loc)
+	_, loc := authorize(url.Values{"prompt": {"none"}})
+	if loc.Query().Get("error") != "login_required" {
+		t.Fatalf("prompt=none no longer refuses without a session: %s", loc)
 	}
 }
 
