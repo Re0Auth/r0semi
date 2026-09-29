@@ -6,7 +6,7 @@
 - **位置**：`internal/lifecycle/lifecycle.go:262`
 - **影响**：受 `Destroy` 失败影响的账号，其审计里唯一一条记录写的是 `outcome=ok` + `pseudonym_destroyed=true`（假名钥匙仍在、仍可归因到被抹除账号），运维据此得到「审计史已不可链接」的错误结论——合规意义上的「抹除已证明完成」是假的；失败路径连一行 `slog` 都没有（`internal/httpapi/account_routes.go:54-65`），运维拿不到任何反向信号，而 500 文案「the audit log records the step that failed」对这一条是假的。
 - **修法**：在 `lifecycle.go:277-283` 的失败分支补第二条记录：先把 `res.PseudonymDestroyed` 复位为 false，再 `d.record(ctx, actor, subject, audit.OutcomeError, res, "pseudonym")`（或调 `d.fail`）。**不要**把 `:269` 的成功记录挪到 `Destroy` 之后——记录本身会重新铸钥匙，代码注释已解释原因，所以应补而非挪。（此为修复建议，非裁定。）
-- **状态**：OPEN
+- **状态**：FIXED（a3de9b9）
 - **证据**：探针 `erasure_test.go::TestZ07ErasureAuditRecordClaimsSuccessWhileTheHistoryStaysLinkable`（红，真 `DELETE /v1/account`）；阳性对照 `::TestZ07ErasureWithAWorkingDestroyIsRecorded`（绿）；第六轮独立夹具 `internal/zzprobe/audit6/z07authsession/erasure_audit_test.go::TestProbeErasure` 同样红（三个断言字符串逐字对上）。
 - **来源**：`docs/audit-7/findings/Z07-VERIFIED.md:46`（裁定表 P1）、`Z07-VERIFIED.md:71-79`（独立证据）；主代理确认 `docs/audit-7/findings/00-MAIN-VERIFICATION.md:228-238`
 
@@ -14,39 +14,39 @@
 - **位置**：`internal/httpapi/health.go:122`（缓存 `:111-133`；探针豁免 `:151-166`；探针周期 `deploy/k8s/base/deployment.yaml:96-100`）
 - **影响**：匿名者每一个 TTL 内赢一次「触发者」竞争（实测 1ms 依赖 8/8、瞬时依赖 5/8 命中）即可让健康副本持续答 503；kubelet `periodSeconds 5 / failureThreshold 3` ⇒ 15 秒内摘除端点，全副本可被匿名削减容量直至整体不可用；原因只进 `slog.Debug`，默认日志级别不可见。
 - **修法**：就绪检查改用不派生自调用方生命周期的上下文（`context.WithoutCancel(r.Context())` 或 `context.Background()`）+ `readinessTimeout`，取消类错误不写缓存。**这是裁定**：共享缓存是全进程的，调用方取消从来不是它的语义。
-- **状态**：OPEN
-- **证据**：`readyz_poison_test.go::TestZ11CallerCancellationPoisonsTheSharedReadinessResult`（红）；`z11verify/readyz_race_test.go`（1ms 依赖 8/8）；`z12verify/verify_readyz_test.go::...SustainedHangUpsHoldReadyzDown`（红，持续挂断可持久化 503）；机制源码 `health.go:94/:122-133` 经主代理读码确认。
+- **状态**：FIXED（98b3c11）
+- **证据**：`readyz_poison_test.go::TestZ11CallerCancellationDoesNotPoisonReadiness`（红）；`z11verify/readyz_race_test.go`（1ms 依赖 8/8）；`z12verify/verify_readyz_test.go::...SustainedHangUpsHoldReadyzDown`（红，持续挂断可持久化 503）；机制源码 `health.go:94/:122-133` 经主代理读码确认。
 - **来源**：`docs/audit-7/findings/Z11-VERIFIED.md:12,58-68`；`docs/audit-7/findings/Z12-VERIFIED.md:87-108`；`docs/audit-7/findings/00-MAIN-VERIFICATION.md:496-511`（合并裁定见 Z11-VERIFIED.md:67-68）
 
 ### Z11-4 桶表被单个 IPv6 /64 填满后，所有新客户端共用一个兜底桶并被 429
 - **位置**：`internal/ratelimit/ratelimit.go:199-215`（键构造 `internal/httpapi/middleware.go:349`；`reclaimLocked` `:226-240`）
 - **影响**：任何**新**客户端（新 IP、重新拨号、NAT 出口变化）在三个平面上全部 429，登录/授权/数据面一起不可用；已被跟踪的客户端不受影响。进程不崩、探针照常 200，k8s 不重启也不摘除 ⇒ 故障静默。
 - **修法**（裁定）：① overflow 桶按调用方分摊（每键一小桶 + LRU/计数上限）；② 或只拒绝重复进入 overflow 的客户端；③ 或 IPv6 地址按 /64 归并（与 P0-4 相反方向的取舍）。三条都需改 `operations-decision.md:49` 措辞。
-- **状态**：OPEN
-- **证据**：`ratelimit_saturation_test.go::TestZ11OneIPv6Slash64DeniesEveryNewClient`（红）；复核真中间件链 `ratelimit_http_test.go::TestZ11VOverflowStarvesThroughTheRealMiddleware`（空限流器 401 阳性对照 → 填满排空后 429）；绿对照 `TestZ11AtCapacityTheTableStaysBounded`。
+- **状态**：FIXED（98b3c11）
+- **证据**：`ratelimit_saturation_test.go::TestZ11OneIPv6Slash64CannotFillTheBucketTable`（红）；复核真中间件链 `ratelimit_http_test.go::TestZ11VOneIPv6Slash64CannotStarveUnrelatedClients`（空限流器 401 阳性对照 → 填满排空后 429）；绿对照 `TestZ11AtCapacityTheTableStaysBounded`。
 - **来源**：`docs/audit-7/findings/Z11-VERIFIED.md:15,102-104`；`docs/audit-7/findings/00-MAIN-VERIFICATION.md:480-494`
 
 ### Z11-5 全进程一个 in-flight 信号量且不按调用方分摊：一个地址占满全部槽位，其他客户端全 503 而探针仍 200
 - **位置**：`internal/httpapi/middleware.go:393-419`（外层顺序 `internal/httpapi/server.go:621-624`；ReadTimeout `cmd/re0auth/main.go:116`）
 - **影响**：一个匿名地址（约 130 个慢 body socket、~5 req/s）即可持续占满 `max_in_flight`，让所有其他客户端在两个平面持续 503；`/healthz`、`/readyz` 全绿 ⇒ 编排器不摘除、不重启，故障对运维不可见地持续。
 - **修法**（裁定）：① 槽位按 `(plane, client)` 分摊（每客户端上限 = `maxInFlight` 的一个分数 + 共享余量）；② 或把限流令牌绑在 in-flight 上而不是到达上；③ 至少给慢 body 一个远短于 `ReadTimeout` 的期限。
-- **状态**：OPEN
-- **证据**：`inflight_test.go::TestZ11OneAddressCanHoldEveryInFlightSlot`（红，`max_in_flight=2` 下另一源地址 503 而探针 200）；`server.go:621-624`、`main.go:116/775-779` 逐行核对；主代理读码 `middleware.go:393-405`。
+- **状态**：FIXED（98b3c11）
+- **证据**：`inflight_test.go::TestZ11OneAddressCannotHoldEveryInFlightSlot`（红，`max_in_flight=2` 下另一源地址 503 而探针 200）；`server.go:621-624`、`main.go:116/775-779` 逐行核对；主代理读码 `middleware.go:393-405`。
 - **来源**：`docs/audit-7/findings/Z11-VERIFIED.md:16,118-121`；`docs/audit-7/findings/00-MAIN-VERIFICATION.md:470-478`
 
 ### Z11-V1 探针豁免绕过两道上限，却绕过不了会话中间件：一个匿名 Cookie 让每次 `/healthz`、`/readyz` 都变成一次连接池往返
 - **位置**：`internal/httpapi/server.go:616-624`（`isProbe` `internal/httpapi/health.go:164`、`internal/httpapi/middleware.go:335/399`；scs `postgres/sessions.go:75-82`）
 - **影响**：匿名者用任意 Cookie 打 `/readyz`（免限流、免并发上限，不受 `max_in_flight` 约束）即可按请求数驱动池往返 ⇒ 池排队，正常登录/授权请求被饿。持有效 Cookie 时 scs 因 `IdleTimeout>0` 把每次探针标 `Modified` ⇒ 每请求一次写。违反 `docs/operations.md:171-183`「探针必须便宜、每副本每秒最多一次往返」。
 - **修法**（裁定）：`isProbe` 的豁免也跳过 `sessions.LoadAndSave`（把探针挂在会话中间件之外），或对带 Cookie 的探针请求走限流。同步修 `docs/operations.md:177-183` 措辞。
-- **状态**：OPEN
-- **证据**：`internal/zzprobe/audit7/z11verify/probe_session_store_test.go::TestZ11VProbePathStillHitsTheSessionStore`（红）：`control cookie-less /readyz = 0 lookups`、`control /v1/me = 1 lookup`、`finding 20 cookie-bearing /readyz = 20 lookups`。
+- **状态**：FIXED（98b3c11）
+- **证据**：`internal/zzprobe/audit7/z11verify/probe_session_store_test.go::TestZ11VProbePathSkipsTheSessionStore`（红）：`control cookie-less /readyz = 0 lookups`、`control /v1/me = 1 lookup`、`finding 20 cookie-bearing /readyz = 20 lookups`。
 - **来源**：`docs/audit-7/findings/Z11-VERIFIED.md:72-94`
 
 ### Z12-3 首个 seed 之后 `[client]` 的任何改动都被静默忽略
 - **位置**：`cmd/re0auth/main.go:1583-1591`
 - **影响**：① 给 `client.secret_env` 加秘密以为变成机密客户端，实际仍是公开客户端（内省守卫会对它 401）——更重的是轮换 secret 时**旧 secret 仍然有效**；② 改 `redirect_uris` 后回调走旧地址，**删**生产回调地址不生效（本该撤销的回调留在白名单）；③ scopes 既不能加也不能收。日志只在第一次启动说 `registered`。
 - **修法**：`Get` 命中后比对 type/redirects/scopes/secret-hash，不一致**拒绝启动**并点名字段。**这是一次裁定**（会改上线流程）。
-- **状态**：OPEN
+- **状态**：FIXED（657d2f0）
 - **证据**：`z12seedclient_test.go::TestZ12SeedClientNeverReconcilesTheConfiguredClient`（红）；复核端到端真二进制 + `admin_routes.go:100-189` 无任何改写既有 client 的入口；`config.go:780-794` 的 `[client]` 唯一读点在 `seedClient`。
 - **来源**：`docs/audit-7/findings/Z12-VERIFIED.md:41-50`；`docs/audit-7/findings/00-MAIN-VERIFICATION.md:438-450`
 
@@ -54,8 +54,8 @@
 - **位置**：`scripts/restore.sh:29`
 - **影响**：`docs/operations.md:94` 与 `:281` 的恢复/演练命令在装有当前 bash 的主机上直接 `line 29: file: unbound variable` 退出 1，永远到不了边车校验；备份再正确也不能恢复。第五轮 P2-11 的修复**从未被执行过**。
 - **修法**：拆成 `local file="$1"` 与 `local sidecar="$file.sha256" want got` 两条（同文件临时副本已证明可通）。
-- **状态**：OPEN
-- **证据**：`z13verify_test.go::TestZ13VRestoreScriptVerifierAbortsBeforeItVerifies`（红）；真 bash 5.3.9（含 `env -i`）实跑复现 `unbound variable`；修正副本跑通 `checksum verified … STUB pg_restore … restore complete` exit 0 且三条守卫按报告正确拒绝。
+- **状态**：FIXED（a3de9b9）
+- **证据**：`z13verify_test.go::TestZ13VRestoreScriptVerifierRunsAndVerifies`（红）；真 bash 5.3.9（含 `env -i`）实跑复现 `unbound variable`；修正副本跑通 `checksum verified … STUB pg_restore … restore complete` exit 0 且三条守卫按报告正确拒绝。
 - **来源**：`docs/audit-7/findings/Z13-VERIFIED.md:64-80`
 
 ## P2/P3

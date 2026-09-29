@@ -42,7 +42,7 @@
 - **位置**：`internal/oidchttp/oidchttp.go:950`（只有 `prompt=none` 分支；`MaxAge` 生产代码零命中）
 - **影响**：RP 请求 step-up 重新认证时，OP 既不重新认证也不回 `login_required`，id_token 携带**旧会话的 `auth_time`**。`max_age` 完全不被读取。
 - **修法**：`oidcstore.AuthRequest` 没有 `MaxAge`/`Prompt` 字段 ⇒ 需**先在存储边界加字段**再在会话/登录钩子裁决；无活会话时按 `login_required` fail-closed。不是「钩子里比较 auth_time」能解决的。
-- **状态**：OPEN
+- **状态**：FIXED（4658066）
 - **证据**：`internal/zzprobe/audit6/z01protocolauth/consent_face_test.go::TestProbePromptLoginAndMaxAgeDoNotForceReauthentication`（红）、`z02/idtoken_test.go::TestZ02MaxAgeAndPromptLoginAreIgnored`（红）；`00-MAIN-VERIFICATION.md:28,60,269-283`（V-11）
 - **来源**：`00-LAUNCH-READINESS-CONSOLIDATED.md:111`
 
@@ -51,8 +51,8 @@
 - **位置**：`internal/oidchttp/oidchttp.go:1107`（守卫；放行点 `:1115`）
 - **影响**：`Basic z02-d%65vice-…` 使守卫用原始字节查库失败即 `return false`，而库 `url.QueryUnescape` 解码后认证通过 ⇒「内省必须机密客户端」（P0-6 / PROTO-4 的唯一修法）被一行绕过。未误配时攻击者只读到自己的令牌；名单一旦含公开客户端即等价 PROTO-4 复活。
 - **修法**：守卫在查库前对 Basic 里的 client_id 做 `url.QueryUnescape`（与库对齐），或先解码再判定；并收紧 `return false` 的宽容语义（查不到/非机密直接 401，`client_assertion` 路径进守卫前显式拒绝）。
-- **状态**：OPEN
-- **证据**：`internal/zzprobe/audit6/z02introspect/introspect_test.go::TestZ02IntrospectionGuardBypassedByPercentEncodedClientID`（红）；`_audit/protocol.md:31-107`（P-01，红探针 `TestZZAudit_IntrospectionPublicClientGuardIsBypassedByPercentEncoding`）
+- **状态**：FIXED（4658066）
+- **证据**：`internal/zzprobe/audit6/z02protocoltoken/introspect_test.go::TestZ02IntrospectionGuardBypassedByPercentEncodedClientID`（红）；`_audit/protocol.md:31-107`（P-01，红探针 `TestZZAudit_IntrospectionPublicClientGuardIsBypassedByPercentEncoding`）
 - **来源**：`00-LAUNCH-READINESS-CONSOLIDATED.md:112`
 
 ### G-6 匿名者可以机密客户端身份发起设备流
@@ -60,7 +60,7 @@
 - **位置**：`internal/oidchttp/oidchttp.go:576`（项目边界；机制在库 `pkg/op/device.go:138` 丢弃 `ClientIDFromRequest` 的 `authenticated`）
 - **影响**：`POST /oauth/device_authorization` 对任何（含机密）客户端都不要求认证，而验证页会把该客户端的**注册名**展示给任何跟着 user_code 走的人。第 7 轮更正：本项目 `AuthorizeClientIDSecret` 不在这条路径上，**不能靠改它来修**。
 - **修法**：在 `internal/oidchttp` 把请求交给库**之前**对机密客户端强制认证（与 token 端点同形）。
-- **状态**：OPEN
+- **状态**：FIXED（4658066）
 - **证据**：`internal/zzprobe/audit6/z01protocolauth/device_flow_test.go::TestProbeConfidentialClientCanStartADeviceFlowUnauthenticated`（红）；`00-MAIN-VERIFICATION.md:82-92`（V-03 根因更正）
 - **来源**：`00-LAUNCH-READINESS-CONSOLIDATED.md:113`
 
@@ -69,7 +69,7 @@
 - **位置**：`cmd/re0auth/main.go:137`（`endpointRemovalWait=5s`）、`:127`（`shutdownTimeout=30s`）、`internal/store/postgres/auditbatch.go:54`（`auditDrainTimeout=30s`）、`deploy/k8s/base/deployment.yaml:26`（`terminationGracePeriodSeconds: 45`）
 - **影响**：三者串行，最坏 5+30+30=65s > 45s ⇒ SIGKILL 发生在审计排空预算到期**之前约 10s**；「过期拒绝」路径在 k8s 里从不运行，滚动更新/驱逐时在途审计行静默丢失，审计链在 k8s 上不可信。
 - **修法**：`auditDrainTimeout` 改为 `grace - removal - http`（=10s），或把 grace 提到 ≥70s 并同步注释；至少把 `deployment.yaml:21-25` 的「35s total」注释改为全栈口径。
-- **状态**：OPEN
+- **状态**：FIXED（657d2f0）
 - **证据**：`internal/zzprobe/audit6/z04pgstore/drain_budget_probe_test.go::TestTheShutdownStackFitsThePodGrace`（红）、`::TestTheManifestCommentCountsTheWholeStack`（红）；`00-MAIN-VERIFICATION.md:174-185`（V-06，定级 P1）
 - **来源**：`00-LAUNCH-READINESS-CONSOLIDATED.md:119`
 
