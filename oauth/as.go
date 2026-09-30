@@ -162,26 +162,77 @@ func (s *service) Exchange(ctx context.Context, req CodeExchangeRequest) (TokenR
 	if err != nil {
 		return TokenResponse{}, err
 	}
-	code, err := s.tokens.ConsumeCode(ctx, req.Code)
+
+	// Read first, spend second. ConsumeCode is a DELETE, so feeding it a request
+	// whose bindings do not hold let anybody who merely came by a code — no
+	// verifier, no client secret — burn it and deny the client that earned it
+	// their tokens. That is a low-cost targeted denial of service, and it was
+	// invisible: the refusal was identical to a replay and nothing was audited.
+	//
+	// GetCode is a read, so a caller that cannot prove it owns the code loses
+	// nothing. Every binding is judged here, before anything is consumed, in the
+	// order this endpoint has always judged them.
+	code, err := s.tokens.GetCode(ctx, req.Code)
 	if errors.Is(err, ErrTokenNotFound) {
 		return TokenResponse{}, protocolError("invalid_grant", "authorization code is unknown or already used")
 	}
 	if err != nil {
 		return TokenResponse{}, err
 	}
+	if err := s.checkCodeBinding(client, code, req); err != nil {
+		// Failed but the code exists: the observability half of the finding. The
+		// subject is the code's own, so an operator can see who was targeted; the
+		// client is the authenticated caller, i.e. who tried.
+		s.record(ctx, "oauth.exchange_failed", code.Subject, client.ID, audit.OutcomeDenied)
+		return TokenResponse{}, err
+	}
+
+	// The atomic gate. ConsumeCode's DELETE is what decides single use: a
+	// concurrent second request with the same valid code loses this race and is
+	// refused below, so exactly one exchange can mint.
+	claimed, err := s.tokens.ConsumeCode(ctx, req.Code)
+	if errors.Is(err, ErrTokenNotFound) {
+		// Never issued, or already spent — possibly by a request that won the
+		// race between the read above and this claim.
+		return TokenResponse{}, protocolError("invalid_grant", "authorization code is unknown or already used")
+	}
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	// Re-asserted on the record this request actually consumed. A code record is
+	// immutable and the pre-check above already judged it, so this cannot fire
+	// today; it is here so that only the record that won the claim may ever mint,
+	// and so the bindings live in one helper applied to both reads.
+	if err := s.checkCodeBinding(client, claimed, req); err != nil {
+		s.record(ctx, "oauth.exchange_failed", claimed.Subject, client.ID, audit.OutcomeDenied)
+		return TokenResponse{}, err
+	}
+	return s.issue(ctx, client.ID, claimed.Subject, claimed.Scopes, "")
+}
+
+// checkCodeBinding judges an authorization code record against the request about
+// to redeem it, in the order the exchange has always used: expiry first, then the
+// client, the redirect_uri and finally PKCE. Every failure is an invalid_grant
+// (400), and the human-readable text each binding has always carried is kept so
+// no client sees a change on the failure paths.
+//
+// It is one helper because it is applied twice: to the pre-flight read, whose
+// failure must not spend the code, and to the record the atomic claim returned,
+// which is the only record allowed to mint.
+func (s *service) checkCodeBinding(client Client, code AuthorizationCode, req CodeExchangeRequest) error {
 	if !s.now().Before(code.ExpiresAt) {
-		return TokenResponse{}, protocolError("invalid_grant", "authorization code has expired")
+		return protocolError("invalid_grant", "authorization code has expired")
 	}
 	if code.ClientID != client.ID {
-		return TokenResponse{}, protocolError("invalid_grant", "authorization code was issued to another client")
+		return protocolError("invalid_grant", "authorization code was issued to another client")
 	}
 	if code.RedirectURI != req.RedirectURI {
-		return TokenResponse{}, protocolError("invalid_grant", "redirect_uri mismatch")
+		return protocolError("invalid_grant", "redirect_uri mismatch")
 	}
 	if !verifyPKCE(req.CodeVerifier, code.CodeChallenge, code.CodeChallengeMethod) {
-		return TokenResponse{}, protocolError("invalid_grant", "PKCE verification failed")
+		return protocolError("invalid_grant", "PKCE verification failed")
 	}
-	return s.issue(ctx, client.ID, code.Subject, code.Scopes, "")
+	return nil
 }
 
 func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenResponse, error) {

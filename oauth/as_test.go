@@ -410,3 +410,186 @@ func TestIntrospectUnknownTokenIsInactive(t *testing.T) {
 		t.Fatal("unknown token reported active")
 	}
 }
+
+// KIT-4: a request that knows a code but cannot prove it owns it must be refused
+// WITHOUT spending the code. Before the fix the consume happened before every
+// binding check, so anybody who came by a code — no verifier, no client secret —
+// could burn it, a low-cost targeted denial of service on the client that earned
+// it. Each failed attempt here must leave the code redeemable by the fully
+// correct request.
+func TestExchangeFailedBindingDoesNotSpendTheCode(t *testing.T) {
+	ctx := context.Background()
+	const (
+		verifier = "verifier-verifier-verifier-verifier"
+		redirect = "https://app.example/cb"
+	)
+	cases := []struct {
+		name string
+		req  func(code string) CodeExchangeRequest
+	}{
+		{"wrong verifier", func(code string) CodeExchangeRequest {
+			return CodeExchangeRequest{ClientID: "app", Code: code, RedirectURI: redirect, CodeVerifier: "wrong-verifier-wrong-verifier"}
+		}},
+		{"wrong redirect", func(code string) CodeExchangeRequest {
+			return CodeExchangeRequest{ClientID: "app", Code: code, RedirectURI: "https://evil.example/cb", CodeVerifier: verifier}
+		}},
+		{"wrong client", func(code string) CodeExchangeRequest {
+			return CodeExchangeRequest{ClientID: "other", Code: code, RedirectURI: redirect, CodeVerifier: verifier}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, clients, _, _, _ := newTestAS(t)
+			registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})
+			registerClient(t, clients, "other", ClientPublic, "", []Scope{ScopeAccountID})
+
+			auth, err := svc.Authorize(ctx, AuthorizationRequest{
+				ClientID: "app", RedirectURI: redirect, Subject: "u",
+				Scopes: []Scope{ScopeAccountID}, CodeChallenge: pkceChallenge(verifier), CodeChallengeMethod: "S256",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := svc.Exchange(ctx, tc.req(auth.Code)); err == nil {
+				t.Fatalf("%s: the bogus exchange succeeded", tc.name)
+			} else if got := protocolCode(t, err); got != "invalid_grant" {
+				t.Fatalf("%s: code = %q, want invalid_grant", tc.name, got)
+			}
+
+			// The fully correct request must still redeem it: a failed binding
+			// costs the caller nothing.
+			if _, err := svc.Exchange(ctx, CodeExchangeRequest{
+				ClientID: "app", Code: auth.Code, RedirectURI: redirect, CodeVerifier: verifier,
+			}); err != nil {
+				t.Fatalf("%s: the failed exchange spent the code, so the rightful client was denied: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// An expired code is refused by the pre-flight read and, like any other failed
+// binding, is not consumed: the refusal is the service's judgment, not a reason
+// to destroy the record.
+func TestExchangeExpiredCodeIsRefusedWithoutConsuming(t *testing.T) {
+	svc, clients, store, _, clock := newTestAS(t)
+	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})
+	ctx := context.Background()
+	verifier := "verifier-verifier-verifier-verifier"
+
+	auth, err := svc.Authorize(ctx, AuthorizationRequest{
+		ClientID: "app", RedirectURI: "https://app.example/cb", Subject: "u",
+		Scopes: []Scope{ScopeAccountID}, CodeChallenge: pkceChallenge(verifier), CodeChallengeMethod: "S256",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clock.advance(time.Minute + time.Second) // CodeTTL is one minute.
+	_, err = svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "app", Code: auth.Code, RedirectURI: "https://app.example/cb", CodeVerifier: verifier,
+	})
+	if got := protocolCode(t, err); got != "invalid_grant" {
+		t.Fatalf("expired exchange code = %q, want invalid_grant", got)
+	}
+	if _, err := store.GetCode(ctx, auth.Code); err != nil {
+		t.Fatalf("the refusal consumed the expired code: %v", err)
+	}
+}
+
+// The observability half of KIT-4: a binding failure that leaves the code intact
+// must be visible in the audit log — the finding noted that, before this, the
+// refusal was indistinguishable from a replay and nothing recorded who tried.
+func TestExchangeBindingFailureIsAudited(t *testing.T) {
+	svc, clients, _, logger, _ := newTestAS(t)
+	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})
+	ctx := context.Background()
+
+	auth, err := svc.Authorize(ctx, AuthorizationRequest{
+		ClientID: "app", RedirectURI: "https://app.example/cb", Subject: "usr_victim",
+		Scopes: []Scope{ScopeAccountID}, CodeChallenge: pkceChallenge("verifier-verifier-verifier-verifier"), CodeChallengeMethod: "S256",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "app", Code: auth.Code, RedirectURI: "https://app.example/cb", CodeVerifier: "wrong-verifier-wrong-verifier",
+	}); err == nil {
+		t.Fatal("the wrong verifier was accepted")
+	}
+
+	var seen int
+	for _, e := range logger.Events() {
+		if e.Action != "oauth.exchange_failed" {
+			continue
+		}
+		seen++
+		if e.Outcome != audit.OutcomeDenied {
+			t.Errorf("outcome = %q, want %q", e.Outcome, audit.OutcomeDenied)
+		}
+		if e.Subject != "usr_victim" {
+			t.Errorf("subject = %q, want the code's subject usr_victim", e.Subject)
+		}
+		if e.Detail["client_id"] != "app" {
+			t.Errorf("client_id = %q, want the authenticated client app", e.Detail["client_id"])
+		}
+		if e.Provider != "oauth" {
+			t.Errorf("provider = %q, want oauth", e.Provider)
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("oauth.exchange_failed events = %d, want exactly 1", seen)
+	}
+}
+
+// Single use is unchanged by the pre-flight read: a concurrent second exchange
+// with the same, fully valid request must lose the atomic claim. Exactly one
+// request may mint.
+func TestConcurrentExchangeMintsOnce(t *testing.T) {
+	svc, clients, _, _, _ := newTestAS(t)
+	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})
+	ctx := context.Background()
+	verifier := "verifier-verifier-verifier-verifier"
+
+	auth, err := svc.Authorize(ctx, AuthorizationRequest{
+		ClientID: "app", RedirectURI: "https://app.example/cb", Subject: "u",
+		Scopes: []Scope{ScopeAccountID}, CodeChallenge: pkceChallenge(verifier), CodeChallengeMethod: "S256",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := CodeExchangeRequest{ClientID: "app", Code: auth.Code, RedirectURI: "https://app.example/cb", CodeVerifier: verifier}
+
+	const attempts = 2
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, attempts)
+	toks := make([]TokenResponse, attempts)
+	for i := range attempts {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			toks[i], errs[i] = svc.Exchange(ctx, req)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	minted := 0
+	for i, err := range errs {
+		if err == nil {
+			minted++
+			if toks[i].AccessToken == "" || toks[i].RefreshToken == "" {
+				t.Errorf("winner %d minted an empty pair: %+v", i, toks[i])
+			}
+			continue
+		}
+		if got := protocolCode(t, err); got != "invalid_grant" {
+			t.Errorf("loser %d: code = %q, want invalid_grant", i, got)
+		}
+	}
+	if minted != 1 {
+		t.Fatalf("concurrent exchanges minted %d times, want exactly 1", minted)
+	}
+}

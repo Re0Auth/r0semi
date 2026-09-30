@@ -276,8 +276,13 @@ func TestRegressionPKCESyntaxAndMethod(t *testing.T) {
 	}
 }
 
-// The authorization code is bound to client + redirect + verifier, and an
-// error path burns it (single-use holds even when the exchange fails).
+// The authorization code is bound to client + redirect + verifier. This is the
+// WRAPPED OP plane (internal/oidchttp over the OP store), whose AuthRequestByCode
+// is a consume-on-read, so an error path burns the code here (single-use holds
+// even when the exchange fails). That is the OP's fail-closed direction and a
+// different implementation from the Upstream Kit's oauth library, whose KIT-4 fix
+// makes a failed binding cost nothing; the kit's guard is in
+// internal/zzprobe/protocol/kit TestC1/C2 and oauth/as_test.go.
 func TestRegressionCodeBindingAndSingleUseOnFailure(t *testing.T) {
 	e := newPlane(t, planeOptions{})
 

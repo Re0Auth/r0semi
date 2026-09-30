@@ -42,7 +42,15 @@ func TestZZProbeDeviceCodeRepeatMint(t *testing.T) {
 	t.Logf("introspect post-revocation: err=%v active=%v subject=%s", ierr, info.Active, info.Subject)
 }
 
-func TestZZProbeRefreshBurnedByWrongClient(t *testing.T) {
+// A wrong client's refresh attempt must be refused WITHOUT spending the owner's
+// token, and the owner's own refresh must still succeed afterwards.
+//
+// The finding's shape was the same as KIT-4: ConsumeRefresh ran before the client
+// binding was judged, so merely presenting somebody else's refresh token ended
+// their session — the DoS was the refusal's side effect. The ownership pre-check
+// (service.Refresh calls TokenOwner before ConsumeRefresh) is what makes this a
+// guard rather than a log line; it is asserted here, not merely printed.
+func TestZZProbeRefreshNotBurnedByWrongClient(t *testing.T) {
 	svc, clients, _, _, _ := newTestAS(t)
 	registerClient(t, clients, "a", ClientConfidential, "sa", []Scope{ScopeAccountID})
 	registerClient(t, clients, "b", ClientConfidential, "sb", []Scope{ScopeAccountID})
@@ -55,8 +63,16 @@ func TestZZProbeRefreshBurnedByWrongClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_, err = svc.Refresh(ctx, RefreshRequest{ClientID: "b", ClientSecret: "sb", RefreshToken: tok.RefreshToken})
-	t.Logf("refresh by the WRONG client: err=%v", err)
-	_, err = svc.Refresh(ctx, RefreshRequest{ClientID: "a", ClientSecret: "sa", RefreshToken: tok.RefreshToken})
-	t.Logf("refresh by the RIGHT client, afterward: err=%v", err)
+	if err == nil {
+		t.Fatal("a client refreshed a token issued to another client")
+	}
+	if got := protocolCode(t, err); got != "invalid_grant" {
+		t.Fatalf("cross-client refresh code = %q, want invalid_grant", got)
+	}
+
+	if _, err := svc.Refresh(ctx, RefreshRequest{ClientID: "a", ClientSecret: "sa", RefreshToken: tok.RefreshToken}); err != nil {
+		t.Fatalf("the wrong client's attempt burned the owner's refresh token: %v", err)
+	}
 }

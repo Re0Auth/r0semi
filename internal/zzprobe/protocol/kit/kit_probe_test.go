@@ -443,36 +443,41 @@ func TestB3_RestoreClientSkipsRedirectValidation(t *testing.T) {
 // C. authorization code lifecycle
 // ---------------------------------------------------------------------------
 
-// A failed exchange spends the code. The code is consumed before the client,
-// redirect_uri and verifier bindings are checked.
-func TestC1_FailedExchangeConsumesTheCode(t *testing.T) {
+// A failed exchange must NOT spend the code. The exchange reads the record
+// (GetCode), judges the client/redirect_uri/PKCE bindings, and only then claims
+// it atomically (ConsumeCode), so an attacker who merely knows the code cannot
+// deny it to the client that earned it. This is the KIT-4 guard.
+func TestC1_FailedExchangeDoesNotConsumeTheCode(t *testing.T) {
 	svc, _, _, _ := newAS(t)
 	ctx := context.Background()
 	code := issueCode(t, svc, confClientID, confRedirect, probeVerifier, accountScope)
 
-	// Attacker: knows the code, has no verifier.
+	// Attacker: knows the code, has no verifier. Refused, and it must cost the
+	// code nothing.
 	_, err := svc.Exchange(ctx, oauth.CodeExchangeRequest{
 		ClientID: confClientID, ClientSecret: confSecret, Code: code,
 		RedirectURI: confRedirect, CodeVerifier: "wrong-verifier",
 	})
+	if err == nil {
+		t.Fatal("the attacker's exchange with a bad verifier succeeded")
+	}
 	t.Logf("attacker exchange with a bad verifier: %v", err)
 
-	// Legitimate client, correct verifier, immediately after.
-	_, err = svc.Exchange(ctx, oauth.CodeExchangeRequest{
+	// Legitimate client, correct verifier, immediately after: the code is intact.
+	if _, err := svc.Exchange(ctx, oauth.CodeExchangeRequest{
 		ClientID: confClientID, ClientSecret: confSecret, Code: code,
 		RedirectURI: confRedirect, CodeVerifier: probeVerifier,
-	})
-	t.Logf("legitimate exchange afterwards: %v", err)
-	if err == nil {
-		t.Fatal("vacuity: the code was still usable")
+	}); err != nil {
+		t.Errorf("a failed exchange consumed the authorization code (%v), so knowing a code is enough to deny the legitimate client its tokens", err)
 	}
-	t.Errorf("a failed exchange consumed the authorization code, so knowing a code is enough to deny the legitimate client its tokens")
 }
 
-// A wrong client id / redirect_uri / verifier all consume, and the error text is
-// the same "unknown or already used", so the caller cannot tell a replay from a
-// burn. This test passes; it documents the burn's shape.
-func TestC2_AllBindingFailuresBurnTheCode(t *testing.T) {
+// A wrong client id / redirect_uri / verifier is refused, and each refusal leaves
+// the code redeemable by the fully correct request. The error stays the same
+// invalid_grant the endpoint has always written, so clients see no change on the
+// failure paths. Before KIT-4 was fixed this documented the opposite: every
+// failure burned the code.
+func TestC2_BindingFailuresDoNotBurnTheCode(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
 		name string
@@ -493,14 +498,15 @@ func TestC2_AllBindingFailuresBurnTheCode(t *testing.T) {
 			t.Errorf("%s: the exchange SUCCEEDED (vacuity or a real hole)", tc.name)
 			continue
 		}
-		// Second attempt with the fully correct request proves the burn.
+		// Second attempt with the fully correct request: it must redeem, because
+		// the refused attempt spent nothing.
 		_, err2 := svc.Exchange(ctx, oauth.CodeExchangeRequest{
 			ClientID: confClientID, ClientSecret: confSecret, Code: code,
 			RedirectURI: confRedirect, CodeVerifier: probeVerifier,
 		})
 		t.Logf("%-16s -> %v ; then correct exchange -> %v", tc.name, err, err2)
-		if err2 == nil {
-			t.Errorf("%s: the correct exchange still worked afterwards", tc.name)
+		if err2 != nil {
+			t.Errorf("%s: the correct exchange was refused afterwards (%v): the failed attempt burned the code", tc.name, err2)
 		}
 	}
 }
@@ -549,7 +555,8 @@ func TestC3_PKCEMethodEnforcement(t *testing.T) {
 
 // Authorize accepts any non-empty code_challenge with method S256, including one
 // that cannot be a SHA-256 digest in the required encoding. The exchange then
-// fails, so the code is burned for a client that made an honest mistake.
+// fails, so an honest client's mistake costs it the login — though since KIT-4
+// the code itself is no longer burned by the refusal.
 func TestC4_PKCEChallengeShapeIsNotValidated(t *testing.T) {
 	ctx := context.Background()
 	full := challengeFor(probeVerifier)

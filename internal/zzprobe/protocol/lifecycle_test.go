@@ -250,9 +250,13 @@ func TestProbeAuthorizationCodeLifecycle(t *testing.T) {
 		t.Fatalf("a code was exchanged with no code_verifier at all: %v", got)
 	}
 
-	// A failed exchange burns the code (fail-closed, ADR-0005 point 8): that is
-	// deliberate, and it is also the DoS surface — anybody who guesses a code can
-	// spend it. The guard records the direction rather than asserting a fix.
+	// This plane is the WRAPPED OP (internal/oidchttp over internal/store/memory's
+	// OIDCStore), not the Upstream Kit engine: its op.Storage AuthRequestByCode is
+	// a consume-on-read, so a failed exchange here still burns the code. That is
+	// the OP's own fail-closed direction, and it is a different implementation
+	// from the PUBLIC oauth library KIT-4 fixes — the kit's non-burn guard lives in
+	// oauth/as_test.go and internal/zzprobe/protocol/kit. The guard below records
+	// the OP's direction so a change in it is not mistaken for a regression here.
 	burned := issue(t, []string{"account.id"}, "usr_probe")
 	if got, status := e.postToken(t, e.webID, e.webSec, url.Values{
 		"grant_type":    {"authorization_code"},

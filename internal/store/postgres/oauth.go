@@ -79,6 +79,28 @@ func (r authorizationCodeRow) code() oauth.AuthorizationCode {
 	}
 }
 
+// GetCode implements oauth.Store. A SELECT, never a DELETE: the exchange reads
+// the record to judge its client/redirect/PKCE bindings, and only the atomic
+// ConsumeCode delete spends it. A failed binding therefore leaves the row for
+// its rightful owner. Expiry is the service's judgment, so an expired code is
+// returned here rather than hidden.
+func (s *Tokens) GetCode(ctx context.Context, value string) (oauth.AuthorizationCode, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT client_id, subject, scopes, redirect_uri, code_challenge, code_challenge_method, expires_at
+		  FROM oauth_codes WHERE token_hash = $1`, oauth.TokenHash(value))
+	if err != nil {
+		return oauth.AuthorizationCode{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authorizationCodeRow])
+	if noRows(err) {
+		return oauth.AuthorizationCode{}, oauth.ErrTokenNotFound
+	}
+	if err != nil {
+		return oauth.AuthorizationCode{}, err
+	}
+	return row.code(), nil
+}
+
 // ConsumeCode implements oauth.Store. Expiry is checked by the service, so an
 // expired code is still returned (once) rather than swallowed.
 func (s *Tokens) ConsumeCode(ctx context.Context, value string) (oauth.AuthorizationCode, error) {

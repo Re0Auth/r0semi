@@ -93,13 +93,15 @@ type AuthorizationCode struct {
 // Expiry is enforced by the service, not the store, so a store stays a dumb map.
 //
 // BREAKING CHANGE for Store implementers: this interface gained
-// RevokeRefreshFamily and redefined ConsumeRefresh, and AccessToken/RefreshToken
-// gained a FamilyID field. An implementation in another module must add the
-// method, keep each spent refresh value's family reachable (tombstone) so a replay
-// is reported as a *RefreshReuseError rather than ErrTokenNotFound, and record the
-// family on both token kinds. The service relies on all three to satisfy RFC 9700
-// §4.14.2; a store that only implements the old single-use consume silently keeps
-// a detected replay from killing the thief's generation.
+// RevokeRefreshFamily, GetCode and redefined ConsumeRefresh, and
+// AccessToken/RefreshToken gained a FamilyID field. An implementation in another
+// module must add both methods, keep each spent refresh value's family reachable
+// (tombstone) so a replay is reported as a *RefreshReuseError rather than
+// ErrTokenNotFound, and record the family on both token kinds. The service relies
+// on all of them to satisfy RFC 9700 §4.14.2 and to keep a failed code exchange
+// from spending the code; a store that only implements the old single-use consume
+// silently keeps a detected replay from killing the thief's generation, and one
+// without GetCode cannot serve the exchange's pre-flight read at all.
 //
 // ConsumeCode and ConsumeRefresh must be atomic: a code is single-use and a
 // refresh token is single-use because it rotates.
@@ -124,6 +126,21 @@ type AuthorizationCode struct {
 // the next request does not consult.
 type Store interface {
 	SaveCode(ctx context.Context, value string, c AuthorizationCode) error
+	// GetCode returns the record a code value names WITHOUT consuming it, or
+	// ErrTokenNotFound when this store never issued it (or a consume or a
+	// revocation already removed it). It is the read peer of GetAccess, and the
+	// read half of the exchange's two-step claim: the service judges the client,
+	// redirect_uri and PKCE bindings on this record BEFORE it spends anything, so
+	// a failed exchange refuses the caller instead of costing the code's owner
+	// their tokens. Whoever merely knows a code can no longer deny it to the
+	// client that earned it.
+	//
+	// It must return the same record ConsumeCode would return for a value no one
+	// has claimed: GetCode is a pre-flight read, never the claim. Single use is
+	// still decided by ConsumeCode's atomic delete, and only the record that wins
+	// that delete may mint tokens. Expiry, like every other deadline in this
+	// interface, is judged by the service, not the store.
+	GetCode(ctx context.Context, value string) (AuthorizationCode, error)
 	ConsumeCode(ctx context.Context, value string) (AuthorizationCode, error)
 
 	SaveAccess(ctx context.Context, value string, t AccessToken) error
@@ -299,6 +316,19 @@ func (s *MemoryStore) SaveCode(_ context.Context, value string, c AuthorizationC
 	s.codes[TokenHash(value)] = c
 	s.mu.Unlock()
 	return nil
+}
+
+// GetCode implements Store. It is a read under the same mutex the claim takes,
+// so the exchange can judge every binding before ConsumeCode decides whether the
+// code is spent. A failed binding therefore costs the caller nothing.
+func (s *MemoryStore) GetCode(_ context.Context, value string) (AuthorizationCode, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.codes[TokenHash(value)]
+	if !ok {
+		return AuthorizationCode{}, ErrTokenNotFound
+	}
+	return c, nil
 }
 
 // ConsumeCode implements Store.

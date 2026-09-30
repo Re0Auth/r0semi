@@ -146,6 +146,41 @@ func TestMemoryStoreLookupsStillWork(t *testing.T) {
 	}
 }
 
+// GetCode is the non-destructive peer of ConsumeCode: it returns a live code's
+// record and leaves it redeemable. It is what lets the exchange refuse a caller
+// whose bindings do not hold without spending the code, so knowing a code is not
+// enough to deny its owner their tokens (KIT-4).
+func TestMemoryStoreGetCodeIsNonDestructive(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	want := AuthorizationCode{ClientID: "cli", Subject: "usr", RedirectURI: "https://app.example/cb"}
+	if err := store.SaveCode(ctx, "code", want); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetCode(ctx, "code")
+	if err != nil {
+		t.Fatalf("GetCode: %v", err)
+	}
+	if got.ClientID != want.ClientID || got.Subject != want.Subject || got.RedirectURI != want.RedirectURI {
+		t.Fatalf("GetCode = %+v, want %+v", got, want)
+	}
+	// Reading again must not consume it, and the record must still be claimable
+	// exactly once.
+	if _, err := store.GetCode(ctx, "code"); err != nil {
+		t.Fatalf("second GetCode consumed the record: %v", err)
+	}
+	if _, err := store.ConsumeCode(ctx, "code"); err != nil {
+		t.Fatalf("the reads spent the code: %v", err)
+	}
+	if _, err := store.GetCode(ctx, "code"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("GetCode after consume = %v, want ErrTokenNotFound", err)
+	}
+	if _, err := store.GetCode(ctx, "other"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("GetCode of an unknown value = %v, want ErrTokenNotFound", err)
+	}
+}
+
 // A code is a redeemable capability, so bulk revocation has to remove it with the
 // tokens. A Kill Switch that only deleted access/refresh rows would let the code
 // mint a fresh pair afterwards.

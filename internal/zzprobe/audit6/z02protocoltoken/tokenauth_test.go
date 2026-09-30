@@ -234,9 +234,13 @@ func TestZ02CodeExchangeGuardsHold(t *testing.T) {
 		}
 	})
 
-	// A failed exchange burns the code (fail-closed, ADR-0005 §8): the second
-	// exchange — now with the right verifier — must still be refused, or the
-	// burn would only have happened on success.
+	// On this WRAPPED OP plane (internal/oidchttp over the OP store) a failed
+	// exchange burns the code, because op.Storage's AuthRequestByCode is a
+	// consume-on-read: the second exchange — now with the right verifier — must
+	// still be refused. That is the OP's fail-closed direction and a different
+	// implementation from the Upstream Kit's oauth library, where the KIT-4 fix
+	// makes a failed binding leave the code redeemable (guarded in
+	// internal/zzprobe/protocol/kit and oauth/as_test.go).
 	form := newExchange()
 	form.Set("code_verifier", strings.Repeat("w", 64))
 	if body, status := e.postToken(t, e.webID, e.webSec, form); status == http.StatusOK {

@@ -158,8 +158,11 @@ func TestRev4AWriteThroughTheSharedChallengeSteersPKCE(t *testing.T) {
 			"exactly the value the code exchange judges (finding 05-4's mechanism, end to end)")
 	}
 
-	// The flip side, on its own chain (a failed exchange burns the code):
-	// the honest verifier is locked out by the same rewrite.
+	// The flip side, on its own chain: this WRAPPED OP plane's AuthRequestByCode
+	// consumes on read, so the failed exchange burns the code and the honest
+	// verifier is locked out by the same rewrite. (The Upstream Kit's oauth
+	// library no longer burns on a failed binding — KIT-4 — but this fixture is
+	// the OP store, a different implementation.)
 	e2 := newEnv(t, nil)
 	honest := strings.Repeat("y", 64)
 	id2, code2 := rev4Authorize(t, e2, honest)
