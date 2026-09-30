@@ -231,12 +231,17 @@ log "starting the conformance suite and its MongoDB"
 docker network create "${SPIKE_NET}" >/dev/null
 docker run -d --name "${MONGO_NAME}" --network "${SPIKE_NET}" --network-alias mongodb \
   "${MONGO_IMAGE}" >/dev/null
+# JAVA_EXTRA_ARGS is placed BEFORE `-jar` by the image's ENTRYPOINT, so these must be
+# JVM system properties (`-D…`): the `--fintechlabs.…` program-argument spelling the
+# dev compose uses would be parsed as a JVM option and kill the JVM
+# ("Unrecognized option"). Both names exist in the app's application.properties
+# (startredir) / application-dev.properties (devmode).
 docker run -d --name "${SUITE_NAME}" \
   --network "${SPIKE_NET}" \
   --add-host re0auth.test:host-gateway \
   -e MONGODB_HOST=mongodb \
   -e BASE_URL="http://localhost:${SUITE_PORT}" \
-  -e JAVA_EXTRA_ARGS="--fintechlabs.devmode=true --fintechlabs.startredir=true" \
+  -e JAVA_EXTRA_ARGS="-Dfintechlabs.devmode=true -Dfintechlabs.startredir=true" \
   -p "${SUITE_PORT}:8080" \
   "${SUITE_IMAGE}" >/dev/null
 
