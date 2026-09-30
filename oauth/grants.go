@@ -207,6 +207,16 @@ func (s *MemoryStore) DeleteBySubjectClient(_ context.Context, subject, clientID
 			delete(s.codes, key)
 		}
 	}
+	// Spent tokens' tombstones carry the same owner fields, so they are dropped
+	// too. They are not credentials, but a tombstone outliving the revocation of
+	// the grant it belonged to would keep reporting that grant's family as
+	// replayable — and would keep it revocable — after the user was told it was
+	// gone.
+	for key, tomb := range s.tombstones {
+		if tomb.Subject == subject && tomb.ClientID == clientID {
+			delete(s.tombstones, key)
+		}
+	}
 	return nil
 }
 
@@ -237,6 +247,15 @@ func (s *MemoryStore) RevokeTokens(_ context.Context, f TokenFilter) (int, error
 	for key, c := range s.codes {
 		if f.Matches(c.ClientID, c.Subject) {
 			delete(s.codes, key)
+		}
+	}
+	// Matching tombstones are cleared but not counted: they are the residue of
+	// spent tokens, not tokens a client can still use. Leaving one behind would
+	// keep the revoked family's replay signal armed, which is the opposite of what
+	// a Kill Switch promises.
+	for key, tomb := range s.tombstones {
+		if f.Matches(tomb.ClientID, tomb.Subject) {
+			delete(s.tombstones, key)
 		}
 	}
 	return removed, nil

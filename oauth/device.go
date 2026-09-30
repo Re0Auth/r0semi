@@ -305,7 +305,7 @@ func (s *service) PollDeviceAuthorization(ctx context.Context, req DeviceCodeExc
 	case DeviceDenied:
 		return TokenResponse{}, protocolError("access_denied", "the user denied the request")
 	}
-	return s.issue(ctx, client.ID, rec.Subject, rec.Scopes)
+	return s.issue(ctx, client.ID, rec.Subject, rec.Scopes, "")
 }
 
 // DescribeDeviceAuthorization returns what the verification page must render.

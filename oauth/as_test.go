@@ -272,16 +272,19 @@ func TestRefreshRotatesAndNarrows(t *testing.T) {
 		t.Fatalf("narrowed scope = %q", next.Scope)
 	}
 
-	// The old refresh token is consumed by rotation.
-	_, err = svc.Refresh(ctx, RefreshRequest{ClientID: "app", RefreshToken: tok.RefreshToken})
-	if got := protocolCode(t, err); got != "invalid_grant" {
-		t.Fatalf("reused refresh code = %q", got)
-	}
-
-	// Widening is refused.
+	// Widening is refused. Checked before the replay below: the replay is now the
+	// RFC 9700 §4.14.2 detection, and it revokes every generation of this token's
+	// family — including `next` — so `next` would be gone by then.
 	_, err = svc.Refresh(ctx, RefreshRequest{ClientID: "app", RefreshToken: next.RefreshToken, Scopes: []Scope{ScopePhigrosB30}})
 	if got := protocolCode(t, err); got != "invalid_scope" {
 		t.Fatalf("widen code = %q", got)
+	}
+
+	// The old refresh token is consumed by rotation; presenting it again is
+	// refused as a reuse (invalid_grant, the same 400 the unknown case gets).
+	_, err = svc.Refresh(ctx, RefreshRequest{ClientID: "app", RefreshToken: tok.RefreshToken})
+	if got := protocolCode(t, err); got != "invalid_grant" {
+		t.Fatalf("reused refresh code = %q", got)
 	}
 }
 

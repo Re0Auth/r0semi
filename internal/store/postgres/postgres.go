@@ -289,7 +289,7 @@ func (db *DB) PoolStats() *pgxpool.Stat { return db.pool.Stat() }
 func (db *DB) Accounts() *Accounts { return &Accounts{pool: db.pool} }
 
 // Tokens returns the authorization-code and token store.
-func (db *DB) Tokens() *Tokens { return &Tokens{pool: db.pool} }
+func (db *DB) Tokens() *Tokens { return &Tokens{pool: db.pool, now: db.now} }
 
 // Devices returns the device-authorization store.
 func (db *DB) Devices() *Devices { return &Devices{pool: db.pool} }

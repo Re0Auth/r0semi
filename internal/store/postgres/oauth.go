@@ -18,7 +18,32 @@ import (
 // Every row is keyed by oauth.TokenHash(value): the opaque code or token is used
 // only to compute the key and is never written. Single-use operations are a
 // one-statement DELETE ... RETURNING, so two concurrent callers cannot both win.
-type Tokens struct{ pool *pgxpool.Pool }
+//
+// Refresh rotation also leaves a tombstone (oauth_refresh_tombstones) carrying the
+// spent token's family, so a replay of a spent value is recognised as reuse and
+// its whole family can be revoked (RFC 9700 §4.14.2). The tombstone is what lets
+// ConsumeRefresh distinguish "already spent" from "never issued"; see the method.
+type Tokens struct {
+	pool *pgxpool.Pool
+	// now judges the tombstone's own deadline. It is the store clock, not the
+	// database's, for the reason postgres.go's single-clock policy states: a
+	// deadline written by this process is judged by the process that wrote it.
+	now func() time.Time
+}
+
+// Tokens must satisfy the public oauth.Store contract, tombstone obligations
+// included. Asserted at compile time so a method dropped from the interface's
+// shape fails here rather than at the composition root.
+var _ oauth.Store = (*Tokens)(nil)
+
+// clock reads the store clock, tolerating a Tokens built without one (the
+// zero-value handle) rather than dereferencing a nil function.
+func (s *Tokens) clock() time.Time {
+	if s.now == nil {
+		return time.Now()
+	}
+	return s.now()
+}
 
 // SaveCode implements oauth.Store.
 func (s *Tokens) SaveCode(ctx context.Context, value string, c oauth.AuthorizationCode) error {
@@ -78,9 +103,10 @@ func (s *Tokens) ConsumeCode(ctx context.Context, value string) (oauth.Authoriza
 // SaveAccess implements oauth.Store.
 func (s *Tokens) SaveAccess(ctx context.Context, value string, t oauth.AccessToken) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO oauth_access_tokens (token_hash, client_id, subject, scopes, issued_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		oauth.TokenHash(value), t.ClientID, t.Subject, scopeArray(t.Scopes), t.IssuedAt, t.ExpiresAt)
+		INSERT INTO oauth_access_tokens (token_hash, client_id, subject, scopes, family_id, issued_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		oauth.TokenHash(value), t.ClientID, t.Subject, scopeArray(t.Scopes),
+		t.FamilyID, t.IssuedAt, t.ExpiresAt)
 	return err
 }
 
@@ -89,6 +115,7 @@ type tokenRow struct {
 	ClientID  string    `db:"client_id"`
 	Subject   string    `db:"subject"`
 	Scopes    []string  `db:"scopes"`
+	FamilyID  string    `db:"family_id"`
 	IssuedAt  time.Time `db:"issued_at"`
 	ExpiresAt time.Time `db:"expires_at"`
 }
@@ -96,21 +123,21 @@ type tokenRow struct {
 func (r tokenRow) accessToken() oauth.AccessToken {
 	return oauth.AccessToken{
 		ClientID: r.ClientID, Subject: r.Subject, Scopes: scopesFrom(r.Scopes),
-		IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt,
+		FamilyID: r.FamilyID, IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt,
 	}
 }
 
 func (r tokenRow) refreshToken() oauth.RefreshToken {
 	return oauth.RefreshToken{
 		ClientID: r.ClientID, Subject: r.Subject, Scopes: scopesFrom(r.Scopes),
-		IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt,
+		FamilyID: r.FamilyID, IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt,
 	}
 }
 
 // GetAccess implements oauth.Store.
 func (s *Tokens) GetAccess(ctx context.Context, value string) (oauth.AccessToken, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT client_id, subject, scopes, issued_at, expires_at
+		SELECT client_id, subject, scopes, family_id, issued_at, expires_at
 		  FROM oauth_access_tokens WHERE token_hash = $1`, oauth.TokenHash(value))
 	if err != nil {
 		return oauth.AccessToken{}, err
@@ -135,35 +162,131 @@ func (s *Tokens) DeleteAccess(ctx context.Context, value string) error {
 // SaveRefresh implements oauth.Store.
 func (s *Tokens) SaveRefresh(ctx context.Context, value string, t oauth.RefreshToken) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO oauth_refresh_tokens (token_hash, client_id, subject, scopes, issued_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		oauth.TokenHash(value), t.ClientID, t.Subject, scopeArray(t.Scopes), t.IssuedAt, t.ExpiresAt)
+		INSERT INTO oauth_refresh_tokens (token_hash, client_id, subject, scopes, family_id, issued_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		oauth.TokenHash(value), t.ClientID, t.Subject, scopeArray(t.Scopes),
+		t.FamilyID, t.IssuedAt, t.ExpiresAt)
 	return err
 }
 
-// ConsumeRefresh implements oauth.Store. Rotation makes the token single-use.
+// ConsumeRefresh implements oauth.Store. Rotation makes the token single-use, and
+// the claim leaves a tombstone so a later replay of the same value is recognised
+// as reuse rather than mistaken for a value that was never issued.
+//
+// The DELETE and the tombstone INSERT share one transaction: the row is the only
+// place the family is recorded before it is gone, and a crash between the two
+// would leave the family unrecoverable — a replay could then only be refused, not
+// traced to the thief's generation.
+//
+// On no rows the replay branch runs: an unexpired tombstone for this hash names
+// the family the presented token belonged to, and that is the RFC 9700 §4.14.2
+// theft signal. A database error is returned as an error and never folded into
+// either "unknown" or "reused": a store that cannot tell must fail closed.
 func (s *Tokens) ConsumeRefresh(ctx context.Context, value string) (oauth.RefreshToken, error) {
-	rows, err := s.pool.Query(ctx, `
+	hash := oauth.TokenHash(value)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return oauth.RefreshToken{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
 		DELETE FROM oauth_refresh_tokens
 		 WHERE token_hash = $1
-		RETURNING client_id, subject, scopes, issued_at, expires_at`, oauth.TokenHash(value))
+		RETURNING client_id, subject, scopes, family_id, issued_at, expires_at`, hash)
 	if err != nil {
 		return oauth.RefreshToken{}, err
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[tokenRow])
-	if noRows(err) {
-		return oauth.RefreshToken{}, oauth.ErrTokenNotFound
-	}
-	if err != nil {
+	switch {
+	case err == nil:
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO oauth_refresh_tombstones (token_hash, family_id, client_id, subject, expires_at)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (token_hash) DO UPDATE
+			   SET family_id = EXCLUDED.family_id, client_id = EXCLUDED.client_id,
+			       subject = EXCLUDED.subject, expires_at = EXCLUDED.expires_at`,
+			hash, row.FamilyID, row.ClientID, row.Subject, row.ExpiresAt); err != nil {
+			return oauth.RefreshToken{}, fmt.Errorf("postgres: record spent refresh token: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return oauth.RefreshToken{}, err
+		}
+		return row.refreshToken(), nil
+	case !noRows(err):
 		return oauth.RefreshToken{}, err
 	}
-	return row.refreshToken(), nil
+
+	// The live row is gone. The tombstone rotation left for this hash is the only
+	// surviving pointer to the family.
+	var familyID string
+	err = tx.QueryRow(ctx, `
+		SELECT family_id FROM oauth_refresh_tombstones
+		 WHERE token_hash = $1 AND expires_at > $2`, hash, s.clock()).Scan(&familyID)
+	switch {
+	case err == nil:
+		return oauth.RefreshToken{}, &oauth.RefreshReuseError{FamilyID: familyID}
+	case noRows(err):
+		// No tombstone: this value was never issued here, or its spent generation
+		// has passed the point where a replay could mint anything.
+		return oauth.RefreshToken{}, oauth.ErrTokenNotFound
+	default:
+		return oauth.RefreshToken{}, fmt.Errorf("postgres: look up spent refresh token: %w", err)
+	}
 }
 
-// DeleteRefresh implements oauth.Store.
+// DeleteRefresh implements oauth.Store. The value's tombstone goes with it: an
+// explicit revocation of a spent token says the replay signal is no longer wanted
+// for that value.
 func (s *Tokens) DeleteRefresh(ctx context.Context, value string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tokens WHERE token_hash = $1`, oauth.TokenHash(value))
+	hash := oauth.TokenHash(value)
+	if _, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tokens WHERE token_hash = $1`, hash); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tombstones WHERE token_hash = $1`, hash)
 	return err
+}
+
+// RevokeRefreshFamily implements oauth.Store. One transaction removes the whole
+// chain: every live refresh generation, every tombstone of the family, and every
+// access record minted with it. Sharing a transaction is what makes the report
+// honest — a family revocation that applied half of itself and errored is not a
+// state a retry can distinguish from success.
+//
+// An empty familyID revokes nothing: it is the caller's "I have no family" case,
+// and matching it would delete every row whose id was left empty by a malformed
+// insert.
+func (s *Tokens) RevokeRefreshFamily(ctx context.Context, familyID string) (int, error) {
+	if familyID == "" {
+		return 0, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	total := 0
+	for _, q := range []string{
+		`DELETE FROM oauth_access_tokens WHERE family_id = $1`,
+		`DELETE FROM oauth_refresh_tokens WHERE family_id = $1`,
+	} {
+		tag, err := tx.Exec(ctx, q, familyID)
+		if err != nil {
+			return total, err
+		}
+		total += int(tag.RowsAffected())
+	}
+	// Tombstones are residue, not token records: cleared, but not counted.
+	if _, err := tx.Exec(ctx, `DELETE FROM oauth_refresh_tombstones WHERE family_id = $1`, familyID); err != nil {
+		return total, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // grantRecordRow is one row of the access/refresh UNION ListBySubject reads.
@@ -238,6 +361,11 @@ func (s *Tokens) DeleteBySubjectClient(ctx context.Context, subject, clientID st
 	for _, q := range []string{
 		`DELETE FROM oauth_access_tokens WHERE subject = $1 AND client_id = $2`,
 		`DELETE FROM oauth_refresh_tokens WHERE subject = $1 AND client_id = $2`,
+		// The spent generations' tombstones carry the same owner fields. They are
+		// not credentials, but leaving one behind would keep the revoked grant's
+		// family reported as replayable — and revocable — after the user was told
+		// it was gone.
+		`DELETE FROM oauth_refresh_tombstones WHERE subject = $1 AND client_id = $2`,
 	} {
 		if _, err := tx.Exec(ctx, q, subject, clientID); err != nil {
 			return err
@@ -282,14 +410,21 @@ func (s *Tokens) TokenOwner(ctx context.Context, value string) (string, error) {
 // Authorization codes are removed with the tokens: a code that was never
 // redeemed is a redeemable capability, and leaving it behind after a Kill Switch
 // would let it mint fresh tokens.
+//
+// Spent generations' tombstones are cleared too but are NOT added to the count:
+// they are residue no client can use, and inflating a Kill Switch report with
+// them would tell an operator it revoked credentials it did not. Leaving them
+// would keep each revoked family's replay signal armed after the switch.
 func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
 	total, err := revokeMatching(ctx, s.pool, []string{"oauth_access_tokens", "oauth_refresh_tokens"}, f)
 	if err != nil {
 		return total, err
 	}
 	clause, args := revokePredicate(f)
-	if _, err := s.pool.Exec(ctx, `DELETE FROM oauth_codes`+clause, args...); err != nil {
-		return total, err
+	for _, table := range []string{"oauth_codes", "oauth_refresh_tombstones"} {
+		if _, err := s.pool.Exec(ctx, `DELETE FROM `+table+clause, args...); err != nil {
+			return total, err
+		}
 	}
 	return total, nil
 }
@@ -305,6 +440,10 @@ func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, er
 //
 // The legacy token tables (oauth_access_tokens, oauth_refresh_tokens) are NOT
 // touched here; they are covered by RevokeTokens, which the same erasure calls.
+// The spent generations' tombstones (oauth_refresh_tombstones) go with them
+// there, so an erasure cannot leave a subject's family residue behind — the
+// integration guard TestAccountDeletionLeavesNoOrphans sees the table through
+// information_schema and would fail if that step were dropped.
 func (s *Tokens) PurgeLegacySubject(ctx context.Context, subject string) (int, error) {
 	if subject == "" {
 		return 0, errors.New("postgres: subject is required")

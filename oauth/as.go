@@ -181,7 +181,7 @@ func (s *service) Exchange(ctx context.Context, req CodeExchangeRequest) (TokenR
 	if !verifyPKCE(req.CodeVerifier, code.CodeChallenge, code.CodeChallengeMethod) {
 		return TokenResponse{}, protocolError("invalid_grant", "PKCE verification failed")
 	}
-	return s.issue(ctx, client.ID, code.Subject, code.Scopes)
+	return s.issue(ctx, client.ID, code.Subject, code.Scopes, "")
 }
 
 func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenResponse, error) {
@@ -190,10 +190,28 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 		return TokenResponse{}, err
 	}
 	rt, err := s.tokens.ConsumeRefresh(ctx, req.RefreshToken)
-	if errors.Is(err, ErrTokenNotFound) {
+	var reuse *RefreshReuseError
+	switch {
+	case errors.As(err, &reuse):
+		// RFC 9700 §4.14.2: a token that is already spent means two parties hold
+		// it, and the presentation is the theft signal. Revoke every generation of
+		// the family before refusing, or the thief's current access and refresh
+		// pair stays live for the rest of the refresh TTL.
+		//
+		// A failure here is returned as-is rather than swallowed into the refusal:
+		// the caller must not be told "refused" while the family it asked to kill
+		// is still alive. Failing closed is the only honest answer.
+		if _, revErr := s.tokens.RevokeRefreshFamily(ctx, reuse.FamilyID); revErr != nil {
+			return TokenResponse{}, revErr
+		}
+		// The spent record is gone, so there is no subject to name; the client is
+		// known and is the half that can still be attributed. The outcome is denied
+		// because this request was refused as a suspected replay.
+		s.record(ctx, "oauth.reuse_detected", "", client.ID, audit.OutcomeDenied)
 		return TokenResponse{}, protocolError("invalid_grant", "refresh token is unknown or already used")
-	}
-	if err != nil {
+	case errors.Is(err, ErrTokenNotFound):
+		return TokenResponse{}, protocolError("invalid_grant", "refresh token is unknown or already used")
+	case err != nil:
 		return TokenResponse{}, err
 	}
 	if !s.now().Before(rt.ExpiresAt) {
@@ -212,7 +230,7 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 		}
 		scopes = req.Scopes
 	}
-	return s.issue(ctx, client.ID, rt.Subject, scopes)
+	return s.issue(ctx, client.ID, rt.Subject, scopes, rt.FamilyID)
 }
 
 func (s *service) Revoke(ctx context.Context, req RevokeRequest) error {
@@ -282,7 +300,16 @@ func (s *service) Introspect(ctx context.Context, accessToken string) (TokenInfo
 	}, nil
 }
 
-func (s *service) issue(ctx context.Context, clientID, subject string, scopes []Scope) (TokenResponse, error) {
+// issue mints an access and refresh pair. familyID names the rotation family the
+// pair joins: empty mints a new one (a first issuance — a code exchange or a
+// device grant), and non-empty inherits the spent token's family (a rotation), so
+// every generation descended from one authorization is revocable together.
+//
+// The same family goes on both records. The access token belongs to the chain
+// too: it is minted alongside a refresh token and dies with the family when a
+// replay is detected, otherwise the thief's current access token would outlive
+// the revocation.
+func (s *service) issue(ctx context.Context, clientID, subject string, scopes []Scope, familyID string) (TokenResponse, error) {
 	at, err := newToken()
 	if err != nil {
 		return TokenResponse{}, err
@@ -291,15 +318,25 @@ func (s *service) issue(ctx context.Context, clientID, subject string, scopes []
 	if err != nil {
 		return TokenResponse{}, err
 	}
+	if familyID == "" {
+		// A fresh generation is its own family. Drawn from the same CSPRNG as the
+		// tokens: it is not a credential, but a guessable family id would let one
+		// client's revocation name another's chain.
+		if familyID, err = newToken(); err != nil {
+			return TokenResponse{}, err
+		}
+	}
 	now := s.now()
 	access := AccessToken{
 		ClientID: clientID, Subject: subject,
 		Scopes:   append([]Scope(nil), scopes...),
+		FamilyID: familyID,
 		IssuedAt: now, ExpiresAt: now.Add(s.atTTL),
 	}
 	refresh := RefreshToken{
 		ClientID: clientID, Subject: subject,
 		Scopes:   append([]Scope(nil), scopes...),
+		FamilyID: familyID,
 		IssuedAt: now, ExpiresAt: now.Add(s.rtTTL),
 	}
 	if err := s.tokens.SaveAccess(ctx, at, access); err != nil {

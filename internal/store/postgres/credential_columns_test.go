@@ -26,7 +26,10 @@ var credentialColumnAllowed = map[string]string{
 	"oauth_codes.token_hash":          "sha256 of the code",
 	"oauth_access_tokens.token_hash":  "sha256 of the access token",
 	"oauth_refresh_tokens.token_hash": "sha256 of the refresh token",
-	"oidc_refresh_tokens.token_hash":  "sha256 of the refresh token",
+	// The hash of a token that was already rotated, kept so a replay can be traced
+	// to its family (RFC 9700 §4.14.2). Same value as the row it outlived.
+	"oauth_refresh_tombstones.token_hash": "sha256 of the spent refresh token",
+	"oidc_refresh_tokens.token_hash":      "sha256 of the refresh token",
 	// The hash of a token that was already rotated, kept so a replay can be traced
 	// to its family (RFC 9700 §4.14.2). Same value as the row it outlived.
 	"oidc_refresh_token_tombstones.token_hash": "sha256 of the spent refresh token",

@@ -226,6 +226,8 @@ func seedEveryAccountTable(t *testing.T, db *DB, subject, identityID string) err
 			[]any{"la-h", "cli", subject, now, now.Add(time.Hour)}},
 		{`INSERT INTO oauth_refresh_tokens (token_hash, client_id, subject, issued_at, expires_at) VALUES ($1,$2,$3,$4,$5)`,
 			[]any{"lr-h", "cli", subject, now, now.Add(time.Hour)}},
+		{`INSERT INTO oauth_refresh_tombstones (token_hash, family_id, client_id, subject, expires_at) VALUES ($1,$2,$3,$4,$5)`,
+			[]any{"lrt-h", "lfam-h", "cli", subject, now.Add(time.Hour)}},
 		{`INSERT INTO oauth_device_authorizations (device_code_hash, user_code, client_id, status, subject, expires_at) VALUES ($1,$2,$3,$4,$5,$6)`,
 			[]any{"ld-h", "WXYZ", "cli", "approved", subject, now.Add(time.Hour)}},
 	}

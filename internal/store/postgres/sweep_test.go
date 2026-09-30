@@ -96,6 +96,9 @@ func TestSweepExpiredRemovesDatedRows(t *testing.T) {
 		{"oauth_refresh_tokens", `INSERT INTO oauth_refresh_tokens
 			(token_hash, client_id, subject, scopes, issued_at, expires_at)
 			VALUES ($1, 'cli', 'usr', '{}', now(), $2)`},
+		{"oauth_refresh_tombstones", `INSERT INTO oauth_refresh_tombstones
+			(token_hash, family_id, client_id, subject, expires_at)
+			VALUES ($1, 'fam', 'cli', 'usr', $2)`},
 		{"oauth_device_authorizations", `INSERT INTO oauth_device_authorizations
 			(device_code_hash, user_code, client_id, scopes, status, expires_at)
 			VALUES ($1, 'ABCD', 'cli', '{}', 'pending', $2)`},

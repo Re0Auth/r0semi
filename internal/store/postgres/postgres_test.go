@@ -54,7 +54,7 @@ func openTestDBWith(t testing.TB, opts PoolOptions, options ...Option) *DB {
 
 	if _, err := db.pool.Exec(context.Background(), `
 		TRUNCATE accounts_users, accounts_identities, oauth_codes,
-		         oauth_access_tokens, oauth_refresh_tokens,
+		         oauth_access_tokens, oauth_refresh_tokens, oauth_refresh_tombstones,
 		         oauth_device_authorizations, oauth_clients,
 		         vault_credentials, federation_bindings, federation_bind_flows,
 		         sessions, audit_events,
@@ -268,14 +268,28 @@ func TestTokensConsumeIsSingleUse(t *testing.T) {
 		t.Fatalf("second consume = %v, want ErrTokenNotFound", err)
 	}
 
-	if err := tokens.SaveRefresh(ctx, "rt", oauth.RefreshToken{ClientID: "c", Subject: "s"}); err != nil {
+	if err := tokens.SaveRefresh(ctx, "rt", oauth.RefreshToken{ClientID: "c", Subject: "s", FamilyID: "fam-rt"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tokens.ConsumeRefresh(ctx, "rt"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tokens.ConsumeRefresh(ctx, "rt"); !errors.Is(err, oauth.ErrTokenNotFound) {
-		t.Fatalf("second refresh = %v, want ErrTokenNotFound", err)
+	// A second consume of a rotated value is a REUSE, not an unknown: RFC 9700
+	// §4.14.2 keys the family revocation on that distinction, and the tombstone the
+	// rotation left is what carries the family back.
+	var reuse *oauth.RefreshReuseError
+	if _, err := tokens.ConsumeRefresh(ctx, "rt"); !errors.As(err, &reuse) {
+		t.Fatalf("second refresh = %v, want *oauth.RefreshReuseError", err)
+	}
+	if reuse.FamilyID != "fam-rt" {
+		t.Fatalf("reuse family = %q, want fam-rt", reuse.FamilyID)
+	}
+	if !errors.Is(reuse, oauth.ErrRefreshTokenReused) {
+		t.Fatal("the typed reuse error does not unwrap to ErrRefreshTokenReused")
+	}
+	// A value that was never issued is still the ordinary unknown.
+	if _, err := tokens.ConsumeRefresh(ctx, "never-issued"); !errors.Is(err, oauth.ErrTokenNotFound) {
+		t.Fatalf("unknown refresh = %v, want ErrTokenNotFound", err)
 	}
 }
 

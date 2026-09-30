@@ -24,6 +24,7 @@ var erasureHandledTables = map[string]string{
 	"oidc_refresh_token_tombstones": "tokens.RevokeTokens",
 	"oauth_access_tokens":           "tokens.RevokeTokens (legacy)",
 	"oauth_refresh_tokens":          "tokens.RevokeTokens (legacy)",
+	"oauth_refresh_tombstones":      "tokens.RevokeTokens (legacy)",
 	"oauth_codes":                   "legacy.PurgeLegacySubject",
 	"oauth_device_authorizations":   "legacy.PurgeLegacySubject",
 }

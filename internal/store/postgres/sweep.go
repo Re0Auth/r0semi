@@ -27,6 +27,7 @@ var expiredTables = []struct{ table, column string }{
 	{"oauth_codes", "expires_at"},
 	{"oauth_access_tokens", "expires_at"},
 	{"oauth_refresh_tokens", "expires_at"},
+	{"oauth_refresh_tombstones", "expires_at"},
 	{"oauth_device_authorizations", "expires_at"},
 	{"federation_bind_flows", "expires_at"},
 	{"oidc_auth_requests", "expires_at"},
