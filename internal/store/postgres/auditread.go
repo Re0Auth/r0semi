@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/Re0Auth/r0semi/audit"
 )
@@ -15,6 +18,19 @@ const (
 	defaultAuditPage = 100
 	maxAuditPage     = 1000
 )
+
+// auditReadRow is one audit_events row as the operator read path selects it. The
+// db tags name the columns, so a column the SQL stops returning is a mapping error
+// rather than a silently shifted field.
+type auditReadRow struct {
+	ID         int64             `db:"id"`
+	OccurredAt time.Time         `db:"occurred_at"`
+	Action     string            `db:"action"`
+	Subject    string            `db:"subject"`
+	Provider   string            `db:"provider"`
+	Outcome    string            `db:"outcome"`
+	Detail     map[string]string `db:"detail"`
+}
 
 // Query implements the operator read path over the audit log.
 //
@@ -87,7 +103,10 @@ func (l *AuditLogger) Query(ctx context.Context, q audit.Query) (audit.Page, err
 	if err != nil {
 		return audit.Page{}, fmt.Errorf("postgres: audit: query: %w", err)
 	}
-	defer rows.Close()
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[auditReadRow])
+	if err != nil {
+		return audit.Page{}, fmt.Errorf("postgres: audit: query scan: %w", err)
+	}
 
 	// The capacity is the reader's default, not the requested limit: sizing an
 	// allocation from a value that arrived in a request is a denial-of-service shape
@@ -95,16 +114,11 @@ func (l *AuditLogger) Query(ctx context.Context, q audit.Query) (audit.Page, err
 	// on the request at all. A page larger than the default grows by append, and the
 	// SQL LIMIT is what bounds the rows in either case.
 	page := audit.Page{Entries: make([]audit.Entry, 0, defaultAuditPage), Limit: limit}
-	for rows.Next() {
-		var e audit.Entry
-		if err := rows.Scan(&e.ID, &e.Time, &e.Action, &e.Subject, &e.Provider,
-			&e.Outcome, &e.Detail); err != nil {
-			return audit.Page{}, fmt.Errorf("postgres: audit: query scan: %w", err)
-		}
-		page.Entries = append(page.Entries, e)
-	}
-	if err := rows.Err(); err != nil {
-		return audit.Page{}, fmt.Errorf("postgres: audit: query iterate: %w", err)
+	for _, r := range scanned {
+		page.Entries = append(page.Entries, audit.Entry{
+			ID: r.ID, Time: r.OccurredAt, Action: r.Action, Subject: r.Subject,
+			Provider: r.Provider, Outcome: r.Outcome, Detail: r.Detail,
+		})
 	}
 
 	// The extra row is the probe, not part of the page.

@@ -242,6 +242,61 @@ func codeChallenge(challenge, method string) *oidc.CodeChallenge {
 	return &oidc.CodeChallenge{Challenge: challenge, Method: oidc.CodeChallengeMethod(method)}
 }
 
+// authRequestRow is one oidc_auth_requests row in the shape both the read and the
+// consume paths select it. The db tags name the columns, so a projection change is
+// a mapping error rather than a silently shifted field.
+type authRequestRow struct {
+	ID                  string     `db:"id"`
+	ClientID            string     `db:"client_id"`
+	RedirectURI         string     `db:"redirect_uri"`
+	ResponseType        string     `db:"response_type"`
+	ResponseMode        string     `db:"response_mode"`
+	Scopes              []string   `db:"scopes"`
+	State               string     `db:"state"`
+	Nonce               string     `db:"nonce"`
+	CodeChallenge       string     `db:"code_challenge"`
+	CodeChallengeMethod string     `db:"code_challenge_method"`
+	Subject             string     `db:"subject"`
+	Done                bool       `db:"done"`
+	AuthTime            *time.Time `db:"auth_time"`
+	Prompt              []string   `db:"prompt"`
+	MaxAgeSeconds       *int       `db:"max_age_seconds"`
+}
+
+// authRequestOwnerRow is the subject/client projection used when a refused
+// request is audited.
+type authRequestOwnerRow struct {
+	Subject  string `db:"subject"`
+	ClientID string `db:"client_id"`
+}
+
+// authRequestFreshnessRow is the locked projection CompleteLogin reads to decide
+// whether the interactive decision must re-authenticate.
+type authRequestFreshnessRow struct {
+	Prompt        []string   `db:"prompt"`
+	MaxAgeSeconds *int       `db:"max_age_seconds"`
+	AuthTime      *time.Time `db:"auth_time"`
+}
+
+func (r authRequestRow) request() oidcstore.AuthRequest {
+	return oidcstore.AuthRequest{
+		ID:            r.ID,
+		ClientID:      r.ClientID,
+		RedirectURI:   r.RedirectURI,
+		ResponseType:  oidc.ResponseType(r.ResponseType),
+		ResponseMode:  oidc.ResponseMode(r.ResponseMode),
+		Scopes:        r.Scopes,
+		State:         r.State,
+		Nonce:         r.Nonce,
+		CodeChallenge: codeChallenge(r.CodeChallenge, r.CodeChallengeMethod),
+		Subject:       r.Subject,
+		IsDone:        r.Done,
+		AuthTime:      r.AuthTime,
+		Prompt:        r.Prompt,
+		MaxAge:        maxAgeFromSeconds(r.MaxAgeSeconds),
+	}
+}
+
 // AuthRequestByID implements op.Storage.
 func (s *OIDCStore) AuthRequestByID(ctx context.Context, id string) (op.AuthRequest, error) {
 	return s.scanAuthRequest(ctx, `
@@ -270,52 +325,36 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 		return nil, errors.New("postgres: authorization code is unknown or expired")
 	}
 
-	var (
-		a         oidcstore.AuthRequest
-		challenge string
-		method    string
-		authTime  *time.Time
-		maxAge    *int
-	)
-	if err := tx.QueryRow(ctx, `
+	rows, err := tx.Query(ctx, `
 		DELETE FROM oidc_auth_requests
 		 WHERE id = $1
 		RETURNING id, client_id, redirect_uri, response_type, response_mode, scopes, state, nonce,
 		          code_challenge, code_challenge_method, subject, done, auth_time,
-		          prompt, max_age_seconds`, requestID).Scan(
-		&a.ID, &a.ClientID, &a.RedirectURI, &a.ResponseType, &a.ResponseMode, &a.Scopes,
-		&a.State, &a.Nonce, &challenge, &method, &a.Subject, &a.IsDone, &authTime,
-		&a.Prompt, &maxAge,
-	); err != nil {
+		          prompt, max_age_seconds`, requestID)
+	if err != nil {
+		return nil, errors.New("postgres: auth request not found")
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestRow])
+	if err != nil {
 		return nil, errors.New("postgres: auth request not found")
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	a.CodeChallenge = codeChallenge(challenge, method)
-	a.AuthTime = authTime
-	a.MaxAge = maxAgeFromSeconds(maxAge)
+	a := row.request()
 	return &a, nil
 }
 
 func (s *OIDCStore) scanAuthRequest(ctx context.Context, query string, args ...any) (op.AuthRequest, error) {
-	var (
-		a         oidcstore.AuthRequest
-		challenge string
-		method    string
-		authTime  *time.Time
-		maxAge    *int
-	)
-	if err := s.pool.QueryRow(ctx, query, args...).Scan(
-		&a.ID, &a.ClientID, &a.RedirectURI, &a.ResponseType, &a.ResponseMode, &a.Scopes,
-		&a.State, &a.Nonce, &challenge, &method, &a.Subject, &a.IsDone, &authTime,
-		&a.Prompt, &maxAge,
-	); err != nil {
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
 		return nil, fmt.Errorf("postgres: auth request: %w", err)
 	}
-	a.CodeChallenge = codeChallenge(challenge, method)
-	a.AuthTime = authTime
-	a.MaxAge = maxAgeFromSeconds(maxAge)
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestRow])
+	if err != nil {
+		return nil, fmt.Errorf("postgres: auth request: %w", err)
+	}
+	a := row.request()
 	return &a, nil
 }
 
@@ -340,9 +379,14 @@ func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 	// Read the subject and client before deleting: a refused request leaves as
 	// much trace as an approved one, and this row is the only place the two ids
 	// live. The subject is empty for a request nobody signed in for, which is
-	// itself the honest record.
+	// itself the honest record. A lookup failure leaves both empty, as before.
 	var subject, clientID string
-	_ = tx.QueryRow(ctx, `SELECT subject, client_id FROM oidc_auth_requests WHERE id = $1`, id).Scan(&subject, &clientID)
+	if rows, err := tx.Query(ctx,
+		`SELECT subject, client_id FROM oidc_auth_requests WHERE id = $1`, id); err == nil {
+		if owner, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestOwnerRow]); err == nil {
+			subject, clientID = owner.Subject, owner.ClientID
+		}
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_codes WHERE request_id = $1`, id); err != nil {
 		return err
 	}
@@ -467,20 +511,39 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	return accessID, value, expires, nil
 }
 
+// refreshRequestRow is one oidc_refresh_tokens row as TokenRequestByRefreshToken
+// reads it.
+type refreshRequestRow struct {
+	IDHash   string     `db:"id_hash"`
+	ClientID string     `db:"client_id"`
+	Subject  string     `db:"subject"`
+	Scopes   []string   `db:"scopes"`
+	AMR      []string   `db:"amr"`
+	Audience []string   `db:"audience"`
+	AuthTime *time.Time `db:"auth_time"`
+}
+
 // TokenRequestByRefreshToken implements op.Storage.
 func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string) (op.RefreshTokenRequest, error) {
-	var (
-		r        oidcstore.RefreshRequest
-		authTime *time.Time
-	)
-	if err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT id_hash, client_id, subject, scopes, amr, audience, auth_time
-		  FROM oidc_refresh_tokens WHERE token_hash = $1`, hashValue(value)).Scan(
-		&r.IDHash, &r.ClientID, &r.Subject, &r.Scopes, &r.AMR, &r.Audience, &authTime,
-	); err != nil {
+		  FROM oidc_refresh_tokens WHERE token_hash = $1`, hashValue(value))
+	if err != nil {
 		return nil, errors.New("postgres: invalid refresh token")
 	}
-	r.AuthTime = authTime
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[refreshRequestRow])
+	if err != nil {
+		return nil, errors.New("postgres: invalid refresh token")
+	}
+	r := oidcstore.RefreshRequest{
+		IDHash:   row.IDHash,
+		ClientID: row.ClientID,
+		Subject:  row.Subject,
+		Scopes:   row.Scopes,
+		AMR:      row.AMR,
+		Audience: row.Audience,
+		AuthTime: row.AuthTime,
+	}
 	return &r, nil
 }
 
@@ -692,23 +755,30 @@ func (s *OIDCStore) SetUserinfoFromScopes(_ context.Context, userinfo *oidc.User
 // One query, and the row's own subject is what is published. The expiry is judged
 // in Go from the stored value, exactly as SetIntrospectionFromToken does, so the
 // two readers of one token row cannot disagree about a clock comparison.
+// accessTokenReadRow is the subject/expiry projection the userinfo path reads.
+type accessTokenReadRow struct {
+	Subject   string    `db:"subject"`
+	ExpiresAt time.Time `db:"expires_at"`
+}
+
 func (s *OIDCStore) SetUserinfoFromToken(ctx context.Context, userinfo *oidc.UserInfo, tokenID, subject, _ string) error {
 	if tokenID == "" {
 		return errNotAnAccessToken
 	}
-	var (
-		stored  string
-		expires time.Time
-	)
-	if err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT subject, expires_at FROM oidc_access_tokens WHERE id_hash = $1`,
-		hashValue(tokenID)).Scan(&stored, &expires); err != nil {
+		hashValue(tokenID))
+	if err != nil {
 		return errNotAnAccessToken
 	}
-	if stored != subject || !expires.After(s.now()) {
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[accessTokenReadRow])
+	if err != nil {
 		return errNotAnAccessToken
 	}
-	userinfo.Subject = stored
+	if row.Subject != subject || !row.ExpiresAt.After(s.now()) {
+		return errNotAnAccessToken
+	}
+	userinfo.Subject = row.Subject
 	return nil
 }
 
@@ -718,26 +788,34 @@ func (s *OIDCStore) SetUserinfoFromToken(ctx context.Context, userinfo *oidc.Use
 // string, and distinguishing the cases would turn it into an oracle.
 var errNotAnAccessToken = errors.New("not a live access token")
 
+// introspectionRow is the client/scope/expiry projection the introspection path
+// reads.
+type introspectionRow struct {
+	ClientID  string    `db:"client_id"`
+	Scopes    []string  `db:"scopes"`
+	ExpiresAt time.Time `db:"expires_at"`
+}
+
 // SetIntrospectionFromToken implements op.Storage.
 func (s *OIDCStore) SetIntrospectionFromToken(ctx context.Context, introspection *oidc.IntrospectionResponse, tokenID, subject, _ string) error {
-	var (
-		clientID string
-		scopes   []string
-		expires  time.Time
-	)
-	if err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT client_id, scopes, expires_at FROM oidc_access_tokens WHERE id_hash = $1`,
-		hashValue(tokenID)).Scan(&clientID, &scopes, &expires); err != nil {
+		hashValue(tokenID))
+	if err != nil {
 		return errors.New("postgres: token not found")
 	}
-	if !expires.After(s.now()) {
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[introspectionRow])
+	if err != nil {
+		return errors.New("postgres: token not found")
+	}
+	if !row.ExpiresAt.After(s.now()) {
 		return errors.New("postgres: token expired")
 	}
 	introspection.Active = true
 	introspection.Subject = subject
-	introspection.ClientID = clientID
-	introspection.Scope = scopes
-	introspection.Expiration = oidc.FromTime(expires)
+	introspection.ClientID = row.ClientID
+	introspection.Scope = row.Scopes
+	introspection.Expiration = oidc.FromTime(row.ExpiresAt)
 	return nil
 }
 
@@ -779,6 +857,33 @@ func (s *OIDCStore) StoreDeviceAuthorization(ctx context.Context, clientID, devi
 	return nil
 }
 
+// deviceStateRow is one oidc_devices row in the shape both device-state readers
+// select it.
+type deviceStateRow struct {
+	ClientID  string     `db:"client_id"`
+	Scopes    []string   `db:"scopes"`
+	ExpiresAt time.Time  `db:"expires_at"`
+	Done      bool       `db:"done"`
+	Denied    bool       `db:"denied"`
+	Subject   string     `db:"subject"`
+	AuthTime  *time.Time `db:"auth_time"`
+}
+
+func (r deviceStateRow) state() *op.DeviceAuthorizationState {
+	st := op.DeviceAuthorizationState{
+		ClientID: r.ClientID,
+		Scopes:   r.Scopes,
+		Expires:  r.ExpiresAt,
+		Done:     r.Done,
+		Denied:   r.Denied,
+		Subject:  r.Subject,
+	}
+	if r.AuthTime != nil {
+		st.AuthTime = *r.AuthTime
+	}
+	return &st
+}
+
 // GetDeviceAuthorizatonState implements op.Storage.
 //
 // It consumes an approved authorization on the first read: the library reads the
@@ -788,22 +893,17 @@ func (s *OIDCStore) StoreDeviceAuthorization(ctx context.Context, clientID, devi
 // between two polls cannot be replayed away. A pending or denied record is not
 // touched and falls through to a plain read for the library to answer.
 func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, deviceCode string) (*op.DeviceAuthorizationState, error) {
-	var (
-		st       op.DeviceAuthorizationState
-		authTime *time.Time
-	)
-	err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		DELETE FROM oidc_devices
 		 WHERE device_code_hash = $1 AND client_id = $2 AND done = true AND denied = false
 		RETURNING client_id, scopes, expires_at, done, denied, subject, auth_time`,
-		hashValue(deviceCode), clientID).Scan(
-		&st.ClientID, &st.Scopes, &st.Expires, &st.Done, &st.Denied, &st.Subject, &authTime,
-	)
+		hashValue(deviceCode), clientID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: consume device authorization: %w", err)
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[deviceStateRow])
 	if err == nil {
-		if authTime != nil {
-			st.AuthTime = *authTime
-		}
-		return &st, nil
+		return row.state(), nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("postgres: consume device authorization: %w", err)
@@ -839,21 +939,17 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 }
 
 func (s *OIDCStore) deviceState(ctx context.Context, where string, args ...any) (*op.DeviceAuthorizationState, error) {
-	var (
-		st       op.DeviceAuthorizationState
-		authTime *time.Time
-	)
-	if err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT client_id, scopes, expires_at, done, denied, subject, auth_time
-		  FROM oidc_devices WHERE `+where, args...).Scan(
-		&st.ClientID, &st.Scopes, &st.Expires, &st.Done, &st.Denied, &st.Subject, &authTime,
-	); err != nil {
+		  FROM oidc_devices WHERE `+where, args...)
+	if err != nil {
 		return nil, errors.New("postgres: device authorization not found")
 	}
-	if authTime != nil {
-		st.AuthTime = *authTime
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[deviceStateRow])
+	if err != nil {
+		return nil, errors.New("postgres: device authorization not found")
 	}
-	return &st, nil
+	return row.state(), nil
 }
 
 // --- consent / device UI helpers (app-owned, not part of op.Storage) ---
@@ -887,20 +983,21 @@ func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scope
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var (
-		prompt   []string
-		maxAge   *int
-		authTime *time.Time
-	)
-	if err := tx.QueryRow(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT prompt, max_age_seconds, auth_time
 		  FROM oidc_auth_requests
 		 WHERE id = $1
-		 FOR UPDATE`, id).Scan(&prompt, &maxAge, &authTime); err != nil {
+		 FOR UPDATE`, id)
+	if err != nil {
+		return errors.New("postgres: auth request not found")
+	}
+	locked, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestFreshnessRow])
+	if err != nil {
 		return errors.New("postgres: auth request not found")
 	}
 	now := s.now()
-	req := oidcstore.AuthRequest{Prompt: prompt, MaxAge: maxAgeFromSeconds(maxAge), AuthTime: authTime}
+	authTime := locked.AuthTime
+	req := oidcstore.AuthRequest{Prompt: locked.Prompt, MaxAge: maxAgeFromSeconds(locked.MaxAgeSeconds), AuthTime: authTime}
 	if req.RequiresReauthentication(now) || authTime == nil {
 		authTime = &now
 	}
@@ -996,6 +1093,17 @@ func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
 
 // --- engine-neutral business-plane surface (same shapes as oauth.Service) ---
 
+// grantTokenRow is one row of the access/refresh UNION Grants reads. The fifth
+// column is a bare true/false literal, so Postgres names it "?column?" — the db
+// tag says so explicitly rather than relying on position.
+type grantTokenRow struct {
+	ClientID  string    `db:"client_id"`
+	Scopes    []string  `db:"scopes"`
+	IssuedAt  time.Time `db:"issued_at"`
+	ExpiresAt time.Time `db:"expires_at"`
+	HasRT     bool      `db:"?column?"`
+}
+
 // Grants lists what each client can still do as this subject, derived from the
 // OP token tables. It is the OP-backed counterpart of oauth.Service.Grants.
 func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, error) {
@@ -1011,43 +1119,33 @@ func (s *OIDCStore) Grants(ctx context.Context, subject string) ([]oauth.Grant, 
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list grants: %w", err)
 	}
-	defer rows.Close()
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[grantTokenRow])
+	if err != nil {
+		return nil, err
+	}
 
 	byClient := make(map[string]*oauth.Grant)
-	for rows.Next() {
-		var (
-			clientID string
-			scopes   []string
-			issued   time.Time
-			expires  time.Time
-			hasRT    bool
-		)
-		if err := rows.Scan(&clientID, &scopes, &issued, &expires, &hasRT); err != nil {
-			return nil, err
-		}
-		g, ok := byClient[clientID]
+	for _, r := range scanned {
+		g, ok := byClient[r.ClientID]
 		if !ok {
-			g = &oauth.Grant{ClientID: clientID, IssuedAt: issued, ExpiresAt: expires}
-			byClient[clientID] = g
+			g = &oauth.Grant{ClientID: r.ClientID, IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt}
+			byClient[r.ClientID] = g
 		}
-		for _, sc := range scopes {
+		for _, sc := range r.Scopes {
 			if sc == oidc.ScopeOfflineAccess {
 				continue
 			}
 			g.Scopes = appendScopeUnique(g.Scopes, oauth.Scope(sc))
 		}
-		if issued.Before(g.IssuedAt) {
-			g.IssuedAt = issued
+		if r.IssuedAt.Before(g.IssuedAt) {
+			g.IssuedAt = r.IssuedAt
 		}
-		if expires.After(g.ExpiresAt) {
-			g.ExpiresAt = expires
+		if r.ExpiresAt.After(g.ExpiresAt) {
+			g.ExpiresAt = r.ExpiresAt
 		}
-		if hasRT {
+		if r.HasRT {
 			g.HasRefresh = true
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	// Names come from one lookup for the page. They used to come from a Get
 	// inside the loop above — one extra round trip per distinct client, on a query

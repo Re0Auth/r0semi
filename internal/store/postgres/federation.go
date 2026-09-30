@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Re0Auth/r0semi/internal/account"
@@ -16,20 +17,49 @@ import (
 // table has no such column, and federation.Binding has no such field.
 type Bindings struct{ pool *pgxpool.Pool }
 
+// bindingRow is one federation_bindings row, named so scanning matches by column
+// rather than by position.
+type bindingRow struct {
+	UserID     string     `db:"user_id"`
+	Game       string     `db:"game"`
+	Source     string     `db:"source"`
+	TokenType  string     `db:"token_type"`
+	Expiry     *time.Time `db:"expiry"`
+	HasRefresh bool       `db:"has_refresh"`
+	// Version is scanned through int64 on purpose. The stored value is a
+	// random uint64 written as int64(v); scanning the bigint straight into a
+	// uint64 leaves the conversion to the driver's codec, which is not a
+	// promise this project wants to depend on. Reading the signed value and
+	// converting back is bit-exact and driver-agnostic.
+	Version int64 `db:"version"`
+}
+
+func (r bindingRow) binding() federation.Binding {
+	b := federation.Binding{
+		User:       account.UserID(r.UserID),
+		Game:       r.Game,
+		Source:     r.Source,
+		TokenType:  r.TokenType,
+		HasRefresh: r.HasRefresh,
+		Version:    uint64(r.Version),
+	}
+	if r.Expiry != nil {
+		b.Expiry = *r.Expiry
+	}
+	return b
+}
+
 // Get implements federation.BindingStore.
 func (s *Bindings) Get(ctx context.Context, user account.UserID, game, source string) (federation.Binding, error) {
-	binding, err := scanBinding(s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT user_id, game, source, token_type, expiry, has_refresh, version
 		  FROM federation_bindings
 		 WHERE user_id = $1 AND game = $2 AND source = $3`,
-		string(user), game, source))
-	if noRows(err) {
-		return federation.Binding{}, federation.ErrNotBound
-	}
+		string(user), game, source)
 	if err != nil {
 		return federation.Binding{}, err
 	}
-	return binding, nil
+	return scanBinding(rows)
 }
 
 // Put implements federation.BindingStore.
@@ -130,44 +160,30 @@ func (s *Bindings) queryBindings(ctx context.Context, query string, args ...any)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	out := make([]federation.Binding, 0, 4)
-	for rows.Next() {
-		binding, err := scanBinding(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, binding)
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[bindingRow])
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+
+	out := make([]federation.Binding, 0, len(scanned))
+	for _, r := range scanned {
+		out = append(out, r.binding())
+	}
+	return out, nil
 }
 
-// rowScanner is the slice of pgx shared by a Row and the current row of Rows.
-type rowScanner interface{ Scan(dest ...any) error }
-
-func scanBinding(row rowScanner) (federation.Binding, error) {
-	var (
-		binding federation.Binding
-		userID  string
-		expiry  *time.Time
-		// version is scanned through int64 on purpose. The stored value is a
-		// random uint64 written as int64(v); scanning the bigint straight into a
-		// uint64 leaves the conversion to the driver's codec, which is not a
-		// promise this project wants to depend on. Reading the signed value and
-		// converting back is bit-exact and driver-agnostic.
-		version int64
-	)
-	if err := row.Scan(&userID, &binding.Game, &binding.Source, &binding.TokenType,
-		&expiry, &binding.HasRefresh, &version); err != nil {
+// scanBinding maps the single row of a one-row result, reporting the store's
+// not-bound sentinel for an empty result. CollectOneRow produces pgx.ErrNoRows,
+// which is the same signal the old QueryRow.Scan produced.
+func scanBinding(rows pgx.Rows) (federation.Binding, error) {
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[bindingRow])
+	if noRows(err) {
+		return federation.Binding{}, federation.ErrNotBound
+	}
+	if err != nil {
 		return federation.Binding{}, err
 	}
-	binding.User = account.UserID(userID)
-	binding.Version = uint64(version)
-	if expiry != nil {
-		binding.Expiry = *expiry
-	}
-	return binding, nil
+	return row.binding(), nil
 }
 
 // BindFlows implements federation.BindFlowStore on Postgres. Consume is a single
@@ -193,26 +209,43 @@ func (s *BindFlows) Put(ctx context.Context, f federation.BindFlow) error {
 	return err
 }
 
+// bindFlowRow is the RETURNING shape of a consumed federation_bind_flows row.
+type bindFlowRow struct {
+	ID           string    `db:"id"`
+	UserID       string    `db:"user_id"`
+	Game         string    `db:"game"`
+	Source       string    `db:"source"`
+	PKCEVerifier string    `db:"pkce_verifier"`
+	ReturnTo     string    `db:"return_to"`
+	ExpiresAt    time.Time `db:"expires_at"`
+}
+
 // Consume implements federation.BindFlowStore.
 func (s *BindFlows) Consume(ctx context.Context, state string) (federation.BindFlow, error) {
-	var (
-		flow   federation.BindFlow
-		userID string
-	)
-	err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		DELETE FROM federation_bind_flows
 		 WHERE state = $1
-		RETURNING id, user_id, game, source, pkce_verifier, return_to, expires_at`, state).
-		Scan(&flow.ID, &userID, &flow.Game, &flow.Source, &flow.Verifier, &flow.ReturnTo, &flow.ExpiresAt)
+		RETURNING id, user_id, game, source, pkce_verifier, return_to, expires_at`, state)
+	if err != nil {
+		return federation.BindFlow{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[bindFlowRow])
 	if noRows(err) {
 		return federation.BindFlow{}, federation.ErrUnknownBind
 	}
 	if err != nil {
 		return federation.BindFlow{}, err
 	}
-	flow.State = state
-	flow.User = account.UserID(userID)
-	return flow, nil
+	return federation.BindFlow{
+		ID:        row.ID,
+		User:      account.UserID(row.UserID),
+		Game:      row.Game,
+		Source:    row.Source,
+		Verifier:  row.PKCEVerifier,
+		State:     state,
+		ReturnTo:  row.ReturnTo,
+		ExpiresAt: row.ExpiresAt,
+	}, nil
 }
 
 // PurgeUserFlows implements federation.BindFlowStore: every pending bind flow an

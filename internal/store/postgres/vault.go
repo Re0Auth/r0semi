@@ -2,7 +2,9 @@ package postgres
 
 import (
 	"context"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Re0Auth/r0semi/vault"
@@ -16,6 +18,35 @@ import (
 type Vault struct{ pool *pgxpool.Pool }
 
 const vaultCols = `subject, provider, version, wrapped_dek, kek_id, nonce, ciphertext, meta, created_at, updated_at`
+
+// vaultRow is one vault_credentials row, named so scanning matches by column
+// rather than by position.
+type vaultRow struct {
+	Subject    string            `db:"subject"`
+	Provider   string            `db:"provider"`
+	Version    int16             `db:"version"`
+	WrappedDEK []byte            `db:"wrapped_dek"`
+	KEKID      string            `db:"kek_id"`
+	Nonce      []byte            `db:"nonce"`
+	Ciphertext []byte            `db:"ciphertext"`
+	Meta       map[string]string `db:"meta"`
+	CreatedAt  time.Time         `db:"created_at"`
+	UpdatedAt  time.Time         `db:"updated_at"`
+}
+
+func (r vaultRow) record() vault.Record {
+	return vault.Record{
+		Identity:   vault.Identity{Subject: r.Subject, Provider: r.Provider},
+		Version:    byte(r.Version),
+		WrappedDEK: r.WrappedDEK,
+		KEKID:      r.KEKID,
+		Nonce:      r.Nonce,
+		Ciphertext: r.Ciphertext,
+		Meta:       r.Meta,
+		CreatedAt:  r.CreatedAt,
+		UpdatedAt:  r.UpdatedAt,
+	}
+}
 
 // List implements vault.Repo.
 //
@@ -50,22 +81,16 @@ func (s *Vault) queryRecords(ctx context.Context, query string, args ...any) ([]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	out := make([]vault.Record, 0, 8)
-	for rows.Next() {
-		var (
-			rec     vault.Record
-			version int16
-		)
-		if err := rows.Scan(&rec.Identity.Subject, &rec.Identity.Provider, &version, &rec.WrappedDEK,
-			&rec.KEKID, &rec.Nonce, &rec.Ciphertext, &rec.Meta, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
-			return nil, err
-		}
-		rec.Version = byte(version)
-		out = append(out, rec)
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[vaultRow])
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+
+	out := make([]vault.Record, 0, len(scanned))
+	for _, r := range scanned {
+		out = append(out, r.record())
+	}
+	return out, nil
 }
 
 // Put implements vault.Repo. An existing record is replaced wholesale, so the
@@ -121,23 +146,20 @@ func (s *Vault) RewrapIfUnchanged(ctx context.Context, id vault.Identity, expect
 
 // Get implements vault.Repo.
 func (s *Vault) Get(ctx context.Context, id vault.Identity) (vault.Record, error) {
-	var (
-		rec     vault.Record
-		version int16
-	)
-	err := s.pool.QueryRow(ctx,
+	rows, err := s.pool.Query(ctx,
 		`SELECT `+vaultCols+` FROM vault_credentials WHERE subject = $1 AND provider = $2`,
-		id.Subject, id.Provider).
-		Scan(&rec.Identity.Subject, &rec.Identity.Provider, &version, &rec.WrappedDEK,
-			&rec.KEKID, &rec.Nonce, &rec.Ciphertext, &rec.Meta, &rec.CreatedAt, &rec.UpdatedAt)
+		id.Subject, id.Provider)
+	if err != nil {
+		return vault.Record{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[vaultRow])
 	if noRows(err) {
 		return vault.Record{}, vault.ErrNotFound
 	}
 	if err != nil {
 		return vault.Record{}, err
 	}
-	rec.Version = byte(version)
-	return rec, nil
+	return row.record(), nil
 }
 
 // Delete implements vault.Repo. Deleting an absent credential is not an error:

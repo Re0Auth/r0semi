@@ -81,6 +81,23 @@ func (r auditRow) canonical() []byte {
 	return b.Bytes()
 }
 
+// auditVerifyRow is one audit_events row in the shape Verify walks it: the row's
+// own fields plus the linkage, hash and signature columns the walk checks. The db
+// tags name the columns, so a projection change is a mapping error rather than a
+// silently shifted field.
+type auditVerifyRow struct {
+	ID         int64             `db:"id"`
+	OccurredAt time.Time         `db:"occurred_at"`
+	Action     string            `db:"action"`
+	Subject    string            `db:"subject"`
+	Provider   string            `db:"provider"`
+	Outcome    string            `db:"outcome"`
+	Detail     map[string]string `db:"detail"`
+	PrevHash   []byte            `db:"prev_hash"`
+	RowHash    []byte            `db:"row_hash"`
+	Signature  []byte            `db:"signature"`
+}
+
 // writeLenPrefixed appends a length-prefixed string, so concatenation is
 // unambiguous: without the length, ("ab","c") and ("a","bc") would hash the same.
 func writeLenPrefixed(b *bytes.Buffer, s string) {
@@ -256,17 +273,24 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 		started bool
 	)
 	for rows.Next() {
-		var (
-			id       int64
-			r        auditRow
-			prevHash []byte
-			rowHash  []byte
-			sig      []byte
-		)
-		if err := rows.Scan(&id, &r.OccurredAt, &r.Action, &r.Subject, &r.Provider,
-			&r.Outcome, &r.Detail, &prevHash, &rowHash, &sig); err != nil {
+		// RowToStructByName is applied per row rather than through CollectRows:
+		// the walk stops at the first bad row, and buffering the whole log to
+		// find it would turn a flat-memory streaming check into one that holds
+		// every chained row at once. The mapping is still by column name.
+		scanned, err := pgx.RowToStructByName[auditVerifyRow](rows)
+		if err != nil {
 			return AuditVerification{}, fmt.Errorf("postgres: audit: verify scan: %w", err)
 		}
+		id := scanned.ID
+		r := auditRow{
+			OccurredAt: scanned.OccurredAt,
+			Action:     scanned.Action,
+			Subject:    scanned.Subject,
+			Provider:   scanned.Provider,
+			Outcome:    scanned.Outcome,
+			Detail:     scanned.Detail,
+		}
+		prevHash, rowHash, sig := scanned.PrevHash, scanned.RowHash, scanned.Signature
 		if rowHash == nil {
 			// A pre-chain row. It must not appear after the chain has started: a
 			// chained row whose hash was cleared would otherwise be silently

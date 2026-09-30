@@ -31,29 +31,48 @@ func (s *Tokens) SaveCode(ctx context.Context, value string, c oauth.Authorizati
 	return err
 }
 
+// authorizationCodeRow is the RETURNING shape of a consumed oauth_codes row.
+type authorizationCodeRow struct {
+	ClientID            string    `db:"client_id"`
+	Subject             string    `db:"subject"`
+	Scopes              []string  `db:"scopes"`
+	RedirectURI         string    `db:"redirect_uri"`
+	CodeChallenge       string    `db:"code_challenge"`
+	CodeChallengeMethod string    `db:"code_challenge_method"`
+	ExpiresAt           time.Time `db:"expires_at"`
+}
+
+func (r authorizationCodeRow) code() oauth.AuthorizationCode {
+	return oauth.AuthorizationCode{
+		ClientID:            r.ClientID,
+		Subject:             r.Subject,
+		Scopes:              scopesFrom(r.Scopes),
+		RedirectURI:         r.RedirectURI,
+		CodeChallenge:       r.CodeChallenge,
+		CodeChallengeMethod: r.CodeChallengeMethod,
+		ExpiresAt:           r.ExpiresAt,
+	}
+}
+
 // ConsumeCode implements oauth.Store. Expiry is checked by the service, so an
 // expired code is still returned (once) rather than swallowed.
 func (s *Tokens) ConsumeCode(ctx context.Context, value string) (oauth.AuthorizationCode, error) {
-	row := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		DELETE FROM oauth_codes
 		 WHERE token_hash = $1
 		RETURNING client_id, subject, scopes, redirect_uri, code_challenge, code_challenge_method, expires_at`,
 		oauth.TokenHash(value))
-
-	var (
-		c      oauth.AuthorizationCode
-		scopes []string
-	)
-	err := row.Scan(&c.ClientID, &c.Subject, &scopes, &c.RedirectURI,
-		&c.CodeChallenge, &c.CodeChallengeMethod, &c.ExpiresAt)
+	if err != nil {
+		return oauth.AuthorizationCode{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authorizationCodeRow])
 	if noRows(err) {
 		return oauth.AuthorizationCode{}, oauth.ErrTokenNotFound
 	}
 	if err != nil {
 		return oauth.AuthorizationCode{}, err
 	}
-	c.Scopes = scopesFrom(scopes)
-	return c, nil
+	return row.code(), nil
 }
 
 // SaveAccess implements oauth.Store.
@@ -65,24 +84,45 @@ func (s *Tokens) SaveAccess(ctx context.Context, value string, t oauth.AccessTok
 	return err
 }
 
+// tokenRow is the column shape shared by the access- and refresh-token tables.
+type tokenRow struct {
+	ClientID  string    `db:"client_id"`
+	Subject   string    `db:"subject"`
+	Scopes    []string  `db:"scopes"`
+	IssuedAt  time.Time `db:"issued_at"`
+	ExpiresAt time.Time `db:"expires_at"`
+}
+
+func (r tokenRow) accessToken() oauth.AccessToken {
+	return oauth.AccessToken{
+		ClientID: r.ClientID, Subject: r.Subject, Scopes: scopesFrom(r.Scopes),
+		IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt,
+	}
+}
+
+func (r tokenRow) refreshToken() oauth.RefreshToken {
+	return oauth.RefreshToken{
+		ClientID: r.ClientID, Subject: r.Subject, Scopes: scopesFrom(r.Scopes),
+		IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt,
+	}
+}
+
 // GetAccess implements oauth.Store.
 func (s *Tokens) GetAccess(ctx context.Context, value string) (oauth.AccessToken, error) {
-	var (
-		t      oauth.AccessToken
-		scopes []string
-	)
-	err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT client_id, subject, scopes, issued_at, expires_at
-		  FROM oauth_access_tokens WHERE token_hash = $1`, oauth.TokenHash(value)).
-		Scan(&t.ClientID, &t.Subject, &scopes, &t.IssuedAt, &t.ExpiresAt)
+		  FROM oauth_access_tokens WHERE token_hash = $1`, oauth.TokenHash(value))
+	if err != nil {
+		return oauth.AccessToken{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[tokenRow])
 	if noRows(err) {
 		return oauth.AccessToken{}, oauth.ErrTokenNotFound
 	}
 	if err != nil {
 		return oauth.AccessToken{}, err
 	}
-	t.Scopes = scopesFrom(scopes)
-	return t, nil
+	return row.accessToken(), nil
 }
 
 // DeleteAccess implements oauth.Store. Deleting an absent token is not an error,
@@ -103,29 +143,48 @@ func (s *Tokens) SaveRefresh(ctx context.Context, value string, t oauth.RefreshT
 
 // ConsumeRefresh implements oauth.Store. Rotation makes the token single-use.
 func (s *Tokens) ConsumeRefresh(ctx context.Context, value string) (oauth.RefreshToken, error) {
-	var (
-		t      oauth.RefreshToken
-		scopes []string
-	)
-	err := s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		DELETE FROM oauth_refresh_tokens
 		 WHERE token_hash = $1
-		RETURNING client_id, subject, scopes, issued_at, expires_at`, oauth.TokenHash(value)).
-		Scan(&t.ClientID, &t.Subject, &scopes, &t.IssuedAt, &t.ExpiresAt)
+		RETURNING client_id, subject, scopes, issued_at, expires_at`, oauth.TokenHash(value))
+	if err != nil {
+		return oauth.RefreshToken{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[tokenRow])
 	if noRows(err) {
 		return oauth.RefreshToken{}, oauth.ErrTokenNotFound
 	}
 	if err != nil {
 		return oauth.RefreshToken{}, err
 	}
-	t.Scopes = scopesFrom(scopes)
-	return t, nil
+	return row.refreshToken(), nil
 }
 
 // DeleteRefresh implements oauth.Store.
 func (s *Tokens) DeleteRefresh(ctx context.Context, value string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tokens WHERE token_hash = $1`, oauth.TokenHash(value))
 	return err
+}
+
+// grantRecordRow is one row of the access/refresh UNION ListBySubject reads.
+type grantRecordRow struct {
+	ClientID  string    `db:"client_id"`
+	Scopes    []string  `db:"scopes"`
+	IssuedAt  time.Time `db:"issued_at"`
+	ExpiresAt time.Time `db:"expires_at"`
+	IsRefresh bool      `db:"is_refresh"`
+}
+
+func (r grantRecordRow) record() oauth.GrantRecord {
+	rec := oauth.GrantRecord{
+		ClientID: r.ClientID, Scopes: scopesFrom(r.Scopes),
+		IssuedAt: r.IssuedAt, ExpiresAt: r.ExpiresAt,
+		Kind: oauth.TokenKindAccess,
+	}
+	if r.IsRefresh {
+		rec.Kind = oauth.TokenKindRefresh
+	}
+	return rec
 }
 
 // ListBySubject implements oauth.Store.
@@ -145,26 +204,16 @@ func (s *Tokens) ListBySubject(ctx context.Context, subject string) ([]oauth.Gra
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[grantRecordRow])
+	if err != nil {
+		return nil, err
+	}
 
 	var out []oauth.GrantRecord
-	for rows.Next() {
-		var (
-			r         oauth.GrantRecord
-			scopes    []string
-			isRefresh bool
-		)
-		if err := rows.Scan(&r.ClientID, &scopes, &r.IssuedAt, &r.ExpiresAt, &isRefresh); err != nil {
-			return nil, err
-		}
-		r.Scopes = scopesFrom(scopes)
-		r.Kind = oauth.TokenKindAccess
-		if isRefresh {
-			r.Kind = oauth.TokenKindRefresh
-		}
-		out = append(out, r)
+	for _, r := range scanned {
+		out = append(out, r.record())
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // DeleteBySubjectClient implements oauth.Store.
@@ -333,6 +382,37 @@ type Devices struct{ pool *pgxpool.Pool }
 
 const deviceCols = `device_code_hash, user_code, client_id, scopes, status, subject, explicit_scopes, expires_at, last_poll`
 
+// deviceRow is one oauth_device_authorizations row, named so scanning matches by
+// column rather than by position.
+type deviceRow struct {
+	DeviceCodeHash string     `db:"device_code_hash"`
+	UserCode       string     `db:"user_code"`
+	ClientID       string     `db:"client_id"`
+	Scopes         []string   `db:"scopes"`
+	Status         string     `db:"status"`
+	Subject        string     `db:"subject"`
+	ExplicitScopes []string   `db:"explicit_scopes"`
+	ExpiresAt      time.Time  `db:"expires_at"`
+	LastPoll       *time.Time `db:"last_poll"`
+}
+
+func (r deviceRow) device() oauth.DeviceAuthorizationRecord {
+	d := oauth.DeviceAuthorizationRecord{
+		DeviceCodeHash: r.DeviceCodeHash,
+		UserCode:       r.UserCode,
+		ClientID:       r.ClientID,
+		Scopes:         scopesFrom(r.Scopes),
+		Status:         oauth.DeviceStatus(r.Status),
+		Subject:        r.Subject,
+		Explicit:       scopesFrom(r.ExplicitScopes),
+		ExpiresAt:      r.ExpiresAt,
+	}
+	if r.LastPoll != nil {
+		d.LastPoll = *r.LastPoll
+	}
+	return d
+}
+
 // SaveDevice implements oauth.DeviceStore.
 func (s *Devices) SaveDevice(ctx context.Context, deviceCode string, d oauth.DeviceAuthorizationRecord) error {
 	_, err := s.pool.Exec(ctx, `
@@ -345,19 +425,25 @@ func (s *Devices) SaveDevice(ctx context.Context, deviceCode string, d oauth.Dev
 
 // GetDevice implements oauth.DeviceStore.
 func (s *Devices) GetDevice(ctx context.Context, deviceCode string) (oauth.DeviceAuthorizationRecord, error) {
-	row := s.pool.QueryRow(ctx,
+	rows, err := s.pool.Query(ctx,
 		`SELECT `+deviceCols+` FROM oauth_device_authorizations WHERE device_code_hash = $1`,
 		oauth.TokenHash(deviceCode))
-	return scanDevice(row)
+	if err != nil {
+		return oauth.DeviceAuthorizationRecord{}, err
+	}
+	return scanDevice(rows)
 }
 
 // GetDeviceByUserCode implements oauth.DeviceStore.
 func (s *Devices) GetDeviceByUserCode(ctx context.Context, userCode string) (oauth.DeviceAuthorizationRecord, error) {
-	row := s.pool.QueryRow(ctx,
+	rows, err := s.pool.Query(ctx,
 		`SELECT `+deviceCols+` FROM oauth_device_authorizations
 		  WHERE upper(replace(user_code, '-', '')) = $1`,
 		oauth.NormalizeUserCode(userCode))
-	return scanDevice(row)
+	if err != nil {
+		return oauth.DeviceAuthorizationRecord{}, err
+	}
+	return scanDevice(rows)
 }
 
 // RecordPoll implements oauth.DeviceStore. Only last_poll moves: a poll is not a
@@ -394,29 +480,15 @@ func (s *Devices) RecordDecision(ctx context.Context, deviceCodeHash string, d o
 	return tag.RowsAffected() == 1, nil
 }
 
-func scanDevice(row pgx.Row) (oauth.DeviceAuthorizationRecord, error) {
-	var (
-		d       oauth.DeviceAuthorizationRecord
-		scopes  []string
-		expl    []string
-		status  string
-		lastPol *time.Time
-	)
-	err := row.Scan(&d.DeviceCodeHash, &d.UserCode, &d.ClientID, &scopes, &status,
-		&d.Subject, &expl, &d.ExpiresAt, &lastPol)
+func scanDevice(rows pgx.Rows) (oauth.DeviceAuthorizationRecord, error) {
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[deviceRow])
 	if noRows(err) {
 		return oauth.DeviceAuthorizationRecord{}, oauth.ErrDeviceNotFound
 	}
 	if err != nil {
 		return oauth.DeviceAuthorizationRecord{}, err
 	}
-	d.Scopes = scopesFrom(scopes)
-	d.Explicit = scopesFrom(expl)
-	d.Status = oauth.DeviceStatus(status)
-	if lastPol != nil {
-		d.LastPoll = *lastPol
-	}
-	return d, nil
+	return row.device(), nil
 }
 
 // Clients implements oauth.ClientRegistry on Postgres. Only the secret digest is
@@ -437,13 +509,35 @@ func (s *Clients) Create(ctx context.Context, c oauth.Client) error {
 	return err
 }
 
+// clientRow is one oauth_clients row, named so scanning matches by column rather
+// than by position.
+type clientRow struct {
+	ID            string    `db:"id"`
+	Name          string    `db:"name"`
+	Type          string    `db:"type"`
+	Status        string    `db:"status"`
+	SecretHash    []byte    `db:"secret_hash"`
+	RedirectURIs  []string  `db:"redirect_uris"`
+	AllowedScopes []string  `db:"allowed_scopes"`
+	CreatedAt     time.Time `db:"created_at"`
+}
+
+func (r clientRow) client() (oauth.Client, error) {
+	return oauth.RestoreClientWithStatus(r.ID, r.Name, oauth.ClientType(r.Type), oauth.ClientStatus(r.Status),
+		r.SecretHash, r.RedirectURIs, scopesFrom(r.AllowedScopes), r.CreatedAt)
+}
+
 // Get implements oauth.ClientRegistry. A suspended client is reported as not
 // found: the protocol plane must treat it as a client id that never existed,
 // not as one that is merely forbidden.
 func (s *Clients) Get(ctx context.Context, id string) (oauth.Client, error) {
-	return scanClient(s.pool.QueryRow(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at
-		  FROM oauth_clients WHERE id = $1 AND status <> 'suspended'`, id))
+		  FROM oauth_clients WHERE id = $1 AND status <> 'suspended'`, id)
+	if err != nil {
+		return oauth.Client{}, err
+	}
+	return scanClient(rows)
 }
 
 // List implements oauth.ClientAdmin. Suspended clients are included, because the
@@ -455,17 +549,20 @@ func (s *Clients) List(ctx context.Context) ([]oauth.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[clientRow])
+	if err != nil {
+		return nil, err
+	}
 
 	var out []oauth.Client
-	for rows.Next() {
-		c, err := scanClient(rows)
+	for _, r := range scanned {
+		c, err := r.client()
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ClientNames implements oauth.ClientNameLookup: every name for a grants page in
@@ -475,6 +572,12 @@ func (s *Clients) List(ctx context.Context) ([]oauth.Client, error) {
 // that were issued to somebody: suspension stops a client acting, it does not
 // make the user's grant disappear, and an unnamed row would be the one the user
 // most needs to recognise before revoking it.
+// clientNameRow is the id/name projection ClientNames reads.
+type clientNameRow struct {
+	ID   string `db:"id"`
+	Name string `db:"name"`
+}
+
 func (s *Clients) ClientNames(ctx context.Context, ids []string) (map[string]string, error) {
 	out := make(map[string]string, len(ids))
 	if len(ids) == 0 {
@@ -484,15 +587,14 @@ func (s *Clients) ClientNames(ctx context.Context, ids []string) (map[string]str
 	if err != nil {
 		return nil, fmt.Errorf("postgres: client names: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var id, name string
-		if err := rows.Scan(&id, &name); err != nil {
-			return nil, err
-		}
-		out[id] = name
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[clientNameRow])
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	for _, r := range scanned {
+		out[r.ID] = r.Name
+	}
+	return out, nil
 }
 
 // SetStatus implements oauth.ClientAdmin.
@@ -545,27 +647,16 @@ func (s *Clients) RotateSecret(ctx context.Context, id string, secretHash []byte
 	return oauth.ErrNoSecretToRotate
 }
 
-// scanClient reads one client row in the column order used above.
-func scanClient(row pgx.Row) (oauth.Client, error) {
-	var (
-		id         string
-		name       string
-		typ        string
-		status     string
-		secretHash []byte
-		redirects  []string
-		allowed    []string
-		createdAt  time.Time
-	)
-	err := row.Scan(&id, &name, &typ, &status, &secretHash, &redirects, &allowed, &createdAt)
+// scanClient reads one client row by column name.
+func scanClient(rows pgx.Rows) (oauth.Client, error) {
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[clientRow])
 	if noRows(err) {
 		return oauth.Client{}, oauth.ErrClientNotFound
 	}
 	if err != nil {
 		return oauth.Client{}, err
 	}
-	return oauth.RestoreClientWithStatus(id, name, oauth.ClientType(typ), oauth.ClientStatus(status),
-		secretHash, redirects, scopesFrom(allowed), createdAt)
+	return row.client()
 }
 
 func scopeArray(scopes []oauth.Scope) []string {

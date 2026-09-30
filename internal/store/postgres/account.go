@@ -24,6 +24,44 @@ type Accounts struct{ pool *pgxpool.Pool }
 
 const accountIdentityCols = `id, user_id, provider, subject, display_name, email, avatar_url, linked_at, last_login_at`
 
+// identityRow is one accounts_identities row, named so scanning matches by column
+// rather than by position.
+type identityRow struct {
+	ID          string     `db:"id"`
+	UserID      string     `db:"user_id"`
+	Provider    string     `db:"provider"`
+	Subject     string     `db:"subject"`
+	DisplayName string     `db:"display_name"`
+	Email       string     `db:"email"`
+	AvatarURL   string     `db:"avatar_url"`
+	LinkedAt    time.Time  `db:"linked_at"`
+	LastLoginAt *time.Time `db:"last_login_at"`
+}
+
+func (r identityRow) identity() account.Identity {
+	ident := account.Identity{
+		ID:          account.IdentityID(r.ID),
+		User:        account.UserID(r.UserID),
+		Provider:    idp.Provider(r.Provider),
+		Subject:     r.Subject,
+		DisplayName: r.DisplayName,
+		Email:       r.Email,
+		AvatarURL:   r.AvatarURL,
+		LinkedAt:    r.LinkedAt,
+	}
+	if r.LastLoginAt != nil {
+		ident.LastLoginAt = *r.LastLoginAt
+	}
+	return ident
+}
+
+// userRow is one accounts_users row as GetUser selects it.
+type userRow struct {
+	ID              string    `db:"id"`
+	PrimaryIdentity string    `db:"primary_identity"`
+	CreatedAt       time.Time `db:"created_at"`
+}
+
 // querier is the shared surface of *pgxpool.Pool, *pgxpool.Conn and pgx.Tx.
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
@@ -208,26 +246,26 @@ func (s *Accounts) Identities(ctx context.Context, user account.UserID) ([]accou
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[identityRow])
+	if err != nil {
+		return nil, err
+	}
 
 	var out []account.Identity
-	for rows.Next() {
-		ident, err := scanIdentity(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, ident)
+	for _, r := range scanned {
+		out = append(out, r.identity())
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // GetUser implements account.Store.
 func (s *Accounts) GetUser(ctx context.Context, user account.UserID) (account.User, error) {
-	var id, primary string
-	var createdAt time.Time
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, primary_identity, created_at FROM accounts_users WHERE id = $1`, string(user)).
-		Scan(&id, &primary, &createdAt)
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, primary_identity, created_at FROM accounts_users WHERE id = $1`, string(user))
+	if err != nil {
+		return account.User{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[userRow])
 	if noRows(err) {
 		return account.User{}, account.ErrNotFound
 	}
@@ -235,9 +273,9 @@ func (s *Accounts) GetUser(ctx context.Context, user account.UserID) (account.Us
 		return account.User{}, err
 	}
 	return account.User{
-		ID:              account.UserID(id),
-		PrimaryIdentity: account.IdentityID(primary),
-		CreatedAt:       createdAt,
+		ID:              account.UserID(row.ID),
+		PrimaryIdentity: account.IdentityID(row.PrimaryIdentity),
+		CreatedAt:       row.CreatedAt,
 	}, nil
 }
 
@@ -271,29 +309,15 @@ func (s *Accounts) DeleteUser(ctx context.Context, user account.UserID) error {
 }
 
 func identityByKey(ctx context.Context, q querier, provider idp.Provider, subject string) (account.Identity, error) {
-	row := q.QueryRow(ctx,
+	rows, err := q.Query(ctx,
 		`SELECT `+accountIdentityCols+` FROM accounts_identities WHERE provider = $1 AND subject = $2`,
 		string(provider), subject)
-	return scanIdentity(row)
-}
-
-func scanIdentity(row pgx.Row) (account.Identity, error) {
-	var (
-		ident     account.Identity
-		id        string
-		userID    string
-		provider  string
-		lastLogin *time.Time
-	)
-	if err := row.Scan(&id, &userID, &provider, &ident.Subject, &ident.DisplayName,
-		&ident.Email, &ident.AvatarURL, &ident.LinkedAt, &lastLogin); err != nil {
+	if err != nil {
 		return account.Identity{}, err
 	}
-	ident.ID = account.IdentityID(id)
-	ident.User = account.UserID(userID)
-	ident.Provider = idp.Provider(provider)
-	if lastLogin != nil {
-		ident.LastLoginAt = *lastLogin
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[identityRow])
+	if err != nil {
+		return account.Identity{}, err
 	}
-	return ident, nil
+	return row.identity(), nil
 }
