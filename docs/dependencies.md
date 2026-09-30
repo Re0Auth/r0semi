@@ -94,6 +94,14 @@
   在 `internal/oidchttp` 拒绝三段式 compact JWS 形状的 bearer（本 OP 的访问令牌是五段 compact JWE，
   形状不相交），并让 store 的 `SetUserinfoFromToken` 要求 `tokenID` 命中一条**活着的**行
   ——一次查表同时决定过期、撤销与那次 JWT 回退（P0-2）。**不等待上游修 `DecryptToken`。**
+- **库在刷新路径上硬编码协议错误，store 再正确分类也换不来 500。**
+  `zitadel/oidc/v3` `pkg/op/token_refresh.go:150` 对 `TokenRequestByRefreshToken` 的任何错误
+  都无条件 `oidc.ErrInvalidGrant().WithParent(err)`，所以库故障与「令牌不存在」在线上
+  形状相同；而撤销路径 `pkg/op/token_revocation.go:47-51` 会认类型并渲染 500。
+  **判据是调用链**：分类仍然要做（store 用 `oauth.ErrTokenNotFound` 表示「本签发者从未
+  发出」，其余用 `%w` 保留原因），但刷新路径的可观测性必须在本项目边界补——
+  `internal/oidchttp` 的 store 装饰器把基础设施故障计入
+  `re0auth_store_unavailable_total`（N-02）。
 
 ## 5. 前端依赖（`web/`）
 

@@ -120,7 +120,13 @@ Go 堆之外的主要占用来自连接缓冲与并发请求的响应体；数�
   `io.ReadAll` **之前**按自己可能持有的字节数预约——最坏 `maxBody`（4 MiB），
   若上游声明了更小的 `Content-Length` 就只预约那么多——预约不下就**当场 503**
   （`federation.ErrBufferBudget` → `temporarily_unavailable` + `Retry-After: 1`），不排队、不分配。
-  不变量是 `held <= max_upstream_buffer_bytes`，所以这个数要与容器 limit 挂钩而不是与流量挂钩：
+  预算是**全局先到先得 + 每调用方份额**：全局不变量是 `held <= max_upstream_buffer_bytes`；在此之上，
+  每个调用方（键为 subject，见 [operations-decision.md](./operations-decision.md) 决策 8）最多持有
+  `max(2 × maxBody, max_upstream_buffer_bytes / 4)`——出厂默认 `max(8 MiB, 16 MiB) = 16 MiB`，即四次
+  最坏情形读取，其余是所有调用方共享的余量；超过自己份额的读取以**同一个** `ErrBufferBudget` 被拒绝，
+  不会去花别人的余量（否则一个 subject 的十几个只 flush 响应头不发正文的读取就能把其他用户挤成 503）。
+  份额下限 `2 × maxBody`：预算本身低于该下限时全局上限先起作用，小预算仍是全局先到先得。
+  所以这个数要与容器 limit 挂钩而不是与流量挂钩，尺寸公式是：
   `max_upstream_buffer_bytes <= 容器 limit − 运行时/连接池/审计缓冲的开销`（出厂 k8s 是 512Mi limit
   与 64 MiB 预算；`deployment.yaml` 另设 `GOMEMLIMIT=384MiB`，让 GC 在撞上硬 limit 之前先变慢，
   而不是被 SIGKILL 掉整进程）。没有“无上限”取值。

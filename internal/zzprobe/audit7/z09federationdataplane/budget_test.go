@@ -1,7 +1,7 @@
 //go:build audit7
 
-// Z09-4: the upstream response budget has no per-caller share, and the reservation
-// is taken before a single body byte arrives.
+// Z09-4: the upstream response budget needs a per-caller share, not just a global
+// first-come-first-served limit.
 //
 // Config.MaxBufferedBytes (shipped default 64 MiB) is a joint budget; each
 // buffering read reserves the worst case it may hold — `maxBody+1` = 4 MiB + 1 for
@@ -9,16 +9,23 @@
 // unknown — and `bufferBudget.acquire` sheds (ErrBufferBudget → 503 +
 // Retry-After) rather than blocking. The direction is documented.
 //
-// What is not: fifteen in-flight reads are all it takes to consume the shipped
-// budget, they need transfer ZERO body bytes (a source that flushes headers and
-// stalls holds the reservation), and the callers they shed are unrelated users'
-// reads. This probe drives the real HTTP surface with the SHIPPED default (it does
-// not tune MaxBufferedBytes), so the numbers are the ones a default deployment
-// has.
+// What was missing: the budget was global first-come-first-served only, so fifteen
+// in-flight reads were all it took to consume the shipped budget, they needed
+// transfer ZERO body bytes (a source that flushes headers and stalls holds the
+// reservation), and the callers they shed were unrelated users' reads. Cost to the
+// attacker: 15 sockets and one token.
+//
+// The fix gives every caller (keyed by subject) its own share,
+// `max(2*maxBody, limit/4)` = 16 MiB under the shipped default, so the sleeper's
+// subject can hold at most its own share while the remaining budget stays as
+// headroom for everyone else. This probe drives the real HTTP surface with the
+// SHIPPED default (it does not tune MaxBufferedBytes), so the numbers are the ones
+// a default deployment has. It guards the property directly: with 15 sleepers in
+// flight the victim's full-cap read must still be answered 200, while the
+// sleepers' own excess reservations are the ones that get shed.
 package zzprobe_z09federationdataplane
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -34,8 +41,6 @@ const zzVictimScope = "phigros.profile.read"
 const zzSleeperScope = "phigros.score.read"
 
 func TestZ09SleeperReadsShedAFullCapReadForAnotherUser(t *testing.T) {
-	ctx := context.Background()
-
 	// The sleeper upstream: headers, then stall. The client has its reservation by
 	// then (rawFetch acquires after Do returns and before it reads), and no body
 	// byte has crossed the wire.
@@ -99,8 +104,11 @@ func TestZ09SleeperReadsShedAFullCapReadForAnotherUser(t *testing.T) {
 		t.Fatalf("baseline victim read = %d, want 200; the probe cannot attribute anything to the sleepers", code)
 	}
 
-	// 16 sleepers: 15 x (4 MiB + 1) fits the 64 MiB budget, the 16th does not.
+	// 16 sleepers, all one subject: without a share, 15 x (4 MiB + 1) fits the
+	// 64 MiB budget and the 16th does not, but every one of them shares usr_atk's
+	// 16 MiB share, which admits only three full-cap raw reservations.
 	const sleepers = 16
+	var shed, admitted atomic.Int64
 	for i := 0; i < sleepers; i++ {
 		go func() {
 			req, err := http.NewRequest(http.MethodGet, sleeperURL, nil)
@@ -112,13 +120,22 @@ func TestZ09SleeperReadsShedAFullCapReadForAnotherUser(t *testing.T) {
 			if err != nil {
 				return
 			}
+			switch resp.StatusCode {
+			case http.StatusOK:
+				admitted.Add(1)
+			case http.StatusServiceUnavailable:
+				shed.Add(1)
+			}
 			_, _ = io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 		}()
 	}
 
 	waitUntil(t, 3*time.Second, func() bool { return inHandler.Load() >= sleepers-1 })
-	time.Sleep(200 * time.Millisecond) // let every admitted client take its reservation
+	// Every sleeper has seen its headers by now; the ones inside their subject's
+	// share hold reservations, the rest have been shed onto their own subject.
+	waitUntil(t, 3*time.Second, func() bool { return shed.Load() >= 1 })
+	time.Sleep(200 * time.Millisecond)
 
 	// The victim's read, polled so a slow scheduling of the sleepers cannot turn
 	// this into a false green.
@@ -131,21 +148,39 @@ func TestZ09SleeperReadsShedAFullCapReadForAnotherUser(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Logf("with %d sleepers holding reservations (handlers reached: %d of %d), an unrelated user's read = %d",
-		sleepers, inHandler.Load(), sleepers, code)
+	t.Logf("with %d sleepers of one subject in flight (handlers reached %d of %d, shed %d), "+
+		"an unrelated user's read = %d",
+		sleepers, inHandler.Load(), sleepers, shed.Load(), code)
 	if code == http.StatusServiceUnavailable {
 		t.Errorf("an unrelated account's read was SHED (503) while %d zero-byte reads were in flight. The "+
-			"budget is joint and first-come-first-served: 15 reservations of maxBody+1 exhaust the shipped 64 MiB, "+
-			"the reservation is taken before a single body byte arrives (a source that flushes headers and stalls "+
-			"holds it), and the failure lands on other users. Cost to the attacker: 15 sockets and one token",
-			sleepers)
+			"budget for one subject is still first-come-first-served: 15 reservations of maxBody+1 exhaust the "+
+			"shipped 64 MiB, the reservation is taken before a single body byte arrives (a source that flushes "+
+			"headers and stalls holds it), and the failure lands on other users. Cost to the attacker: 15 "+
+			"sockets and one token", sleepers)
 	} else {
 		t.Logf("the read was not shed (%d): the budget arithmetic changed, so re-derive this probe", code)
 	}
 
-	// Control: releasing the sleepers frees the budget, so the 503 above was
+	// The fix is visible on the sleeper's own subject too: the excess reservations
+	// must be refused THERE, not paid for by the other caller.
+	if shed.Load() == 0 {
+		t.Errorf("none of the %d sleepers was shed: a single subject held every reservation it asked for, "+
+			"so the byte budget has no per-caller share", sleepers)
+	}
+
+	// Control: releasing the sleepers frees the budget, so the shed above was
 	// caused by the held reservations and not by anything else on the path.
 	stop()
+
+	// The admitted sleepers were parked inside the upstream read (our server
+	// buffers the whole body before writing any response), so their 200 is only
+	// observable after the release. At least one must have been admitted, or the
+	// victim's read above proves nothing about sharing the budget.
+	waitUntil(t, 3*time.Second, func() bool { return admitted.Load() >= 1 })
+	if admitted.Load() == 0 {
+		t.Errorf("no sleeper was admitted, so the victim's read proves nothing about sharing the budget")
+	}
+
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		code, _, _ = zzGet(t, srv.Client(), victimURL, vic)
@@ -159,7 +194,6 @@ func TestZ09SleeperReadsShedAFullCapReadForAnotherUser(t *testing.T) {
 		t.Errorf("the read did not recover after the sleepers were released: %d (the shed above is not "+
 			"attributable to the held reservations)", code)
 	}
-	_ = ctx
 }
 
 func waitUntil(t *testing.T, d time.Duration, cond func() bool) {

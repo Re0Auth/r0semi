@@ -228,7 +228,9 @@ func recordAudit(ctx context.Context, l audit.Logger, e audit.Event) {
 		e.Time = time.Now().UTC()
 	}
 	if err := l.Record(ctx, e); err != nil {
-		slog.Error("auth audit record failed", "action", e.Action, "subject", e.Subject, "err", err)
+		// No raw subject: the process log must not carry an account identifier the
+		// pseudonym key cannot reach (G-23). The action says what failed.
+		slog.Error("auth audit record failed", "action", e.Action, "err", err)
 	}
 }
 

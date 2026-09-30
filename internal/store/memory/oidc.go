@@ -660,7 +660,9 @@ func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) 
 			s.revokeFamilyLocked(ts.familyID)
 			return nil, ErrRefreshTokenSpent
 		}
-		return nil, errors.New("memory: invalid refresh token")
+		// A token value this issuer never handed out — the same sentinel the
+		// Postgres backend returns, so a boundary can classify both alike (N-02).
+		return nil, oauth.ErrTokenNotFound
 	}
 	// Copy every slice and the *time.Time: Scopes was already copied, but AMR,
 	// Audience and AuthTime aliased the stored record, so a caller's write reached
@@ -1100,7 +1102,7 @@ func (s *OIDCStore) purgeExpiredDevicesLocked(now time.Time) int {
 // SweepExpired removes every record whose deadline has passed and returns how
 // many it removed.
 //
-// A lookup already refuses an expired record, but nothing removed it. That is
+// Most lookups already refuse an expired record, but nothing removed it. That is
 // the leak this closes: without a sweep the maps keep every token, code and
 // pending request the deployment ever issued, for the life of the process. It
 // matters twice over, because the calls that scan them under the store's single
@@ -1108,8 +1110,10 @@ func (s *OIDCStore) purgeExpiredDevicesLocked(now time.Time) int {
 // as the maps grow.
 //
 // No goroutine starts here, so a test can call it directly; the composition root
-// runs it on a ticker. A record is removed only once a lookup would already
-// refuse it, so a sweep can never revoke something still in use.
+// runs it on a ticker. Deleting by deadline is the stricter direction, so a sweep
+// can never revoke something still in use — but the "a lookup already refuses it"
+// invariant is NOT yet true for device authorizations (G-7) and auth requests
+// read by id (Z07-1), which only this sweep removes until those fixes land.
 func (s *OIDCStore) SweepExpired() int {
 	now := s.now()
 	s.mu.Lock()

@@ -77,6 +77,7 @@ type Metrics struct {
 	upstreamFetchDuration *prometheus.HistogramVec
 	upstreamRefresh       *prometheus.CounterVec
 	circuitTransitions    *prometheus.CounterVec
+	storeUnavailable      *prometheus.CounterVec
 	vaultOps              *prometheus.CounterVec
 	vaultLatency          *prometheus.HistogramVec
 }
@@ -132,6 +133,9 @@ func New() *Metrics {
 			"Upstream token refreshes, by result.", "result"),
 		circuitTransitions: counter("upstream_circuit_transitions_total",
 			"Upstream circuit breaker state transitions, by the state entered.", "state"),
+		storeUnavailable: counter("store_unavailable_total",
+			"Store reads that failed for infrastructure reasons rather than returning an answer, by operation.",
+			"operation"),
 		vaultOps: counter("vault_operations_total",
 			"Credential-vault operations, by operation and result.", "operation", "result"),
 		vaultLatency: histogram("vault_operation_duration_seconds",
@@ -142,6 +146,7 @@ func New() *Metrics {
 		m.logins, m.tokensIssued, m.tokenErrors, m.deviceDecision,
 		m.revocations, m.tokensRevoked, m.adminActions, m.auditVerify, m.auditAppend,
 		m.upstreamFetch, m.upstreamFetchDuration, m.upstreamRefresh, m.circuitTransitions,
+		m.storeUnavailable,
 		m.vaultOps, m.vaultLatency,
 	)
 	// The runtime and process collectors are what make /metrics useful during an
@@ -381,6 +386,19 @@ func (m *Metrics) ObserveDeviceDecision(decision string) {
 		return
 	}
 	m.deviceDecision.WithLabelValues(decision).Inc()
+}
+
+// ObserveStoreUnavailable records a store read that failed for infrastructure
+// reasons instead of returning an answer. It is deliberately separate from the
+// protocol-error counters: the library maps a refresh-store failure to
+// invalid_grant, so without this a failover and a genuinely dead token look
+// identical from the outside. operation is a fixed small set, never a token, a
+// subject or a grant type (N-02).
+func (m *Metrics) ObserveStoreUnavailable(operation string) {
+	if m == nil {
+		return
+	}
+	m.storeUnavailable.WithLabelValues(operation).Inc()
 }
 
 // ObserveRevocation records one revocation operation. kind is one of the

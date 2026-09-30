@@ -496,7 +496,11 @@ func (s *service) record(ctx context.Context, actor, action, subject, outcome st
 		Outcome:  outcome,
 		Detail:   merged,
 	}); err != nil {
-		slog.Error("admin audit record failed", "action", action, "subject", subject, "err", err)
+		// The subject is deliberately absent: a raw usr_… in the process log is
+		// exactly what the erasure's pseudonym-key destruction cannot reach (G-23).
+		// action identifies what failed; the audit sink is where a subject is
+		// correlated, and it is the sink that just failed.
+		slog.Error("admin audit record failed", "action", action, "err", err)
 	}
 }
 

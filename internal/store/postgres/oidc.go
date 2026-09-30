@@ -640,12 +640,16 @@ func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string
 		SELECT id_hash, client_id, subject, scopes, amr, audience, auth_time, nonce
 		  FROM oidc_refresh_tokens WHERE token_hash = $1 AND expires_at > $2`, hashValue(value), s.now())
 	if err != nil {
-		return nil, errors.New("postgres: invalid refresh token")
+		// The database did not answer, so this is not "unknown token". The library
+		// hardcodes invalid_grant on this path (pkg/op/token_refresh.go), so the
+		// wire answer cannot change here — but preserving the cause is what lets
+		// the composition root count and alert on a store outage (N-02).
+		return nil, fmt.Errorf("postgres: load refresh token: %w", err)
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[refreshRequestRow])
 	if err != nil {
 		if !noRows(err) {
-			return nil, errors.New("postgres: invalid refresh token")
+			return nil, fmt.Errorf("postgres: load refresh token: %w", err)
 		}
 		// The live row is gone. The tombstone rotation left for the spent hash is
 		// the only surviving pointer to the family, and finding one is the theft
@@ -677,7 +681,7 @@ func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string
 			// as an ordinary unknown token.
 			return nil, fmt.Errorf("postgres: revoke replayed refresh token family: %w", lookupErr)
 		}
-		return nil, errors.New("postgres: invalid refresh token")
+		return nil, oauth.ErrTokenNotFound
 	}
 	r := oidcstore.RefreshRequest{
 		IDHash:   row.IDHash,

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/federation"
 )
 
@@ -36,24 +37,30 @@ func TestZZProbeUpstreamBufferBudgetIsJointAndInBytes(t *testing.T) {
 	// Each read reserves what it may hold. A body declaring Content-Length =
 	// maxBody-1 reserves maxBody on the raw path (which reads up to maxBody+1), so
 	// a 3x maxBody budget admits exactly 3 concurrent reads.
+	//
+	// The budget also gives every caller (keyed by subject) its own share
+	// (Z09-4): max(2*maxBody, limit/4) = 2*maxBody at this limit. Three reads of
+	// one subject would therefore be refused by that subject's share and the
+	// GLOBAL limit would never be exercised, so each caller below is a distinct
+	// subject and stays well inside its own share.
 	const budget = 3 * maxBody
 	const declared = maxBody - 1
 	const callers = 8
 
 	upstream := newParkingUpstream(declared)
-	svc := budgetService(t, upstream, budget)
+	svc := budgetService(t, upstream, budget, callers)
 
 	results := make(chan error, callers)
 	for i := 0; i < callers; i++ {
-		go func() {
+		go func(i int) {
 			res, err := svc.Raw(context.Background(), federation.RawRequest{
-				User: "usr_1", Game: "phigros", Source: "src", Path: "records",
+				User: callerOf(i), Game: "phigros", Source: "src", Path: "records",
 			})
 			if err == nil && len(res.Body) != declared {
 				err = errors.New("the body was truncated to " + strconv.Itoa(len(res.Body)))
 			}
 			results <- err
-		}()
+		}(i)
 	}
 
 	// Exactly the admitted number of readers may be parked in the upstream body,
@@ -101,15 +108,15 @@ func TestZZProbeUpstreamBufferBudgetIsJointAndInBytes(t *testing.T) {
 	// small bodies, the same number of callers all get through. Without this, a
 	// request-counting implementation would satisfy every assertion above.
 	small := newParkingUpstream(1 << 10)
-	smallSvc := budgetService(t, small, budget)
+	smallSvc := budgetService(t, small, budget, callers)
 	smallResults := make(chan error, callers)
 	for i := 0; i < callers; i++ {
-		go func() {
+		go func(i int) {
 			_, err := smallSvc.Raw(context.Background(), federation.RawRequest{
-				User: "usr_1", Game: "phigros", Source: "src", Path: "records",
+				User: callerOf(i), Game: "phigros", Source: "src", Path: "records",
 			})
 			smallResults <- err
-		}()
+		}(i)
 	}
 	if got := small.waitForReaders(t, callers); got != callers {
 		t.Fatalf("only %d of %d callers with 1 KiB bodies were admitted under the same budget: "+
@@ -128,9 +135,13 @@ func TestZZProbeUpstreamBufferBudgetIsJointAndInBytes(t *testing.T) {
 	}
 }
 
+// callerOf names the i-th caller as a distinct subject, so the probe exercises
+// the GLOBAL byte budget rather than one subject's per-caller share (Z09-4).
+func callerOf(i int) account.UserID { return account.UserID("usr_" + strconv.Itoa(i+1)) }
+
 // budgetService wires a federation service whose only relevant knob is the buffer
-// budget: one source, one bound user, and the upstream under test.
-func budgetService(t *testing.T, upstream *parkingUpstream, budget int) federation.Service {
+// budget: one source, `users` distinct bound subjects, and the upstream under test.
+func budgetService(t *testing.T, upstream *parkingUpstream, budget, users int) federation.Service {
 	t.Helper()
 	reg, err := federation.NewRegistry(federation.Source{
 		Game: "phigros", Name: "src", DisplayName: "Src", Issuer: "https://upstream.example",
@@ -145,13 +156,15 @@ func budgetService(t *testing.T, upstream *parkingUpstream, budget int) federati
 	}
 	bindings := federation.NewMemoryBindingStore()
 	v := newTestVault(t)
-	b := federation.Binding{User: "usr_1", Game: "phigros", Source: "src", Version: 1}
-	if err := bindings.Put(context.Background(), b); err != nil {
-		t.Fatal(err)
-	}
-	if err := v.Enroll(context.Background(), federation.BindingIdentity(b),
-		mustPair(t, "upstream-token", ""), nil); err != nil {
-		t.Fatal(err)
+	for i := 0; i < users; i++ {
+		b := federation.Binding{User: callerOf(i), Game: "phigros", Source: "src", Version: 1}
+		if err := bindings.Put(context.Background(), b); err != nil {
+			t.Fatal(err)
+		}
+		if err := v.Enroll(context.Background(), federation.BindingIdentity(b),
+			mustPair(t, "upstream-token", ""), nil); err != nil {
+			t.Fatal(err)
+		}
 	}
 	svc, err := federation.NewService(federation.Config{
 		Registry: reg, Bindings: bindings, Vault: v,

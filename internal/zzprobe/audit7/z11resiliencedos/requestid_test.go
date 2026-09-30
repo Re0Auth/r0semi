@@ -1,16 +1,15 @@
 //go:build audit7
 
-// Z11-3: the caller's X-Request-Id is unbounded and is copied verbatim into both
-// the response header and the access log line.
+// Z11-3: the caller's X-Request-Id is adopted only when it is a short opaque
+// token (<= 128 bytes, [A-Za-z0-9._-]); anything else is replaced with a
+// generated id.
 //
-// withRequestContext adopts `X-Request-Id` as-is (middleware.go:138-142), with no
-// charset and no length cap, and withAccessLog writes it into every line
-// (middleware.go:262). The HTTP server's own cap is MaxHeaderBytes = 64 KiB
-// (cmd/re0auth/main.go:122), so one unauthenticated request can make the process
-// read 64 KiB, echo 64 KiB, and format a ~64 KiB log line — roughly 650x the
-// bytes of an ordinary request against the access log's steady state. The
-// shipped rate limit (50/s, burst 100) bounds one address at ~3 MiB/s of log;
-// an IPv6 /64 or a handful of addresses removes even that.
+// Before the fix `withRequestContext` (middleware.go) adopted the header
+// verbatim, so its size was priced by the request: one unauthenticated 60 000
+// byte header was echoed in the response header, written into the problem body
+// and formatted into a ~60 000 byte access log line. The server's own
+// MaxHeaderBytes = 64 KiB (cmd/re0auth/main.go) is what bounded the input, and
+// the shipped rate limit bounds the resulting log only per address.
 package zzprobe_z11resiliencedos
 
 import (
@@ -21,8 +20,12 @@ import (
 	"testing"
 )
 
-// TestZ11ACallerChosenRequestIDIsEchoedAndLoggedInFull is red while the id is
-// echoed and logged without a bound.
+// TestZ11ACallerChosenRequestIDIsEchoedAndLoggedInFull guards that the id is
+// replaced rather than echoed. The earlier version of this probe asserted the
+// vulnerable echo (`len(echoed) != idLen`) and called `t.Errorf` in both
+// branches of its final check, so it could never go green; this rewrite is the
+// regression guard for the fixed behaviour. The name is kept because the
+// acceptance command selects the probe by it.
 func TestZ11ACallerChosenRequestIDIsEchoedAndLoggedInFull(t *testing.T) {
 	srv := miniAPI(t, miniConfig{})
 
@@ -54,21 +57,35 @@ func TestZ11ACallerChosenRequestIDIsEchoedAndLoggedInFull(t *testing.T) {
 	t.Logf("status=%d echoed=%d bytes logged=%d bytes (a normal request's line is ~150 bytes)",
 		resp.StatusCode, len(echoed), len(logged))
 
-	if len(echoed) != idLen {
-		t.Errorf("the response echoed %d of %d bytes of the caller's request id", len(echoed), idLen)
+	if len(logged) == 0 {
+		t.Fatal("nothing was logged, so the log assertions below would be vacuous")
 	}
-	if !strings.Contains(logged, id) {
-		t.Errorf("the access log did not carry the caller's request id in full; %d bytes of log were written",
-			len(logged))
+	if echoed == "" {
+		t.Fatal("no request id was echoed, so the header assertions below would be vacuous")
 	}
-	if len(logged) < idLen {
-		t.Errorf("the access log line for one unauthenticated request was %d bytes (the id alone is %d): "+
-			"the log grows with a caller-chosen header, with no cap between the client and the disk",
-			len(logged), idLen)
-	} else {
+	if echoed == id {
+		t.Errorf("the response echoed the caller's %d-byte request id verbatim", idLen)
+	}
+	if !strings.HasPrefix(echoed, "req_") {
+		t.Errorf("the echoed request id %q does not look generated (want the req_ prefix)", echoed)
+	}
+	if len(echoed) > 128 {
+		t.Errorf("the echoed request id is %d bytes, want at most 128", len(echoed))
+	}
+	for i := 0; i < len(echoed); i++ {
+		c := echoed[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == '-'
+		if !ok {
+			t.Fatalf("the echoed request id %q is outside the accepted charset", echoed)
+		}
+	}
+	if strings.Contains(logged, id) {
+		t.Errorf("the access log carried the caller's request id in full; %d bytes of log were written", len(logged))
+	}
+	if len(logged) >= idLen/10 {
 		t.Errorf("one unauthenticated request produced a %d-byte access log line by setting X-Request-Id to %d "+
-			"bytes: the log is proportional to a caller-controlled header (no charset and no length cap at "+
-			"middleware.go:138-142), so 50 requests/s per address is ~3 MiB/s of log and an IPv6 /64 removes "+
-			"even that bound", len(logged), idLen)
+			"bytes: the log is proportional to a caller-controlled header, so the per-address rate limit is the only "+
+			"bound and an IPv6 /64 removes even that", len(logged), idLen)
 	}
 }

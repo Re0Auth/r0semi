@@ -405,7 +405,7 @@ func TestZ13VKeyBackupLeavesPlaintextWhereTheSiblingLeavesNothing(t *testing.T) 
 set -u
 export PATH="$STUBDIR:/usr/bin:/bin"
 cd "$ROOT" || exit 9
-d1=$(mktemp -d); d2=$(mktemp -d); k1=$(mktemp -d)
+d1=$(mktemp -d); d2=$(mktemp -d); k1=$(mktemp -d); k2=$(mktemp -d)
 echo "AGE_PRESENT=$(command -v age || echo no)"
 DATABASE_URL=postgres://x RE0AUTH_CONFIG=/nonexistent BACKUP_AGE_RECIPIENT=age1test \
   bash scripts/backup.sh "$d1" >/tmp/d1.log 2>&1; echo "D1EXIT=$?"
@@ -419,6 +419,11 @@ RE0AUTH_KEK=KEKVAL RE0AUTH_OIDC_TOKEN_KEY=TOKVAL RE0AUTH_OIDC_SIGNING_KEY=SIGNVA
 echo "K1FILES=$(ls -1 "$k1" | tr '\n' ',')"
 echo "K1PLAINTEXT=$(head -c 300 "$k1"/re0auth-keys-*.env 2>/dev/null | tr '\n' '|')"
 echo "K1STDERR=$(tr '\n' '|' < /tmp/k1.log)"
+RE0AUTH_KEK=KEKVAL RE0AUTH_OIDC_TOKEN_KEY=TOKVAL RE0AUTH_OIDC_SIGNING_KEY=SIGNVAL \
+  RE0AUTH_AUDIT_KEY=AUDVAL RE0AUTH_CONFIG=/nonexistent \
+  bash scripts/backup-keys.sh "$k2" >/tmp/k2.log 2>&1; echo "K2EXIT=$?"
+echo "K2FILES=$(ls -1 "$k2" | tr '\n' ',')"
+echo "K2PLAINTEXT=$(head -c 300 "$k2"/re0auth-keys-*.env 2>/dev/null | tr '\n' '|')"
 `
 	out, errb, code := runBashScript(t, bin, body, []string{
 		"ROOT=" + bashPathOf(root),
@@ -443,26 +448,33 @@ echo "K1STDERR=$(tr '\n' '|' < /tmp/k1.log)"
 	if strings.Contains(got["D1FILES"], ".dump") {
 		t.Errorf("backup.sh left a dump behind after the age check failed: %s", got["D1FILES"])
 	}
-	// The finding.
+	// The finding, now fixed (Z13-4): the tool check runs before the first write, so
+	// the failed run leaves nothing behind — not even the .env the probe used to
+	// inspect.
 	if got["K1EXIT"] != "1" {
 		t.Fatalf("control: backup-keys.sh did not fail without age (%v)", got)
 	}
 	if !strings.Contains(got["K1STDERR"], "age is not installed") {
 		t.Fatalf("control: the failure was not the missing-age branch: %s", got["K1STDERR"])
 	}
-	if !strings.Contains(got["K1FILES"], ".env") {
-		t.Fatalf("control: no key file was written, so the write path was never reached (%v)", got)
+	if strings.Contains(got["K1FILES"], ".env") {
+		t.Errorf("backup-keys.sh left a plaintext key file behind after the missing-age "+
+			"refusal: %s (an operator who saw the non-zero exit has no reason to look)", got["K1FILES"])
 	}
-	if !strings.Contains(got["K1PLAINTEXT"], "RE0AUTH_KEK=KEKVAL") ||
-		!strings.Contains(got["K1PLAINTEXT"], "RE0AUTH_OIDC_SIGNING_KEY=SIGNVAL") {
-		t.Errorf("the plaintext key file survived the failed age path but does not carry the keys: %s",
-			got["K1PLAINTEXT"])
-	} else {
-		t.Errorf("backup-keys.sh exits 1 on the missing-age branch AFTER writing %s in plaintext "+
-			"(backup.sh checks for the tool before it writes anything and leaves no dump). The operator "+
-			"who sees the non-zero exit has no reason to look for the file, and the script's own header "+
-			"says the KEK must not sit in plaintext in the backup bucket", got["K1FILES"])
+	if strings.Contains(got["K1PLAINTEXT"], "RE0AUTH_KEK=") {
+		t.Errorf("the plaintext key file survived the failed age path: %s", got["K1PLAINTEXT"])
 	}
+	// Anti-vacuity: a recipient-less run of the same script really does write the
+	// keys, so the assertions above are about the failure path and not about a
+	// script that never writes.
+	if got["K2EXIT"] != "0" || !strings.Contains(got["K2FILES"], ".env") {
+		t.Fatalf("control: a recipient-less run wrote no key file (%v)", got)
+	}
+	if !strings.Contains(got["K2PLAINTEXT"], "RE0AUTH_KEK=KEKVAL") ||
+		!strings.Contains(got["K2PLAINTEXT"], "RE0AUTH_OIDC_SIGNING_KEY=SIGNVAL") {
+		t.Fatalf("control: the recipient-less key file does not carry the keys: %s", got["K2PLAINTEXT"])
+	}
+	t.Logf("the missing-age path left %q and the recipient-less path wrote the keys", got["K1FILES"])
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"io/fs"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -161,5 +162,69 @@ func TestSweepExpiredRemovesDatedRows(t *testing.T) {
 	}
 	if again != 0 {
 		t.Fatalf("second sweep removed %d, want 0", again)
+	}
+}
+
+// TestEverySweptReadPathAdjudicatesItsDeadline is the N-01 guard. The sweep's
+// safety argument is "an expired row is one a lookup already refuses"; that is
+// true for most tables but not for all of them, and a table added to
+// expiredTables must not be able to inherit the claim silently. Every swept table
+// needs an explicit entry: a read-path predicate this test can see in the shipped
+// source, or a citation for the service layer that owns the deadline — or, for the
+// two known gaps (G-7, Z07-1), an explicit exemption that has to be deleted when
+// those fixes land.
+//
+// The marker check is a file-level `contains`, so a marker shared by several
+// tables (the `$2` forms) is weaker than a per-method extraction; the entry map is
+// what actually stops a new table from slipping in.
+func TestEverySweptReadPathAdjudicatesItsDeadline(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("cannot read %s: %v", name, err)
+		}
+		return string(b)
+	}
+	files := map[string]string{
+		"oidc.go":       read("oidc.go"),
+		"oauth.go":      read("oauth.go"),
+		"federation.go": read("federation.go"),
+	}
+	adjudicated := map[string]struct {
+		file   string
+		marker string
+		note   string
+	}{
+		"oidc_codes":                    {"oidc.go", "expires_at > $2", ""},
+		"oidc_access_tokens":            {"oidc.go", "ExpiresAt.After(s.now())", ""},
+		"oidc_refresh_tokens":           {"oidc.go", "expires_at > $2", ""},
+		"oidc_refresh_token_tombstones": {"oidc.go", "expires_at > $2", ""},
+		"oidc_auth_requests":            {"oidc.go", "", "Z07-1: the by-id read judges no deadline yet; delete this exemption when it lands"},
+		"oidc_devices":                  {"oidc.go", "", "G-7: the consume predicate judges no deadline yet; delete this exemption when it lands"},
+		"oauth_codes":                   {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read"},
+		"oauth_access_tokens":           {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read"},
+		"oauth_refresh_tokens":          {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read"},
+		"oauth_refresh_tombstones":      {"oauth.go", "expires_at > $2", ""},
+		"oauth_device_authorizations":   {"oauth.go", "", "service: oauth/device.go judges expiry before the store is read"},
+		"federation_bind_flows":         {"federation.go", "", "service: internal/federation/bind.go judges expiry"},
+	}
+	for _, tc := range expiredTables {
+		entry, ok := adjudicated[tc.table]
+		if !ok {
+			t.Errorf("swept table %q has no read-path adjudication entry: name the predicate that refuses an "+
+				"expired row, or cite the service layer that owns the deadline (N-01)", tc.table)
+			continue
+		}
+		if entry.marker == "" {
+			if entry.note == "" {
+				t.Errorf("swept table %q carries neither a predicate nor a citation (N-01)", tc.table)
+			}
+			continue
+		}
+		if !strings.Contains(files[entry.file], entry.marker) {
+			t.Errorf("swept table %q claims %s adjudicates its deadline, but %s does not contain %q (N-01)",
+				tc.table, entry.file, entry.file, entry.marker)
+		}
 	}
 }

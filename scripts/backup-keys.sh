@@ -21,10 +21,26 @@
 set -euo pipefail
 
 dir="${1:-./backups}"
+
+# 0600 from the start, and *before* mkdir: the file is the KEK, both OIDC keys and
+# the audit key, and a directory a fresh install creates must not be
+# world-traversable either. backup.sh states the same rule for the same reason.
+# (Set here rather than next to the first write: by then mkdir has already run.)
+umask 077
 mkdir -p "$dir"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 out="$dir/re0auth-keys-$stamp.env"
+
+# The tool a configured recipient needs is checked before anything is written.
+# It used to be checked after the plaintext file existed, so
+# BACKUP_AGE_RECIPIENT set with no `age` on PATH left the key material under
+# backups/ and exited 1 — an operator who sees the non-zero exit has no reason to
+# look for the file (Z13-4). backup.sh checks before it dumps for the same reason.
+if [ -n "${BACKUP_AGE_RECIPIENT:-}" ] && ! command -v age >/dev/null; then
+  echo "BACKUP_AGE_RECIPIENT is set but age is not installed" >&2
+  exit 1
+fi
 
 # getenv prints a variable's value, or nothing if it is unset. printenv is used
 # rather than an indirect expansion so the script does not depend on how a given
@@ -67,9 +83,8 @@ if [ -e "$cfg" ]; then
   fi
 fi
 
-# 0600 from the start, so the plaintext never exists with wider permissions even
-# briefly before encryption.
-umask 077
+# The plaintext file is created here already under the umask set at the top of the
+# script, so it never exists with wider permissions even briefly.
 : > "$out"
 
 # Every required key, each written once. The list is deduplicated because a config
@@ -97,11 +112,13 @@ for name in RE0AUTH_OIDC_RETIRED_SIGNING_KEYS RE0AUTH_OIDC_RETIRED_TOKEN_KEYS; d
 done
 
 if [ -n "${BACKUP_AGE_RECIPIENT:-}" ]; then
-  if ! command -v age >/dev/null; then
-    echo "BACKUP_AGE_RECIPIENT is set but age is not installed" >&2
+  # The tool was checked before the first write; a failure here must not leave the
+  # plaintext behind either, so the half-written pair is removed before exiting.
+  if ! age --recipient "$BACKUP_AGE_RECIPIENT" --output "$out.age" "$out"; then
+    rm -f "$out" "$out.age"
+    echo "age failed; the plaintext key file was removed" >&2
     exit 1
   fi
-  age --recipient "$BACKUP_AGE_RECIPIENT" --output "$out.age" "$out"
   shred -u "$out" 2>/dev/null || rm -f "$out"
   out="$out.age"
 fi

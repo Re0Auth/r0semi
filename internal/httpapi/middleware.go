@@ -140,7 +140,7 @@ func (s *Server) withBodyLimit(next http.Handler) http.Handler {
 func (s *Server) withRequestContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")
-		if id == "" {
+		if !validRequestID(id) {
 			id = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", id)
@@ -321,6 +321,32 @@ func newRequestID() string {
 		return "req_unknown"
 	}
 	return "req_" + hex.EncodeToString(b)
+}
+
+// maxRequestIDBytes and validRequestID bound what this service adopts from the
+// caller. The adopted id is echoed in a response header (above), written into
+// every problem+json body (responses.go RequestID) and put on every access log
+// line, so without a gate its size and content are priced by the request: one
+// unauthenticated 64 KiB header produces a 64 KiB log line and two 64 KiB
+// echoes, and the shipped rate limit bounds that only per address. Anything that
+// is not a short opaque token is replaced with a generated id rather than
+// truncated — a truncated caller-chosen id is still caller-chosen, and could
+// still collide with another caller's.
+const maxRequestIDBytes = 128
+
+func validRequestID(id string) bool {
+	if len(id) == 0 || len(id) > maxRequestIDBytes {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // withRateLimit rejects a caller that exceeds its budget. It runs before the

@@ -53,6 +53,16 @@ var ErrBufferBudget = errors.New("federation: the upstream response buffer budge
 // invariant the deployment can be sized against — held <= limit — instead of a
 // request count that has to be re-derived for every body cap.
 //
+// The budget is global first-come-first-served PLUS a per-caller share, the same
+// shape as the inbound in-flight limiter's per-client share
+// (internal/httpapi/middleware.go). The global limit is the memory invariant, but
+// a single caller must not be able to spend all of it: a source that flushes its
+// response headers and then stalls holds a full reservation while transferring
+// zero body bytes, so fifteen such reads from one subject would otherwise shed
+// every other caller's read. Each caller (keyed by subject) may therefore hold at
+// most share bytes, and a read that would exceed its own share is shed with the
+// same ErrBufferBudget instead of consuming another caller's headroom.
+//
 // It never blocks. Waiting would move the memory pressure into a queue of
 // goroutines each still holding a connection and a request, so a caller that does
 // not fit is shed (ErrBufferBudget), the same direction the in-flight limiter and
@@ -60,15 +70,37 @@ var ErrBufferBudget = errors.New("federation: the upstream response buffer budge
 type bufferBudget struct {
 	mu    sync.Mutex
 	limit int
+	share int
 	held  int
+	// perKey holds the bytes each caller is holding right now. An entry exists
+	// only while its caller holds bytes and is deleted when it returns to zero,
+	// so the map is bounded by limit (every live entry holds at least one byte).
+	perKey map[string]int
 }
 
-func newBufferBudget(limit int) *bufferBudget { return &bufferBudget{limit: limit} }
+// bufferShare is one caller's share of a byte budget: a quarter of the global
+// limit, but never less than two worst-case reads (2 x maxBody). With the shipped
+// default that is max(8 MiB, 16 MiB) = 16 MiB — four worst-case reads — and the
+// remaining 48 MiB is headroom every caller draws from. A limit below the floor
+// leaves share > limit, which is deliberate: a small budget stays global
+// first-come-first-served because the global limit binds first.
+func bufferShare(limit int) int {
+	share := limit / 4
+	if floor := 2 * maxBody; share < floor {
+		share = floor
+	}
+	return share
+}
 
-// acquire reserves n bytes, reporting whether they fit. A budget that was never
-// constructed (nil) refuses: "no budget" must not read as "unbounded", since that
-// is the state the finding is about.
-func (b *bufferBudget) acquire(n int) bool {
+func newBufferBudget(limit int) *bufferBudget {
+	return &bufferBudget{limit: limit, share: bufferShare(limit), perKey: make(map[string]int)}
+}
+
+// acquire reserves n bytes for one caller, reporting whether they fit both the
+// global limit and that caller's share. A budget that was never constructed (nil)
+// refuses: "no budget" must not read as "unbounded", since that is the state the
+// finding is about.
+func (b *bufferBudget) acquire(key string, n int) bool {
 	if b == nil {
 		return false
 	}
@@ -77,11 +109,15 @@ func (b *bufferBudget) acquire(n int) bool {
 	if b.held+n > b.limit {
 		return false
 	}
+	if b.perKey[key]+n > b.share {
+		return false
+	}
 	b.held += n
+	b.perKey[key] += n
 	return true
 }
 
-func (b *bufferBudget) release(n int) {
+func (b *bufferBudget) release(key string, n int) {
 	if b == nil {
 		return
 	}
@@ -91,6 +127,14 @@ func (b *bufferBudget) release(n int) {
 		// A release without its acquire is a bug in the caller, and letting the
 		// counter drift negative would hand out budget that was never reserved.
 		b.held = 0
+	}
+	if b.perKey != nil {
+		b.perKey[key] -= n
+		if b.perKey[key] <= 0 {
+			// Delete at zero so the map holds only callers with a live
+			// reservation; this is what keeps it bounded by the budget.
+			delete(b.perKey, key)
+		}
 	}
 	b.mu.Unlock()
 }
@@ -236,19 +280,28 @@ type Config struct {
 	// verbatim proxy and the normalized fetch). Zero takes
 	// defaultMaxBufferedBytes.
 	//
-	// It is the "in-flight x body size" bound that a request cap cannot express.
-	// Each buffering read reserves what it may hold — up to maxBody (4 MiB) for a
-	// raw passthrough, or the upstream's declared Content-Length plus one when that
-	// is smaller — and a read that does not fit is shed with ErrBufferBudget
-	// instead of allocated. Size it against the container's memory limit, not
-	// against the traffic: the number that matters is
+	// It is the "in-flight x body size" bound that a request cap cannot express,
+	// and it has two halves. GLOBALLY it is first-come-first-served: each
+	// buffering read reserves what it may hold — up to maxBody (4 MiB) for a raw
+	// passthrough, or the upstream's declared Content-Length plus one when that is
+	// smaller — and a read that does not fit is shed with ErrBufferBudget instead
+	// of allocated. On top of that, EVERY caller (keyed by subject) holds at most
+	// max(2*maxBody, MaxBufferedBytes/4) at once; a caller that exceeds its own
+	// share is shed with the SAME ErrBufferBudget rather than consuming another
+	// caller's headroom. Without that share one subject's stalled reads — a source
+	// that flushes its headers and sends no body still holds the reservation —
+	// would exhaust the global budget and shed every other caller's read.
+	//
+	// Size it against the container's memory limit, not against the traffic: the
+	// number that matters is
 	//
 	//	MaxBufferedBytes <= (container limit - runtime, pool and audit overhead)
 	//
 	// The shipped default (64 MiB) is a quarter of the 512Mi limit in
-	// deploy/k8s/base/deployment.yaml and permits sixteen worst-case reads; the
-	// same manifest sets GOMEMLIMIT so the heap has a soft limit below the
-	// container's hard one.
+	// deploy/k8s/base/deployment.yaml and permits sixteen worst-case reads in
+	// total, at most four of them from any one caller (16 MiB = max(8 MiB,
+	// 64 MiB/4)); the same manifest sets GOMEMLIMIT so the heap has a soft limit
+	// below the container's hard one.
 	MaxBufferedBytes int
 	// TotalTimeout bounds ONE data-plane request end to end, across every outbound
 	// call it makes in series (candidate sources, token refreshes, the fetch again
@@ -486,7 +539,7 @@ func (s *service) trySource(ctx context.Context, src Source, req FetchRequest) (
 
 	var data json.RawMessage
 	err = s.callWithRefresh(ctx, src, binding, func(token string) error {
-		d, e := s.fetchResource(ctx, src, req.Resource, token)
+		d, e := s.fetchResource(ctx, src, req.Resource, token, string(req.User))
 		if e != nil {
 			return e
 		}
@@ -581,7 +634,7 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 	var out RawResult
 	start := time.Now()
 	err = s.callWithRefresh(ctx, src, binding, func(token string) error {
-		result, e := s.rawFetch(ctx, src, req.Path, req.Query, token)
+		result, e := s.rawFetch(ctx, src, req.Path, req.Query, token, string(req.User))
 		if e != nil {
 			return e
 		}
@@ -686,7 +739,7 @@ func rejectEscapingPath(raw string) error {
 	return ErrRawPathEscapes
 }
 
-func (s *service) rawFetch(ctx context.Context, src Source, path string, query url.Values, token string) (RawResult, error) {
+func (s *service) rawFetch(ctx context.Context, src Source, path string, query url.Values, token, caller string) (RawResult, error) {
 	cleaned, err := cleanRawPath(path)
 	if err != nil {
 		return RawResult{}, err
@@ -723,10 +776,10 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	// the fact would mean the budget can only report an overrun it has already
 	// suffered.
 	reserve := reserveFor(resp, maxBody+1)
-	if !s.buffers.acquire(reserve) {
+	if !s.buffers.acquire(caller, reserve) {
 		return RawResult{}, ErrBufferBudget
 	}
-	defer s.buffers.release(reserve)
+	defer s.buffers.release(caller, reserve)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return RawResult{}, fmt.Errorf("federation: read raw %s: %w", src.Name, err)
@@ -741,7 +794,7 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	}, nil
 }
 
-func (s *service) fetchResource(ctx context.Context, src Source, resource, token string) (json.RawMessage, error) {
+func (s *service) fetchResource(ctx context.Context, src Source, resource, token, caller string) (json.RawMessage, error) {
 	endpoint := strings.TrimRight(src.Issuer, "/") + "/resources/" + url.PathEscape(resource)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -758,10 +811,10 @@ func (s *service) fetchResource(ctx context.Context, src Source, resource, token
 	// Same joint budget as the raw path: a normalized fetch holds one body of up
 	// to maxBody while it parses. See Config.MaxBufferedBytes.
 	reserve := reserveFor(resp, maxBody)
-	if !s.buffers.acquire(reserve) {
+	if !s.buffers.acquire(caller, reserve) {
 		return nil, ErrBufferBudget
 	}
-	defer s.buffers.release(reserve)
+	defer s.buffers.release(caller, reserve)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return nil, fmt.Errorf("federation: read %s: %w", src.Name, err)

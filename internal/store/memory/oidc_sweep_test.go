@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -190,5 +191,179 @@ func TestSweepExpiredKeepsMapsBounded(t *testing.T) {
 	}
 	if got := store.Counts().Records(); got != 0 {
 		t.Fatalf("records = %d after five swept rounds, want 0", got)
+	}
+}
+
+// TestEverySweptReadPathRefusesExpiredBeforeTheSweep is the N-01 guard for the
+// memory backend, the twin of the Postgres guard
+// (internal/store/postgres/sweep_test.go
+// TestEverySweptReadPathAdjudicatesItsDeadline).
+//
+// The sweep's safety argument is "an expired record is one a lookup already
+// refuses", so nothing it removes can have been reachable. That argument is only
+// worth something if the read path is actually checked; this drives each record
+// class past its deadline on the fake clock and asserts the READ refuses it while
+// the record is still in the maps — before SweepExpired has run.
+//
+// Two classes are known not to hold yet. They are skipped by name rather than
+// quietly omitted, and the skip is the signal: when G-7 / Z07-1 land, deleting
+// the t.Skip is what turns this guard green and keeps that fix from regressing.
+func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
+	// Past every deadline in the table — including the 30-day refresh token and
+	// the tombstone it leaves — so one advance covers every class.
+	const pastAll = 31 * 24 * time.Hour
+
+	plantAuthRequest := func(t *testing.T, s *OIDCStore) string {
+		t.Helper()
+		ar, err := s.CreateAuthRequest(context.Background(), &oidc.AuthRequest{
+			ClientID:     "cli",
+			RedirectURI:  "https://app.example/cb",
+			ResponseType: oidc.ResponseTypeCode,
+			Scopes:       oidc.SpaceDelimitedArray{"account.id"},
+		}, "usr_1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ar.GetID()
+	}
+
+	cases := []struct {
+		name string
+		// gap names the open finding this class is red for. Non-empty means the
+		// read path does not judge the deadline yet, so the case is skipped with
+		// that finding named.
+		gap string
+		// plant stores one live record and returns the value its read path uses.
+		plant func(t *testing.T, s *OIDCStore) string
+		read  func(t *testing.T, s *OIDCStore, key string) error
+		// notFound requires the refusal to be oauth.ErrTokenNotFound, not merely
+		// an error: the replay path also errors with ErrRefreshTokenSpent while
+		// the tombstone is live, which is not a deadline refusal.
+		notFound bool
+	}{
+		{
+			name:  "auth request by id",
+			gap:   "Z07-1",
+			plant: plantAuthRequest,
+			read: func(_ *testing.T, s *OIDCStore, key string) error {
+				_, err := s.AuthRequestByID(context.Background(), key)
+				return err
+			},
+		},
+		{
+			name: "authorization code",
+			plant: func(t *testing.T, s *OIDCStore) string {
+				t.Helper()
+				id := plantAuthRequest(t, s)
+				if err := s.SaveAuthCode(context.Background(), id, "the-code"); err != nil {
+					t.Fatal(err)
+				}
+				return "the-code"
+			},
+			read: func(_ *testing.T, s *OIDCStore, key string) error {
+				_, err := s.AuthRequestByCode(context.Background(), key)
+				return err
+			},
+		},
+		{
+			name: "access token",
+			plant: func(t *testing.T, s *OIDCStore) string {
+				t.Helper()
+				id, _, err := s.CreateAccessToken(context.Background(), tokenRequest())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return id
+			},
+			read: func(_ *testing.T, s *OIDCStore, key string) error {
+				return s.SetIntrospectionFromToken(context.Background(), new(oidc.IntrospectionResponse), key, "usr_1", "")
+			},
+		},
+		{
+			name:     "refresh token",
+			notFound: true,
+			plant: func(t *testing.T, s *OIDCStore) string {
+				t.Helper()
+				_, rt, _, err := s.CreateAccessAndRefreshTokens(context.Background(), tokenRequest(), "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return rt
+			},
+			read: func(_ *testing.T, s *OIDCStore, key string) error {
+				_, err := s.TokenRequestByRefreshToken(context.Background(), key)
+				return err
+			},
+		},
+		{
+			name:     "refresh token tombstone",
+			notFound: true,
+			plant: func(t *testing.T, s *OIDCStore) string {
+				t.Helper()
+				_, spent, _, err := s.CreateAccessAndRefreshTokens(context.Background(), tokenRequest(), "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Rotate once: the spent value now has a live tombstone, so the
+				// read below is the replay path and its deadline is the
+				// tombstone's, not the (also expired) live row's.
+				if _, _, _, err := s.CreateAccessAndRefreshTokens(context.Background(), tokenRequest(), spent); err != nil {
+					t.Fatalf("rotation: %v", err)
+				}
+				return spent
+			},
+			read: func(_ *testing.T, s *OIDCStore, key string) error {
+				_, err := s.TokenRequestByRefreshToken(context.Background(), key)
+				return err
+			},
+		},
+		{
+			name: "device authorization",
+			gap:  "G-7",
+			plant: func(t *testing.T, s *OIDCStore) string {
+				t.Helper()
+				if err := s.StoreDeviceAuthorization(context.Background(), "cli", "device-code", "BCDF-GHJK",
+					s.now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+					t.Fatal(err)
+				}
+				return "device-code"
+			},
+			read: func(_ *testing.T, s *OIDCStore, key string) error {
+				_, err := s.GetDeviceAuthorizatonState(context.Background(), "cli", key)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.gap != "" {
+				t.Skipf("%s: the memory %s read does not judge its deadline yet, so the sweep is still the "+
+					"only thing that removes an expired one; delete this t.Skip when %s lands — the case then "+
+					"proves the read refuses it before the sweep (N-01)", tc.gap, tc.name, tc.gap)
+			}
+			clock := newTestClock()
+			store := clockedStore(t, clock)
+			key := tc.plant(t, store)
+
+			// Past every deadline, but BEFORE the sweep: the read must refuse on
+			// its own, or the sweep's "already refused" claim is false.
+			clock.Advance(pastAll)
+			err := tc.read(t, store, key)
+			if err == nil {
+				t.Fatalf("%s: the read path accepted a record %s past its deadline; the sweep cannot claim to "+
+					"remove only already-refused records (N-01)", tc.name, pastAll)
+			}
+			if tc.notFound && !errors.Is(err, oauth.ErrTokenNotFound) {
+				t.Errorf("%s: expired read = %v, want oauth.ErrTokenNotFound — an expired record must not look "+
+					"like a replay (N-01)", tc.name, err)
+			}
+			// Control: the record is still in the maps, so it was the read that
+			// refused it, not the sweep.
+			if got := store.Counts().Records(); got == 0 {
+				t.Errorf("%s: the store is empty before the sweep; the read refused a record that is not there",
+					tc.name)
+			}
+		})
 	}
 }

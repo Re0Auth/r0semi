@@ -204,9 +204,11 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 			// Logged as well as returned. No endpoint can reach the residue and only
 			// an account erasure clears it, so the caller seeing this error is not
 			// enough on its own: an operator has to learn that a decryptable upstream
-			// token is stranded.
+			// token is stranded. The subject is deliberately not named — a raw usr_…
+			// here would outlive the erasure's pseudonym key (G-23); game and source
+			// locate the binding, and the audit sink carries the account.
 			slog.ErrorContext(ctx, "could not roll back a bind's vault secret; a secret is left with no binding",
-				"user", string(binding.User), "game", binding.Game, "source", binding.Source, "err", rerr)
+				"game", binding.Game, "source", binding.Source, "err", rerr)
 			return Binding{}, flow, errors.Join(err,
 				fmt.Errorf("federation: a secret is left in the vault with no binding: %w", rerr))
 		}

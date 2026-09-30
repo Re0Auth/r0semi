@@ -403,6 +403,52 @@ func TestRequestIDIsEchoed(t *testing.T) {
 	}
 }
 
+// TestOversizedOrHostileRequestIDIsReplaced is the guard for Z11-3: the adopted
+// id is echoed in a response header, written into the problem body and put on
+// every access log line, so an unbounded caller-chosen value is priced by the
+// request rather than by the deployment. Anything outside the short opaque-token
+// shape is replaced with a generated id.
+func TestOversizedOrHostileRequestIDIsReplaced(t *testing.T) {
+	env := newTestEnv(t)
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{"oversized", strings.Repeat("A", 60000)},
+		{"crlf", "x\r\nInjected: 1"},
+		{"nul", "x\x00y"},
+		{"markup", "x<script>"},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := env.do(http.MethodGet, "/v1/nope", "", map[string]string{"X-Request-Id": tc.input})
+			got := rec.Header().Get("X-Request-Id")
+			if got == "" {
+				t.Fatal("no request id was echoed at all")
+			}
+			if tc.input != "" && got == tc.input {
+				t.Errorf("the caller's request id was adopted verbatim: %q", got)
+			}
+			if len(got) > maxRequestIDBytes {
+				t.Errorf("echoed request id is %d bytes, want at most %d", len(got), maxRequestIDBytes)
+			}
+			for i := 0; i < len(got); i++ {
+				c := got[i]
+				ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+					c == '.' || c == '_' || c == '-'
+				if !ok {
+					t.Fatalf("echoed request id %q is not in the accepted charset", got)
+				}
+			}
+			// The same value reaches the problem body, so the gate has to cover it
+			// too rather than only the header.
+			if body := decodeJSON(t, rec); body["request_id"] != got {
+				t.Errorf("problem body request_id = %v, want the echoed %q", body["request_id"], got)
+			}
+		})
+	}
+}
+
 func TestIntrospectAndRevoke(t *testing.T) {
 	env := newTestEnv(t)
 	env.register(t, "conf", oauth.ClientConfidential, "s3cret", []oauth.Scope{oauth.ScopeAccountID})

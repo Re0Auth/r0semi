@@ -219,7 +219,7 @@ func New(cfg Config) (*Handler, error) {
 	}
 	options = append(options, op.WithCrypto(op.NewCompositeCrypto(currentCrypto, decrypters)))
 
-	provider, err := op.NewProvider(oconfig, cfg.Storage, issuer, options...)
+	provider, err := op.NewProvider(oconfig, withStoreMetrics(cfg.Storage, cfg.Metrics), issuer, options...)
 	if err != nil {
 		return nil, err
 	}

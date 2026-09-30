@@ -151,14 +151,16 @@ func (s *service) refreshRejected(ctx context.Context, spent Binding) (Binding, 
 	if err := s.vault.Revoke(ctx, BindingIdentity(spent)); err != nil {
 		// Keep the row so the secret stays reachable by Unbind or the kill switch,
 		// and retryable on the next refresh. Logged, because an unrecorded orphan
-		// here is exactly what the rest of this package treats as a defect.
+		// here is exactly what the rest of this package treats as a defect. The
+		// subject is not named: a raw usr_… in the process log survives the
+		// erasure's pseudonym key (G-23), and game/source locate the binding.
 		slog.ErrorContext(ctx, "could not revoke a rejected binding's secret; leaving the binding in place",
-			"user", string(spent.User), "game", spent.Game, "source", spent.Source, "err", err)
+			"game", spent.Game, "source", spent.Source, "err", err)
 		return Binding{}, &NotBoundError{Game: spent.Game, Source: spent.Source}
 	}
 	if err := s.bindings.Delete(ctx, spent.User, spent.Game, spent.Source); err != nil {
 		slog.ErrorContext(ctx, "could not delete a rejected binding",
-			"user", string(spent.User), "game", spent.Game, "source", spent.Source, "err", err)
+			"game", spent.Game, "source", spent.Source, "err", err)
 	}
 	return Binding{}, &NotBoundError{Game: spent.Game, Source: spent.Source}
 }

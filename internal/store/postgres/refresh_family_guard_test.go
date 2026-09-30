@@ -33,6 +33,32 @@ func oidcStoreMethod(t *testing.T, src, name string) string {
 	return rest
 }
 
+// TestRefreshHotPathClassifiesTheDatabaseFailure is the N-02 guard: a database
+// that could not answer must not be reported as "unknown token". The library
+// hardcodes invalid_grant on this path (pkg/op/token_refresh.go), so the wire
+// answer cannot carry the distinction — the store must, or the composition root
+// cannot count and alert on a store outage.
+func TestRefreshHotPathClassifiesTheDatabaseFailure(t *testing.T) {
+	body, err := os.ReadFile("oidc.go")
+	if err != nil {
+		t.Fatalf("cannot read the adapter source: %v", err)
+	}
+	read := oidcStoreMethod(t, string(body), "TokenRequestByRefreshToken")
+
+	if n := strings.Count(read, `errors.New("postgres: invalid refresh token")`); n != 0 {
+		t.Errorf("TokenRequestByRefreshToken still folds %d outcome(s) into a bare not-found error: a store "+
+			"outage is indistinguishable from an unknown token, so nothing at the boundary can count it (N-02)", n)
+	}
+	if n := strings.Count(read, `fmt.Errorf("postgres: load refresh token: %w", err)`); n != 2 {
+		t.Errorf("TokenRequestByRefreshToken wraps the database failure %d time(s), want 2 (the query error and "+
+			"the non-noRows collect error); an unwrapped cause cannot be classified (N-02)", n)
+	}
+	if !strings.Contains(read, "oauth.ErrTokenNotFound") {
+		t.Error("TokenRequestByRefreshToken no longer returns oauth.ErrTokenNotFound for a value this issuer " +
+			"never handed out, so a boundary cannot tell that outcome from an outage (N-02)")
+	}
+}
+
 // TestRefreshReplayReadPathConsultsTheTombstone pins the mechanism the library
 // forces: a refresh grant calls TokenRequestByRefreshToken FIRST, so a stale
 // replay never reaches rotation and the family revocation must live on this read

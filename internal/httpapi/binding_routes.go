@@ -53,9 +53,11 @@ func (s *Server) handleListBindings(w http.ResponseWriter, r *http.Request) {
 	bindings, err := s.federate.Bindings(r.Context(), user)
 	if err != nil {
 		// The wire answer is generic; the error itself (a database fault, a scan
-		// failure) goes to the log, where an operator can act on it.
+		// failure) goes to the log, where an operator can act on it. The subject is
+		// not logged: a raw usr_… outlives the erasure's pseudonym key (G-23), and
+		// request_id already correlates this line with the request.
 		slog.ErrorContext(r.Context(), "could not read bindings",
-			"user", string(user), "request_id", requestID(r), "err", err)
+			"request_id", requestID(r), "err", err)
 		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "could not read bindings")
 		return
 	}
