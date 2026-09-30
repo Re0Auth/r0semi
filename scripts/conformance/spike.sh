@@ -122,44 +122,67 @@ docker run -d --name "${CADDY_NAME}" \
   -v "${WORK}/Caddyfile:/etc/caddy/Caddyfile:ro" \
   caddy:2 >/dev/null
 
+# The runner has no DNS entry for the issuer name (first CI run died on
+# "Could not resolve host: re0auth.test"). Pin it to loopback for the host-side
+# checks with --resolve; containers get --add-host instead. No /etc/hosts edit, so
+# no sudo.
+host_curl() {
+  curl -fsSk --resolve "re0auth.test:${PUBLIC_PORT}:127.0.0.1" "$@"
+}
+
 for _ in $(seq 1 40); do
-  if curl -fsSk "${ISSUER}/.well-known/openid-configuration" >/dev/null 2>&1; then break; fi
+  if host_curl "${ISSUER}/.well-known/openid-configuration" >/dev/null 2>&1; then break; fi
   sleep 0.5
 done
-curl -fsSk "${ISSUER}/.well-known/openid-configuration" >/dev/null \
+host_curl "${ISSUER}/.well-known/openid-configuration" >/dev/null \
   || { docker logs "${CADDY_NAME}"; fail "Caddy never served the discovery document"; }
 pass "milestones 2/3: discovery is served over TLS through Caddy"
 
 # ---- 4. the container-to-OP path with Caddy's own CA ------------------------
-log "extracting Caddy's root CA"
+log "extracting Caddy's CAs"
 docker cp "${CADDY_NAME}:/data/caddy/pki/authorities/local/root.crt" "${WORK}/caddy-root.crt"
+# Caddy's local PKI is root -> intermediate -> leaf, and some builds serve only the
+# leaf. Trust both so the chain can always be built; the intermediate is optional so
+# a Caddy layout without it degrades to the previous behaviour instead of failing.
+docker cp "${CADDY_NAME}:/data/caddy/pki/authorities/local/intermediate.crt" "${WORK}/caddy-intermediate.crt" 2>/dev/null || true
+if cat "${WORK}/caddy-root.crt" "${WORK}/caddy-intermediate.crt" > "${WORK}/caddy-ca-bundle.crt" 2>/dev/null; then
+  log "using a root+intermediate CA bundle"
+else
+  cp "${WORK}/caddy-root.crt" "${WORK}/caddy-ca-bundle.crt"
+fi
 docker run --rm \
   --add-host re0auth.test:host-gateway \
-  -v "${WORK}/caddy-root.crt:/etc/ssl/certs/caddy-root.crt:ro" \
+  -v "${WORK}/caddy-ca-bundle.crt:/etc/ssl/certs/caddy-ca.crt:ro" \
   curlimages/curl:latest \
-  -fsS --cacert /etc/ssl/certs/caddy-root.crt "${ISSUER}/.well-known/openid-configuration" >/dev/null
+  -fsS --cacert /etc/ssl/certs/caddy-ca.crt "${ISSUER}/.well-known/openid-configuration" >/dev/null
 pass "milestone 4: a container reaches the OP over TLS with the spike CA"
 
 # ---- 4b. a suite image that trusts the spike CA -----------------------------
 # The suite runs on the JVM, whose trust store is its own `cacerts`; mounting a
-# PEM into the container does nothing for it. Derive an image that imports Caddy's
-# root CA, so the suite will accept the self-signed issuer. A build failure falls
-# back to the upstream image so the connectivity milestones below still report.
+# PEM into the container does nothing for it. Derive an image that imports both CA
+# certificates, so the suite will accept the self-signed issuer. A build failure
+# falls back to the upstream image so the connectivity milestones below still report.
 SUITE_IMAGE="openid/conformance-suite"
 log "building a suite image that trusts the spike CA"
 # A clean build context: the working directory also holds the generated keys, and
 # a build context is shipped to the daemon whole.
 mkdir -p "${WORK}/suite-image"
 cp "${WORK}/caddy-root.crt" "${WORK}/suite-image/caddy-root.crt"
+# COPY requires the file to exist; an empty stand-in makes the RUN step skip it.
+cp "${WORK}/caddy-root.crt" "${WORK}/suite-image/caddy-intermediate.crt"
+[[ -s "${WORK}/caddy-intermediate.crt" ]] && cp "${WORK}/caddy-intermediate.crt" "${WORK}/suite-image/caddy-intermediate.crt"
 cat > "${WORK}/suite-image/Dockerfile" <<'DOCKEREOF'
 FROM openid/conformance-suite
 USER root
-COPY caddy-root.crt /tmp/re0auth-spike-ca.crt
+COPY caddy-root.crt caddy-intermediate.crt /tmp/
 RUN set -eux; \
     ks="${JAVA_HOME:-/opt/java/openjdk}/lib/security/cacerts"; \
-    keytool -importcert -noprompt -trustcacerts \
-      -alias re0auth-spike -file /tmp/re0auth-spike-ca.crt \
-      -keystore "${ks}" -storepass changeit
+    keytool -importcert -noprompt -trustcacerts -alias re0auth-spike-root \
+      -file /tmp/caddy-root.crt -keystore "${ks}" -storepass changeit; \
+    if [ -s /tmp/caddy-intermediate.crt ]; then \
+      keytool -importcert -noprompt -trustcacerts -alias re0auth-spike-intermediate \
+        -file /tmp/caddy-intermediate.crt -keystore "${ks}" -storepass changeit; \
+    fi
 DOCKEREOF
 if docker build -t re0auth-conformance-spike:local -f "${WORK}/suite-image/Dockerfile" "${WORK}/suite-image" > "${WORK}/suite-build.log" 2>&1; then
   SUITE_IMAGE="re0auth-conformance-spike:local"

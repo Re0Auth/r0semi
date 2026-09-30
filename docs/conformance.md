@@ -78,10 +78,12 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 
 - **JVM trust store.** Addressed by milestone 4b: the script builds a
   `FROM openid/conformance-suite` image that runs `keytool -importcert` against
-  `${JAVA_HOME}/lib/security/cacerts` with Caddy's root CA. This has not been
-  observed on a runner yet — if the base image's JDK path differs, the build fails
-  and the script falls back to the upstream image (the connectivity milestones
-  still report). A publicly trusted certificate removes the need entirely.
+  `${JAVA_HOME}/lib/security/cacerts` with Caddy's local CA — root, plus the
+  intermediate when the layout has one, because the chain is root → intermediate →
+  leaf and some builds serve only the leaf. This has not been observed on a runner
+  yet — if the base image's JDK path differs, the build fails and the script falls
+  back to the upstream image (the connectivity milestones still report). A publicly
+  trusted certificate removes the need entirely.
 - **Client registration.** The redirect URI the suite generates must be the one
   seeded into `[client]` (`CONFORMANCE_REDIRECT_URI`). Until it is observed, the
   value in the script is a placeholder.
