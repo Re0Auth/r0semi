@@ -31,10 +31,16 @@ placeholders for another plan. What must line up:
 
 | field | must equal |
 |---|---|
-| `planName`, `variant` keys | the plan and its variant parameters from `plan-catalogue.json` |
+| `planName` | a plan from `plan-catalogue.json` |
+| `variant` keys | **only the variants that plan leaves to the user.** The Basic OP plan offers just `server_metadata` (`static`/`discovery`) and `client_registration` (`static_client`/`dynamic_client`) — it fixes `response_type`, `client_auth_type` and `response_mode` itself. Sending a plan-fixed variant is a 400: `Variant 'client_auth_type' has been set by user, but test plan already sets this variant for module 'oidcc-server'`. |
 | `config.server.discoveryUrl` | the OP's discovery URL, `https://re0auth.test:8443/.well-known/openid-configuration` |
 | `config.client.client_id` / `client_secret` | `conformance` / `CONFORMANCE_CLIENT_SECRET` (default `spike-secret`) — what the spike seeds in `[client]` |
+| `config.client2`, `config.client_secret_post` | the plan lists `client2.client_secret` and `client_secret_post.client_secret` as required fields; the spike points both at the same seeded client |
 | `config.alias` | the path segment the suite puts in its redirect URI |
+
+The catalogue entry for each plan lists its `variants` (with `variantValues`) and
+`configurationFields` — read it before editing a payload. The current Basic OP entry
+was taken from a real `plan-catalogue.json` produced by this spike.
 
 The suite derives its redirect URI as
 **`https://oidf-suite:8443/test/a/<alias>/callback`** (its `fintechlabs.base_url`, on

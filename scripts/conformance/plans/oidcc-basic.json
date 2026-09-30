@@ -1,9 +1,8 @@
 {
   "planName": "oidcc-basic-certification-test-plan",
   "variant": {
-    "response_type": "code",
-    "client_auth_type": "client_secret_basic",
-    "response_mode": "default"
+    "server_metadata": "discovery",
+    "client_registration": "static_client"
   },
   "config": {
     "alias": "conformance",
@@ -11,6 +10,10 @@
       "discoveryUrl": "https://re0auth.test:8443/.well-known/openid-configuration"
     },
     "client": {
+      "client_id": "conformance",
+      "client_secret": "spike-secret"
+    },
+    "client2": {
       "client_id": "conformance",
       "client_secret": "spike-secret"
     },
