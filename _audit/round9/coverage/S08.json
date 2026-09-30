@@ -1,0 +1,86 @@
+{
+  "scope": "S08",
+  "findings": [
+    {
+      "id": "S08-1",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "cmd/re0auth/zz_audit_keysource_test.go",
+      "test_func": "TestAuditRenamedKekEnvLosesToTheFixedName",
+      "asserts": "CONFIRMED direct. Opens the cited file/function: it writes a config with kek_env = \"MY_KEK\" while RE0AUTH_KEK (0xAA) and MY_KEK (0xBB) are both set, calls loadConfig (exercising config.go:729-739, the RE0AUTH_KEK-first precedence), and asserts cfg.KEK bytes.Equal(0xAA*32) AND NOT bytes.Equal(0xBB*32), then asserts configSecretEnvNames reports vault.kek_env=MY_KEK. It is defect-pinning in the exact sense required: if the loader were fixed so vault.kek_env gained precedence, cfg.KEK would be 0xBB and line 58/61 would fail. It exercises the real production path (loadConfig) and the defect. Caveat retained: //go:build audit || audit6, so it is not in the default `go test` run. The second probe, internal/zzprobe/audit7/z12verify/verify_kekenv_test.go TestZ12VerifyKekReadsRE0AUTHKEKRegardlessOfKekEnv (//go:build audit7), drives the real binary with a valid file-named key plus a deliberately bad ambient RE0AUTH_KEK and t.Errorf's unless the bad hardcoded value decides the run; it independently pins the same precedence.",
+      "gap_note": ""
+    },
+    {
+      "id": "S08-2",
+      "verdict": "direct",
+      "corrected": true,
+      "test_path": "cmd/re0auth/zz_audit9_dsnenv_test.go",
+      "test_func": "TestAudit9DSNEnvIsIgnoredWhenDriverIsInferred",
+      "asserts": "CORRECTED from partial to direct. The auditor's cited test (cmd/re0auth/main_test.go TestStorageDriverResolution) is real but only drives the inferred branch through the literal DATABASE_URL (and TestProbeDatabaseURLAloneSelectsDurable / the z12 loader tests likewise), so by itself it would be partial. However, a test that directly pins the defect was missed: cmd/re0auth/zz_audit9_dsnenv_test.go TestAudit9DSNEnvIsIgnoredWhenDriverIsInferred writes [storage] dsn_env=\"RE0AUTH_DSN\" with no driver, sets RE0AUTH_DSN=postgres://..., leaves DATABASE_URL empty, calls loadConfig, and asserts cfg.StorageDriver==\"postgres\" (line 49), cfg.DatabaseURL==\"\" (line 53, t.Fatalf 'S08-2 appears fixed' if non-empty) and cfg.AuditKey==nil (line 60, i.e. the durable-audit gate is skipped). That is exactly the silent memory downgrade and it fails the moment the inferred branch resolves the declared variable or refuses when it is unset. Verified empirically: `go test ./cmd/re0auth/ -run TestAudit9DSNEnvIsIgnoredWhenDriverIsInferred -v` PASSES against the current defective code. Provenance caveat: the file is UNTRACKED in the working tree (git status '??') and has no build tag, so unlike the tracked audit6/audit7 probes it currently runs in the default suite; if the project convention only counts committed tests this reverts to partial. Residual gaps below remain unasserted even with this probe.",
+      "gap_note": "Residual (still unasserted): the declared-but-unset dsn_env variable is not driven to a config-stage error, and the explicit driver=\"postgres\" + file dsn_env with a stale DATABASE_URL in the environment (which value wins) is not pinned. Harness needed for those: loadConfig with dsn_env naming an unset variable -> assert startup error; and driver=\"postgres\", dsn_env=\"RE0AUTH_DSN\", DATABASE_URL set to a different DSN -> assert which URL is used."
+    },
+    {
+      "id": "S08-3",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/lifecycle/lifecycle_test.go",
+      "test_func": "TestDeleteAccountDestroysThePseudonymKeyLast",
+      "asserts": "CONFIRMED partial. Opens the cited file/function and the surrounding tests: TestDeleteAccountDestroysThePseudonymKeyLast pins only the ordering half - fakePseudonyms records the audit log length at Destroy time and the test asserts eventsAtDestroy==1 (the outcome=ok account.delete record is already written before Destroy runs) and that the record survives. TestDeleteAccountReportsAFailedPseudonymDestroy asserts a failing Destroy is surfaced ('still linkable'). internal/zzprobe/audit7/z07authsessionlifecycle/erasure_test.go (//go:build audit7) and internal/zzprobe/audit6/z07authsession/erasure_audit_test.go add that after a failing Destroy the LAST account.delete record is not outcome=ok and carries failed_at=pseudonym. None of these makes the corrective record itself fail, so the finding's actual defect - fail() discarding the record error (`_ = d.record(...)`, lifecycle.go:299-302), leaving a false outcome=ok/pseudonym_destroyed=true as the only durable record - is never asserted; all probes use a working audit.NewMemoryLogger (the only mid-run failure test, TestDeleteAccountFailsWhenTheRecordCannotBeWritten, fails the FIRST record, not the corrective one).",
+      "gap_note": "Harness needed: an audit.Logger whose Record succeeds on the first (success) event but errors on the corrective event, combined with a Pseudonyms.Destroy that fails; assert the run cannot leave the false success as the only record for the subject (e.g. the correction error is propagated/joined into the returned error, or the first record is written with pseudonym_destroyed=false plus a pending marker). Currently such a test would not exist in either direction."
+    },
+    {
+      "id": "S08-4",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/killswitch_test.go",
+      "test_func": "TestRevokeUserBindingsLeavesOthersAlone",
+      "asserts": "CONFIRMED partial. Opens the cited file/function: it covers only the successful sweep - asserts summary.Total==1 && summary.Revoked==1 and that another user's binding is untouched; TestRevokeAllBindingsCutsEverySource explicitly asserts summary.Failed==0. On the lifecycle side TestDeleteAccountClearsEveryStoreInUpstreamFirstOrder carries BindingOutcome{Total:2,Revoked:2} through to Result.Bindings.Revoked using the fakeBindings stub, which can return any BindingOutcome but is never given Failed>0. No test injects a local unlink failure (vault.Revoke or bindings.Delete error, where Unbind returns err and killswitch.go counts failed:1 with a nil error) into RevokeUserBindings, and no test asserts DeleteAccount's outcome/HTTP status when res.Bindings.Failed>0. Independent greps for 'Failed: N'/'Failed == N'/'bindings_failed' in *_test.go returned no assertion; internal/zzprobe/verifyfederation/killswitch_test.go is about RevokeAllBindings' partial summary being dropped by the admin plane, not this defect.",
+      "gap_note": "Harness needed: bind a user in internal/federation over a vault whose Revoke returns an error (the existing revokeBrokenVault in refresh_rejected_test.go is the right shape), assert RevokeUserBindings returns Failed>=1 with a nil error; then drive internal/lifecycle.DeleteAccount with a Bindings port returning BindingOutcome{Failed:1} and assert it does not return nil / does not write outcome=ok (the fix), plus an HTTP-level DELETE /v1/account case asserting it is not 200 OK with result.bindings.failed=1."
+    },
+    {
+      "id": "S08-5",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "cmd/re0auth/main_test.go",
+      "test_func": "TestUniversalTrustedPrefixNeedsAcknowledgement",
+      "asserts": "CONFIRMED partial. Opens the cited file/function: it asserts hasUniversalPrefix==true for exactly ['0.0.0.0/0','::/0'] and ==false for ['10.0.0.0/8','127.0.0.1/32'] (only the p.Bits()==0 spelling), and cmd/re0auth/zzprobe_startup_test.go TestProbeUniversalTrustedPrefixNeedsAcknowledgement (lines 176-216, opened) additionally asserts loadConfig refuses trusted_proxies=[\"0.0.0.0/0\"] without RE0AUTH_TRUSTED_PROXIES_ANY and accepts it with the acknowledgement. The bypass the finding is about - two /1 halves covering the whole family and therefore containing no Bits()==0 entry - is never constructed; an independent grep for '0.0.0.0/1','128.0.0.0/1','::/1','8000::/1' in *_test.go found no match, so the guard's incompleteness is not pinned (a coverage-based fix would leave all listed tests green).",
+      "gap_note": "Harness needed: call parseTrustedProxies([]string{\"0.0.0.0/1\",\"128.0.0.0/1\"}) and the IPv6 pair (\"::/1\",\"8000::/1\") and assert hasUniversalPrefix returns true / loadConfig refuses them without trusted_proxies_any, i.e. a prefix-union coverage check rather than a single Bits()==0 scan."
+    },
+    {
+      "id": "S08-6",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/zzprobe/audit7/z19verify/printenv_test.go",
+      "test_func": "TestZ19VPrintSecretEnvEchoesAPastedValueNullifiesThePositiveClaim",
+      "asserts": "CONFIRMED direct. Opens the cited file/function: it runs the real binary with `-print-secret-env`; the control config kek_env=\"Z19V_CONTROL_KEK\" must echo role=name (exit 0, 'vault.kek_env=<name>'), then the subject config kek_env=\"<a secret value>\" is asserted via t.Errorf to NOT appear in stdout ('DISCLOSURE: -print-secret-env echoes a secret pasted into an *_env name verbatim'). This exercises configSecretEnvNames (config.go:418-448, `role+\"=\"+name` with no shape check) through main.go's subcommand, and is a red probe: it fails while the verbatim echo exists and turns green if the value is validated/withheld. Caveat retained: //go:build audit7, not in the default run. The default-suite test cmd/re0auth/secret_env_test.go TestConfigSecretEnvNamesListsEveryDeclaredSecret only asserts a well-formed name is listed per role and would not catch the disclosure.",
+      "gap_note": ""
+    },
+    {
+      "id": "S08-7",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "cmd/re0auth/timeouts_test.go",
+      "test_func": "TestDataPlaneTimeoutFitsInsideTheWriteTimeout",
+      "asserts": "CONFIRMED partial. Opens the cited file/function: it pins dataPlaneTimeout < writeTimeout with >=5s slack, dataPlaneTimeout > the 20s outbound deadline, and readTimeout < dataPlaneTimeout. It never references shutdownTimeout, so the third (shorter) bound the finding is about is unchecked. I opened the shutdown-budget tests it contrasts with - internal/zzprobe/deploy/artifacts_test.go TestGracefulShutdownWindowsAgree and internal/zzprobe/audit7/z10adminauditprivacy/shutdown_budget_test.go (plus audit6 drain_budget_probe_test.go): they assert endpointRemovalWait + shutdownTimeout (+ auditDrainTimeout) <= terminationGracePeriodSeconds, and none compares the drain budget with dataPlaneTimeout. Independent grep for shutdownTimeout in *_test.go found no data-plane relation.",
+      "gap_note": "Harness needed: an assertion of the intended relation between the drain budget and the data-plane deadline (e.g. shutdownTimeout >= dataPlaneTimeout + the slack needed to write the refusal), in the same style as TestDataPlaneTimeoutFitsInsideTheWriteTimeout, together with the matching terminationGracePeriodSeconds. Today shutdownTimeout(30s) < dataPlaneTimeout(45s) would pass every existing test."
+    },
+    {
+      "id": "S08-8",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "CONFIRMED none. Independent grep over the whole tree for server.max_upstream_buffer_bytes|MaxUpstreamBufferBytes|RE0AUTH_MAX_UPSTREAM_BUFFER_BYTES: no *_test.go matches the field, the setting or the env var; the only test hit is a prose comment at internal/zzprobe/perf/hotpath_test.go:483. The budget tests that exist - internal/federation/buffer_budget_test.go TestBufferBudgetNilAndZeroRefuse / TestBufferBudgetShareFormula, the heldbody probes and verifyperf - construct bufferBudget/federation.Config.MaxBufferedBytes directly and never go through loadConfig and the `if cfg.MaxBufferedBytes == 0 { cfg.MaxBufferedBytes = defaultMaxBufferedBytes }` coercion in federation.NewService (service.go:382-383). No test was missed.",
+      "gap_note": "Harness needed: loadConfig with the file setting max_upstream_buffer_bytes = 0 and, separately, RE0AUTH_MAX_UPSTREAM_BUFFER_BYTES=0, then assert either a config-stage refusal naming the field (like the negative branch) or that federation.NewService keeps the resolved 0 (fail-closed) rather than substituting the 64 MiB default; a plain 'unset takes the default' assertion would also pin the intended pointer semantics."
+    },
+    {
+      "id": "S08-9",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "idp/oidc_test.go",
+      "test_func": "TestCustomOIDCProviderDiscoversEndpoints",
+      "asserts": "CONFIRMED partial. Opens the cited file/function: it registers a custom provider 'authentik' with Issuer = provider.URL (an httptest server, i.e. an http:// issuer) and asserts it is registered, that the authorization endpoint is discovered from the issuer and that Exchange/Identity succeed; it would break if the idp layer itself started enforcing https, but it tests discovery, not the scheme policy, and it never reaches loadIdP. cmd/re0auth/main_test.go TestLoadIdPAllowsCustomOIDCProvider uses an https issuer and asserts only registration, and TestLoadIdPRejectsCustomProviderWithoutIssuer checks only the empty-issuer case (the only two loadIdP call sites in *_test.go); idp/oidc_test.go TestCustomOIDCProviderNeedsIssuer is the same. No test asserts that a custom idp.*.issuer of 'http://idp.example' is refused (or explicitly acknowledged) at the config boundary.",
+      "gap_note": "Harness needed: a loadIdP/loadConfig case with [idp.custom] issuer = \"http://idp.example\" asserting a refusal naming the field unless an acknowledgement is set (or a prominent scheme warning is logged); today the non-https issuer is silently accepted, and the existing https-only config test plus the httptest-based idp test do not pin that policy in either direction."
+    }
+  ]
+}

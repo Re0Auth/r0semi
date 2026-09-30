@@ -1,0 +1,122 @@
+{
+  "scope": "S01",
+  "findings": [
+    {
+      "id": "S01-1",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/device_test.go",
+      "test_func": "TestDeviceAuthorizationHappyPath",
+      "asserts": "Drives BeginDeviceAuthorization -> DecideDeviceAuthorization -> one PollDeviceAuthorization after approval and asserts the poll returns an access+refresh pair, that the scope string is right and that the token introspects. It polls the approved device_code exactly once, so it says nothing about whether the code stays redeemable on a second poll. oauth/zz_probe_test.go TestZZProbeDeviceCodeRepeatMint (//go:build audit5) does poll an approved code twice, but it only t.Logf's the second result and has no assertion, so it would not fail if the code became single-use.",
+      "gap_note": "No test asserts single-use redemption of an approved device_code. Needed: a default-suite test that (a) redeems an approved device_code, then polls the same code again after the poll interval and asserts invalid_grant and that no second access/refresh pair exists in the store, and (b) N concurrent post-approval polls where exactly one succeeds. Implementing this needs the recommended ConsumeDevice/RecordRedemption store method (or a redemption nonce) so the losing poll can be told invalid_grant."
+    },
+    {
+      "id": "S01-2",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "No test exercises MemoryDeviceStore growth or pruning. oauth/tokens_test.go TestMemoryStoreKeysByHashNotPlaintext inspects MemoryDeviceStore.byDev, but only to prove the key is the hashed device code; it never counts records, ages them or looks for a sweep. internal/zzprobe/concurrency/growth_test.go TestUnauthenticatedAuthorizeGrowsTheStoreWithoutBound (//go:build audit5) asserts a device count after N unauthenticated /oauth/device_authorization calls, but it runs against internal/store/memory.OIDCStore (which does prune via purgeExpiredDevicesLocked), not against oauth.MemoryDeviceStore, so it does not cover this store or this defect.",
+      "gap_note": "No harness reaches the leak. Needed: a store-level test that writes N device records with past ExpiresAt values, advances/sets now, and asserts the memory still holds them (or that no SweepExpired/prune API exists), plus a service-level test showing BeginDeviceAuthorization records are never reclaimed. This also requires adding a SweepExpired/Consume-like method to MemoryDeviceStore before a positive test can be written; today the absence of any pruning API can only be pinned by a source/API guard or by reflecting on the maps."
+    },
+    {
+      "id": "S01-3",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "oauth/tokens_reuse_test.go",
+      "test_func": "TestMemoryStoreSweepReclaimsExpiredTombstones",
+      "asserts": "Saves a refresh token whose ExpiresAt is now.Add(time.Minute) with now fixed at time.Unix(1_700_000_000, 0) (long past against the wall clock), consumes it to plant the tombstone, then asserts at line 188 that ConsumeRefresh of the spent value still returns ErrRefreshTokenReused while the tombstone has not been swept, and only after SweepExpired(now.Add(2*time.Minute)) returns ErrTokenNotFound. The reuse assertion therefore fails the moment ConsumeRefresh starts comparing tomb.ExpiresAt against time.Now() (the recommended fix), i.e. it pins the ignore-the-deadline behaviour. TestMemoryStoreReplayReportsReuseNotUnknown pins the same thing independently (ExpiresAt also fixed in the past, replay asserted to be a reuse).",
+      "gap_note": ""
+    },
+    {
+      "id": "S01-4",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/as_test.go",
+      "test_func": "TestAuthorizationCodeFlow",
+      "asserts": "Exercises service.issue (oauth/as.go:388-423) end to end on the happy path: SaveAccess and SaveRefresh both succeed and the test asserts the returned token pair. No test ever makes SaveRefresh fail after SaveAccess has written, so the orphan-access-token state is never produced or asserted; existing store doubles (stubRevoker, failingRevokeStore) override RevokeRefreshFamily/RevokeTokens only.",
+      "gap_note": "No failure-injection harness for issuance. Needed: a Store wrapper around MemoryStore whose SaveRefresh returns a sentinel error (and, separately, whose SaveAccess fails), then assert that oauth.Exchange/Refresh returns the error and that GetAccess/Introspect finds no live record for the value that would have been returned. Once a SaveTokenPair pair API is added, the test becomes one call asserting neither row survives a failure."
+    },
+    {
+      "id": "S01-5",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/as_test.go",
+      "test_func": "TestConfidentialClientMustAuthenticate",
+      "asserts": "Asserts only the protocol code: Exchange with a wrong secret yields protocolCode == invalid_client. It never inspects oe.Description, so the 'unknown client' vs 'invalid client credentials' difference is not asserted, and no test measures the timing difference (plain map lookup vs SHA-256 plus ConstantTimeCompare). oauth/device_test.go TestDeviceAuthorizationRejectsUnknownClientAndScope likewise only asserts the invalid_client code for an unknown id.",
+      "gap_note": "Need a test that submits both an unknown client id and a registered id with a wrong secret through s.client(..., true) (token/revoke/AuthenticateClient), captures the serialised error_description, and asserts the two are byte-identical (and, ideally, a statistical timing assertion). Also only reachable if the description is unified first; today the two descriptions differ by design."
+    },
+    {
+      "id": "S01-6",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "upstreamkit/cascade_test.go",
+      "test_func": "TestCascadeIsAdvertisedOnlyWhenImplemented",
+      "asserts": "Exercises upstreamkit's handleCascadeRevocation gate with (a) no credentials -> 401 and hook not called, (b) an unknown confidential client -> 401 and hook not called, and (c) a registered confidential client -> 200 and the hook runs. Every client registered in this fixture is oauth.ClientConfidential, so the public-client branch of AuthenticateClient (client(..., true) skips the secret check for ClientPublic) is never exercised and the claim that a public client reaches the destructive hook is not asserted.",
+      "gap_note": "Need a cascade test whose registry contains a ClientPublic client and which POSTs /oauth/cascade_revocation with that public client_id, a bogus client_secret and an arbitrary token, asserting the request is refused (401) before the hook. Currently it would succeed, so any such test must be written against the recommended fix (refuse cascade for public clients, or verify token ownership against the client id inside the kit)."
+    },
+    {
+      "id": "S01-7",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/client_rotate_test.go",
+      "test_func": "TestRotateSecretReplacesTheDigest",
+      "asserts": "Rotates a confidential client's secret with NewSecretHash('new-secret') (a valid 32-byte digest), asserts the old secret stops authenticating and the new one works, and asserts RotateSecret rejects a nil/empty hash, a public client (ErrNoSecretToRotate) and an unknown id (ErrClientNotFound). It never passes a non-32-byte digest, so the mutually contradictory validation (RotateSecret accepts any non-empty length; RestoreClientWithStatus demands sha256.Size) is not asserted.",
+      "gap_note": "Need a test that calls RotateSecret with a truncated digest (e.g. NewSecretHash('x')[:16]) and with a hex/base64-encoded 64-byte digest and asserts it is rejected, plus a control that a wrong-length digest makes Authenticate fail. Requires adding the len==sha256.Size check to RotateSecret."
+    },
+    {
+      "id": "S01-8",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/tokens_reuse_test.go",
+      "test_func": "TestMemoryStoreDeleteRefreshClearsItsTombstone",
+      "asserts": "Calls MemoryStore.DeleteRefresh directly on a spent value and asserts the tombstone is gone (ConsumeRefresh then returns ErrTokenNotFound). That proves the documented DeleteRefresh behaviour, but it bypasses oauth.Service.Revoke. No test calls svc.Revoke with a spent/rotated refresh value and asserts either that the tombstone is cleared or that live descendants of its family are revoked, so the claim that Revoke's TokenOwner pre-check (oauth/as.go:311-345) can never reach DeleteRefresh is untested.",
+      "gap_note": "Need a service-level test: rotate RT1 -> RT2, call svc.Revoke(RevokeRequest{ClientID, Token: RT1}), then present RT1 again and assert it is not reported as *RefreshReuseError (tombstone cleared) and/or that RT2 is revoked. Requires MemoryStore.TokenOwner to resolve spent values via the tombstone (or an explicit tombstone-aware revocation path)."
+    },
+    {
+      "id": "S01-9",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/as_test.go",
+      "test_func": "TestExchangeBindingFailureIsAudited",
+      "asserts": "Asserts the audit events that service.record emits when the sink succeeds: oauth.exchange_failed with the right outcome/subject/client_id/provider, and TestAuthorizationCodeFlow asserts oauth.authorize then oauth.token, while refresh_family_test.go asserts oauth.reuse_detected. All use audit.NewMemoryLogger, which never errors, so the '_ = s.audit.Record(...)' discard is never exercised.",
+      "gap_note": "Need a test with a failing audit.Logger injected into oauth.NewService that drives a security-relevant path (reuse_detected, revoke, grant revoke) and asserts the drop is observable (error returned, logged at error level, or a counter incremented). Today the failure is silent by construction, so a negative test can only be written after the error is no longer discarded."
+    },
+    {
+      "id": "S01-10",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/client_rotate_test.go",
+      "test_func": "TestRotateSecretReplacesTheDigest",
+      "asserts": "Uses NewSecretHash as an opaque value and asserts the resulting digest authenticates the right secret and rejects the old one. No test inspects how the digest is derived, so the unsalted single-round SHA-256 (and the equality with TokenHash) is not asserted anywhere; oauth/client_test.go also only feeds NewSecretHash into RestoreClient.",
+      "gap_note": "Need a test that pins the KDF contract: e.g. assert the stored digest is not sha256.Sum256(secret) (or that it contains a per-client salt / is a versioned argon2/bcrypt string), and a config-loading test that a weak [client].clientSecret is rejected or hashed with the salted KDF. Requires changing NewSecretHash first; today a test asserting a salted format would fail, and no test currently asserts the unsalted format either."
+    },
+    {
+      "id": "S01-11",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/grants_test.go",
+      "test_func": "TestGrantsListWhatAClientCanStillDo",
+      "asserts": "Exercises the Grants path (MemoryStore.ListBySubject via service.Grants) for correctness and ordering, and tokens_sweep_test.go exercises SweepExpired's removal counts. No test asserts the lock discipline that the finding is about: that the store uses one sync.Mutex, that ListBySubject/DeleteBySubjectClient/SweepExpired scan every map under it, or that a concurrent GetAccess/introspection is stalled by a grants-page read. internal/zzprobe/perf/memstore_test.go's lock-contention probes target internal/store/memory.OIDCStore, not oauth.MemoryStore.",
+      "gap_note": "Need a performance/concurrency probe on oauth.MemoryStore: seed a large store, call ListBySubject/SweepExpired while another goroutine loops GetAccess, and assert the read latency during the scan is bounded by the caller's own records (or that the two reads do not exclude each other once sync.RWMutex/per-subject indexes are added). A source guard could at least pin RWMutex plus an index, but the current test tree has nothing."
+    },
+    {
+      "id": "S01-12",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit7/z18verify/verify_test.go",
+      "test_func": "TestZ18vTokenStoreHandsOutTheStoredScopeSlice",
+      "asserts": "Writes through the Scopes slice returned by MemoryStore.GetAccess ('handedOut.Scopes[0] = escalated.one') and through the caller's original slice after SaveAccess, rereads the store, and fails if the stored grant changed; TestZ18vGrantsViewSharesTheStoredScopeSlice in the same file does the same through MemoryStore.ListBySubject's GrantRecord.Scopes, and internal/zzprobe/audit7/z18gohazardsweep/probes_test.go TestZ18IntrospectionDoesNotHandOutTheStoredScopeSlice pins GetAccess. Together they assert exactly the aliasing defect on the cited read paths. Caveat: all three are behind //go:build audit7 and assert the safe property (they are RED while the defect exists); there is no equivalent test in the default oauth/ suite.",
+      "gap_note": "The cited //go:build audit7 probes exercise the exact read paths (GetAccess, ListBySubject) and are RED while the aliasing exists, but they assert the safe cloned property rather than pinning the aliasing as expected behaviour: applying the finding's recommendation (defensive copies on every read) turns them green. A test that merely exercises the path and fails on the defect detects it; it does not pin it, so direct is unsupported. The default untagged oauth/ suite has no equivalent assertion, so partial."
+    },
+    {
+      "id": "S01-13",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/httpapi/bodylimit_test.go",
+      "test_func": "TestBodyLimitHandlesAnUndeclaredLength",
+      "asserts": "Builds a request with ContentLength = -1 and TransferEncoding 'chunked' carrying MaxFormBytes+1 bytes and asserts /oauth/token answers 400 with an invalid_request OAuth error rather than 413 — i.e. it pins exactly the described chunked-body behaviour and would fail if the MaxBytesError were mapped to 413. Caveat: it covers the httpapi protocol plane, and the finding also cites upstreamkit/server.go:242-246; for that plane the default test upstreamkit/bodylimit_test.go covers only the declared-length case, while the chunked->413 expectation lives in the //go:build audit5 probe internal/zzprobe/protocol/kit/kit_probe_test.go TestE6_BodyLimitVariants line 1018. The finding is marked already_mitigated (the cap holds in all cases).",
+      "gap_note": ""
+    }
+  ]
+}

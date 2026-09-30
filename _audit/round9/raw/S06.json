@@ -1,0 +1,214 @@
+{
+  "scope": "S06",
+  "title": "Outbound HTTP, SSRF, upstream kit, IdP adapters",
+  "findings": [
+    {
+      "id": "S06-1",
+      "title": "OIDC discovery and JWKS fetches read an unbounded upstream body (go-oidc io.ReadAll) while the adapter's own 1 MiB cap does not apply",
+      "severity": "high",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "idp/idp.go:298",
+        "idp/idp.go:711",
+        "idp/idp.go:836"
+      ],
+      "evidence": "\t\thc = httpclient.NewOutboundClient(httpclient.OutboundConfig{\n\t\t\tTimeout:   10 * time.Second,\n\t\t\tTransport: httpclient.TransportConfig{DenyPrivateAddresses: true},\n\t\t})\n...\n\tprovider, err := oidc.NewProvider(oidc.ClientContext(ctx, c.http), c.issuer)\n...\n\tbody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))",
+      "why": "idp caps its own userinfo/QQ reads at 1 MiB (idp/idp.go:836) but the OIDC discovery document and the JWKS key set are fetched by go-oidc, which does `body, err := io.ReadAll(resp.Body)` (go-oidc v3.21.0 oidc/oidc.go:312 for discovery and oidc/jwks.go:315 for keys) with no size limit. The only bound is the client's Timeout, which limits time, not bytes; net/http auto-decompresses gzip, so a gzip bomb amplifies the allocation. One login can therefore allocate gigabytes and kill the process.",
+      "exploit": "A configured OIDC provider (self-hosted Keycloak/Authentik, or a compromised/hijacked public IdP such as the issuer named in Credentials.Issuer) serves /.well-known/openid-configuration or its jwks_uri as an endless/deflated body. Discovery is fetched at every providerTTL boundary (default 15 min), and the JWKS whenever the id_token's kid misses the cache; the process OOMs during a normal sign-in.",
+      "recommendation": "Wrap the http.Client handed to oidc.ClientContext in a RoundTripper that caps the response body (both ContentLength check and a hard LimitReader on resp.Body), or build the oidc.Provider/key set from a bounded fetch. The 1 MiB cap already used by getText is the right bound to apply here too.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-2",
+      "title": "DenyPrivateAddresses is applied to the proxy address, not the target, whenever an HTTP(S) proxy is configured in the environment",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "httpclient/outbound.go:92",
+        "httpclient/outbound.go:95",
+        "httpclient/outbound.go:42"
+      ],
+      "evidence": "\treturn &http.Transport{\n\t\tProxy: http.ProxyFromEnvironment,\n\t\tDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {\n\t\t\tdialer := &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}\n\t\t\tif cfg.DenyPrivateAddresses {\n\t\t\t\t// Control rather than a check on the URL: this runs on the resolved\n\t\t\t\t// address, so it also covers a hostname the peer's DNS has been made\n\t\t\t\t// to answer differently than it did when the source was registered.\n\t\t\t\tdialer.Control = denyPrivateAddress\n\t\t\t}\n\t\t\treturn dialer.DialContext(ctx, network, address)\n\t\t},",
+      "why": "http.ProxyFromEnvironment makes net/http dial the proxy; DialContext (and therefore the Control hook, and therefore IsPublicAddress) is handed the proxy's address. The target host is never resolved or checked by this process. The field's own doc-comment claims the check 'is checked at dial time, on the address the kernel is about to be given', which is false under a proxy. A deployment that sets HTTP_PROXY/HTTPS_PROXY therefore loses the SSRF guard entirely: the proxy can reach RFC1918/loopback/169.254.169.254 on the client's behalf.",
+      "exploit": "Deployment (.env / service environment) carries HTTPS_PROXY for egress. A registered source, or an OIDC issuer that is compromised or DNS-hijacked, names an internal host (metadata service, admin listener). NewOutboundClient dials the proxy, the guard approves the proxy's public address, and the proxy fetches the internal target; on the raw passthrough the response body is returned to the caller.",
+      "recommendation": "Either refuse to combine DenyPrivateAddresses with a proxy (reject when ProxyFromEnvironment returns a proxy while the guard is on), or perform the check on the request URL/target rather than relying solely on DialContext, and document that the address guard is a no-proxy control.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-3",
+      "title": "oidcProvider holds providerMu across a network discovery round trip, and a failed discovery is not cached, so a dead issuer serializes every concurrent login",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "idp/idp.go:705",
+        "idp/idp.go:711",
+        "idp/idp.go:713"
+      ],
+      "evidence": "func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {\n\tc.providerMu.Lock()\n\tdefer c.providerMu.Unlock()\n\tif c.discovered != nil && time.Since(c.discoveredAt) < c.providerTTL {\n\t\treturn c.discovered, nil\n\t}\n\tprovider, err := oidc.NewProvider(oidc.ClientContext(ctx, c.http), c.issuer)\n\tif err != nil {\n\t\treturn c.retainOnDiscoveryFailure(fmt.Errorf(\"idp: %s: discovery failed: %w\", c.provider, err))\n\t}",
+      "why": "The mutex is held for the whole oidc.NewProvider call, which is a network fetch with a 10s client timeout. A failed discovery does not advance discoveredAt and is not negatively cached ('A failed discovery is not cached, so it can be retried on the next request'), so after the TTL expires each waiting goroutine acquires the lock and performs its own fresh fetch instead of observing the previous failure. With N concurrent logins and an unreachable issuer this is N serial 10s attempts (a convoy), not one.",
+      "exploit": "After the 15-minute provider TTL, an attacker (or ordinary traffic) drives concurrent sign-in attempts against a provider whose discovery endpoint is hung or down. Every attempt blocks on providerMu behind the previous one's timeout; login latency grows linearly with concurrency and consumes server goroutines until request deadlines fire.",
+      "recommendation": "Do the fetch outside the lock with a single-flight (e.g. golang.org/x/sync/singleflight) and cache the failure for a short negative TTL, so N callers share one attempt and a retry storm is bounded.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-4",
+      "title": "SocialLogin.states is an unbounded map swept in O(n) on every unauthenticated start request",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "referencesource/social.go:102",
+        "referencesource/social.go:104",
+        "referencesource/social.go:193"
+      ],
+      "evidence": "\tl.mu.Lock()\n\tl.sweepLocked()\n\tl.states[state] = socialState{\n\t\tprovider:  provider,\n\t\tverifier:  verifier,\n\t\tnonce:     nonce,\n\t\treturnTo:  r.URL.Query().Get(\"return_to\"),\n\t\texpiresAt: l.now().Add(l.stateTTL),\n\t}\n\tl.mu.Unlock()\n...\nfunc (l *SocialLogin) sweepLocked() {\n\tnow := l.now()\n\tfor state, st := range l.states {\n\t\tif !now.Before(st.expiresAt) {\n\t\t\tdelete(l.states, state)\n\t\t}\n\t}\n}",
+      "why": "There is no cap on the number of in-flight authorizations and no periodic sweeper; expiry is enforced only by a full map scan performed under the mutex on each new start. An unauthenticated flood of GET /login/{provider}/start grows the map (bounded only by the 10-minute TTL times request rate) and makes each insert O(n), i.e. O(n^2) work overall, while holding the lock that callbacks also need.",
+      "exploit": "An attacker sends a high rate of GET /login/{provider}/start for a configured provider. Entries accumulate for up to StateTTL; every subsequent start scans the whole map under the mutex, so CPU per request rises with the attack and legitimate callbacks to handleCallback contend on the same lock. Memory grows without bound until expiry.",
+      "recommendation": "Bound the map (reject or evict oldest when a max is reached), sweep on a timer rather than per-insert, and/or rate-limit the start endpoint.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-5",
+      "title": "TapTapLogin.attempts is an unbounded map with an O(n) sweep per challenge, reachable unauthenticated",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "referencesource/taptap.go:124",
+        "referencesource/taptap.go:126",
+        "referencesource/taptap.go:258"
+      ],
+      "evidence": "\tl.mu.Lock()\n\tl.sweepLocked()\n\tl.attempts[id] = &attempt{auth: auth, nextPoll: l.now()}\n\tl.mu.Unlock()\n...\nfunc (l *TapTapLogin) sweepLocked() {\n\tnow := l.now()\n\tfor id, a := range l.attempts {\n\t\tif !now.Before(a.auth.ExpiresAt) {\n\t\t\tdelete(l.attempts, id)\n\t\t}\n\t}\n}",
+      "why": "Same shape as the social login: one entry per POST /login/taptap/challenge, no cap, and the only expiry is a full O(n) scan run under the mutex on each begin. Each entry holds a DeviceAuth including the verification URL/codes, so the memory per entry is non-trivial. The map is never swept by a timer, so it also lingers after traffic stops.",
+      "exploit": "An unauthenticated attacker POSTs /login/taptap/challenge repeatedly (each call also makes an upstream Start request, but the map grows independently of whether the visitor ever polls). With n entries, each new challenge is O(n) under the lock shared by every poll, turning a modest flood into quadratic CPU plus unbounded memory.",
+      "recommendation": "Cap the attempt map, evict oldest on overflow, and sweep from a background ticker instead of on the request path.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-6",
+      "title": "Conformance runner leaks the response body of a non-200 metadata document (never closed)",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "upstreamkit/conformance/conformance.go:211",
+        "upstreamkit/conformance/conformance.go:212",
+        "upstreamkit/conformance/conformance.go:216"
+      ],
+      "evidence": "\tresp, err := r.request(http.MethodGet, \"/.well-known/oauth-authorization-server\", \"\", nil)\n\tif err != nil || resp.StatusCode != http.StatusOK {\n\t\tr.warn(\"oauth.metadata\", \"authorization server metadata not reachable; inline endpoints are assumed\")\n\t\treturn\n\t}\n\tdefer closeBody(resp)",
+      "why": "When the request succeeds at the transport level but the server answers a non-200 status, the branch returns before `defer closeBody(resp)` is registered, so resp.Body is never closed. `closeBody` exists precisely to stop the suite leaking a connection per check; this path bypasses it. It is the only request in the file without an unconditional close.",
+      "exploit": "A target that answers /.well-known/oauth-authorization-server with, say, 403 or 500 leaks one connection (and the associated goroutine/read buffer) per Run call; a repeated conformance run against such a source accumulates leaked connections instead of reusing the pool.",
+      "recommendation": "Register `defer closeBody(resp)` immediately after the error check (before the status check), or restructure to `if err != nil { ... }` then `defer closeBody(resp)` then test the status.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-7",
+      "title": "A partial AuthURL/TokenURL override on a discovered OIDC provider is silently discarded",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "idp/idp.go:505",
+        "idp/idp.go:507",
+        "idp/idp.go:520"
+      ],
+      "evidence": "\tcfg := c.oauth\n\tif cfg.Endpoint.AuthURL != \"\" && cfg.Endpoint.TokenURL != \"\" {\n\t\treturn cfg, nil\n\t}\n\tprovider, err := c.oidcProvider(ctx)\n\tif err != nil {\n\t\treturn oauth2.Config{}, err\n\t}\n\tendpoint := provider.Endpoint()\n...\n\tcfg.Endpoint = endpoint\n\treturn cfg, nil",
+      "why": "The static short-circuit requires BOTH endpoints; if only one is configured the code goes to discovery and then overwrites cfg.Endpoint wholesale with the discovered pair. An operator who configures, for example, only TokenURL (a proxy token endpoint) or only AuthURL has that value ignored at runtime, with no error and no log, and the client secret/authorization code goes to the discovered endpoint instead of the configured one.",
+      "exploit": "Misconfiguration: Credentials for a self-hosted provider sets TokenURL (e.g. https://proxy.internal/token) but leaves AuthURL empty. The login is sent to the operator's proxy, but the token exchange (carrying the client secret and code) is posted to the discovered token_endpoint; the intended endpoint never receives it. A partial SecurityTLS/proxy setup silently degrades to the default.",
+      "recommendation": "Reject a partial override at NewRegistry time (both or neither), or merge per-field: keep any configured AuthURL/TokenURL and only fill the empty side from discovery.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-8",
+      "title": "Injected RegistryConfig.HTTPClient may have no timeout, and go-oidc's JWKS fetch is context.WithoutCancel'd, so a hung IdP can pin a login goroutine",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "medium",
+      "locations": [
+        "idp/idp.go:287",
+        "idp/idp.go:751",
+        "idp/idp.go:648"
+      ],
+      "evidence": "\thc := cfg.HTTPClient\n\tif hc == nil {\n\t\t// The library's own default is hardened too, not just the composition\n\t\t// root's: a caller that forgets to pass one should not silently get the\n\t\t// unhardened default client.\n\t\thc = httpclient.NewOutboundClient(httpclient.OutboundConfig{\n\t\t\tTimeout:   10 * time.Second,\n\t\t\tTransport: httpclient.TransportConfig{DenyPrivateAddresses: true},\n\t\t})\n\t}\n...\n\tidToken, err := verifier.Verify(oidc.ClientContext(ctx, c.http), rawIDToken)",
+      "why": "The service guarantees a timeout only for its own default client. A caller-injected HTTPClient is used as-is, and go-oidc builds its RemoteKeySet with `ctx: context.WithoutCancel(ctx)` (jwks.go:74), so the JWKS request created inside Verify is not cancellable when the HTTP request is cancelled and carries no deadline of its own; the only bound is http.Client.Timeout. An injected client with Timeout 0 makes the JWKS fetch unbounded, and the discovery doc read shares the same client.",
+      "exploit": "A deployment injects a custom *http.Client (for metrics, a custom transport, or an authenticating proxy) without a Timeout. The IdP's jwks_uri stalls; each sign-in goroutine blocks in verifier.Verify until the TCP/keepalive stack gives up, and client disconnects do not release it.",
+      "recommendation": "In NewRegistry, refuse or wrap an injected client that has no Timeout (or apply a context.WithTimeout around discovery/verification), and document the timeout as required.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-9",
+      "title": "federation.NewService's Doer-only fallback builds an outbound client with the SSRF guard off",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "internal/federation/service.go:376",
+        "httpclient/outbound.go:304"
+      ],
+      "evidence": "\t\t} else {\n\t\t\t// Not http.DefaultClient: that is the one client in the process with no\n\t\t\t// timeout and no redirect policy, and this one posts the authorization\n\t\t\t// code and the client secret. A caller that supplies only a Doer still\n\t\t\t// gets a bounded client for the exchange.\n\t\t\tcfg.HTTPClient = httpclient.NewOutboundClient(httpclient.OutboundConfig{})\n\t\t}",
+      "why": "NewOutboundClient honours Transport.DenyPrivateAddresses, whose zero value is false (documented as off for self-hosted sources). The fallback therefore installs a client with a timeout and redirect policy but no address guard, and this is the client used to POST the authorization code and client secret to the source's token endpoint. The production composition root passes an explicit guarded HTTPClient, so this is a library-default trap rather than a live production hole.",
+      "exploit": "Any embedder using federation.NewService with a custom Doer and no HTTPClient gets an outbound token-exchange client that will dial loopback/RFC1918 for a source registered (or DNS-hijacked) to resolve there.",
+      "recommendation": "Make the fallback fail closed (DenyPrivateAddresses: true) or require the caller to choose explicitly, matching idp.NewRegistry's default.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-10",
+      "title": "SocialLogin stores and echoes return_to without safeurl.RelativePath validation",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "referencesource/social.go:108",
+        "referencesource/social.go:189"
+      ],
+      "evidence": "\t\treturnTo:  r.URL.Query().Get(\"return_to\"),\n...\n\twriteJSON(w, http.StatusOK, map[string]any{\n\t\t\"state\": \"confirmed\", \"subject\": subject, \"return_to\": st.returnTo,\n\t})",
+      "why": "Everywhere else in the repo a request-supplied return_to is sanitized through internal/safeurl.RelativePath before it can reach a redirect (internal/auth/auth.go:612, internal/httpapi/federation_routes.go:378). The reference source stores the raw query value and returns it in the callback JSON with no validation. The value is attacker-controlled (it arrives on an unauthenticated GET /login/{provider}/start) and is handed to whatever frontend consumes this JSON.",
+      "exploit": "A caller requests /login/google/start?return_to=https://evil.example/x and completes the flow; the callback JSON then carries `return_to: https://evil.example/x`. A frontend that navigates to that field performs an open redirect (and, with javascript: or //evil.example, potentially worse) from the source's origin.",
+      "recommendation": "Apply safeurl.RelativePath to return_to at store time or emit time, as the rest of the codebase does.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S06-11",
+      "title": "safeurl.RelativePath resists scheme-relative, backslash and control-byte escapes; percent-encoded and dot-segment forms cannot change origin",
+      "severity": "info",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/safeurl/safeurl.go:34"
+      ],
+      "evidence": "\tif !strings.HasPrefix(v, \"/\") || strings.HasPrefix(v, \"//\") {\n\t\treturn \"/\"\n\t}\n\t// Browsers treat a backslash as a separator in enough contexts that allowing\n\t// it means having to know which one is resolving. Refusing it is something a\n\t// reader can check.\n\tif strings.Contains(v, \"\\\\\") {\n\t\treturn \"/\"\n\t}\n\tif _, err := url.Parse(v); err != nil {\n\t\treturn \"/\"\n\t}",
+      "why": "Checked the three bypass shapes against the code: scheme-relative '//host', any backslash (including a path-adjacent '\\\\'), and control bytes (url.Parse rejects TAB/LF/CR, which browsers strip before parsing) are all replaced with '/'. Percent-encoded variants such as /%2F%2Fhost, /%5Chost and /%2E%2E//host stay on the original origin because the authority is fixed before path normalization and encoded separators are not re-parsed as authority. No bypass found; recorded as verified rather than suspicious.",
+      "exploit": "None found.",
+      "recommendation": "No change; keep this as the single implementation of the rule.",
+      "already_mitigated": true
+    }
+  ],
+  "coverage": [
+    "httpclient/httpclient.go",
+    "httpclient/outbound.go",
+    "httpclient/retry.go",
+    "httpclient/circuitbreaker.go",
+    "internal/safeurl/safeurl.go",
+    "idp/idp.go",
+    "upstreamkit/discovery.go",
+    "upstreamkit/server.go",
+    "upstreamkit/conformance/conformance.go",
+    "referencesource/login.go",
+    "referencesource/source.go",
+    "referencesource/taptap.go",
+    "referencesource/social.go",
+    "referencesource/cascade.go",
+    "oauth/http.go (cross-package sink for BuildRedirect/ClientCredentials/BearerToken)",
+    "oauth/bodylimit.go (cross-package for LimitFormBody)",
+    "oauth/as.go (cross-package for describe/Authorize/client auth)",
+    "oauth/scope.go (cross-package for Risk/ExplicitConsent semantics)",
+    "vault/service.go (cross-package for Enroll copying/scrubbing the credential)",
+    "internal/federation/service.go:355-393 (cross-package caller of NewOutboundClient fallback)",
+    "internal/federation/federation.go:140-220 (cross-package source endpoint validation)",
+    "go-oidc v3.21.0 oidc/oidc.go, oidc/jwks.go, oidc/verify.go (dependency fetch/caching behaviour)"
+  ],
+  "notes": "Gaps/uncertainties: (1) The unbounded OIDC/JWKS read (S06-1) and the uncancellable JWKS fetch (S06-8) are facts about go-oidc v3.21.0 (module cache); the repository code only supplies the client, so the fix must wrap that client. (2) S06-2's impact depends on HTTP_PROXY/HTTPS_PROXY being set in the deployment; the code path is unconditional. (3) S06-10 has no in-repo consumer of the referencesource JSON, so exploitability rests on the (out-of-repo) frontend. (4) Out of S06's primary file set but observed while tracing callers, not reported as S06 findings: internal/federation.NewRegistry (federation.go:151-161) trims and accepts Source.Issuer without validating scheme/host/userinfo, and builds TokenEndpoint/RevocationEndpoint by string concatenation; that belongs to the federation scope. (5) Tests were not used as the source of any claim. (6) taptapoauth floors a missing/zero Interval to 5s (taptapoauth/client.go:96-98), so the upstream-controlled poll interval in referencesource/taptap.go:160 is mitigated and was not reported."
+}

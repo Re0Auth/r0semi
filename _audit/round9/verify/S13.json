@@ -1,0 +1,83 @@
+{
+  "scope": "S13",
+  "verified": [
+    {
+      "id": "S13-1",
+      "status": "confirmed",
+      "final_severity": "high",
+      "reason": "Chain order proven at internal/httpapi/server.go:619-647: withCanonicalPath/sessions/withBodyLimit/withRateLimit/withInFlightLimit are layered inside compressor.Handler (h = s.compressor.Handler(h) at 644). compress.Handler (internal/compress/compress.go:147-152) calls c.notAccept(w,r) and returns without next.ServeHTTP when negotiate reports acceptable=false. negotiate returns ('', false) for `*;q=0` / `identity;q=0` via compress.go:229-238 (identityQ = star = 0). withRequestContext, withAccessLog and metrics.Middleware are outside compression (server.go:647-654), so each refused request still pays request-id generation, trusted-proxy client-key derivation, the access log line and the request counter, while consuming no limiter token and holding no in-flight slot. The design is deliberate for security headers (server.go:610-618) and the project's own test comment says so ('it refuses without ever calling next', internal/httpapi/security_headers_test.go:124-141; test at internal/zzprobe/audit6/z06httpedge/compress_test.go:300 drives `identity;q=0, *;q=0`). Reachable unauthenticated on every non-protocol path (eligible = planeOf != planeProtocol, server.go:353-355). Impact: both anti-abuse bounds are disabled on a caller-driven path -> connection/goroutine burst and access-log flood past the configured per-address rate. High stands.",
+      "evidence_checked": "internal/httpapi/server.go:619-654; internal/httpapi/server.go:353-376; internal/compress/compress.go:137-164,169-239,502-506; internal/httpapi/middleware.go:111-126,140-160,248-270,356-402,430-486; internal/httpapi/security_headers_test.go:124-141; internal/zzprobe/audit6/z06httpedge/compress_test.go:287-307"
+    },
+    {
+      "id": "S13-2",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Code matches exactly. internal/store/memory/oidc.go:1050-1056 calls s.purgeExpiredDevicesLocked under s.mu before every insert, and purgeExpiredDevicesLocked (1124-1134) ranges the ENTIRE s.devices map. The same s.mu is the single lock for every token lookup, auth-request read and device decision (struct at 33-54). The devices map has no count cap; it is bounded only by the device-code lifetime, which is 10 minutes (internal/oidchttp/oidchttp.go:185-186). The library calls StoreDeviceAuthorization on every public device_authorization request (zitadel/oidc v3.51.3 pkg/op/device.go:101). So each public request is O(n) under the hottest lock and total create work is O(n^2). Exploit precondition is a registered client (device_authorization requires client_id), which the finding states; at the default per-address budget the live population is ~30k and a single scan is sub-millisecond, so the lock-contention claim is directional rather than dramatic at one address, but distributed source addresses scale it without any per-process cap. Severity medium retained, with the note that the practical lock impact at the default budget is modest.",
+      "evidence_checked": "internal/store/memory/oidc.go:33-54,1049-1064,1122-1134; internal/oidchttp/oidchttp.go:185-186; C:\\Users\\r-0semi\\go\\pkg\\mod\\github.com\\zitadel\\oidc\\v3@v3.51.3\\pkg\\op\\device.go:84-104"
+    },
+    {
+      "id": "S13-3",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Code matches. internal/store/memory/oidc.go:508-521 ranges the whole s.codes map to delete rows with requestID == id, under s.mu. AuthRequestByCode deletes the code for the request at 462-471 before the library's post-mint DeleteAuthRequest, so on the normal exchange path the scan finds nothing and is pure overhead. The library does call DeleteAuthRequest after every authorization-code mint (zitadel/oidc v3.51.3 pkg/op/token.go:49-53). Codes carry expiresAt = now+requestTTL (oidc.go:497, requestTTL default 30m from cmd/re0auth/config.go:349 and main.go:1350/1359), so the map holds up to 30 minutes of issued/unexchanged codes and the exchange path is O(#pending codes) under the same global lock. Impact as stated: token-exchange latency grows with an unrelated population while holding the store lock. Medium retained; real algorithmic issue, magnitude proportional to outstanding-code population.",
+      "evidence_checked": "internal/store/memory/oidc.go:458-529; cmd/re0auth/config.go:343-349; cmd/re0auth/main.go:1344-1360; C:\\Users\\r-0semi\\go\\pkg\\mod\\github.com\\zitadel\\oidc\\v3@v3.51.3\\pkg\\op\\token.go:35-58"
+    },
+    {
+      "id": "S13-4",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The code pattern is real: memory/oidc.go:1308-1328 and 1334-1349 call s.record while s.mu is held via defer, whereas CompleteLogin (1253-1283) and CreateAccessToken (532-549) unlock first. But the stated production impact is false for this store. memory.NewOIDCStore is constructed only when cfg.DatabaseURL == \"\" (cmd/re0auth/main.go:892-900 and 1352-1360), and in that same no-DATABASE_URL branch the audit.Logger handed in is audit.NewMemoryLogger() (main.go:900, passed as `logger` at 1352-1358) -- a bounded 10k-event in-memory ring whose Record is a short mutex + slice append (audit/audit.go:101-158), not postgres.AuditLogger.Record. The postgres.AuditLogger is paired only with the postgres OIDCStore, which holds no store-wide mutex across the audit call at all (postgres/oidc.go:1312-1339,1347-1360). So the claimed 'held across a database round trip plus chain-head serialization' cannot occur in any shipped wiring. It remains a latent hazard for an embedder that injects a durable/slow audit.Logger via OIDCOptions.Audit, hence downgraded to low rather than rejected.",
+      "evidence_checked": "internal/store/memory/oidc.go:1253-1283,1301-1349,340-360; audit/audit.go:35-39,101-158; internal/store/postgres/oidc.go:1312-1360; cmd/re0auth/main.go:890-916,1294-1372"
+    },
+    {
+      "id": "S13-5",
+      "status": "confirmed",
+      "final_severity": "high",
+      "reason": "Core claim verified. Every map in memory/oidc.go:33-54 has no count cap; each refresh rotation writes exactly one tombstone keyed by the spent value hash with expiresAt = held.expiresAt, i.e. the spent token's own 30-day expiry (639-646; refreshTTL = 30*24h at 334), then deletes the live row. SweepExpired ranges the whole refreshTombstones map (and every other map) while holding s.mu (1153-1197) and is driven every 5 minutes (cmd/re0auth/main.go:81,573). In-memory mode is a supported deployment (same no-DATABASE_URL branch, main.go:892-916). An authenticated client holding one offline_access refresh token can rotate at up to the per-address budget and leave one 30-day tombstone per call: at the default 50 req/s that is ~1.3e8 entries, multi-GB, ending in OOM or GC death; even 1 req/s leaves ~2.6M. Two corrections to the evidence, neither changing the verdict: (a) /oauth/token is protocol plane (internal/oidchttp/oidchttp.go:38,200) and the compressor's Eligible predicate excludes the protocol plane (server.go:353-355), so the S13-1 limiter bypass does NOT apply to the refresh endpoint -- the per-address rate limiter still runs there; distributed sources are what scale it. (b) The Kill Switch allocation addendum concerns the live access/refresh/auth-request maps (accessKeysLocked/refreshKeysLocked/requestKeysLocked, oidc.go:161-207); tombstones are ranged in place at 1512-1518 and are not materialized into a slice, so 'hundreds of MB' from tombstones during revocation is wrong, though RevokeTokens does range them under the lock. High stands on the unbounded-growth/OOM and periodic multi-second lock hold.",
+      "evidence_checked": "internal/store/memory/oidc.go:33-54,613-658,1153-1197,1488-1544; cmd/re0auth/main.go:78-81,566-573,892-916,1294-1372; internal/httpapi/server.go:353-355; internal/oidchttp/oidchttp.go:38,200"
+    },
+    {
+      "id": "S13-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Code matches exactly. compress.go:318-348 latches w.wroteHeader=true on the first WriteHeader (including any 1xx), sets w.skip=true for status<200 and forwards that informational status; a subsequent final WriteHeader returns immediately at 319-321, and finish() (416-433) also returns on skip without writing the final status. So the final 2xx-5xx is swallowed and the logged/metriced status stays the 1xx, contradicting net/http's contract of many 1xx then one final header. No handler in the tree emits 1xx (grep found no 103/StatusEarlyHints/bare WriteHeader(1xx) in production code), so it is latent. Low as stated.",
+      "evidence_checked": "internal/compress/compress.go:299-348,414-433; repo-wide grep for StatusEarlyHints/103/informational in Go sources"
+    },
+    {
+      "id": "S13-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Code matches. observability.go:309-311 passes strconv.Itoa(rec.status) raw into the status label while method is normalized by normalizeMethod; statusRecorder.WriteHeader (629-635) latches r.status before delegating to the wrapped writer. The raw federation proxy writes the source's status verbatim (federation_routes.go:320), so an upstream answer can mint new series (deployments can return arbitrary 3-digit codes from 099 to 999 because Go's client only requires len==3 and value >= 0 -- GOROOT net/http/response.go:179-186). For a code <100 or >999, net/http's checkWriteHeaderCode panics inside statusRecorder.WriteHeader after the latch, and recoverBrowser (outside metrics? no -- metrics is outermost, so the recoverer is inside the recorder) recovers while the counter still records the never-delivered status. Cardinality is bounded by ~1000 codes, not unbounded; a malleable series set rather than a strict leak. Low as stated.",
+      "evidence_checked": "internal/observability/observability.go:286-313,621-662; internal/httpapi/federation_routes.go:295-322; C:\\Program Files\\Go\\src\\net\\http\\response.go:175-190"
+    },
+    {
+      "id": "S13-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Code matches: registerPprof (observability.go:611-619) mounts net/http/pprof Index/Cmdline/Profile/Symbol/Trace directly on the internal mux with no seconds clamp and no concurrency/size budget, and the internal handler is a plain newServer(metrics.InternalHandler()) (cmd/re0auth/main.go:726-737) with no MaxRequestsInFlight. net/http/pprof.Profile honours any positive `seconds` by sleeping that long with CPU profiling on (a second concurrent profile fails only because StartCPUProfile errors); heap/goroutine/trace each take large snapshots. Reachability is gated: the listener is off unless internal_addr is set and a non-loopback address is refused at startup unless expose_internal is acknowledged (cmd/re0auth/config.go:643-660, classifier at 984-1010). Low retained, consistent with the opt-in precondition.",
+      "evidence_checked": "internal/observability/observability.go:598-619; cmd/re0auth/main.go:722-738,778-796; cmd/re0auth/config.go:122-133,291-301,643-660,984-1010"
+    },
+    {
+      "id": "S13-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Code matches. withBodyLimit (middleware.go:111-125) only pre-rejects when oauth.LimitFormBody returns ErrBodyTooLarge, and LimitFormBody (oauth/bodylimit.go:27-34) returns that error only for r.ContentLength > 64KiB; for a chunked body (ContentLength -1) it installs http.MaxBytesReader, which trips on read and surfaces *http.MaxBytesError to the JSON decoder. Handlers map every decode error to 400 'malformed JSON body' (e.g. admin_routes.go:133-135, and the same pattern in the other cited JSON handlers), so an undeclared oversized body gets 400 where a declared one gets the plane-shaped 413. The io.LimitReader(r.Body, 1<<20) is indeed dead because MaxBytesReader trips first. No security boundary crossed; API-shape contract bug. Low as stated.",
+      "evidence_checked": "internal/httpapi/middleware.go:101-126; oauth/bodylimit.go:14-34; internal/httpapi/admin_routes.go:128-136; internal/httpapi/authorization_routes.go,device_routes.go,binding_routes.go,account_routes.go (same LimitReader+400 pattern)"
+    },
+    {
+      "id": "S13-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Code matches: oauth.MemoryStore (tokens.go:263-283) holds codes/access/refresh/tombstones with no count cap; SweepExpired exists but is explicitly not driven by any internal timer (285-328, doc admits the caller must loop). MemoryDeviceStore and MemoryClientRegistry are likewise uncapped (device.go:139+, client.go:334-343). The doc's own framing ('non-durable ... for development and tests') and the fact that oauth.Service is not on the shipped path are consistent: internal/wiring KeyAS has no non-test consumer, and cmd/re0auth builds the OP-backed store. One correction: oauth.NewMemoryClientRegistry IS used on the shipped memory-mode path (cmd/re0auth/main.go:896), so the blanket 'not on the shipped request path' is wrong for the client registry -- but client creation is admin-only (admin_routes.go register), so there is no request-driven growth there. Latent embedding hazard for MemoryStore/MemoryDeviceStore. Low retained.",
+      "evidence_checked": "oauth/tokens.go:256-328; oauth/device.go:139-200; oauth/client.go:334-397; internal/wiring/keys.go,oauth.go; cmd/re0auth/main.go:890-916,1344-1360; internal/httpapi/admin_routes.go:126-136"
+    },
+    {
+      "id": "S13-11",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Code matches. cmd/perfreport/main.go:355 divides by base.median() with no zero/positivity guard; median (119-128) returns 0.0 for an empty sample list and can be 0 for a baseline line reporting 0 ns/op, so delta becomes +Inf or NaN. logSum += math.Log1p(delta/100) at 358 then poisons the headline geomean at 373, and formatDelta prints '+Inf%'/'NaN%'. The tool's purpose of pinning a percentage across a workflow step is defeated for that run. Low as stated (tooling/report correctness, not runtime).",
+      "evidence_checked": "cmd/perfreport/main.go:55-128,323-391"
+    }
+  ],
+  "summary": "11 findings re-verified against current code, callers, library call sites and shipped wiring. 10 confirmed, 1 downgraded, 0 rejected. Confirmed-high: S13-1 (compressor 406 returns before withRateLimit/withInFlightLimit on every non-protocol path; unauthenticated unlimited 406s, project's own test comment proves no next call) and S13-5 (uncapped refreshTombstones, one 30-day tombstone per rotation, 5-minute full-map sweep under the global lock; in-memory mode is a supported deployment). Confirmed-medium: S13-2 (O(n) device purge on every public device_authorization under s.mu) and S13-3 (DeleteAuthRequest full codes scan on every token exchange under s.mu). S13-4 downgraded to low: the memory OIDCStore holds its mutex across s.record, but that store is only wired when DATABASE_URL is empty and in that branch the sink is audit.NewMemoryLogger() (fast bounded ring), never the postgres durable sink, so the claimed DB round-trip/chain stall under the lock cannot occur in shipped wiring; it is a latent hazard only. Confirmed-low: S13-6 (latent 1xx status swallow), S13-7 (raw status label; bounded ~1000-code cardinality and a reachable invalid-status panic path), S13-8 (pprof seconds/concurrency uncapped but loopback-only opt-in listener), S13-9 (chunked oversized JSON returns 400 instead of 413), S13-10 (uncapped legacy oauth in-memory stores; note MemoryClientRegistry IS on the shipped memory path but is admin-written), S13-11 (unguarded division by zero baseline median). Performance claims were reasoned about call frequency/allocation: S13-2/S13-3 are real algorithmic/lock issues but modest at the default per-address budget, while S13-5's growth is the genuine memory-exhaustion path. Two evidence corrections recorded without changing verdicts: the S13-1 bypass does NOT apply to /oauth/token (protocol plane is compression-ineligible), and Kill Switch revocation does not materialize tombstones into a slice."
+}

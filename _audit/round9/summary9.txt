@@ -1,0 +1,627 @@
+﻿[medium|downgraded] S01-1 An approved device_code is redeemable repeatedly: every poll mints a fresh token pair instead of consuming the device authorization
+  LOC: oauth/device.go:302-308, oauth/device.go:269-309
+  WHY: PollDeviceAuthorization never invalidates or consumes the approved device record. Once a record reaches DeviceApproved, every later poll falls through the switch and calls s.issue again, minting a brand-new access+refresh pair (each in a brand-new family, because familyID is ""). RFC 8628 requires t...
+
+[medium|confirmed] S01-2 MemoryDeviceStore never prunes pending/decided device records and exposes no sweep API, so device authorizations grow unbounded
+  LOC: oauth/device.go:139-163, oauth/device.go:224-247, oauth/as.go:57-59
+  WHY: SaveDevice inserts into byDev and byUser and nothing in the package ever deletes from either map: MemoryDeviceStore has no delete, no expiry sweep and no SweepExpired counterpart to MemoryStore.SweepExpired. Expiry is enforced only on read. Every BeginDeviceAuthorization therefore permanently adds o...
+
+[medium|confirmed] S01-3 MemoryStore.ConsumeRefresh ignores the tombstone deadline, so expired spent refresh values still trigger family revocation while the Postgres store correctly reports them unknown
+  LOC: oauth/tokens.go:440-450, oauth/tokens.go:248-261, oauth/as.go:264-283, internal/store/postgres/oauth.go:269-284
+  WHY: The tombstone carries ExpiresAt and the struct comment promises it 'expires on the spent token's own deadline', but ConsumeRefresh never reads tomb.ExpiresAt; any tombstone still resident in the map is reported as *RefreshReuseError regardless of age. The only remover is the manual SweepExpired, whi...
+
+[low|confirmed] S01-4 Token issuance is not atomic: a failure after SaveAccess leaves a live, undeliverable access token in the store
+  LOC: oauth/as.go:405-432, oauth/as.go:388-423
+  WHY: issue writes the access token and then the refresh token with no transaction and no rollback. If SaveRefresh fails (a database error, a constraint, a timeout), the caller receives an error and never learns the access-token value, yet the record remains live for AccessTokenTTL and Introspect/Authenti...
+
+[low|confirmed] S01-5 Client authentication tells an unknown client apart from a wrong secret, contradicting the kit's stated indistinguishability requirement
+  LOC: oauth/as.go:437-448, upstreamkit/server.go:339-345
+  WHY: The two failure branches return different Description strings ("unknown client" vs "invalid client credentials") on the same invalid_client code. upstreamkit's writeProtocolError serialises oe.Description verbatim into error_description, and the comment at upstreamkit/server.go:341-342 states the op...
+
+[medium|confirmed] S01-6 AuthenticateClient treats public clients as always authenticated, so the cascade-revocation gate does not actually gate public clients
+  LOC: oauth/as.go:437-448, oauth/as.go:89-92, upstreamkit/server.go:330-357
+  WHY: client(..., auth=true) only verifies a secret when c.Type == ClientConfidential. For a public client the supplied secret is ignored and the call succeeds unconditionally. upstreamkit handles POST /oauth/cascade_revocation by first calling AuthenticateClient and only then invoking the destructive Cas...
+
+[low|confirmed] S01-7 RotateSecret accepts a hash of any length while RestoreClient demands sha256.Size, so a bad rotation silently locks a confidential client out
+  LOC: oauth/client.go:415-432, oauth/client.go:124-145, oauth/client.go:107-114
+  WHY: RotateSecret validates only len(secretHash) != 0, but Authenticate compares c.secretHash against sha256.Sum256(secret) with subtle.ConstantTimeCompare, which returns 0 whenever the lengths differ. A hash that is not 32 bytes (e.g. a truncated or base64-encoded digest passed by an admin integration) ...
+
+[low|confirmed] S01-8 Revoke cannot reach a spent refresh token's tombstone: the documented DeleteRefresh tombstone-clear is unreachable and RFC 7009 revocation of a rotated token is a false success
+  LOC: oauth/as.go:311-345, oauth/tokens.go:393-405, oauth/tokens.go:453-464
+  WHY: TokenOwner only consults the live access and refresh maps; a value that ConsumeRefresh already spent lives only in the tombstone map, for which TokenOwner returns ErrTokenNotFound. Revoke therefore returns the idempotent success immediately and never reaches DeleteRefresh - the one place that clears...
+
+[low|confirmed] S01-9 Audit failures are silently discarded, so reuse detection, revocation and failed exchanges can go unrecorded
+  LOC: oauth/as.go:451-459
+  WHY: Every security-relevant event in the service funnels through record: oauth.authorize, oauth.exchange_failed, oauth.reuse_detected (the RFC 9700 theft signal), oauth.token, oauth.revoke, oauth.grant.revoke and the device events. The error is explicitly discarded with '_, so a failing or back-pressure...
+
+[low|confirmed] S01-10 Client secrets are stored as an unsalted SHA-256 digest, so a weak config-file secret is off-line crackable if the store leaks
+  LOC: oauth/client.go:99-105, oauth/client.go:107-114, cmd/re0auth/main.go:1634-1643
+  WHY: Client secrets are compared through a plain, unsalted, single-round SHA-256. The token store justifies this for access/refresh tokens because those are 32 random bytes with nothing to brute-force; client secrets have no such guarantee. The admin path generates high-entropy secrets (internal/admin/ad...
+
+[low|confirmed] S01-11 MemoryStore serialises all token operations on one Mutex and scans every record under the lock, so account-page reads and sweeps block token introspection
+  LOC: oauth/tokens.go:263-273, oauth/tokens.go:298-328, oauth/grants.go:157-221
+  WHY: The store uses a single sync.Mutex (not RWMutex) and holds it across whole-map scans. SweepExpired iterates all four maps while locked; ListBySubject scans every access and refresh record for one subject; DeleteBySubjectClient and RevokeTokens walk every map. Every GetAccess - which is on the hot pa...
+
+[low|confirmed] S01-12 Store reads return struct copies whose Scopes slices alias the stored backing array, so a caller mutating a returned record corrupts stored authorization state
+  LOC: oauth/tokens.go:373-382, oauth/tokens.go:341-349, oauth/tokens.go:421-429, oauth/as.go:370-376
+  WHY: The maps store structs by value but the Scopes field is a slice header; copying the struct copies the header, not the backing array. GetAccess/GetCode/GetRefresh/ConsumeRefresh/ConsumeCode all return that header, and oauth.Introspect forwards it directly as TokenInfo.Scopes (as.go:374) into a public...
+
+[info|confirmed] S01-13 The declared-length pre-check is the only path to 413; a chunked body over the cap surfaces as a 400 malformed-form instead
+  LOC: oauth/bodylimit.go:27-34, upstreamkit/server.go:162-169, upstreamkit/server.go:242-246
+  WHY: The size cap itself is enforced for every body (MaxBytesReader caps the reads), so this is not a bypass. The contract is only that a caller can distinguish 'too large' by error. For a chunked or Content-Length:-1 request the pre-check is skipped and the overrun is reported to the handler as a read e...
+
+[high|confirmed] S02-1 prompt=login / max_age never re-authenticate: the OP fabricates a fresh auth_time instead
+  LOC: internal/oidcstore/oidcstore.go:226, internal/oidchttp/oidchttp.go:1006, internal/store/memory/oidc.go:1274, internal/store/postgres/oidc.go:1269
+  WHY: RequiresReauthentication is the only place the recorded session age is compared with the request's freshness bound, and its result is never used to force a re-login. cmd/re0auth/main.go's login hook only copies sessions.AuthenticatedAt into the pending request (SetAuthTime) and returns the consent U...
+
+[medium|confirmed] S02-2 prompt=none with a live session redirects into the interactive consent UI instead of returning consent_required
+  LOC: internal/oidchttp/oidchttp.go:991, internal/oidchttp/oidchttp.go:995, cmd/re0auth/main.go:1341
+  WHY: Only the no-session half of OIDC Core §3.1.2.1 is implemented. Re0Auth has no remembered/pre-configured consent: every authorization creates a fresh AuthRequest that only CompleteLogin marks Done, and CreateAuthRequest never consults existing grants. So with a live session the request is always driv...
+
+[medium|confirmed] S02-3 Device authorization endpoint refuses spec-compliant Basic secrets: id is form-unescaped, secret is not
+  LOC: internal/oidchttp/oidchttp.go:1114, internal/oidchttp/oidchttp.go:1152, internal/oidchttp/oidchttp.go:1175
+  WHY: basicID is decoded with url.QueryUnescape two lines before use, but the paired basicSecret is passed raw to client.Authenticate, which hashes it and compares with the stored SHA-256 of the plaintext secret. RFC 6749 §2.3.1 requires a client to form-urlencode both id and secret before base64 in the A...
+
+[medium|confirmed] S02-4 ValidateSigner enforces the 2048-bit floor on the current key only, not on retired keys published in the JWKS
+  LOC: internal/oidcstore/oidcstore.go:62, internal/oidcstore/oidcstore.go:69, internal/oidcstore/oidcstore.go:73
+  WHY: RetiredSigningKey.Public is published by Signer.KeySet() alongside the current key and is used by object ID token hint / access-token verification (op.OpenIDKeySet over the whole KeySet). The guard reason ('a small RSA key is not a defensible signature at this tier') applies only to s.key. A retired...
+
+[info|downgraded] S02-5 Discovery documents are cached for the process lifetime while the issuer is derived per request from Host
+  LOC: internal/oidchttp/oidchttp.go:294, internal/oidchttp/oidchttp.go:300, internal/oidchttp/oidchttp.go:193
+  WHY: When Config.Issuer is empty, the library's issuer function is op.IssuerFromHost(""), which builds the issuer from the request's Forwarded/Host header (pkg/op/config.go dynamicIssuer). The rendered discovery body and headers are then cached under the path key for the life of the handler. The first re...
+
+[low|confirmed] S02-6 Protocol-plane 405 responses omit the mandatory Allow header
+  LOC: internal/oidchttp/oidchttp.go:478, internal/oidchttp/oidchttp.go:256, internal/oidchttp/oidchttp.go:263
+  WHY: writeOAuthJSONError sets only Content-Type/Cache-Control (and WWW-Authenticate for 401); it never sets Allow. RFC 9110 §15.5.6 requires an origin server to generate an Allow header in a 405. The business plane (internal/httpapi/server.go:700) does set Allow and advertises HEAD alongside GET, so the ...
+
+[low|confirmed] S02-7 Discovery rewrite mutates URL.Path but not RawPath, so a percent-encoded RFC 8414 alias 404s instead of serving the OIDC document
+  LOC: internal/oidchttp/oidchttp.go:255, internal/oidchttp/oidchttp.go:300, internal/oidchttp/oidchttp.go:46
+  WHY: serveDiscovery clones the request and rewrites only URL.Path. Go's url.URL sets RawPath whenever the escaped form differs from the default escaping of Path, and go-chi routes on RawPath when it is non-empty (v5.3.2 mux.go:454: `if r.URL.RawPath != "" { routePath = r.URL.RawPath }`). A request for /....
+
+[low|confirmed] S02-8 Handler.Introspect collapses a store outage into Active=false, reporting infrastructure failure to /v1 as an invalid token
+  LOC: internal/oidchttp/oidchttp.go:1677, internal/oidchttp/oidchttp.go:1664
+  WHY: The business plane's only bearer authentication path is h.introspect through this method. Every error from SetIntrospectionFromToken — including a database connection failure, failover or statement timeout — becomes TokenInfo{Active:false}, which internal/httpapi/middleware.go withBearer turns into ...
+
+[low|confirmed] S02-9 Every successful token response is fully JSON-decoded and re-encoded by sanitizeTokenResponse
+  LOC: internal/oidchttp/oidchttp.go:1538, internal/oidchttp/oidchttp.go:670, internal/oidchttp/oidchttp.go:761
+  WHY: The token endpoint is the busiest protocol path and it is fully buffered (serveOAuth). For every 200 the wrapper allocates a map[string]json.RawMessage over a body that can be a few KB (access_token + refresh_token + id_token), decodes it, then re-marshals it whenever offline_access is present — whi...
+
+[low|confirmed] S02-10 No length cap on state, nonce (or other authorize parameters) at the entrance, unlike PKCE, request-id and handle ids
+  LOC: internal/oidchttp/oidchttp.go:934, internal/oidchttp/oidchttp.go:1046, internal/oidchttp/oidchttp.go:1416
+  WHY: validateAuthorize caps the PKCE value (43-128 bytes) and the rest of the codebase caps other caller-chosen identifiers (middleware.go maxRequestIDBytes=128, auth maxBoundHandleBytes=128), but state and nonce are unbounded. They are stored verbatim in oidc_auth_requests (state, nonce columns; CreateA...
+
+[info|confirmed] S02-11 DenyAuthorization uses the static issuer only, so a dynamic-issuer deployment emits a denial without the RFC 9207 iss parameter
+  LOC: internal/oidchttp/oidchttp.go:1794, internal/oidchttp/oidchttp.go:1444
+  WHY: DenyAuthorization has no *http.Request (it is the business-plane Interaction call), so it falls back to h.issuer, which is empty when Config.Issuer is empty. withIssuer(location, "") returns the location untouched, so the denial redirect carries no iss while the success and error paths on the HTTP h...
+
+[high|confirmed] S03-1 Unbounded caller-controlled return_to persisted in the server-side session
+  LOC: internal/auth/auth.go:612, internal/auth/auth.go:616, internal/auth/auth.go:289, internal/safeurl/safeurl.go:34
+  WHY: safeurl.RelativePath only enforces form (leading single slash, no backslash, url.Parse-able); it has no length bound, so return_to is stored verbatim in the session. Scs re-encodes the whole session value map and commits it at response end, so each anonymous GET /auth/{provider}/start can persist up...
+
+[low|downgraded] S03-2 SignIn leaves an authenticated session outside the SessionIndex when RenewToken fails
+  LOC: internal/auth/auth.go:161, internal/auth/auth.go:166, internal/auth/auth.go:177
+  WHY: The documented contract of SignIn is that a session which cannot be recorded is destroyed ('a session outside the index would be one an operator cannot reach'). That destroy is only performed on the index.Remember failure path (auth.go:177-180). If RenewToken fails, the function returns with keyUser...
+
+[low|downgraded] S03-3 EndSession forgets the session index before destroying the session, so a failed sign-out leaves an unrevocable live session
+  LOC: internal/auth/auth.go:210, internal/auth/auth.go:212, internal/auth/auth.go:216
+  WHY: The session_subjects row is deleted first and Destroy is called second. If Destroy fails (store error), SignOut returns an error and the handler answers 500, but the session row is still live and scs re-commits it at response end because IdleTimeout>0 forces status=Modified. The only record that map...
+
+[low|downgraded] S03-4 Concurrent first login of the same identity is reported as signup_failed instead of retrying the lookup
+  LOC: internal/auth/auth.go:713, internal/auth/auth.go:714, internal/auth/auth.go:716
+  WHY: Both stores enforce I-3 with a uniqueness check (MemoryStore.CreateWithIdentity returns ErrIdentityTaken when the key exists; postgres relies on the UNIQUE(provider,subject) constraint and maps a violation to ErrIdentityTaken). Two concurrent callbacks carrying the same identity (double-clicked call...
+
+[low|confirmed] S03-5 Session referencing a missing account answers 500 instead of tearing the session down
+  LOC: internal/httpapi/session_routes.go:27, internal/httpapi/session_routes.go:29, internal/httpapi/identity_routes.go:26, internal/httpapi/export_routes.go:64
+  WHY: account.Store.GetUser/Identities return account.ErrNotFound when the account row is gone, but every session-scoped handler maps any error to 500 internal_error. A session can outlive its account: memory mode cannot revoke an account's sessions (cmd/re0auth/main.go:696-701 warns about exactly this), ...
+
+[low|confirmed] S03-6 Admin authorization trusts the session claim without re-checking that the account still exists
+  LOC: internal/httpapi/admin_routes.go:62, internal/httpapi/admin_routes.go:67, internal/httpapi/server.go:305
+  WHY: adminAllowed is a static map built once in New() from Config.Admins, and requireAdmin/requireAdminWrite never consult the account store. A live session whose account has been erased therefore keeps full operator authority: it passes the allowlist and, for mutations, the CSRF and reauth (auth_time is...
+
+[low|confirmed] S03-7 MemoryStore.Identities scans every identity in the process and holds the lock for the whole scan
+  LOC: internal/account/account.go:231, internal/account/account.go:281, internal/account/account.go:283
+  WHY: Identities() takes an RLock and then walks the entire identities map to filter one user's rows, allocating and sorting the result. Memory mode is a production configuration (cmd/re0auth/main.go:895), and Identities is called on every SPA bootstrap (/v1/sessions/current), on /v1/identities, and on /v...
+
+[low|confirmed] S03-8 Postgres Identities uses an EXISTS round trip before the real SELECT
+  LOC: internal/store/postgres/account.go:236, internal/store/postgres/account.go:244
+  WHY: Every Identities call performs two pooled round trips (existence probe + list) plus two allocations, on the SPA bootstrap path (/v1/sessions/current) and /v1/identities, for a distinction (ErrNotFound vs empty list) that the single list query plus a zero-row check cannot make anyway. Under pool pres...
+
+[low|confirmed] S03-9 clearFlow does not remove the OIDC nonce from the session
+  LOC: internal/auth/auth.go:44, internal/auth/auth.go:737, internal/auth/auth.go:739
+  WHY: flowKeys is the list clearFlow removes, and keyFlowNonce is not in it, although handleStart writes it (auth.go:618) and handleCallback reads it (auth.go:654) as part of the same one-shot flow state. After every completed or attempted callback the nonce therefore remains in the server-side session un...
+
+[low|confirmed] S03-10 Kill Switch session revocation is unbounded and not atomic
+  LOC: internal/store/postgres/sessions.go:198, internal/store/postgres/sessions.go:202, internal/store/postgres/sessions.go:216
+  WHY: The Kill Switch's session half is two unbounded DELETE statements outside any transaction, unlike SweepExpired which is deliberately batched (sessionSweepBatchSize) precisely so a large backlog cannot exceed the pool's statement_timeout. On a large sessions table, `DELETE FROM sessions` (target 'all...
+
+[low|confirmed] S03-11 core.App.Remove races with an in-flight load, allowing a removed fiber to be marked active without its scope
+  LOC: internal/core/app.go:99, internal/core/app.go:105, internal/core/app.go:334
+  WHY: step() releases a.mu while Apply runs (f.state == StateLoading). Remove() only transitions to StateUnloading when it observes StateActive, so it splices the fiber out and forceUnload disposes the context underneath the running Apply. When Apply returns nil, step re-acquires a.mu and unconditionally ...
+
+[medium|downgraded] S04-1 Enabled device authorization is never consumed: one device_code mints unlimited token pairs and silently undoes a grant revocation
+  LOC: oauth/device.go:302-309, oauth/device.go:124-137, oauth/grants.go:128-137
+  WHY: PollDeviceAuthorization treats a DeviceApproved record as reusable forever: the read at line 274 is followed by an unconditional s.issue(...) and nothing marks the record spent or deletes it. DeviceStore (lines 124-137) exposes no consume/claim operation, so the store contract makes single use unrep...
+
+[low|downgraded] S04-2 BeginDeviceAuthorization does not authenticate confidential clients, allowing anonymous device requests that impersonate a trusted client on the consent screen
+  LOC: oauth/device.go:224-228, oauth/device.go:415-419, oauth/device.go:437-448
+  WHY: BeginDeviceAuthorization (line 225) validates the client through describeScopes, which calls s.client(ctx, clientID, "", false) with auth=false (line 416). service.client (oauth/as.go:445) only checks the secret when auth is true and the client is confidential, so an anonymous caller can start a dev...
+
+[low|downgraded] S04-3 MemoryDeviceStore never expires anything: device authorizations accumulate for the process lifetime
+  LOC: oauth/device.go:140-163, oauth/device.go:224-247
+  WHY: MemoryDeviceStore has no expiry, eviction or sweep. SaveDevice is the only writer of byDev/byUser and no method ever deletes; GetDevice/GetDeviceByUserCode/RecordPoll simply return the stale record (the TTL is enforced only in the service, oauth/device.go:286 and 320). oauth.NewService uses this sto...
+
+[low|downgraded] S04-4 Grants page scans every token in the process under the store's single mutex (no subject index in the in-memory store)
+  LOC: oauth/grants.go:158-180, internal/httpapi/grants_routes.go:31-43
+  WHY: MemoryStore.ListBySubject is a full scan of both the access and refresh maps for every grants call, holding the store-wide mutex for the entire walk; DeleteBySubjectClient (lines 191-221) and RevokeTokens (lines 230-261) do the same for revocation. GET /v1/grants calls this on every page load (grant...
+
+[low|confirmed] S04-5 freeUserCode treats every store error as a collision and checks uniqueness non-atomically
+  LOC: oauth/device.go:432-443, oauth/device.go:155-163
+  WHY: The uniqueness test only accepts ErrDeviceNotFound as 'free'. Any other error (a transient database failure in a persistent DeviceStore, a context cancellation) is treated as 'taken', so the loop burns its eight attempts and finally returns a misleading 'could not allocate a unique user code' error,...
+
+[low|confirmed] S04-6 slow_down is returned before the terminal device status, and the advertised interval is truncated
+  LOC: oauth/device.go:289-307, oauth/device.go:252-255
+  WHY: The throttle check runs before the rec.Status switch, so a client polling a code whose user has already denied (or approved) receives slow_down rather than the terminal access_denied / tokens until its next poll falls outside the interval. RFC 8628 section 3.5 treats slow_down as a pacing response t...
+
+[low|confirmed] S04-7 Consent decision conflates store failures with an expired authorization request
+  LOC: internal/httpapi/authorization_routes.go:97-101, internal/httpapi/authorization_routes.go:151-155, internal/httpapi/authorization_routes.go:159-166, internal/httpapi/authorization_routes.go:173-183
+  WHY: handleGetAuthorizationRequest, the deny branch, and writeDecisionError (default case) map every engine error that is not a recognised oauth.Error to 404 not_found 'authorization request expired'. A database outage, a context deadline or a serialization failure in the authorization store is therefore...
+
+[low|confirmed] S04-8 Registry.Register mutates the scope map without synchronization while Get/Resolve read it concurrently
+  LOC: oauth/scope.go:183-197, oauth/scope.go:199-213, oauth/scope.go:217-235
+  WHY: Registry has no mutex. Register writes r.byScope while Get, Descriptors and Resolve read the same map, so any Register call that races a serving request is a data race and can crash the process ('concurrent map read and map write') or produce a torn read. The doc comment says Register 'is meant to b...
+
+[low|confirmed] S04-9 Device authorization accepts an empty scope set and issues a scope-less token pair
+  LOC: oauth/device.go:224-228, oauth/device.go:373-386, oauth/device.go:308
+  WHY: describeScopes resolves whatever scope slice it is given, and Registry.Resolve(nil, ...) returns an empty descriptor list with no error, so BeginDeviceAuthorization succeeds with zero scopes. DecideDeviceAuthorization then accepts `scopes == nil` as 'grant the requested set', which is the empty set,...
+
+[medium|confirmed] S05-1 Refresh rejection classifies every 400/401/403 as a dead grant and crypto-shreds the binding
+  LOC: internal/federation/refresh.go:170, internal/federation/refresh.go:179, internal/federation/refresh.go:142
+  WHY: A 400/401/403 is treated as a definitively dead grant regardless of the OAuth error code or the response body. refreshRejected then does vault.Revoke (crypto-shreds the upstream token) plus bindings.Delete (refresh.go:151-165). RFC 6749 defines retryable/configuration errors that are returned with t...
+
+[medium|downgraded] S05-2 CompleteBind bypasses the per-binding keyed lock, so a completing bind can resurrect a row and secret after Unbind or account erasure
+  LOC: internal/federation/bind.go:157, internal/federation/bind.go:192, internal/federation/bind.go:198, internal/federation/unbind.go:50, internal/federation/killswitch.go:200
+  WHY: Every removal/mutation path (refreshBinding refresh.go:40, Unbind unbind.go:50, CascadeRevoke revocation.go:132, shredBinding killswitch.go:201) takes s.locks.lock(bindingKey(user,game,source)) so that a refresh cannot write a secret back after a removal. BeginBind/CompleteBind take no lock. Between...
+
+[low|downgraded] S05-3 MemoryBindingStore.List pre-allocates for the whole deployment and ListAllPage re-sorts the whole map on every page
+  LOC: internal/federation/binding.go:219, internal/federation/binding.go:262, internal/federation/binding.go:255
+  WHY: List is the account-page path for one user, but it sizes the result slice by len(s.m), the number of bindings of the entire deployment. For a single-node/no-DB deployment with N bindings, one account list allocates capacity for N Binding structs (~96 bytes each) even though the user holds a handful....
+
+[low|downgraded] S05-4 MissingBindings is O((sources x resources)^2) with a copy+sort per candidate lookup
+  LOC: internal/federation/missing.go:65, internal/federation/missing.go:70, internal/federation/missing.go:74
+  WHY: registry.Sources(game) copies and sorts the game's source slice on every (source, matching-resource) pair, and cand.Resource(name) is a linear scan of the candidate's resources. A game with S sources of R resources each costs roughly S*R inner iterations, each doing an O(S log S) copy+sort plus O(R)...
+
+[low|confirmed] S05-5 NewRegistry validates RawBase and token_class but not Status, so an unrecognized status is fail-open
+  LOC: internal/federation/federation.go:162, internal/federation/federation.go:173, internal/federation/federation.go:637
+  WHY: The same validation block refuses an unrecognized token_class precisely because a typo would be read as the wrong capability (federation.go:173-180), but Status accepts any string. Only the exact value StatusRetired is filtered: candidates() checks `if src.Status == StatusRetired { continue }` (fede...
+
+[low|confirmed] S05-6 Source.Issuer and endpoint overrides are not validated as absolute http(s), unlike RawBase
+  LOC: internal/federation/federation.go:144, internal/federation/federation.go:151, internal/federation/bind.go:150, internal/federation/bind.go:235
+  WHY: validateRawBase (federation.go:207-220) refuses a RawBase that is not an absolute http(s) URL without query or fragment, with the explicit rationale that such a value silently changes where a token-bearing request goes. Issuer, AuthorizationEndpoint, TokenEndpoint, RevocationEndpoint and CascadeRevo...
+
+[low|confirmed] S05-7 BeginBind and CompleteBind accept a retired source that the rest of the plane refuses
+  LOC: internal/federation/bind.go:127, internal/federation/bind.go:171, internal/federation/service.go:637
+  WHY: Neither BeginBind nor CompleteBind checks src.Status. candidates() excludes retired sources (service.go:637-639) and Raw returns ErrSourceRetired (service.go:684), and the account view reports Bindable=false for a retired source (internal/httpapi/binding_routes.go:97) — so an operator who retires a ...
+
+[low|confirmed] S05-8 revokeUpstream logs a vault error that can embed the raw subject identity
+  LOC: internal/federation/unbind.go:124, vault/service.go:309
+  WHY: The error being logged comes from s.useBindingSecret -> vault.Use. vault.Use formats the full identity into its key-not-configured error: fmt.Errorf("vault: %s was wrapped by key %q, which is not configured; "+"declare it as a retired key if this deployment rotated away from it", id, rec.KEKID) wher...
+
+[info|confirmed] S05-9 MemoryBindFlowStore.SweepExpired uses time.Now instead of the service clock
+  LOC: internal/federation/bind.go:112, internal/federation/bind.go:144, internal/federation/bind.go:165
+  WHY: BeginBind stamps ExpiresAt from the injected s.now() clock (bind.go:144) and CompleteBind enforces it with s.now() (bind.go:165), but the sweeper ignores Config.Now and uses the wall clock. Whenever Now is not time.Now (tests, and any embedding that supplies a logical clock), the sweeper and the enf...
+
+[info|downgraded] S05-10 CompleteBind consumes the flow before the owner check (cross-account DoS), mitigated by the HTTP handler
+  LOC: internal/federation/bind.go:158, internal/federation/bind.go:163, internal/httpapi/federation_routes.go:410
+  WHY: The single-use flow is deleted from the store before flow.User is compared with the caller, so a caller who knows a state string destroys someone else's pending bind (and its PKCE verifier) even though the call then fails. The only in-tree caller, handleBindCallback, checks sessions.Bound and sessio...
+
+[high|confirmed] S06-1 OIDC discovery and JWKS fetches read an unbounded upstream body (go-oidc io.ReadAll) while the adapter's own 1 MiB cap does not apply
+  LOC: idp/idp.go:298, idp/idp.go:711, idp/idp.go:836
+  WHY: idp caps its own userinfo/QQ reads at 1 MiB (idp/idp.go:836) but the OIDC discovery document and the JWKS key set are fetched by go-oidc, which does `body, err := io.ReadAll(resp.Body)` (go-oidc v3.21.0 oidc/oidc.go:312 for discovery and oidc/jwks.go:315 for keys) with no size limit. The only bound ...
+
+[medium|confirmed] S06-2 DenyPrivateAddresses is applied to the proxy address, not the target, whenever an HTTP(S) proxy is configured in the environment
+  LOC: httpclient/outbound.go:92, httpclient/outbound.go:95, httpclient/outbound.go:42
+  WHY: http.ProxyFromEnvironment makes net/http dial the proxy; DialContext (and therefore the Control hook, and therefore IsPublicAddress) is handed the proxy's address. The target host is never resolved or checked by this process. The field's own doc-comment claims the check 'is checked at dial time, on ...
+
+[medium|confirmed] S06-3 oidcProvider holds providerMu across a network discovery round trip, and a failed discovery is not cached, so a dead issuer serializes every concurrent login
+  LOC: idp/idp.go:705, idp/idp.go:711, idp/idp.go:713
+  WHY: The mutex is held for the whole oidc.NewProvider call, which is a network fetch with a 10s client timeout. A failed discovery does not advance discoveredAt and is not negatively cached ('A failed discovery is not cached, so it can be retried on the next request'), so after the TTL expires each waiti...
+
+[medium|confirmed] S06-4 SocialLogin.states is an unbounded map swept in O(n) on every unauthenticated start request
+  LOC: referencesource/social.go:102, referencesource/social.go:104, referencesource/social.go:193
+  WHY: There is no cap on the number of in-flight authorizations and no periodic sweeper; expiry is enforced only by a full map scan performed under the mutex on each new start. An unauthenticated flood of GET /login/{provider}/start grows the map (bounded only by the 10-minute TTL times request rate) and ...
+
+[medium|confirmed] S06-5 TapTapLogin.attempts is an unbounded map with an O(n) sweep per challenge, reachable unauthenticated
+  LOC: referencesource/taptap.go:124, referencesource/taptap.go:126, referencesource/taptap.go:258
+  WHY: Same shape as the social login: one entry per POST /login/taptap/challenge, no cap, and the only expiry is a full O(n) scan run under the mutex on each begin. Each entry holds a DeviceAuth including the verification URL/codes, so the memory per entry is non-trivial. The map is never swept by a timer...
+
+[low|confirmed] S06-6 Conformance runner leaks the response body of a non-200 metadata document (never closed)
+  LOC: upstreamkit/conformance/conformance.go:211, upstreamkit/conformance/conformance.go:212, upstreamkit/conformance/conformance.go:216
+  WHY: When the request succeeds at the transport level but the server answers a non-200 status, the branch returns before `defer closeBody(resp)` is registered, so resp.Body is never closed. `closeBody` exists precisely to stop the suite leaking a connection per check; this path bypasses it. It is the onl...
+
+[low|confirmed] S06-7 A partial AuthURL/TokenURL override on a discovered OIDC provider is silently discarded
+  LOC: idp/idp.go:505, idp/idp.go:507, idp/idp.go:520
+  WHY: The static short-circuit requires BOTH endpoints; if only one is configured the code goes to discovery and then overwrites cfg.Endpoint wholesale with the discovered pair. An operator who configures, for example, only TokenURL (a proxy token endpoint) or only AuthURL has that value ignored at runtim...
+
+[low|confirmed] S06-8 Injected RegistryConfig.HTTPClient may have no timeout, and go-oidc's JWKS fetch is context.WithoutCancel'd, so a hung IdP can pin a login goroutine
+  LOC: idp/idp.go:287, idp/idp.go:751, idp/idp.go:648
+  WHY: The service guarantees a timeout only for its own default client. A caller-injected HTTPClient is used as-is, and go-oidc builds its RemoteKeySet with `ctx: context.WithoutCancel(ctx)` (jwks.go:74), so the JWKS request created inside Verify is not cancellable when the HTTP request is cancelled and c...
+
+[low|confirmed] S06-9 federation.NewService's Doer-only fallback builds an outbound client with the SSRF guard off
+  LOC: internal/federation/service.go:376, httpclient/outbound.go:304
+  WHY: NewOutboundClient honours Transport.DenyPrivateAddresses, whose zero value is false (documented as off for self-hosted sources). The fallback therefore installs a client with a timeout and redirect policy but no address guard, and this is the client used to POST the authorization code and client sec...
+
+[low|confirmed] S06-10 SocialLogin stores and echoes return_to without safeurl.RelativePath validation
+  LOC: referencesource/social.go:108, referencesource/social.go:189
+  WHY: Everywhere else in the repo a request-supplied return_to is sanitized through internal/safeurl.RelativePath before it can reach a redirect (internal/auth/auth.go:612, internal/httpapi/federation_routes.go:378). The reference source stores the raw query value and returns it in the callback JSON with ...
+
+[info|confirmed] S06-11 safeurl.RelativePath resists scheme-relative, backslash and control-byte escapes; percent-encoded and dot-segment forms cannot change origin
+  LOC: internal/safeurl/safeurl.go:34
+  WHY: Checked the three bypass shapes against the code: scheme-relative '//host', any backslash (including a path-adjacent '\\'), and control bytes (url.Parse rejects TAB/LF/CR, which browsers strip before parsing) are all replaced with '/'. Percent-encoded variants such as /%2F%2Fhost, /%5Chost and /%2E%...
+
+[medium|confirmed] S07-1 Credential-bearing outbound requests rely entirely on the injected Doer for redirect policy; custom auth headers are copied to cross-host redirect targets by net/http
+  LOC: tapsign/client.go:114, tapsign/client.go:115, tapsign/client.go:125, taptapoauth/client.go:195
+  WHY: The long-lived TapTap session token is sent as X-LC-Session and the app key as X-LC-Key, and taptapoauth sends the MAC Authorization header. When the Doer is an *http.Client whose CheckRedirect is nil (the stdlib default), the client follows redirects. net/http's shouldCopyHeaderOnRedirect only stri...
+
+[medium|confirmed] S07-2 vault.Enroll persists the credential before writing its audit event, so an audit failure returns an error for a write that already happened and leaves an un-audited (and in federation, orphaned) secret
+  LOC: vault/service.go:245, vault/service.go:259
+  WHY: Unlike Use (which fails closed before handing over the plaintext, service.go:334-339), Enroll writes the encrypted credential first and audits second. If the audit sink fails the caller is told the enrollment failed while the credential is stored and unaudited; no rollback is attempted. The in-repo ...
+
+[low|confirmed] S07-3 MemoryRepo.ListPage reloads clones and re-sorts the entire store on every page, making a rotation O(N^2 log N) with N clones per page
+  LOC: vault/repo.go:229, vault/repo.go:233
+  WHY: List (repo.go:202-217) materialises and deep-clones (cloneRecord: WrappedDEK, Nonce, Ciphertext, Meta) every record and sorts them; ListPage calls it once per page. Rotate uses pages of rotatePageSize=200 (rotate.go:45, :96), so for N records the rotation does ceil(N/200) full passes: O(N^2/200) clo...
+
+[info|downgraded] S07-4 Use builds the AEAD AAD from the requested identity while Rotate builds it from the stored record identity
+  LOC: vault/service.go:300, vault/rotate.go:104
+  WHY: Enroll seals under the identity it was given (service.go:224), so the ciphertext is bound to that (subject, provider). Rotation reconstructs the AAD from rec.Identity, Use from the caller's id. For the in-repo repos Get is keyed by id, so they coincide today; but any third-party Repo (the Repo inter...
+
+[low|confirmed] S07-5 taptapoauth accepts upstream-controlled interval and expires_in without an upper bound or overflow guard
+  LOC: taptapoauth/client.go:96, taptapoauth/client.go:100
+  WHY: data.Interval and data.ExpiresIn are int64 JSON fields from the untrusted upstream response. Multiplying by time.Second (1e9) can overflow int64: some values wrap negative (silently replaced by the defaults, which is harmless for interval but not for the caller's intent), while values just under the...
+
+[low|confirmed] S07-6 tapsign.Verify performs a credential-bearing upstream call with no audit record
+  LOC: tapsign/client.go:44, tapsign/client.go:40
+  WHY: Verify sends the decrypted session token to the upstream host (a cross-boundary operation with a credential) but, unlike Rotate/Revoke/Redeem, never calls c.finish/audit.Record. The package's own I3 rationale (audit the use of a credential before/at the boundary) is not applied to the one method tha...
+
+[info|downgraded] S07-7 taptapoauth bounds upstream error text for logs but only strips CR/LF, leaving other control characters
+  LOC: taptapoauth/client.go:337, taptapoauth/client.go:338
+  WHY: The comments (client.go:330-335) state the intent is to stop a hostile upstream from forging a log entry. Replacing only \r and \n leaves ANSI/terminal escape sequences (ESC, e.g. \x1b[2J), NUL and other C0 control characters intact in the string that businessError/tokenBusinessError embed into the ...
+
+[info|downgraded] S07-8 tapsign.drain and the response handling dereference resp and resp.Body without a nil check
+  LOC: tapsign/client.go:224, tapsign/client.go:48
+  WHY: httpclient.drain (httpclient/retry.go:195-201) guards resp == nil and resp.Body == nil; this copy does not. Every tapsign path does `resp, err := c.do(...)`, returns on err != nil, and then calls drain(resp) or immediately reads resp.StatusCode (client.go:48, :88, :178). A Doer that returns (nil, ni...
+
+[info|downgraded] S07-9 Re-enrolling a credential overwrites CreatedAt, discarding the original creation time
+  LOC: vault/service.go:244, vault/service.go:253
+  WHY: Enroll is documented as 'stores, or replaces' (service.go:19-20) and Repo.Put replaces wholesale; the Postgres adapter maps created_at = EXCLUDED.created_at (internal/store/postgres/vault.go:112-120). A re-bind/refresh that re-enrolls the same identity resets CreatedAt to the re-enrollment time, so ...
+
+[low|confirmed] S07-10 tapsign.Rotate returns the replacement token together with an audit error, inviting callers to discard a token that is now the only live credential
+  LOC: tapsign/client.go:60, tapsign/client.go:197
+  WHY: rotate() has already invalidated the old session token upstream and returned the replacement. If the audit record then fails, finish() returns a non-nil error, but Rotate still returns `next` alongside it. The natural caller pattern `next, err := Rotate(...); if err != nil { return err }` drops `nex...
+
+[info|confirmed] S07-11 bindingAAD truncates identity lengths to uint32 before length-prefixing
+  LOC: vault/envelope.go:148, vault/envelope.go:150
+  WHY: If either field ever exceeded 4 GiB the truncated prefix would make distinct identities share an AAD, defeating the anti-swap binding. In practice subject is a usr_/openid identifier and provider is game+"."+source, both far below the bound; the concern is explicitly documented and the AAD layout is...
+
+[medium|downgraded] S08-1 Vault KEK resolution hardcodes RE0AUTH_KEK ahead of vault.kek_env, silently ignoring a renamed key
+  LOC: cmd/re0auth/config.go:729-743, cmd/re0auth/config.go:471, scripts/backup-keys.sh:74-77
+  WHY: The file convention the package documents is that a config NEVER holds a secret and instead names the environment variable holding it; every other setting resolves as FirstNonEmpty(env, file) or through a dedicated RE0AUTH_ override, and -print-secret-env / scripts/backup-keys.sh read the KEK's vari...
+
+[high|confirmed] S08-2 storage.dsn_env is never resolved when driver is inferred in the config loading logic
+  LOC: cmd/re0auth/config.go:680-710, cmd/re0auth/config.go:472, cmd/re0auth/config.go:722-724, cmd/re0auth/config.go:749-759, cmd/re0auth/main.go:892-917
+  WHY: cfg.DatabaseURL is pre-loaded only from the literal DATABASE_URL (config.go:472). When Driver is empty and dsn_env names some other variable, the switch sets driver = "postgres" but never calls config.Secret on that name, so DatabaseURL stays empty. openStorage then takes the memory branch (main.go:...
+
+[low|downgraded] S08-3 DeleteAccount writes an outcome=ok record claiming the pseudonym key was destroyed before Destroy runs, and the correcting record is best-effort
+  LOC: internal/lifecycle/lifecycle.go:262-271, internal/lifecycle/lifecycle.go:277-291, internal/lifecycle/lifecycle.go:299-302
+  WHY: The success event is written to an append-only sink with pseudonym_destroyed=true BEFORE the destroy step runs; the only thing that can contradict it is a second event written by fail(), whose error is deliberately discarded. The order itself is justified in the comments (writing after Destroy would...
+
+[medium|confirmed] S08-4 DeleteAccount reports success and writes outcome=ok when the binding sweep has Failed>0 local removals
+  LOC: internal/lifecycle/lifecycle.go:200-206, internal/lifecycle/lifecycle.go:313-315, internal/federation/killswitch.go:140-146, internal/federation/killswitch.go:180-183
+  WHY: federation.RevokeUserBindings returns an error only when it cannot enumerate bindings; a binding whose LOCAL removal failed (vault.Revoke or bindings.Delete returned an error - Unbind only returns err for those two paths, upstream failures are folded into result.Upstream) is counted as summary.Faile...
+
+[low|downgraded] S08-5 Universal trusted-proxy list check only matches a single /0 prefix, so two /1 entries bypass the acknowledgement
+  LOC: cmd/re0auth/config.go:1016-1023, cmd/re0auth/config.go:589-601
+  WHY: The guard exists to force an explicit acknowledgement (server.trusted_proxies_any / RE0AUTH_TRUSTED_PROXIES_ANY) whenever the trust list is universal, because a universal list makes every peer trusted and hands the rate-limit bucket key back to the caller. It only recognises a single prefix of lengt...
+
+[low|confirmed] S08-6 -print-secret-env echoes whatever is in an *_env name slot verbatim, disclosing a value pasted into the wrong field
+  LOC: cmd/re0auth/config.go:424-431, cmd/re0auth/config.go:441-445, cmd/re0auth/main.go:276-290
+  WHY: The flag prints role=value with no shape check, and the *_env slot is exactly where the documented mistake (pasting the secret instead of the variable name) lands; config.Secret was hardened not to echo the configured string, but this exit prints it. The output is machine-read by scripts/backup-keys...
+
+[low|confirmed] S08-7 Graceful-shutdown drain budget (30s) is shorter than dataPlaneTimeout (45s), so shutdown cuts the request the design says must get a readable refusal
+  LOC: cmd/re0auth/main.go:128, cmd/re0auth/main.go:116-150, cmd/re0auth/main.go:854-866
+  WHY: The comment pins dataPlaneTimeout against writeTimeout so that a slow data-plane request is refused with a 504 the caller can read, never with a dropped connection. The signal path introduces a third, shorter bound that the invariant does not account for: on SIGTERM the drain gets shutdownTimeout (3...
+
+[low|confirmed] S08-8 An explicitly configured max_upstream_buffer_bytes = 0 is silently replaced by the 64 MiB default
+  LOC: cmd/re0auth/config.go:553-571, cmd/re0auth/main.go:523, internal/federation/service.go:382-383
+  WHY: The field is a pointer specifically so "absent" (take the default) is distinguishable from a chosen value, and -1 is documented as "not chosen". A configured 0 (file or RE0AUTH_MAX_UPSTREAM_BUFFER_BYTES=0) passes validation as a chosen value, reaches federation.NewService as 0, and is coerced back t...
+
+[low|confirmed] S08-9 A custom OIDC provider's issuer is not required to be https, so the token exchange can run in cleartext
+  LOC: cmd/re0auth/config.go:855-890, idp/idp.go:530-548
+  WHY: For a custom provider, loadIdP validates only that issuer is non-empty; the idp layer parses it as a URL and pins discovered endpoints to the same scheme+host, but never requires https. A provider registered as issuer = "http://idp.example" is accepted, and the authorization redirect, discovery, JWK...
+
+[medium|confirmed] S09-1 DSN (with password) can reach logs on the migration-down path: withMigrationLock never redacts the driver's parse error
+  LOC: internal/store/postgres/postgres.go:378, internal/store/postgres/postgres.go:399, internal/store/postgres/postgres.go:402, internal/store/postgres/postgres.go:240, internal/store/postgres/postgres.go:452
+  WHY: poolConfig redacts the driver's parse error, but withMigrationLock — used by Migrate and, crucially, by MigrateDown (which calls it directly, without ever going through poolConfig) — wraps the raw pgx.ParseConfig error. sql.Open only records the DSN; the parse happens in connector.Connect -> pgx.Par...
+
+[medium|confirmed] S09-2 Tokens.RevokeTokens is not transactional although revokeMatching documents that it is, so a bulk Kill Switch/erasure can half-apply
+  LOC: internal/store/postgres/oauth.go:466, internal/store/postgres/oauth.go:471, internal/store/postgres/oauth.go:517, internal/store/postgres/oidc.go:1503
+  WHY: revokeMatching is called on s.pool (autocommit, one transaction per statement) and two further DELETEs run on the pool. The doc comment on revokeMatching explicitly claims RevokeTokens wraps it in one transaction; the OIDCStore.RevokeTokens does, so this is a drift from the stated invariant, not a d...
+
+[low|confirmed] S09-3 UnlinkIdentity masks any database error as ErrNotFound because ownership is checked before err
+  LOC: internal/store/postgres/account.go:199
+  WHY: When Scan fails for any reason other than no-rows (connection loss, statement_timeout, context cancellation), owner keeps its zero value ""; the second disjunct `account.UserID("") != user` is therefore true whenever user is non-empty, so the function returns account.ErrNotFound before the `if err !...
+
+[info|downgraded] S09-4 ConsumeRefresh claims expired values (no expires_at predicate) although the Store contract says "live", unlike the OP store's rotation claim
+  LOC: internal/store/postgres/oauth.go:242, internal/store/postgres/oidc.go:514, oauth/as.go:289, oauth/tokens.go:168
+  WHY: The legacy Tokens.ConsumeRefresh deletes the row regardless of expiry, arms a tombstone whose expires_at is already in the past, and only then does the service check rt.ExpiresAt. Two stores implementing the same interface disagree on what a claim is, and an expired (but still known) refresh token i...
+
+[low|confirmed] S09-5 Rolling back migrations 0024/0025 silently drops refresh-family tombstones and replay detection; the MigrateDown guard only covers 13/14
+  LOC: internal/store/postgres/postgres.go:469, internal/store/postgres/postgres.go:496, internal/store/postgres/migrations/0024_refresh_token_family.sql:50, internal/store/postgres/migrations/0025_oauth_refresh_family.sql:59
+  WHY: refuseAuditChainRollback deliberately protects the two migrations whose Down destroys integrity state, but migrations 0024/0025 drop the only pointer from a spent refresh token to its family (the tombstones) and the family_id columns. Re-applying Up cannot reconstruct the tombstones: migration 0024/...
+
+[low|confirmed] S09-6 Verify reads audit_chain.head_hash as a witness but never compares it to the walked chain, so tail truncation is not detected even though the anchor is in hand
+  LOC: internal/store/postgres/auditchain.go:259, internal/store/postgres/auditchain.go:346
+  WHY: head is read and used only for the "all chain columns cleared" witness. After the walk, the final row hash (prev) is discarded and never compared with head, so deleting the chained tail rows from audit_events leaves every surviving row self-consistent: Verify returns OK=true while audit_chain.head_h...
+
+[low|confirmed] S09-7 Database outages are collapsed into protocol 'not found' on the authorization-code and device-poll paths, unlike every refresh/revocation path
+  LOC: internal/store/postgres/oidc.go:327, internal/store/postgres/oidc.go:1210, internal/store/postgres/oidc.go:660
+  WHY: TokenRequestByRefreshToken and RevokeToken (oidc.go:787-789) deliberately preserve the cause of a database failure so an outage is not reported as "unknown", but AuthRequestByCode and deviceState replace any error with a sentinel. A cancelled context, connection failure or statement timeout during c...
+
+[low|confirmed] S09-8 Several multi-statement deletes run without a transaction, leaving orphaned session index rows and post-revocation replay tombstones
+  LOC: internal/store/postgres/sessions.go:197, internal/store/postgres/sessions.go:211, internal/store/postgres/oauth.go:290, internal/store/postgres/oauth.go:495
+  WHY: Each of these methods promises that two pieces of state go together, but every statement is autocommit. On failure the second half stays: RevokeAllSessions can leave session_subjects rows whose sessions are gone (a later RevokeSubjectSessions finds nothing to revoke, and the sweep only clears them a...
+
+[low|confirmed] S09-9 Audit pseudonym cache is dropped wholesale at 4096 entries, so bursts over distinct subjects put 1-3 extra queries on the vault fail-closed path
+  LOC: internal/store/postgres/auditpseudo.go:144, internal/store/postgres/auditpseudo.go:115, internal/store/postgres/auditpseudo.go:69
+  WHY: When the working set of distinct audited subjects exceeds pseudoCacheMax, every new subject evicts the entire map, so subsequent writes for subjects already seen miss again. AuditLogger.Record is the vault's fail-closed precondition (a credential is not handed over until the row is committed), and e...
+
+[info|confirmed] S09-10 OP token issued_at is written by the database's now(), not the store clock the rest of OIDCStore uses
+  LOC: internal/store/postgres/oidc.go:429, internal/store/postgres/oidc.go:573, internal/store/postgres/migrations/0009_oidc_token_issued_at.sql:5, internal/store/postgres/oidc.go:41
+  WHY: Every token INSERT omits issued_at, so the column takes the migration's DEFAULT now() — the database's clock — while expires_at comes from s.now(). Grants reads both back and merges them into one record (oidc.go:1408-1413), so under clock skew or WithClock the displayed issue time mixes clocks with ...
+
+[high|confirmed] S10-1 In-flight per-client cap is keyed per (plane, client), so one address can occupy the entire process-wide concurrency cap
+  LOC: internal/httpapi/middleware.go:434, internal/httpapi/middleware.go:459, internal/httpapi/middleware.go:466, internal/httpapi/middleware.go:491
+  WHY: The comment above withInFlightLimit states the guarantee: "one (plane, client) may hold at most half of it, and the other half is headroom every other client draws from". That guarantee holds only per key, and the key includes the plane (planeOf(...).String()). The shared semaphore is process-wide b...
+
+[medium|confirmed] S10-2 A panic in the readiness probe wedges /readyz at "checking" (503) forever
+  LOC: internal/httpapi/health.go:183, internal/httpapi/health.go:194
+  WHY: readinessCache.check sets c.running = true before invoking the probe and clears it only on the normal return path, after probe(probeCtx). If the probe panics, control leaves check with c.running still true, c.settled never closed, and c.state still readinessUnknown. Every later caller takes the `fre...
+
+[low|downgraded] S10-3 Compression writer is never closed or pooled when a handler panics after compression starts
+  LOC: internal/compress/compress.go:160, internal/compress/compress.go:162
+  WHY: finish() is the only path that calls c.release(w.coding, w.enc), which calls WriteCloser.Close() and returns the writer to the per-coding sync.Pool (compress.go:292-297, 416-424). If next.ServeHTTP panics, finish() is skipped; the writer acquired by startCompress (compress.go:389) is abandoned. This...
+
+[informational|downgraded] S10-4 Business-plane responses carrying the session CSRF token are compressed (BREACH-style compression oracle)
+  LOC: internal/httpapi/server.go:353, internal/compress/compress.go:336, internal/httpapi/session_routes.go:42, internal/httpapi/device_routes.go:75, internal/auth/auth.go:240
+  WHY: The server deliberately excludes the protocol plane from compression to keep token responses out of BREACH (server.go:344-355 comment), but the predicate is plane-based and the business plane is eligible. writeJSON sets Cache-Control: no-store, not no-transform, and compressibleContentType (compress...
+
+[none|rejected] S10-5 Limiter.Check heap-allocates a *rate.Reservation on every request
+  LOC: internal/ratelimit/ratelimit.go:289, internal/ratelimit/ratelimit.go:295
+  WHY: golang.org/x/time/rate's ReserveN returns *Reservation (it takes the address of a local and returns it: rate.go:227-230 in x/time@v0.16.0), so the pointer escapes and every Check allocates one Reservation on the heap. Check is on the path of every request on both planes (withRateLimit calls it uncon...
+
+[low|downgraded] S11-1 Admin audit detail stores the raw operator account id in Detail["actor"], defeating pseudonym-key destruction
+  LOC: internal/admin/admin.go:485, internal/admin/admin.go:490, audit/audit.go:73, audit/audit.go:84
+  WHY: The durable sink replaces Event.Subject with a keyed pseudonym so that destroying the per-subject key (audit_subject_keys row) unlinks an account's audit history. Detail["actor"] bypasses that mechanism entirely: it holds the literal `usr_...` account id, is stored as-is in audit_events.detail, is c...
+
+[low|downgraded] S11-2 Kill Switch silently reports sessions_revoked=0 when the deployment has no session revoker, with no unavailability marker
+  LOC: internal/admin/admin.go:351, internal/admin/admin.go:167, internal/admin/admin.go:169, cmd/re0auth/main.go:618, cmd/re0auth/main.go:903
+  WHY: The Report design explicitly refuses to let 'no bindings existed' and 'this deployment cannot sweep bindings' look identical (BindingsUnavailable). Sessions get exactly that treatment: when s.sessions is nil the condition is skipped, SessionsRevoked stays 0, and the endpoint answers 200 with session...
+
+[low|downgraded] S11-3 Kill Switch `all` cannot purge in-flight bind flows and does not say so, allowing access to be re-created after the sweep
+  LOC: internal/admin/admin.go:399, internal/admin/admin.go:404, internal/federation/bind.go:47
+  WHY: The code itself states that a pending bind flow is a live capability: completing it creates a new binding and a new upstream credential. A global sweep (target=all) revokes tokens, sessions and bindings, but leaves every pending flow in the store. Because flows have a multi-minute TTL, a flow starte...
+
+[low|downgraded] S11-4 Kill Switch returns a bare 500 on a partial failure, discarding the counts of what was already revoked
+  LOC: internal/admin/admin.go:361, internal/admin/admin.go:388, internal/httpapi/admin_routes.go:281
+  WHY: The Kill Switch runs several irreversible steps in sequence (suspend client, revoke tokens, revoke sessions, revoke bindings, purge flows). A failure in any later step returns an error, and the handler maps every non-target error to 500 with no body, so the partially-complete Report -- the number of...
+
+[low|downgraded] S11-5 Kill Switch `client` target aborts before token revocation when the client row is gone, so its live tokens survive
+  LOC: internal/admin/admin.go:324, internal/admin/admin.go:326, internal/httpapi/admin_routes.go:277
+  WHY: DELETE /v1/admin/clients/{id} removes the registration first and purges tokens second. If the token purge fails, the operator gets a 500 with the client row already gone and live tokens remaining. The natural recovery attempt -- POST /v1/admin/kill_switch {"target":"client","client_id":...} -- calls...
+
+[medium|confirmed] S11-6 /v1/admin/audit/verify runs a full-table chain walk synchronously with no concurrency bound, holding a pooled DB connection up to 45s
+  LOC: internal/httpapi/audit_routes.go:171, internal/store/postgres/auditchain.go:220, internal/store/postgres/auditchain.go:264
+  WHY: Verify opens a transaction, raises statement_timeout to 45s and scans the entire audit_events table, holding one pooled connection for the whole walk. There is no per-endpoint concurrency limit and no cache of the result, so an operator (or anyone who steals an admin session) can issue the request r...
+
+[low|confirmed] S11-7 Audit subject filter performs an uncached negative DB lookup per distinct subject and leaks 'has pseudonym key' timing
+  LOC: internal/store/postgres/auditpseudo.go:69, internal/store/postgres/auditread.go:67, internal/store/postgres/auditpseudo.go:144
+  WHY: Two issues, both operator-gated. (1) The read path's stated goal is to avoid 'a one-bit account-existence oracle about an arbitrary subject' (auditread.go:71-79), but the response shape is not where the oracle lives: a subject with a pseudonym key costs two DB round trips (the key lookup plus the fi...
+
+[low|confirmed] S11-8 Account export claims to be everything held about the account but omits sessions, issued tokens and audit history, while the notice only disclaims credentials
+  LOC: internal/httpapi/export_routes.go:10, internal/httpapi/export_routes.go:30, internal/httpapi/export_routes.go:39
+  WHY: The comment promises 'everything Re0Auth holds about the signed-in account', but the document contains only profile, identities, bindings and grants. It omits the account's audit history (which is personal data about the account, resolvable through the pseudonym key while the account is live and exp...
+
+[low|confirmed] S11-9 GET /v1/admin/clients returns every client with no pagination or cap
+  LOC: internal/httpapi/admin_routes.go:100, internal/store/postgres/oauth.go:732
+  WHY: The admin client list has no limit parameter, no keyset cursor and no cap: the store materialises the entire oauth_clients table with pgx.CollectRows and the handler builds a second full slice plus JSON. The same class of endpoint (the audit read API) deliberately caps pages at 100/1000 for exactly ...
+
+[medium|confirmed] S12-1 Per-attempt request timeout is disarmed before the response body is read
+  LOC: web/src/lib/api.ts:334, web/src/lib/api.ts:354, web/src/lib/api.ts:369
+  WHY: fetch() resolves as soon as the response *headers* arrive, but the only deadline in the client is cleared at line 354 before the body is consumed at line 369. The AbortController therefore never fires for a response whose body stalls, so res.text() can remain pending forever. Every caller awaits thi...
+
+[info|rejected] S12-2 Dev root redirect does not match a request that carries a query string
+  LOC: web/vite.config.ts:27, web/vite.config.ts:28
+  WHY: req.url is the full request target, so a request to '/?error=access_denied' yields the string '/?error=access_denied', which is neither '/' nor ''. The middleware therefore calls next() and Vite answers that URL itself. The Go plane's root handler deliberately carries RawQuery through into /app/?err...
+
+[low|confirmed] S12-3 Stale ?error= is carried through SignIn return_to, so a later successful sign-in still reports failure
+  LOC: web/src/routes/+page.svelte:40, web/src/routes/+page.svelte:241
+  WHY: A visitor parked on /?error=access_denied gets a SignIn whose return_to is the current pathname *plus search*, so the stale error code is forwarded to the login plane. safeurl.RelativePath keeps path and query intact (it only refuses cross-origin forms), so after a successful authentication the brow...
+
+[low|confirmed] S12-4 Attacker-controlled ?error= is rendered verbatim inside the branded failure alert
+  LOC: web/src/routes/+page.svelte:41, web/src/routes/+page.svelte:82
+  WHY: The unknown-code branch interpolates the raw query value into a message that is rendered in the genuine, branded danger Alert (title 登录没有完成). Svelte escapes text nodes, so this is not XSS, but it lets an attacker author content inside the application's trust surface, and there is no length cap, so a...
+
+[low|confirmed] S12-5 Account export revokes the object URL synchronously and trusts an unvalidated profile field
+  LOC: web/src/routes/+page.svelte:162, web/src/routes/+page.svelte:164
+  WHY: URL.revokeObjectURL is called in the same task as click(); browsers are allowed to resolve the blob URL when the download manager starts, which is asynchronous, so an immediate revocation can abort the download. Separately, exportAccount returns `call<AccountExport>` with no shape check, so data.pro...
+
+[low|confirmed] S12-6 Focus restoration builds a CSS selector by string interpolation from server/config ids
+  LOC: web/src/lib/a11y.ts:33, web/src/lib/a11y.ts:35, web/src/routes/sources/+page.svelte:186, web/src/routes/grants/+page.svelte:73
+  WHY: Call sites pass selectors assembled from values the server or deployment config supplies, e.g. `[data-disconnect=\"${key(binding)}\"]` (key = game + '/' + source) and `[data-unlink=\"${identity.id}\"]`. Svelte escapes the attribute value so the DOM is correct, but the selector string is not escaped:...
+
+[info|downgraded] S12-7 Sources page re-runs O(available x bindings) scans on every reactive invalidation
+  LOC: web/src/routes/sources/+page.svelte:82, web/src/routes/sources/+page.svelte:89, web/src/routes/sources/+page.svelte:288
+  WHY: resourcesFor is a linear scan over the whole catalogue and is invoked twice per binding inside the keyed each (lines 288 and 290), while connectable is filter(available) x some(bindings). Every call also allocates key() strings. All of this is recomputed whenever selected/confirming/outcome state ch...
+
+[low|confirmed] S12-8 SPA shell is sent with no cache validator, so Cache-Control: no-cache forces a full body transfer each load
+  LOC: internal/webui/webui.go:151, internal/webui/webui.go:152
+  WHY: The shell is served through http.ServeFileFS, and embed.FS file infos report a zero ModTime, so ServeContent emits no Last-Modified and no ETag is generated anywhere. `no-cache` means the browser must revalidate before reuse; with no validator it cannot issue a conditional request, so it re-download...
+
+[info|downgraded] S12-9 Retried responses are discarded without draining or cancelling the body
+  LOC: web/src/lib/api.ts:358, web/src/lib/api.ts:361
+  WHY: Before `continue`, neither res.body.cancel()/res.body?.cancel() nor a read of the body happens. The 502/503/504 response stream is left un-consumed, so the connection cannot be reused and is only reclaimed by GC; with several concurrent GETs (the app fires listIDPProviders, currentSession, listGrant...
+
+[low|confirmed] S12-10 Response shape validation is applied to only two endpoints; the rest throw inside render and expose the JS error via +error.svelte
+  LOC: web/src/lib/api.ts:468, web/src/lib/api.ts:480, web/src/routes/admin/+page.svelte:72, web/src/routes/+error.svelte:9
+  WHY: currentSession and getAuthorizationRequest validate their JSON at the boundary, but every other wrapper asserts a TypeScript type over parsed JSON. A response whose envelope is missing (no `data`, no `profile`) is accepted, the assignment stores undefined, and the failure then happens during Svelte'...
+
+[info|confirmed] S12-11 Every asset request performs three embedded-FS stats
+  LOC: internal/webui/webui.go:106, internal/webui/webui.go:119, internal/webui/webui.go:133
+  WHY: The hot static path stats the embedded FS three times per request: Built() (index.html), isFile() (the requested name), and then ServeFileFS opens/stats the same name again. At steady state a page load is a handful of JS/CSS requests, each paying three embedded lookups plus the clean/prefix work; th...
+
+[info|rejected] S12-12 SignIn appends return_to after a URL fragment, unlike the equivalent link() path
+  LOC: web/src/lib/components/SignIn.svelte:50, web/src/lib/components/SignIn.svelte:52
+  WHY: The provider start URL is mutated by string concatenation, which ignores fragments: if provider.start_url contains '#...', the appended return_to becomes part of the fragment and is never transmitted to the server. +page.svelte's link() builds the same kind of URL correctly with `new URL(...)` and s...
+
+[high|confirmed] S13-1 Compression 406 refusal runs before the rate limiter and the in-flight cap, fully bypassing both
+  LOC: internal/httpapi/server.go:638, internal/httpapi/server.go:642, internal/httpapi/server.go:643, internal/compress/compress.go:147
+  WHY: The middleware chain is built so the compressor wraps withInFlightLimit, which wraps withRateLimit. When negotiation finds no acceptable representation, compress.Handler writes its own 406 and returns WITHOUT calling next, so neither the rate limiter (ratelimit.Limiter.Check) nor the global concurre...
+
+[medium|confirmed] S13-2 StoreDeviceAuthorization is O(n) in the number of live device authorizations, under the store-wide mutex, on every public device-authorization request
+  LOC: internal/store/memory/oidc.go:1050, internal/store/memory/oidc.go:1053, internal/store/memory/oidc.go:1124
+  WHY: The device-authorization endpoint (/oauth/device_authorization, public to registered clients per RFC 8628) calls StoreDeviceAuthorization for every request. Each call ranges over the ENTIRE devices map under s.mu, the single mutex that also guards every token lookup, auth-request read and device dec...
+
+[medium|confirmed] S13-3 DeleteAuthRequest scans every pending authorization code under the store mutex on each token exchange
+  LOC: internal/store/memory/oidc.go:508, internal/store/memory/oidc.go:516
+  WHY: The OIDC library calls DeleteAuthRequest after every authorization-code token mint. The memory store answers it by ranging over the whole codes map to find rows whose requestID matches. AuthRequestByCode has already deleted the code for this request (oidc.go:470-471), so on the normal path this scan...
+
+[low|downgraded] S13-4 Device approve/deny call the synchronous audit sink while holding the OIDC store's global mutex
+  LOC: internal/store/memory/oidc.go:1308, internal/store/memory/oidc.go:1326, internal/store/memory/oidc.go:1334, internal/store/memory/oidc.go:1347, audit/audit.go:35, internal/store/postgres/audit.go:54
+  WHY: The audit contract is synchronous and durable: the production sink is postgres.AuditLogger.Record, which pseudonymizes (possibly a query) and enqueues into the chain batcher, returning only after the batch commits. In ApproveDevice and DenyDevice that call happens with s.mu held via defer, so the st...
+
+[high|confirmed] S13-5 OIDC memory store maps are uncapped; refresh tombstones grow one per rotation for the full 30-day refresh TTL and the 5-minute sweep scans them all under the global lock
+  LOC: internal/store/memory/oidc.go:34, internal/store/memory/oidc.go:44, internal/store/memory/oidc.go:52, internal/store/memory/oidc.go:639, internal/store/memory/oidc.go:1153, internal/store/memory/oidc.go:1174, internal/store/memory/oidc.go:1180, internal/store/memory/oidc.go:1488
+  WHY: Every map in the in-memory OP store (authRequests, codes, accessTokens, refreshTokens, refreshTombstones, devices, userCodes) has no count cap. The worst is refreshTombstones: refresh-token rotation is the normal token-endpoint path and it writes one tombstone per rotation, retained until the spent ...
+
+[low|confirmed] S13-6 compress responseWriter swallows the final status after a 1xx header
+  LOC: internal/compress/compress.go:318, internal/compress/compress.go:327
+  WHY: net/http permits any number of 1xx informational responses followed by one final 2xx-5xx header. This wrapper sets wroteHeader on the first 1xx, writes it through as skipped, and then silently drops the final WriteHeader, so the client is left with the 1xx status (and the recorded status used for lo...
+
+[low|confirmed] S13-7 HTTP status metric label is not normalized and can be set from an upstream-controlled status
+  LOC: internal/observability/observability.go:310, internal/observability/observability.go:629, internal/httpapi/federation_routes.go:320
+  WHY: The package documents that 'every label here is bounded by construction' and normalizeMethod/normalizeGrantType/normalizeOAuthErrorCode enforce that for their labels, but the status label passes the raw recorded int through strconv.Itoa. The raw proxy deliberately writes the data source's own status...
+
+[low|confirmed] S13-8 pprof profile/trace endpoints accept unbounded seconds and have no concurrency or size cap
+  LOC: internal/observability/observability.go:611, internal/observability/observability.go:616, internal/observability/observability.go:618
+  WHY: Go 1.27's net/http/pprof.Profile parses the caller's `seconds` and, if positive, is not capped: it sleeps for that duration (configureWriteDeadline only extends the write deadline to WriteTimeout+seconds, it does not end the handler). A single request such as /debug/pprof/profile?seconds=100000 keep...
+
+[low|confirmed] S13-9 Oversized chunked JSON bodies surface as 400 'malformed JSON body' instead of the middleware's plane-shaped 413
+  LOC: internal/httpapi/admin_routes.go:133, internal/httpapi/authorization_routes.go:144, internal/httpapi/device_routes.go:105, internal/httpapi/binding_routes.go:202, internal/httpapi/account_routes.go:44, internal/httpapi/middleware.go:113, oauth/bodylimit.go:33
+  WHY: withBodyLimit only pre-rejects when the declared Content-Length exceeds 64 KiB; a chunked/streamed body larger than 64 KiB is capped while reading by MaxBytesReader, which returns *http.MaxBytesError to the JSON decoder. Every handler maps any decode error to 400 'malformed JSON body', so the same o...
+
+[low|confirmed] S13-10 oauth.MemoryStore / MemoryDeviceStore / MemoryClientRegistry have no cap and no in-process janitor
+  LOC: oauth/tokens.go:263, oauth/tokens.go:285, oauth/device.go:139, oauth/client.go:334
+  WHY: These three in-memory implementations (the legacy oauth engine's token store, its device store, and its client registry) hold every code, access token, refresh token, tombstone, device record and client forever unless a caller drives SweepExpired itself. The package documents the growth as accepted....
+
+[low|confirmed] S13-11 perfreport divides by the baseline median without a zero check, producing NaN/Inf deltas and a NaN geomean
+  LOC: cmd/perfreport/main.go:355, cmd/perfreport/main.go:373
+  WHY: base.median() can be 0 for a benchmark that legitimately reports 0 ns/op (or when a baseline line carries zero), which makes delta +Inf or NaN. math.Log1p of NaN/Inf poisons logSum, so a single zero-median baseline turns the report's headline geomean into NaN and the per-row comparison into '+Inf%'/...
+
+[low|downgraded] S14-1 memory.OIDCStore device decision holds the store-wide mutex across a durable audit write
+  LOC: internal/store/memory/oidc.go:1308, internal/store/memory/oidc.go:1326, internal/store/memory/oidc.go:1334, internal/store/memory/oidc.go:1347
+  WHY: s.record calls s.audit.Record (internal/store/memory/oidc.go:349-360). The audit.Logger contract is synchronous and durable: audit/audit.go:35-39 says 'Implementations must not return until the event is durably persisted', and the shipped durable sink internal/store/postgres/audit.go:55-85 blocks on...
+
+[high|confirmed] S14-2 federation.CompleteBind writes the vault secret and the binding row without the per-binding keyed mutex, so an in-flight bind can resurrect a just-revoked binding
+  LOC: internal/federation/bind.go:192, internal/federation/bind.go:198, internal/federation/unbind.go:50, internal/federation/revocation.go:132, internal/federation/killswitch.go:201, internal/federation/refresh.go:40
+  WHY: The per-binding keyedMutex (refresh.go:214-248) is documented as the mechanism that orders every writer of one binding's credential: Unbind takes it 'for the whole call' (unbind.go:41-51) so a refresh cannot write a secret back after an unbind shredded it; shredBinding takes it for the same reason (...
+
+[medium|confirmed] S14-3 Memory store pagers re-sort the whole table on every page: vault Rotate and the federation Kill Switch are O(N^2 log N)
+  LOC: vault/repo.go:229, vault/repo.go:233, vault/rotate.go:45, internal/federation/binding.go:255, internal/federation/binding.go:262, internal/federation/killswitch.go:58
+  WHY: Each page call materialises ALL rows, sorts them, and only then applies the cursor as a filter. The cursor does not reduce the work. Rotation pages 200 records at a time (vault/rotate.go:96) and the Kill Switch pages 500 at a time (internal/federation/killswitch.go:99), so a run over N records perfo...
+
+[low|downgraded] S14-4 federation.MemoryBindingStore.List has no per-user index: every account page scans all bindings under the read lock
+  LOC: internal/federation/binding.go:215, internal/federation/binding.go:219, internal/federation/binding.go:220
+  WHY: The store is keyed by a single string (user|game|source) in one map, so a per-user listing is a full scan of every binding in the deployment, held under RLock, on a hot authenticated read path. Every GET /v1/bindings and every GET /v1/account/export (which calls s.federate.Bindings) pays O(total bin...
+
+[medium|confirmed] S14-5 oauth.Service.Refresh: refresh-family revocation is not atomic with rotation, so a concurrent replay can leave the new generation alive
+  LOC: oauth/as.go:264, oauth/as.go:276, oauth/as.go:308, oauth/as.go:418, oauth/as.go:421, oauth/tokens.go:434
+  WHY: ConsumeRefresh is atomic, but the sequence ConsumeRefresh -> RevokeRefreshFamily (on the reuse branch) and ConsumeRefresh -> issue (SaveAccess then SaveRefresh) is not. A replayed/stolen token (or a legitimate duplicate request, e.g. a client retry) racing the winning rotation can run RevokeRefreshF...
+
+[medium|confirmed] S14-6 memory.OIDCStore replays and revocations scan every token and tombstone while holding the single global mutex
+  LOC: internal/store/memory/oidc.go:716, internal/store/memory/oidc.go:720, internal/store/memory/oidc.go:726, internal/store/memory/oidc.go:787, internal/store/memory/oidc.go:806
+  WHY: All of these loops are full-map scans executed under s.mu, the one mutex every OP operation needs. revokeFamilyLocked is reached from TokenRequestByRefreshToken (:677-679) on a replay of a spent refresh token - i.e. from attacker-supplied input - and from CreateAccessAndRefreshTokens (:624-626). Eve...
+
+[low|confirmed] S14-7 memory.OIDCStore.StoreDeviceAuthorization purges expired devices with a full scan under the lock on every call
+  LOC: internal/store/memory/oidc.go:1051, internal/store/memory/oidc.go:1053, internal/store/memory/oidc.go:1124
+  WHY: Every device-authorization request (POST /oauth/device_authorization, reachable by any client registered for the device grant) scans the whole devices map while holding the store's global mutex. The devices map has no upper bound enforced at insert - only a 10-minute TTL and the janitor's periodic s...
+
+[low|confirmed] S14-8 oauth.MemoryDeviceStore has no deletion path and no sweep, so device records grow without bound
+  LOC: oauth/device.go:140, oauth/device.go:206, oauth/as.go:57, oauth/as.go:58
+  WHY: MemoryDeviceStore implements only SaveDevice/GetDevice/GetDeviceByUserCode/RecordPoll/RecordDecision. No method deletes a record: an approved, denied or expired device authorization stays in byDev, and its user-code entry stays in byUser, for the life of the process. The package's own MemoryStore ha...
+
+[low|confirmed] S14-9 readinessCache is not panic-safe: a panicking readiness probe latches /readyz to 503 'checking' forever
+  LOC: internal/httpapi/health.go:183, internal/httpapi/health.go:190, internal/httpapi/health.go:192, internal/httpapi/health.go:195
+  WHY: The state transition that clears c.running and closes c.settled runs only on the normal return path; there is no recover/defer around probe(probeCtx). If the deployment's ReadinessProbe panics, the panic unwinds past the unlock, leaving running=true and settled open forever. Every later /readyz then...
+
+[low|confirmed] S14-10 oauth.Registry.Register mutates a map that Resolve/Get/Descriptors read without any lock
+  LOC: oauth/scope.go:185, oauth/scope.go:195, oauth/scope.go:200, oauth/scope.go:208, oauth/scope.go:226
+  WHY: Register is documented as 'meant to be called at composition time', but nothing enforces it and there is no mutex. A Register after the server begins serving races every Resolve call made by /oauth/authorize, the device endpoint, the consent screen and oauth.Service; a concurrent map write is a Go r...
+
+[info|confirmed] S14-11 oidchttp.serveOAuth can leak a pooled bufferedWriter on panic because release is not deferred
+  LOC: internal/oidchttp/oidchttp.go:636, internal/oidchttp/oidchttp.go:637, internal/oidchttp/oidchttp.go:716, internal/oidchttp/oidchttp.go:717
+  WHY: The buffered writer is taken from the package-level sync.Pool (bufferedWriters, oidchttp.go:1605) and returned only on the normal path. If h.provider.ServeHTTP panics, the panic unwinds through serveOAuth (it is recovered by httpapi's recoverProtocol wrapper, not here) and releaseBufferedWriter is s...
+
+[info|downgraded] S14-12 federation.refreshBinding's row-then-secret write order is deliberately protected by the per-binding lock (suspicious but mitigated)
+  LOC: internal/federation/refresh.go:40, internal/federation/refresh.go:111, internal/federation/refresh.go:121
+  WHY: This looks like a row/vault divergence window: the binding row is committed with the new Version and expiry before the vault holds the rotated secret, so a concurrent reader could observe the new row while the vault still serves the previous token. It is mitigated: refreshBinding holds the per-bindi...
+
+[medium|confirmed] S15-1 scripts/backup.sh leaves the plaintext database dump behind when age encryption fails
+  LOC: scripts/backup.sh:44-48, scripts/backup.sh:10
+  WHY: The script runs under `set -euo pipefail` (scripts/backup.sh:10). If the `age` invocation on line 45 exits non-zero (unreachable recipient, short write, full disk, interrupted process), the shell aborts before line 46 shreds/removes the plaintext dump, so `re0auth-<stamp>.dump` — a custom-format dum...
+
+[low|downgraded] S15-2 CI/release-gate Postgres service image is a floating tag while every other image in the project is digest-pinned
+  LOC: .github/workflows/ci.yml:34, .github/workflows/ci.yml:278, .github/workflows/perf.yml:45, .github/workflows/release.yml:20
+  WHY: ci.yml's `test` and `probes` jobs, and perf.yml's `report` job, pull `postgres:16` by mutable tag. release.yml:19-24 runs ci.yml verbatim as the tag gate (`uses: ./.github/workflows/ci.yml`), so the release pipeline executes whatever `postgres:16` resolves to on that day, in the job that holds the r...
+
+[medium|confirmed] S15-3 Backup CronJob has no activeDeadlineSeconds: a hung pg_dump stops all future backups, silently
+  LOC: deploy/k8s/backup/cronjob.yaml:11-22, deploy/k8s/backup/cronjob.yaml:59-70
+  WHY: `concurrencyPolicy: Forbid` skips every new schedule while a run is still active, and the jobTemplate sets only `backoffLimit: 2` — no `activeDeadlineSeconds`, and the inline `pg_dump` (lines 69-70) has no `timeout`/`statement_timeout`. A pg_dump that blocks (lock wait, stalled I/O, a wedged sidecar...
+
+[low|confirmed] S15-4 .dockerignore excludes scratchpad but not the live audit workspace or generic key shapes, so they enter the `COPY . .` build layer
+  LOC: .dockerignore:42-43, .gitignore:62, Dockerfile:53, .gitleaks.toml:13-20
+  WHY: The comment states the rule (audit workspaces and key-shaped files must not reach the `COPY . .` layer, Dockerfile:53) but the exclusion list implements only `scratchpad`. `.gitignore:62` re-includes `_audit/scriptprobe/**`, i.e. `_audit/` is the tracked audit workspace and is not in .dockerignore; ...
+
+[low|confirmed] S15-5 Base ConfigMap hardcodes trusted_proxies to 10.0.0.0/8; on a non-10/8 pod CIDR every client silently shares one rate-limit bucket
+  LOC: deploy/k8s/base/configmap.yaml:43-44, internal/httpapi/clientaddr.go:104-110, internal/httpapi/clientaddr.go:78-81
+  WHY: clientAddr reads the declared header only when the request peer is inside TrustedProxies (clientaddr.go:78), and forwardedClient returns the peer when the rightmost hop is unparseable or itself trusted (clientaddr.go:104-110). In Kubernetes the peer of the app pod is the ingress-controller pod, whos...
+
+[low|confirmed] S15-6 Release image is pushed under its release tag before the Trivy gate runs; only `latest` is withheld
+  LOC: .github/workflows/release.yml:64-80, .github/workflows/release.yml:100-107, .github/workflows/release.yml:109-119, deploy/k8s/base/deployment.yaml:46
+  WHY: The build-and-push step pushes the version tag (`type=ref,event=tag`, line 61-62) before the scan step at lines 100-107. If the scan fails, the workflow fails and `latest` is not created (the promotion is conditional, lines 114-119), but the version tag already exists in GHCR and is pullable. The k8...
+
+[low|confirmed] S15-7 Trivy scan runs with the host Docker socket mounted inside a job holding packages:write and id-token:write
+  LOC: .github/workflows/release.yml:100-107, .github/workflows/release.yml:36-39
+  WHY: The Trivy container is handed the Docker daemon socket, i.e. root-equivalent control of the runner, inside the job that also has `packages: write` (GHCR push) and `id-token: write` (Fulcio/keyless signing identity) — see release.yml:36-39. The scanner is digest-pinned, which is the right mitigation ...
+
+[low|confirmed] S15-8 Three alert rules keyed on generic go_*/process_* metrics carry no job selector and can fire on unrelated targets
+  LOC: deploy/prometheus/re0auth.rules.yml:304-348, deploy/prometheus/re0auth.rules.yml:4-7
+  WHY: The file header (lines 4-7) says the expressions "name only re0auth_* series and carry no job/instance selector, so they do not bind to one scrape convention". That is true for the re0auth_* rules, but these three use generic per-target series (`go_goroutines`, `process_resident_memory_bytes`, `proc...
+
+[low|confirmed] S15-9 Namespace has no Pod Security Admission labels, so the hardened pod spec is not enforced as a precondition
+  LOC: deploy/k8s/base/namespace.yaml:1-4, deploy/k8s/base/deployment.yaml:29-33, deploy/k8s/base/deployment.yaml:108-111
+  WHY: The Deployment is carefully hardened (pod-level runAsNonRoot/runAsUser 65532/seccomp RuntimeDefault, container-level allowPrivilegeEscalation:false, readOnlyRootFilesystem:true, drop ALL), but the namespace carries no `pod-security.kubernetes.io/enforce` label, so nothing at the cluster level reject...
+
+[low|confirmed] S15-10 scripts/backup-keys.sh is committed mode 100644 while the documented invocation runs it directly
+  LOC: scripts/backup-keys.sh:1, docs/operations.md:90-92
+  WHY: `git ls-tree HEAD scripts/` reports `100644 blob 2ab954cf... scripts/backup-keys.sh` and `100755` for backup.sh and restore.sh, so the key-backup script has no executable bit. docs/operations.md:92 documents running it as `BACKUP_AGE_RECIPIENT=age1... ./scripts/backup-keys.sh /backups`, which fails ...
+
+[low|confirmed] S15-11 Release archives embed the built SPA but do not carry the npm attribution the image deliberately includes
+  LOC: Makefile:160-182, Makefile:215-221, Dockerfile:86-90
+  WHY: The Dockerfile states the obligation explicitly: "The SPA is compiled into the very binary this image ships, so the image has the same npm notice obligation the archives carry; NOTICE covers the Go module graph only" (Dockerfile:86-90) and copies `/npm-attribution.json` into the runtime image. The a...
+
+[info|confirmed] S15-12 Backup CronJob writes plaintext database dumps; no age encryption path is wired, unlike scripts/backup.sh
+  LOC: deploy/k8s/backup/cronjob.yaml:59-70, docs/operations.md:125-126
+  WHY: The CronJob has no `BACKUP_AGE_RECIPIENT`/age step, so the PVC holds plaintext dumps of credential and audit data (0600, non-root, readOnlyRootFilesystem — the mitigations that do exist). docs/operations.md:125-126 explicitly accepts this (the dump is not encrypted; encrypt at the replication step o...
+
+[info|confirmed] S15-13 .gitleaks path allowlist exempts any file matching docs/security-audit-<n>.md from every rule
+  LOC: .gitleaks.toml:17-20, .gitleaks.toml:1-6
+  WHY: gitleaks path allowlists disable all rules for matching files, and the pattern is an unanchored regex, so both `docs/security-audit-7.md` and any path containing that substring are exempt forever. The surrounding comment states the intent is narrowly to silence token-shaped output quoted from a thro...

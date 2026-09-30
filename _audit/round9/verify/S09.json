@@ -1,0 +1,76 @@
+{
+  "scope": "S09",
+  "verified": [
+    {
+      "id": "S09-1",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Independently reproduced with the pinned pgx v5.11.0 and no database: sql.Open is lazy, sqlDB.Conn drives driverConnector.Connect -> pgx.ParseConfig(dc.name) (stdlib/sql.go:372-383), and pgx.ParseConfig returns *pgconn.ParseConfigError. For malformed DSNs whose userinfo has no '@' (e.g. \"postgres://user:hunter2\", \"postgres:user:hunter2\", \"postgres://user:hunter2?sslmode=x\") pgconn's best-effort redactPW leaves the raw password in the error, so the error from withMigrationLock contains it verbatim; the pool path's redactDSNParseError does strip exactly that string (verified changed=true on those shapes). MigrateDown reaches withMigrationLock without ever calling poolConfig, config.go performs no DSN-format validation (DATABASE_URL is passed through), and cmd/re0auth/main.go:1193 wraps the error via die(\"migrate-down\", err) which is logged. So the migration-down path does return the DB password in the logged error while the pool path does not. Correction to the discovery: its example DSN \"postgres://app:se cret@db/tenants\" is NOT a leak even on the pool path (pgconn already masks it to app:xxxxx and redactDSNParseError is a no-op there); the leak requires the no-'@'/malformed shapes above. Severity kept at medium: credential-in-logs, reachable by an operator typo, and the pool path was deliberately hardened against the same class (Z19V-1).",
+      "evidence_checked": "internal/store/postgres/postgres.go:376-403,240,272-278,452-463; cmd/re0auth/main.go:1186-1196,251-253; internal/config: no DSN validation (cmd/re0auth/config.go:683-710); pgx v5.11.0 stdlib/sql.go:372-383, pgconn/errors.go:120-147,236-246 (executed probe)"
+    },
+    {
+      "id": "S09-2",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "The code is exactly as cited. Tokens.RevokeTokens (oauth.go:466-478) calls revokeMatching(ctx, s.pool, ...) with the pool (autocommit, one transaction per statement) and then runs two independent pool.Exec DELETEs for oauth_codes and oauth_refresh_tombstones, while revokeMatching's own doc comment (oauth.go:517-520) states the caller runs it inside its own transaction and names RevokeTokens as doing so. The contrasting OIDCStore.RevokeTokens (oidc.go:1503-1535) begins a pgx.Tx and passes it to revokeMatching. Reachability confirmed: cmd/re0auth/main.go:585-588 appends store.legacy.(oauth.TokenAdmin) to the revoker fan-out, and durable openStorage sets legacy: db.Tokens() (main.go:958), so the legacy method is on the Kill Switch / admin client-suspension / subject-erasure path (internal/admin/admin.go:270,288,337; internal/lifecycle/lifecycle.go:214). A failure after the access/refresh deletes commits but before the oauth_codes delete returns an error with unspent codes still alive, and the method comment asserts codes go with the tokens. Medium retained.",
+      "evidence_checked": "internal/store/postgres/oauth.go:454-535; internal/store/postgres/oidc.go:1489-1535; cmd/re0auth/main.go:585-589,958; internal/admin/admin.go:270,288,337; internal/lifecycle/lifecycle.go:214"
+    },
+    {
+      "id": "S09-3",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "account.go:199-206 is exactly as cited. On a Scan error that is not pgx.ErrNoRows, owner remains the zero value \"\"; account.UserID(\"\") != user is true for every non-empty user, so the right-hand disjunct of the combined condition short-circuits to account.ErrNotFound before the `if err != nil` guard at line 204 can return the real error. The surrounding code is correct (lines 191-197 and 209-211 check err first), so this is a genuine ordering defect, not a misread. Impact as stated: a connection loss / statement_timeout on the ownership SELECT is reported to the caller as ErrNotFound, indistinguishable from a missing row; the DELETE and the primary-identity update never run. Low retained (misleading error / lost outage signal, no privilege escalation).",
+      "evidence_checked": "internal/store/postgres/account.go:180-232, esp. 199-206; noRows helper postgres.go:580"
+    },
+    {
+      "id": "S09-4",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The mechanical observation is true (legacy Tokens.ConsumeRefresh at oauth.go:242-258 deletes the row with no expires_at predicate, arms a tombstone carrying the already-past expires_at, and oauth/as.go:289 judges expiry only after the destructive claim; OIDCStore does add `AND expires_at > $2` at oidc.go:514-519). But the claimed contract violation is a misreading. The Store interface explicitly places expiry in the service: oauth/tokens.go:166 says \"like every other deadline in this interface, expiry is judged by the service, not the store\", and oauth/tokens.go:182-183 says ListBySubject returns expired rows because the store has no clock. \"live\" at tokens.go:168 contrasts with \"a value this store already consumed\", not with \"unexpired\". The reference MemoryStore.ConsumeRefresh (oauth/tokens.go:431-451) deletes the live row and arms the tombstone with zero expiry check, and MemoryStore.ConsumeCode is documented the same way. So the legacy Postgres store matches the intended contract rather than violating it; the OP store's extra predicate is defence-in-depth. Impact is only cosmetic: no token is minted, the wire answer is invalid_grant either way, and an expired grant disappearing from the grants view is harmless. Downgraded to info.",
+      "evidence_checked": "internal/store/postgres/oauth.go:220-297; oauth/as.go:255-309; oauth/tokens.go:140-198,431-451; internal/store/postgres/oidc.go:504-519; oauth/tokens.go:106-123"
+    },
+    {
+      "id": "S09-5",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Accurate. refuseAuditChainRollback (postgres.go:491-508) fires only for versions 13/14 (constants at 469-472); MigrateDown (452-463) invokes it before provider.Down and rolls back exactly one step. Migrations 0024/0025 Down sections (0024:50-53, 0025:59-64) unconditionally DROP the oidc_refresh_token_tombstones / oauth_refresh_tombstones tables and the family_id columns; nothing warns that the replay-detection state is destroyed, and the migration comment itself says the tombstone is the only surviving pointer to a spent token's family. After a down/up cycle the tombstones are unrecoverable and the Up backfill gives every live row its own family (0024:28-30, 0025:33-36), so a replay of a pre-rollback spent token degrades to ErrTokenNotFound instead of *RefreshReuseError and RFC 9700 s4.14.2 family revocation no longer fires. ADR-0008 (docs/migration-decision.md) protects only 0013/0014 and does not name this loss. Low retained: requires two deliberate operator rollbacks plus data loss and is inherent to down-migration policy, but it is a real, unguarded integrity regression.",
+      "evidence_checked": "internal/store/postgres/postgres.go:443-508; internal/store/postgres/migrations/0024_refresh_token_family.sql:26-53; internal/store/postgres/migrations/0025_oauth_refresh_family.sql:30-64; internal/store/postgres/migrations_test.go:103-219; docs/migration-decision.md"
+    },
+    {
+      "id": "S09-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "AuditLogger.Verify reads head_hash at auditchain.go:259-262 (documented as the witness against column clearing) but after the walk (279-342) the final hash is only kept in the loop-local `prev`; the function returns v.OK=true at 357 without ever comparing prev to head. Grep confirms head_hash is only read at auditchain.go:174 (append, FOR UPDATE), 260 (Verify witness) and 367 (Head), so no other path performs the comparison. Tail truncation therefore leaves every surviving row self-consistent and Verify reports OK=true while audit_chain.head_hash names a deleted row; Head/an external anchor is the only detector, and the code's own comments at 361-364 and migration 0013 call that the boundary. The discovery's snapshot caveat is valid (head and rows are separate READ COMMITTED statements in the same tx), so a fix needs one snapshot. Low retained: requires an attacker with DB write/delete privileges on audit_events and is partly a documented design boundary, but it is a real undetected-truncation gap that the already-read head could close.",
+      "evidence_checked": "internal/store/postgres/auditchain.go:241-371; grep head_hash across internal/store/postgres"
+    },
+    {
+      "id": "S09-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "As cited. AuthRequestByCode (oidc.go:319-331) returns the bare sentinel errors.New(\"postgres: authorization code is unknown or expired\") for ANY Scan error, including connection loss, statement_timeout and context cancellation (the subsequent transaction errors at 339-345 are also collapsed). deviceState (oidc.go:1209-1221) maps both the Query and CollectOneRow error to \"device authorization not found\", used by DeviceByUserCode / device polling. The contrasted paths do preserve the cause: TokenRequestByRefreshToken returns fmt.Errorf(\"postgres: load refresh token: %w\", err) for a Query error and for non-noRows collect errors (oidc.go:660-671), and RevokeToken returns oidc.ErrServerError().WithParent(err) (oidc.go:787-788, 808-809). Real reliability/observability defect: a store outage becomes invalid_grant / access_denied with no distinguishable signal. Low retained (the library maps the wire answer identically either way, so this is alerting/diagnosis, not an access-control bypass).",
+      "evidence_checked": "internal/store/postgres/oidc.go:314-351,656-671,765-809,1209-1221"
+    },
+    {
+      "id": "S09-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "All cited pairs are non-transactional: Sessions.RevokeAllSessions (sessions.go:197-206) DELETEs sessions then session_subjects on the pool; RevokeSubjectSessions (211-225) does the same; Tokens.DeleteRefresh (oauth.go:290-297) deletes the live refresh row then the tombstone in separate autocommit statements, while its own comment says the tombstone goes with the value; Tokens.PurgeLegacySubject (495-511) loops two independent DELETEs. The OIDCStore counterparts (DeleteBySubjectClient oauth.go:402-407, RevokeRefreshFamily 313-337, OIDCStore.RevokeTokens oidc.go:1503) do wrap their statements in one pgx.Tx, so the drift is real. Correction to the stated exploit: a leftover tombstone names the token's OWN family_id, so a later presentation triggers revocation of that same (already revoked) family, not an 'unrelated' live family; the concrete harm is half-applied Kill Switch state (orphan session_subjects until the 1-hour sweep, a RevokeAllSessions report that under-counts, residue rows). Low retained as a reliability/idempotency defect; the exploited impact was partially overstated but the transactional defect is genuine.",
+      "evidence_checked": "internal/store/postgres/sessions.go:195-225; internal/store/postgres/oauth.go:287-297,390-407,454-478,495-511,513-535; internal/store/postgres/oidc.go:1503-1535"
+    },
+    {
+      "id": "S09-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Code verified: pseudoCacheMax=4096 (auditpseudo.go:32) and remember (144-151) replaces the whole map with an empty one whenever len(cache) >= pseudoCacheMax, so one new distinct subject past the bound evicts every previously cached subject. Record (audit.go:55-86) calls pseudonymize synchronously before the batcher is reached, and a miss costs 1 indexed SELECT (loadKey 69-91) plus, for a first-time subject, INSERT + re-SELECT (subjectKey 115-142) = up to 3 pool round trips. The map is documented as deliberately crude (29-31). Reasoning about frequency: for a bounded, repeated working set the cache stays warm because a hit never inserts; the wholesale clear only fires when a genuinely new subject is inserted while the map is already full. Under a burst of distinct subjects (bulk Kill Switch/erasure) each first touch would query regardless, and every 4096 inserts drops the hot set, so repeated subjects within the burst miss too and the lookups add round trips on the fail-closed vault path ahead of the coalesced append. Real but bounded (simple PK/index lookups, 1-3 per evicted miss); low retained as a performance finding.",
+      "evidence_checked": "internal/store/postgres/auditpseudo.go:27-32,69-91,115-151; internal/store/postgres/audit.go:13-27,54-86"
+    },
+    {
+      "id": "S09-10",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "True as stated. CreateAccessToken (oidc.go:429-432) and both CreateAccessAndRefreshTokens inserts (oidc.go:573-577, 579-585) omit issued_at, so the column takes migration 0009's DEFAULT now() (migration 0009_oidc_token_issued_at.sql:5-6, the database clock), while expires_at is computed from s.now() (oidc.go:428, 584). oidc.go:41-47 states the single-clock policy. Impact is limited to the grants view/operator display (issued_at and expires_at are surfaced separately at oidc.go:1399-1413 and never compared), so info is correct. Minor correction: issued_at is not a deadline and all replicas share the one database clock, so the 'two replicas order the same token differently' line is not reachable.",
+      "evidence_checked": "internal/store/postgres/oidc.go:41-52,421-437,461-592,1390-1414; internal/store/postgres/migrations/0009_oidc_token_issued_at.sql:1-6"
+    }
+  ],
+  "summary": "All 10 S09 findings were re-read at the cited lines plus callers, guards and the pinned dependency sources. 9 confirmed, 1 downgraded, 0 rejected. Highest confirmed severity is medium: S09-1 (DB password can reach the migrate-down log; empirically reproduced with pgx v5.11.0 - sqlDB.Conn -> pgx.ParseConfig leaks the raw password for no-'@' DSNs while poolConfig's redactDSNParseError strips it, though the discovery's example DSN is already redacted) and S09-2 (Tokens.RevokeTokens is not transactional, contradicting revokeMatching's documented invariant, and is wired onto the durable Kill Switch path). S09-4 was downgraded to info because oauth.Store explicitly places expiry in the service and MemoryStore does the same thing, so the claimed contract violation is a misreading. S09-3/5/6/7/8/9 confirmed at low with two impact corrections (S09-8's 'unrelated family' is the token's own family; S09-9's miss cost is 1-3 indexed lookups). S09-10 confirmed at info."
+}

@@ -1,0 +1,83 @@
+{
+  "scope": "S03",
+  "verified": [
+    {
+      "id": "S03-1",
+      "status": "confirmed",
+      "final_severity": "high",
+      "reason": "The mechanism is real. handleStart stores safeurl.RelativePath(q.Get(\"return_to\")) into the scs session with no byte bound (auth.go:612,616); safeurl.RelativePath only enforces form (safeurl.go:34-52), while the same file refuses bound handles over 128 bytes (auth.go:289,316) precisely because the session is rewritten whole. A cookie-less GET gets a fresh sessionData; Put sets Modified, so scs mints a token and commits a row + Set-Cookie (scs data.go:99-104,155-162; session.go:169-183). MaxHeaderBytes=64 KiB (main.go:118-123) bounds one return_to at ~60 KiB, so each request buys ~60 KiB of persisted state. Two discovery details are overstated and are corrected here: (a) the committed expiry is min(24h lifetime, now+2h IdleTimeout) because scs Commit uses the idle expiry (data.go:111-117; auth.go:93-97), so retention is ~2h, not 24h; (b) memstore has a 1-minute cleanup goroutine (memstore.go:22-23,102-140), so memory mode is bounded (~50/s x 2h = ~360k sessions, ~21GB) rather than literally unbounded. Neither correction removes the impact: the Postgres path is effectively unbounded because SweepExpired deletes at most 1000 rows per 15-minute tick (sessions.go:152-184; main.go:406) = ~1.1 rows/s against 50/s arrivals, so a sustained unauthenticated loop outruns the sweep and grows sessions.data/disk without bound; memory mode still reaches ~21GB. The default limiter is 50/s burst 100 per (plane,/64) (main.go:225-229; config.go:354-355; middleware.go:488-504), so the cited ~3MB/s is right. Availability-only DoS, unauthenticated, requires only one registered IdP. High stands.",
+      "evidence_checked": "internal/auth/auth.go:612-618,289,315-323; internal/safeurl/safeurl.go:34-52; internal/store/postgres/sessions.go:117-129,152-184; cmd/re0auth/main.go:118-123,225-229,406,892-916; internal/httpapi/middleware.go:352-392,488-504; internal/httpapi/server.go:619-642; internal/ratelimit/ratelimit.go:157-188; scs@v2.9.0 data.go:54-124,155-162,282-305, session.go:137-184; memstore/memstore.go:22-23,64-73,102-140"
+    },
+    {
+      "id": "S03-2",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The code sequence is exactly as claimed: keyUser/keyAuthTime are Put before RenewToken (auth.go:161,165,166), and on a RenewToken error SignIn returns before index.Remember (auth.go:169-181), so the destroy branch at 174/178 is skipped. Because Put already sets Modified, scs still commits the session at response end (data.go:155-162, session.go:169-183), persisting an authenticated session under the old, unrotated token with no session_subjects row; the login handler reports session_failed. However the claim is overstated as a medium: in memory mode RenewToken cannot fail (memstore.Delete always returns nil, generateToken effectively cannot fail), so this needs a Postgres-mode transient failure of the DELETE at auth.go:166 that is then followed by a successful INSERT/UPDATE commit of the same token; there is no attacker-controlled trigger. The fixation payoff additionally requires a cookie the attacker can plant and knows, which needs a non-__Host/plain-HTTP deployment. It is a genuine fail-open/revocation-record inconsistency on an error path, so real but low, not medium.",
+      "evidence_checked": "internal/auth/auth.go:153-182; internal/account/account.go:241-249; internal/store/postgres/sessions.go:54-58,117-129,229-236; scs@v2.9.0 data.go:78-83,99-104,111-123,155-162,282-305; session.go:169-184; memstore/memstore.go:77-83; cmd/re0auth/main.go:696-702"
+    },
+    {
+      "id": "S03-3",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "Confirmed as written: EndSession calls index.Forget first and ignores its error, then Destroy (auth.go:210-217). If Destroy fails, doStoreDelete returns the error before status becomes Destroyed (scs data.go:129-150), the load-time IdleTimeout>0 already left status Modified (data.go:81-83), so the session row is re-committed with a still-valid cookie while its session_subjects row is gone; the handler answers 500 (session_routes.go:71-74). What is overstated is the impact framing: the store DELETE must fail (a transient Postgres fault; impossible in memstore), the browser is told sign-out failed rather than success, and only subject-scoped revocation is lost - RevokeAllSessions and the 2h idle/24h expiry still reach the session. A real ordering defect, but an error-path one, so low rather than medium.",
+      "evidence_checked": "internal/auth/auth.go:187-217; internal/httpapi/session_routes.go:66-76; internal/store/postgres/sessions.go:54-58,197-225; scs@v2.9.0 data.go:81-83,129-150; memstore/memstore.go:77-83"
+    },
+    {
+      "id": "S03-4",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The race is real: both stores enforce I-3 (memory via the byKey check at account.go:145-148; Postgres via UNIQUE(provider,subject) mapped to ErrIdentityTaken at postgres/account.go:113-121), and the handler treats every CreateWithIdentity error as codeSignupFailed with no retry at auth.go:713-718. Two concurrent callbacks sharing the session cookie can both load the flow state before either clearFlow commits (auth.go:645-656), both pass the state check, then one loses the create race and sees signup_failed. But medium overstates it: no security impact, no duplicate account, no lockout - the identity now exists, so a retry (or any subsequent start) finds it and signs in; only one interleaved response shows a transient UX error. Correctness only, low.",
+      "evidence_checked": "internal/auth/auth.go:645-656,711-726; internal/account/account.go:137-164; internal/store/postgres/account.go:87-126; scs@v2.9.0 data.go:54-86; session.go:137-166"
+    },
+    {
+      "id": "S03-5",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: every cited session-scoped read maps any account-store error, including account.ErrNotFound, to 500 internal_error - GetUser at session_routes.go:27-31 and export_routes.go:64-68, Identities at session_routes.go:32-36 and identity_routes.go:26-30. account.GetUser/Identities return ErrNotFound for a missing account (account.go:234-236,244-248; postgres/account.go:236-242,269-271). A session can outlive its account: memory mode has no session revoker (main.go:696-702 warns), and a partial Postgres erasure can stop after the account row is gone. The stale cookie then yields an opaque 500 with no path to clear it. No data disclosure; reliability only, low is correct.",
+      "evidence_checked": "internal/httpapi/session_routes.go:20-45; internal/httpapi/identity_routes.go:20-32; internal/httpapi/export_routes.go:56-73; internal/account/account.go:231-249; internal/store/postgres/account.go:234-280; cmd/re0auth/main.go:696-702; internal/lifecycle/lifecycle.go:67-72,120-139"
+    },
+    {
+      "id": "S03-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: requireAdmin resolves the user solely from the session claim and the static adminAllowed map built once in New (admin_routes.go:57-72; server.go:305-308); no admin route re-checks the account store, and requireAdminWrite only adds CSRF plus auth_time freshness (admin_routes.go:77-98). adminAllowed is keyed by UserID, so an erased admin's live session still passes. Reachable in memory mode (no SessionRevoker, main.go:696-702) and on a partial Postgres erasure; the session then keeps full operator authority (clients, kill switch, audit reads) until expiry. Window correction: with the 2h default IdleTimeout the exposure is up to ~2h idle (auth.go:93-97), not 24h. Precondition is a non-durable/partial-erasure deployment, so low is appropriate.",
+      "evidence_checked": "internal/httpapi/admin_routes.go:57-98,100-117,249-288; internal/httpapi/server.go:287-308; internal/auth/auth.go:124-130,93-97; cmd/re0auth/main.go:696-702; internal/lifecycle/lifecycle.go:129-139"
+    },
+    {
+      "id": "S03-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: MemoryStore.Identities takes the RLock and calls identitiesOfLocked, which iterates the whole s.identities map and sorts the filtered slice while still holding the lock (account.go:231-238,281-295); callers include /v1/sessions/current (session_routes.go:32), /v1/identities (identity_routes.go:26) and export (export_routes.go:69). Cost is O(total identities) and writers (CreateWithIdentity/LinkIdentity/TouchLogin/DeleteUser, all sync.Mutex) wait on it. The finding is only mildly overstated: MemoryStore is documented as a development/test store (account.go:108-109) and real deployments use Postgres, and even 30k map iterations is sub-millisecond. Real but low.",
+      "evidence_checked": "internal/account/account.go:108-124,166-196,231-295; internal/httpapi/session_routes.go:20-45; internal/httpapi/identity_routes.go:20-32; internal/httpapi/export_routes.go:69-73; cmd/re0auth/main.go:890-916"
+    },
+    {
+      "id": "S03-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: Accounts.Identities issues SELECT EXISTS(...) and then the real SELECT ... FROM accounts_identities, two pooled round trips (postgres/account.go:236-245), on the bootstrap/list/export paths. The extra probe exists only to distinguish ErrNotFound from an empty list, and the list query could carry that with a join. Real extra per-request DB round trip, performance only, low.",
+      "evidence_checked": "internal/store/postgres/account.go:234-259; internal/httpapi/session_routes.go:27-36; internal/httpapi/identity_routes.go:26-30; internal/httpapi/export_routes.go:64-73"
+    },
+    {
+      "id": "S03-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: flowKeys (auth.go:44) omits keyFlowNonce although handleStart writes it (auth.go:618) and handleCallback reads it (auth.go:654); clearFlow only removes the listed keys (auth.go:737-741), so the nonce stays in the session, is re-encoded with the rest of the session on that response, and is only overwritten by the next start. No exploit (server-generated, never sent to the client), hygiene only. This is already a known-open P3 issue (RP-8 in docs/issues/P3-low.md:115) and a probe pinning it exists at internal/zzprobe/protocol/rp/e2e_test.go:503-544, but the code behavior is exactly as claimed, low.",
+      "evidence_checked": "internal/auth/auth.go:32-44,608-618,643-656,737-741; internal/auth/zz_audit_session_test.go:399-424; docs/issues/P3-low.md:115; internal/zzprobe/protocol/rp/e2e_test.go:503-544"
+    },
+    {
+      "id": "S03-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: RevokeAllSessions runs DELETE FROM sessions and then DELETE FROM session_subjects as two unbounded, non-transactional statements (postgres/sessions.go:197-206); RevokeSubjectSessions has the same shape with an unbounded IN-subselect (sessions.go:211-225). SweepExpired is deliberately batched at 1000 rows precisely because an unbounded statement can exceed the pool statement_timeout, which defaults to 30s (postgres.go:141; sweep docs, sessions.go:145-184). On a grown table (see S03-1, where the sweep cannot keep up) the 'all' DELETE can time out and revoke 0 with an error, and a failure of the second statement after the first committed leaves orphan index rows. admin.KillSwitch propagates the error and reports it (admin.go:351-367). No attacker trigger, reliability/incident-response only, low.",
+      "evidence_checked": "internal/store/postgres/sessions.go:145-225; internal/store/postgres/postgres.go:119-141,248-258; internal/admin/admin.go:348-368; cmd/re0auth/main.go:406,959-978; internal/ratelimit/ratelimit.go:24-33"
+    },
+    {
+      "id": "S03-11",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "The race is real as described. step() sets StateLoading, unlocks, runs Apply outside a.mu, then unconditionally sets StateActive on success (app.go:293-342). Remove() only transitions to StateUnloading when it observes StateActive; if the fiber is StateLoading it splices the fiber out and calls forceUnload, which sets StateUnloading and disposes the context (app.go:84-107,387-407), after which step re-acquires a.mu and revives it as StateActive although it is no longer in a.fibers. scope.add on an already-disposed scope runs the disposer immediately, confirming the 'effect installed under teardown' detail (scope.go:24-38). Reachability is correctly described as latent: the only Go importer of internal/core is internal/wiring (wiring/oauth.go, wiring/keys.go), and no Go file imports internal/wiring (verified by content search), so no production binary reaches this path today; core_test.go exercises it directly. Genuine latent API defect, low.",
+      "evidence_checked": "internal/core/app.go:84-107,278-363,386-407; internal/core/scope.go:24-38; internal/core/core_test.go:10; internal/wiring/oauth.go:4; internal/wiring/keys.go:11; no importers of internal/wiring found"
+    }
+  ],
+  "summary": "All 11 S03 findings were independently re-read against the cited code, callers, guards and vendored scs@v2.9.0 semantics. 8 confirmed, 3 downgraded, 0 rejected. S03-1 (unbounded caller-controlled return_to persisted in the session) is confirmed high: the missing length bound is real and the unauthenticated availability impact stands, with two corrections - per-session retention is the 2h IdleTimeout, not 24h, and memstore does have a minute cleanup (steady state ~21GB at 50/s) while Postgres remains effectively unbounded because SweepExpired clears only 1000 rows/15min against 50/s arrivals. S03-2 and S03-3 are real but downgraded to low: both are fail-open ordering defects that require a transient Postgres store fault that no attacker can trigger (memstore Delete never errors), and S03-2's fixation payoff needs a plantable non-__Host cookie. S03-4 is downgraded to low: a genuine concurrent-signup race with no security impact and a self-healing retry. S03-5 through S03-11 are confirmed at their stated low severities: stale-session 500s, admin allowlist not re-checking the account, memory-store O(N) identity scan, the redundant Postgres EXISTS probe, the missing keyFlowNonce in flowKeys (already known as RP-8), unbounded/non-atomic kill-switch deletes, and the latent App.Remove/Apply race in internal/core (imported only by internal/wiring, which nothing imports). No new severe finding was invented."
+}

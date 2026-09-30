@@ -1,0 +1,186 @@
+{
+  "scope": "S04",
+  "title": "Device authorization, consent and grants (oauth engine + /v1 consent/device/grants routes)",
+  "findings": [
+    {
+      "id": "S04-1",
+      "title": "Enabled device authorization is never consumed: one device_code mints unlimited token pairs and silently undoes a grant revocation",
+      "severity": "high",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "oauth/device.go:302-309",
+        "oauth/device.go:124-137",
+        "oauth/grants.go:128-137"
+      ],
+      "evidence": "switch rec.Status {\n\tcase DevicePending:\n\t\treturn TokenResponse{}, protocolError(\"authorization_pending\", \"the user has not decided yet\")\n\tcase DeviceDenied:\n\t\treturn TokenResponse{}, protocolError(\"access_denied\", \"the user denied the request\")\n\t}\n\treturn s.issue(ctx, client.ID, rec.Subject, rec.Scopes, \"\")",
+      "why": "PollDeviceAuthorization treats a DeviceApproved record as reusable forever: the read at line 274 is followed by an unconditional s.issue(...) and nothing marks the record spent or deletes it. DeviceStore (lines 124-137) exposes no consume/claim operation, so the store contract makes single use unrepresentable. RFC 8628 section 3.5 makes the device_code single-use. Consequences: (1) a client that holds the device_code can obtain an unbounded number of access+refresh pairs for the whole device TTL; (2) more importantly, oauth.Service.RevokeGrant only calls s.tokens.DeleteBySubjectClient (oauth/grants.go:132), which deletes access/refresh/codes/tombstones but cannot reach the DeviceStore, so after a user revokes the grant the client simply polls again with its still-approved device_code and is handed a fresh pair (with a 30-day refresh token), making the revocation permanent no-op. The shipped OP path (internal/store/memory/oidc.go:1086-1103 and internal/store/postgres/oidc.go:1121-1154) explicitly fixes this exact bug ('without this a device_code kept minting fresh access/refresh pairs for the rest of its TTL, and a revocation performed in between was undone by the next poll'), which confirms it is a real defect rather than intent. Reachability: oauth.Service is not wired into cmd/re0auth (which uses the OP), but it is the public oauth/as capability offered by internal/wiring.OAuthComponent and its Config/DeviceStore fields are the documented way to run the device grant, so any embedding that mounts the device endpoints inherits it.",
+      "exploit": "A deployment wires oauth.Service's device endpoints. Client C obtains a device authorization for subject U, U approves it, C exchanges it once. The user then revokes C's grant at the grants endpoint (oauth.Service.RevokeGrant deletes only token rows). C, which never discarded the device_code, polls /oauth/token again after the poll interval; PollDeviceAuthorization still sees Status=DeviceApproved and issues a brand-new access+refresh pair. Repeating the poll keeps the access alive indefinitely, defeating the revocation the user was told succeeded.",
+      "recommendation": "Add an atomic consume/claim to DeviceStore (e.g. ConsumeDevice(ctx, deviceCodeHash) (DeviceAuthorizationRecord, bool, error) that deletes or flips a spent flag only while Status==DeviceApproved), call it in PollDeviceAuthorization before s.issue and return invalid_grant when the claim is lost, and have oauth.Service.RevokeGrant also remove/deny the subject+client's device authorizations. Do not infer spend from the pre-read record.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-2",
+      "title": "BeginDeviceAuthorization does not authenticate confidential clients, allowing anonymous device requests that impersonate a trusted client on the consent screen",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "oauth/device.go:224-228",
+        "oauth/device.go:415-419",
+        "oauth/device.go:437-448"
+      ],
+      "evidence": "func (s *service) describeScopes(ctx context.Context, clientID string, scopes []Scope) (Client, []Descriptor, error) {\n\tclient, err := s.client(ctx, clientID, \"\", false)\n\tif err != nil {\n\t\treturn Client{}, nil, err\n\t}\n\tdescriptors, err := s.scopes.Resolve(scopes, client.ID)",
+      "why": "BeginDeviceAuthorization (line 225) validates the client through describeScopes, which calls s.client(ctx, clientID, \"\", false) with auth=false (line 416). service.client (oauth/as.go:445) only checks the secret when auth is true and the client is confidential, so an anonymous caller can start a device authorization naming any registered confidential client. RFC 8628 section 3.1 applies RFC 6749 section 3.2.1 client-authentication rules to the device authorization endpoint; the shipped OP path implements exactly this and documents the harm: internal/oidchttp/oidchttp.go:1142-1156 refuses a confidential client that does not authenticate, because otherwise 'an anonymous caller mints a device authorization naming any confidential client, and the verification page then presents that client's registered name to whoever follows the user_code.' The device holder cannot redeem the code without the client secret (PollDeviceAuthorization authenticates with auth=true), so this is not direct token theft; the concrete impact is consent-screen spoofing/phishing and consented-and-audited approvals attributed to a client that never asked. The oauth package's own comment on BeginDeviceAuthorization ('validated here, exactly as the interactive flow validates them') is wrong for this endpoint: the interactive authorize endpoint legitimately does not authenticate the client, but the device authorization endpoint must.",
+      "exploit": "Attacker POSTs /oauth/device_authorization with client_id=<a well-known confidential client> and its registered scope, without any secret. The server returns a device_code and user_code. The attacker relays the user_code (or the verification URI) to a victim, who signs in and sees the trusted client's display name; if the victim approves, the record (and the audit event oauth.device.approve) is attributed to that client, and the attacker's user code stays bound in the victim's session. The attacker cannot collect tokens (the poll requires the secret) but has manufactured a trusted-looking consent screen and a false consent record.",
+      "recommendation": "In BeginDeviceAuthorization (or describeScopes for the device path), require client authentication for ClientConfidential clients, mirroring internal/oidchttp's validateDeviceAuthorization: accept HTTP Basic (with form-urlencoded username) or client_secret_post, and refuse with invalid_client otherwise. Only public clients should keep the 'none' method.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-3",
+      "title": "MemoryDeviceStore never expires anything: device authorizations accumulate for the process lifetime",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "oauth/device.go:140-163",
+        "oauth/device.go:224-247"
+      ],
+      "evidence": "func (s *MemoryDeviceStore) SaveDevice(_ context.Context, deviceCode string, d DeviceAuthorizationRecord) error {\n\td.DeviceCodeHash = TokenHash(deviceCode)\n\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\ts.byDev[d.DeviceCodeHash] = d\n\ts.byUser[NormalizeUserCode(d.UserCode)] = d.DeviceCodeHash\n\treturn nil\n}",
+      "why": "MemoryDeviceStore has no expiry, eviction or sweep. SaveDevice is the only writer of byDev/byUser and no method ever deletes; GetDevice/GetDeviceByUserCode/RecordPoll simply return the stale record (the TTL is enforced only in the service, oauth/device.go:286 and 320). oauth.NewService uses this store by default whenever Config.Devices is nil (oauth/as.go:57-59). Each device authorization therefore pins two map entries plus the scopes/subject strings forever, so a long-running process that exposes the device grant grows without bound. There is no rate limit inside the package, so a public client can drive it with POST /device_authorization. Sibling stores show the intended shape: oauth.MemoryStore.SweepExpired (oauth/tokens.go:285-328), OIDCStore.purgeExpiredDevicesLocked (internal/store/memory/oidc.go:1122-1134) and the oidc_devices entry in postgres sweep.go:41-54. oauth/grants.go:126-129 also documents 'the tokens are the grant', but the device records are outside the token store entirely.",
+      "exploit": "An embedding uses the default in-memory device store and exposes the device flow. A client (or an attacker who knows a public client_id) calls the device authorization endpoint in a loop. Expired pending records are never released, so process RSS grows for every request and the byUser scan in freeUserCode (line 438) gets slower; a restart is the only reclaim.",
+      "recommendation": "Give MemoryDeviceStore a SweepExpired(now) that drops entries past ExpiresAt from both maps (and delete or tombstones on consume), and run it from the same janitor loop that already sweeps the token store. Record the deadline on the record so the sweep does not need the service clock.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-4",
+      "title": "Grants page scans every token in the process under the store's single mutex (no subject index in the in-memory store)",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "oauth/grants.go:158-180",
+        "internal/httpapi/grants_routes.go:31-43"
+      ],
+      "evidence": "func (s *MemoryStore) ListBySubject(_ context.Context, subject string) ([]GrantRecord, error) {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\n\tvar out []GrantRecord\n\tfor _, t := range s.access {\n\t\tif t.Subject == subject {\n\t\t\tout = append(out, GrantRecord{\n\t\t\t\tKind: TokenKindAccess, ClientID: t.ClientID, Scopes: t.Scopes,\n\t\t\t\tIssuedAt: t.IssuedAt, ExpiresAt: t.ExpiresAt,\n\t\t\t})",
+      "why": "MemoryStore.ListBySubject is a full scan of both the access and refresh maps for every grants call, holding the store-wide mutex for the entire walk; DeleteBySubjectClient (lines 191-221) and RevokeTokens (lines 230-261) do the same for revocation. GET /v1/grants calls this on every page load (grants_routes.go:37) and it is a session-scoped, cheap-to-invoke endpoint, so one account's grants listing costs O(total live tokens in the process) and blocks every other token operation (issue, exchange, refresh) for the duration. The store that actually serves the same endpoint with an index is the OP store: internal/store/memory/oidc.go:1386-1395 iterates s.accessBySubject.keys(subject)/s.refreshBySubject.keys(subject), and postgres uses subject-leading indexes (migrations 0008/0012). Reachability: oauth.Service is not wired into cmd/re0auth, so this affects embeddings using oauth.MemoryStore for the business-plane grants surface.",
+      "exploit": "An operator runs the oauth engine in memory mode with a few hundred thousand live tokens. Any signed-in user loading the account page triggers a scan of every token row while holding the global lock; a handful of concurrent page loads serialize and stall token issuance for all clients (the rate limiter does not cap lock hold time).",
+      "recommendation": "Maintain subject-keyed secondary indexes (subject -> set of token hashes) in MemoryStore, as the OP store already does, and iterate only the subject's keys; on delete, update both the index and the primary map under the same lock.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-5",
+      "title": "freeUserCode treats every store error as a collision and checks uniqueness non-atomically",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "medium",
+      "locations": [
+        "oauth/device.go:432-443",
+        "oauth/device.go:155-163"
+      ],
+      "evidence": "func (s *service) freeUserCode(ctx context.Context) (string, error) {\n\tfor attempt := 0; attempt < 8; attempt++ {\n\t\tcode, err := newUserCode()\n\t\tif err != nil {\n\t\t\treturn \"\", err\n\t\t}\n\t\tif _, err := s.devices.GetDeviceByUserCode(ctx, code); errors.Is(err, ErrDeviceNotFound) {\n\t\t\treturn code, nil\n\t\t}\n\t}\n\treturn \"\", errors.New(\"oauth: could not allocate a unique user code\")\n}",
+      "why": "The uniqueness test only accepts ErrDeviceNotFound as 'free'. Any other error (a transient database failure in a persistent DeviceStore, a context cancellation) is treated as 'taken', so the loop burns its eight attempts and finally returns a misleading 'could not allocate a unique user code' error, converting an infrastructure fault into an ordinary allocation failure with no error cause preserved (errors.Is chaining is lost). Separately, the code is chosen after the read and written later in SaveDevice; MemoryDeviceStore.SaveDevice overwrites byUser without a duplicate check (line 161), unlike the production stores which reject a duplicate (OIDCStore.StoreDeviceAuthorization returns op.ErrDuplicateUserCode, postgres is backed by the unique index upper(replace(user_code,'-','')) in migration 0008:81-82). Two concurrent BeginDeviceAuthorization calls could therefore both 'win' the same user code; the probability with 21^8 codes is negligible, but the store contract allows it.",
+      "exploit": "A persistent DeviceStore has a brief outage (or the request context is cancelled) while BeginDeviceAuthorization runs: the endpoint retries eight times and then returns a generic 500 'could not allocate a unique user code' instead of surfacing the store error, making the incident look like user-code exhaustion and hiding the real cause from logs.",
+      "recommendation": "Distinguish ErrDeviceNotFound from other errors: return the error when it is not ErrDeviceNotFound. Make allocation collision-proof by having the store assign or reject duplicate user codes on write (as OIDCStore already does) rather than relying on a read-then-write probe.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-6",
+      "title": "slow_down is returned before the terminal device status, and the advertised interval is truncated",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "oauth/device.go:289-307",
+        "oauth/device.go:252-255"
+      ],
+      "evidence": "\tif !rec.LastPoll.IsZero() && now.Before(rec.LastPoll.Add(s.pollInterval)) {\n\t\treturn TokenResponse{}, protocolError(\"slow_down\", \"polling faster than the advertised interval\")\n\t}\n\t// Stamp the poll = and only the stamp. Writing the record read above back\n\t// would erase a decision that landed in between, which is exactly what\n\t// DeviceStore.RecordPoll exists to make impossible.\n\tif err := s.devices.RecordPoll(ctx, rec.DeviceCodeHash, now); err != nil {\n\t\treturn TokenResponse{}, err\n\t}",
+      "why": "The throttle check runs before the rec.Status switch, so a client polling a code whose user has already denied (or approved) receives slow_down rather than the terminal access_denied / tokens until its next poll falls outside the interval. RFC 8628 section 3.5 treats slow_down as a pacing response to a still-pending request; a decided request should return its final state. The interval is also truncated at line 252 (`int64(s.pollInterval / time.Second)`, floored to 1) while the throttle compares against the untruncated s.pollInterval, so a sub-second or non-integral DevicePollInterval makes the server enforce a longer floor than it advertised, producing spurious slow_down responses on a correctly paced client.",
+      "exploit": "A deployment sets DevicePollInterval to 1500ms for faster testing; the response advertises interval=1s but the server refuses a poll at 1.2s with slow_down. A client that polls an already-denied code just after a previous poll is told to slow down instead of receiving access_denied, so it retries the doomed request.",
+      "recommendation": "Evaluate the terminal statuses (denied/approved) before the throttle, and advertise the same effective interval the throttle enforces (e.g. ceil(pollInterval/1s) and use that value for both).",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-7",
+      "title": "Consent decision conflates store failures with an expired authorization request",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/httpapi/authorization_routes.go:97-101",
+        "internal/httpapi/authorization_routes.go:151-155",
+        "internal/httpapi/authorization_routes.go:159-166",
+        "internal/httpapi/authorization_routes.go:173-183"
+      ],
+      "evidence": "\t\tredirect, err := s.authInteract.DenyAuthorization(r.Context(), id)\n\t\tif err != nil {\n\t\t\ts.writeProblem(w, r, http.StatusNotFound, \"not_found\", \"authorization request expired\")\n\t\t\treturn\n\t\t}",
+      "why": "handleGetAuthorizationRequest, the deny branch, and writeDecisionError (default case) map every engine error that is not a recognised oauth.Error to 404 not_found 'authorization request expired'. A database outage, a context deadline or a serialization failure in the authorization store is therefore reported to the user (and to the frontend) as an expired request, so the UI tells the user to start over and no 5xx is surfaced for the outage. The approve path's writeDecisionError distinguishes only *oauth.Error; everything else becomes the same 404. This masks availability problems and makes the failure indistinguishable from the genuinely expired case.",
+      "exploit": "The Postgres pool is exhausted during a consent decision; AuthRequestByID/CompleteLogin times out. The user who just clicked Approve is told the request expired and re-initiates authorization, generating more load against the already-degraded store, while the service emits no 5xx for the incident.",
+      "recommendation": "Classify errors explicitly: map oauth protocol errors to their code/status, map 'not found/expired' sentinels to 404, and return 500 internal_error (with the error logged, not echoed) for anything else, as handleDeviceDecision's deviceProblem already does.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-8",
+      "title": "Registry.Register mutates the scope map without synchronization while Get/Resolve read it concurrently",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "medium",
+      "locations": [
+        "oauth/scope.go:183-197",
+        "oauth/scope.go:199-213",
+        "oauth/scope.go:217-235"
+      ],
+      "evidence": "\tif _, exists := r.byScope[d.Scope]; exists {\n\t\treturn fmt.Errorf(\"oauth: duplicate scope %s\", d.Scope)\n\t}\n\tr.byScope[d.Scope] = d\n\treturn nil",
+      "why": "Registry has no mutex. Register writes r.byScope while Get, Descriptors and Resolve read the same map, so any Register call that races a serving request is a data race and can crash the process ('concurrent map read and map write') or produce a torn read. The doc comment says Register 'is meant to be called by provider packages at composition time', which is a convention, not an enforcement: the same *Registry instance is handed to the service (oauth/as.go:77) and to the HTTP handler, and nothing prevents a composition step, reload or test helper from registering after the server starts. DefaultRegistry/NewRegistry build the map before use, so the shipped path is safe today.",
+      "exploit": "A deployment registers provider scopes lazily (e.g. from a source module's init triggered by the first request, or a config reload) after the server is serving; a concurrent /oauth/authorize Resolve call and the Register write race, and Go's runtime aborts the process with a concurrent-map-write fatal error.",
+      "recommendation": "Either guard byScope with a sync.RWMutex, or make the registry immutable after construction (freeze it, returning an error from Register once serving begins) so the composition-time contract is enforced rather than assumed.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S04-9",
+      "title": "Device authorization accepts an empty scope set and issues a scope-less token pair",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "oauth/device.go:224-228",
+        "oauth/device.go:373-386",
+        "oauth/device.go:308"
+      ],
+      "evidence": "func (s *service) BeginDeviceAuthorization(ctx context.Context, req DeviceAuthorizationRequest) (DeviceAuthorizationResponse, error) {\n\tclient, _, err := s.describeScopes(ctx, req.ClientID, req.Scopes)\n\tif err != nil {\n\t\treturn DeviceAuthorizationResponse{}, err\n\t}",
+      "why": "describeScopes resolves whatever scope slice it is given, and Registry.Resolve(nil, ...) returns an empty descriptor list with no error, so BeginDeviceAuthorization succeeds with zero scopes. DecideDeviceAuthorization then accepts `scopes == nil` as 'grant the requested set', which is the empty set, and RecordDecision approves it; the poll reaches the fall-through at line 308 and s.issue mints an access token carrying no scopes plus a 30-day refresh token. The shipped OP device path refuses this outright (internal/oidchttp/oidchttp.go:1159-1162 returns invalid_request 'scope is required'). The token cannot be widened later (Refresh rejects any scope not already in rt.Scopes), so the impact is bounded to an authorized-but-useless credential and a consent record, but it violates the advertised device-grant contract and creates a subject-bound refresh token with no permission behind it.",
+      "exploit": "A client (or an attacker who knows a public client_id) starts a device authorization with no scope parameter, has the victim approve it, and receives a refresh token bound to the victim's subject. The token grants nothing today, but it is a durable account-linked credential that survives until its TTL and appears in the grants view as a client with no scopes.",
+      "recommendation": "Reject a device authorization request with no scopes (invalid_scope/invalid_request) in BeginDeviceAuthorization, matching validateDeviceAuthorization, and keep the existing 'explicit empty approval is refused' rule in DecideDeviceAuthorization.",
+      "already_mitigated": false
+    }
+  ],
+  "coverage": [
+    "oauth/device.go",
+    "oauth/scope.go",
+    "oauth/grants.go",
+    "oauth/as.go",
+    "oauth/tokens.go",
+    "oauth/service.go",
+    "oauth/client.go",
+    "oauth/http.go",
+    "oauth/bodylimit.go",
+    "internal/httpapi/device_routes.go",
+    "internal/httpapi/authorization_routes.go",
+    "internal/httpapi/grants_routes.go",
+    "internal/httpapi/server.go",
+    "internal/httpapi/middleware.go",
+    "internal/httpapi/responses.go",
+    "internal/httpapi/federation_routes.go (bindURL)",
+    "internal/auth/auth.go (Bind/Bound/OwnerMatches/Unbind/CSRF)",
+    "internal/authorization/interaction.go",
+    "internal/oidchttp/oidchttp.go (consent + device authorization + poll pre-flights)",
+    "internal/oidcstore/oidcstore.go (scope policy helpers)",
+    "internal/store/memory/oidc.go (device, grants, CompleteLogin, sweep)",
+    "internal/store/postgres/oidc.go (device, grants, RevokeGrant)",
+    "internal/store/postgres/sweep.go",
+    "internal/store/postgres/migrations/0008_oidc.sql, 0012_indexes.sql, 0016_oidc_device_last_poll.sql, 0017_oidc_devices_expires_idx.sql, 0018_oidc_refresh_tokens_id_hash_idx.sql, 0021_token_client_indexes.sql, 0022_bulk_revoke_client_indexes.sql",
+    "internal/wiring/oauth.go and internal/wiring/keys.go",
+    "cmd/re0auth/main.go (openOIDC, login hook, device store wiring)",
+    "internal/federation/missing.go"
+  ],
+  "notes": "The scoped oauth.Service device engine is not wired into the shipped cmd/re0auth binary, which runs the zitadel/oidc OP backed by internal/store/{memory,postgres}.OIDCStore. That OP path already consumes an approved device_code on first read and refuses empty confidential-client device requests, so S04-1/S04-2/S04-3/S04-9 are library-level defects of the public oauth/as capability (internal/wiring.OAuthComponent, upstreamkit's OAuth core) rather than live defects of the binary; they are reported because oauth/device.go is explicitly in scope and its Config/DeviceStore surface is the documented way to run the device grant. I did not read AUDIT-ISSUES.md, docs/security-audit-*.md, internal/zzprobe/**, _audit/**, audit/** or scratchpad/**; conclusions come from the current sources only. oauth/grants.go and oauth/as.go were read for the cross-package call graph even though they are not primary scope files. Test files were not used as a source of any claim; go vet over ./oauth and ./internal/httpapi passes clean. No Docker/Postgres was available, so the Postgres device/grants paths were audited by reading SQL and migrations, not executed."
+}

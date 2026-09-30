@@ -1,0 +1,97 @@
+{
+  "scope": "S01",
+  "verified": [
+    {
+      "id": "S01-1",
+      "status": "downgraded",
+      "final_severity": "medium",
+      "reason": "Code confirmed. PollDeviceAuthorization reads the record, stamps only LastPoll, then falls through the status switch to s.issue(client.ID, rec.Subject, rec.Scopes, \"\") on every poll, so an approved device_code mints a new access+refresh pair in a brand-new family each time until DeviceCodeTTL (default 10 min); GetDevice and RecordPoll take the lock separately, so a concurrent burst all reads the same LastPoll and all pass the slow_down gate. This is a real RFC 8628 single-use violation. Severity high is overstated for three reasons: (a) no in-tree HTTP surface serves the device grant - upstreamkit.handleToken accepts only authorization_code and refresh_token and mounts no device_authorization route, and the shipped OP device flow is zitadel pkg/op backed by oauth_device_authorizations/oidc_devices, not oauth/device.go - so the stated POST /oauth/token device_code exploit is not reachable in this repository; (b) the redeemer is the same device that already holds the code and would legitimately receive a pair, so repeated minting is over-issuance rather than privilege escalation; (c) RevokeGrant/RevokeTokens by subject+client still removes every family at once. The defect must still be fixed (atomic consume, invalid_grant for the losing poller) before the library device grant is mounted.",
+      "evidence_checked": "oauth/device.go:269-309, oauth/device.go:302-308, oauth/device.go:191-202, oauth/as.go:388-423, upstreamkit/server.go:242-296"
+    },
+    {
+      "id": "S01-2",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed at the store level: SaveDevice inserts into byDev and byUser and MemoryDeviceStore has no delete and no SweepExpired; the DeviceStore interface declares no pruning method at all, and NewService substitutes the memory store when Config.Devices is nil (oauth/as.go:57-59). referencesource.New leaves Devices unset, so this default is instantiated by a shipped binary. Two qualifiers cap practical reach rather than refute it: no in-tree server mounts BeginDeviceAuthorization (only tests call it), and the Postgres DeviceStore's oauth_device_authorizations table is swept by DB.SweepExpired (sweep.go:46), so unbounded growth is memory-store/embedder-specific. The per-request, never-reclaimed allocation in the library default store remains a real reliability defect; medium retained for the library default.",
+      "evidence_checked": "oauth/device.go:139-163, oauth/device.go:224-247, oauth/as.go:57-59, internal/store/postgres/sweep.go:46, referencesource/source.go:200-208"
+    },
+    {
+      "id": "S01-3",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed divergence. MemoryStore.ConsumeRefresh returns &RefreshReuseError for any resident tombstone without ever reading tomb.ExpiresAt (tokens.go:440-444), while postgres.Tokens.ConsumeRefresh adds AND expires_at > clock() (oauth.go:272-281). Nothing in the oauth package or the composition root calls MemoryStore.SweepExpired - the only janitor (main.go:1004-1024) sweeps the OP memory store and bind flows, and oauth.NewMemoryStore in referencesource has no sweeper - so an expired spent value keeps its tombstone. service.Refresh's errors.As branch then calls RevokeRefreshFamily, killing live later generations of the same family whose deadline is later (each rotation sets ExpiresAt = now+rtTTL). Reachable through the referencesource /oauth/token refresh_token path. Medium retained.",
+      "evidence_checked": "oauth/tokens.go:440-450, oauth/tokens.go:248-261, oauth/as.go:264-288, oauth/tokens.go:298-328, internal/store/postgres/oauth.go:269-284, cmd/re0auth/main.go:1004-1024"
+    },
+    {
+      "id": "S01-4",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: issue writes SaveAccess then SaveRefresh with no transaction and no rollback; a SaveRefresh failure returns an error to the caller while the access row stays live and introspectable (no value is disclosed to anyone). MemoryStore.SaveRefresh cannot fail, so this is a Postgres-store concern (SaveAccess and SaveRefresh are separate pool.Exec calls). Low retained: not attacker-triggerable, impact is orphan-row bloat and unclear issuance accounting.",
+      "evidence_checked": "oauth/as.go:405-432, oauth/as.go:388-423, internal/store/postgres/oauth.go:125-133, internal/store/postgres/oauth.go:184-192"
+    },
+    {
+      "id": "S01-5",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: client() returns protocolError(\"invalid_client\",\"unknown client\") for ErrClientNotFound but \"invalid client credentials\" for a wrong secret, and upstreamkit.writeProtocolError serialises oe.Description verbatim into error_description (server.go:465-478), contradicting the indistinguishability comment at server.go:341-342. The paths also differ (single map lookup vs SHA-256 plus ConstantTimeCompare), so the text is not the only oracle. Low retained: it enumerates registered client ids but grants no access by itself.",
+      "evidence_checked": "oauth/as.go:437-448, upstreamkit/server.go:339-345, upstreamkit/server.go:465-478"
+    },
+    {
+      "id": "S01-6",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed: client(ctx,id,secret,true) only verifies the secret when c.Type == ClientConfidential, and AuthenticateClient is exactly that call, so any secret string authenticates a public client. upstreamkit.handleCascadeRevocation authenticates the client and then invokes the destructive hook, and referencesource's cascadeRevoke resolves the subject from the presented token and ends the upstream session. Precondition = a registered public client id plus a valid token from that source. Medium retained; the in-tree reference source registers only a confidential client, so the gap is in the shared kit/library contract rather than the demo wiring.",
+      "evidence_checked": "oauth/as.go:437-448, oauth/as.go:89-92, upstreamkit/server.go:330-357, referencesource/cascade.go:40-81"
+    },
+    {
+      "id": "S01-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: MemoryClientRegistry.RotateSecret rejects only len(secretHash)==0 and stores the bytes; Authenticate compares them with subtle.ConstantTimeCompare against sha256(secret), which returns 0 on any length mismatch, so a non-32-byte digest silently bricks the client while rotation reports success. RestoreClientWithStatus enforces len(secretHash)==sha256.Size (client.go:139), so the write and load paths disagree about a valid digest. Low retained: operator-induced, recoverable by another rotation.",
+      "evidence_checked": "oauth/client.go:415-432, oauth/client.go:107-114, oauth/client.go:124-145"
+    },
+    {
+      "id": "S01-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: MemoryStore.TokenOwner consults only the live access and refresh maps, so a value already spent by ConsumeRefresh returns ErrTokenNotFound; Revoke then returns the idempotent nil early and never reaches DeleteRefresh, whose tombstone-clearing branch is therefore dead for spent refresh values through the only production caller (as.go:340). The caller gets RFC 7009-compliant 200 while the tombstone stays armed. Low retained.",
+      "evidence_checked": "oauth/as.go:311-345, oauth/tokens.go:393-405, oauth/tokens.go:453-464"
+    },
+    {
+      "id": "S01-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: service.record discards the audit error with '_ =' for every security event (authorize, exchange_failed, reuse_detected, token, revoke, grant.revoke, device), while audit.Logger documents that returning nil means safe to proceed (audit/audit.go:35-39). A failing or back-pressured sink yields a silent gap around the reuse-detection theft signal and revocation. Low retained: the revocation itself still happens; the loss is observability and incident evidence.",
+      "evidence_checked": "oauth/as.go:451-459, audit/audit.go:35-39"
+    },
+    {
+      "id": "S01-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: NewSecretHash is a single unsalted SHA-256, used for admin-generated secrets and for the operator's [client].clientSecret via configuredClient -> NewClient (main.go:1634-1643); admin newSecret is high-entropy, but a config secret may be low-entropy. Disclosure of the registry row or a backup permits offline cracking of that secret. Low retained: requires store disclosure, and generated secrets are not affected.",
+      "evidence_checked": "oauth/client.go:99-114, cmd/re0auth/main.go:1634-1643, internal/admin/admin.go:248-256"
+    },
+    {
+      "id": "S01-11",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed structurally: MemoryStore uses one sync.Mutex (not RWMutex) and SweepExpired, ListBySubject, DeleteBySubjectClient and RevokeTokens hold it across whole-map scans, while GetAccess - the Introspect/withBearer hot path - contends on the same lock, so one scan is O(total tokens) inside a global critical section. Call-frequency qualifier rather than a refutation: the described triggers are not wired in-tree (oauth.Service.Grants is unused by the shipped server and nothing calls MemoryStore.SweepExpired), and the store is documented non-durable. Low retained.",
+      "evidence_checked": "oauth/tokens.go:263-273, oauth/tokens.go:298-328, oauth/grants.go:157-221, oauth/as.go:347-377"
+    },
+    {
+      "id": "S01-12",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: GetAccess/GetCode/GetRefresh/ConsumeRefresh/ConsumeCode return struct copies whose Scopes slice header aliases the stored backing array, and Introspect forwards at.Scopes unchanged into TokenInfo.Scopes; ListBySubject builds GrantRecord with the same aliases. No current caller mutates the slice, so this is latent, but the public Store/Service API hands out a writable alias to stored authorization state. Low retained as a latent API-safety defect.",
+      "evidence_checked": "oauth/tokens.go:373-382, oauth/tokens.go:341-349, oauth/tokens.go:421-429, oauth/as.go:370-376, oauth/grants.go:157-180"
+    },
+    {
+      "id": "S01-13",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Confirmed and correctly self-assessed as mitigated/informational: LimitFormBody only pre-checks r.ContentLength, so a chunked body over MaxFormBytes is caught by http.MaxBytesReader during ParseForm and surfaces as a read error that upstreamkit maps to 400 invalid_request 'malformed form body' instead of the declared-length 413. The cap holds for every body; only the error shape differs. Info retained.",
+      "evidence_checked": "oauth/bodylimit.go:27-34, upstreamkit/server.go:162-169, upstreamkit/server.go:242-246"
+    }
+  ],
+  "summary": "Independently re-read every cited location and traced callers/guards. 13 findings reviewed: 12 confirmed with severity retained, 1 downgraded (S01-1 high -> medium), 0 rejected. S01-1's code behavior is exactly as claimed (an approved device_code re-mints on every throttled poll, and concurrent polls all pass the slow_down gate), but high is overstated because no in-tree HTTP surface mounts the oauth device grant (upstreamkit.handleToken has no device_code case and no device_authorization route; the shipped OP device flow is zitadel pkg/op with its own store) and the redeemer is the party that already legitimately receives a pair. Key cross-checks that held: oauth.MemoryStore.SweepExpired is called by no production loop (the janitor sweeps the OP memory store and bind flows), so S01-3's expired-tombstone premise is real; the Postgres DB sweep does cover oauth_device_authorizations, so S01-2 is memory-store/embedder-specific; S01-5/S01-6 were traced through upstreamkit.writeProtocolError and handleCascadeRevocation; S01-9 is backed by the audit.Logger 'returning nil means safe to proceed' contract. No new severe issue found that was not already cited."
+}

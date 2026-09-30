@@ -1,0 +1,228 @@
+{
+  "scope": "S03",
+  "title": "Authentication, sessions, accounts (S03)",
+  "findings": [
+    {
+      "id": "S03-1",
+      "title": "Unbounded caller-controlled return_to persisted in the server-side session",
+      "severity": "high",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/auth/auth.go:612",
+        "internal/auth/auth.go:616",
+        "internal/auth/auth.go:289",
+        "internal/safeurl/safeurl.go:34"
+      ],
+      "evidence": "returnTo := safeurl.RelativePath(r.URL.Query().Get(\"return_to\"))\n\th.manager.sessions.Put(ctx, keyFlowState, state)\n\th.manager.sessions.Put(ctx, keyFlowProvider, string(provider))\n\th.manager.sessions.Put(ctx, keyFlowMode, mode)\n\th.manager.sessions.Put(ctx, keyFlowReturnTo, returnTo)",
+      "why": "safeurl.RelativePath only enforces form (leading single slash, no backslash, url.Parse-able); it has no length bound, so return_to is stored verbatim in the session. Scs re-encodes the whole session value map and commits it at response end, so each anonymous GET /auth/{provider}/start can persist up to ~64 KiB (server maxHeaderBytes) of attacker-chosen bytes, for the session's full 24h lifetime. There is no cap on the number of sessions either: a request without a cookie creates a new one (scs Lifetime default 24h, Persist=true, and the in-memory memstore used when no database is configured sweeps only by expiry). This directly contradicts the discipline already applied to handles in the same file, where maxBoundHandleBytes=128 exists precisely because 'a session is rewritten whole, so its bytes must not be caller-chosen (Z07-3)'.",
+      "exploit": "Unauthenticated loop, no cookie, registered provider: GET /auth/github/start?return_to=/AAAA...(60 KiB). Each request allocates a fresh session whose payload is dominated by return_to; in memory mode (cmd/re0auth/main.go:892-903 wires auth.NewManager with a nil Store -> scs memstore) this is unbounded process RAM, and in Postgres mode it is unbounded growth of sessions.data bytea. The default limiter is 50/s per (plane,/64) with burst 100, i.e. ~3 MB/s and ~180k sessions/hour from one address, none collected for 24h.",
+      "recommendation": "Bound return_to the same way handles are bounded: add a maxReturnToBytes constant (e.g. 2048) and drop/refuse anything longer before Put. Optionally also cap total session bytes and the number of live sessions in the memory store.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-2",
+      "title": "SignIn leaves an authenticated session outside the SessionIndex when RenewToken fails",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/auth/auth.go:161",
+        "internal/auth/auth.go:166",
+        "internal/auth/auth.go:177"
+      ],
+      "evidence": "\tm.sessions.Put(ctx, keyUser, string(user))\n\t// auth_time is when the human actually authenticated, not when a later\n\t// authorization decision happens. The OP's ID token must carry the former, so\n\t// it is recorded at sign-in and read back by the login hook.\n\tm.sessions.Put(ctx, keyAuthTime, time.Now().UTC().Format(time.RFC3339Nano))\n\tif err := m.sessions.RenewToken(ctx); err != nil {\n\t\treturn err\n\t}\n\tif m.index == nil {\n\t\treturn nil\n\t}",
+      "why": "The documented contract of SignIn is that a session which cannot be recorded is destroyed ('a session outside the index would be one an operator cannot reach'). That destroy is only performed on the index.Remember failure path (auth.go:177-180). If RenewToken fails, the function returns with keyUser already Put and the session token unchanged, and scs still commits at response end (IdleTimeout is set to 2h by default at auth.go:93-97, and scs's Load marks every loaded session Modified when IdleTimeout>0), so an authenticated session can be persisted with the OLD, unrotated token and with no session_subjects row. Two consequences: the subject-scoped Kill Switch cannot revoke that session, and the login handler reports failure (session_failed) while the browser is in fact signed in (fail-open).",
+      "exploit": "Requires a transient store failure on RenewToken's DELETE while the later commit succeeds. In a session-fixation setup that is only possible when the cookie is not __Host- protected (Secure=false / plain-HTTP dev deployment), an attacker who can plant a session cookie keeps a token that remains valid after the victim's login 'failed'.",
+      "recommendation": "On RenewToken error, call m.sessions.Destroy(ctx) (mirroring the Remember-failure path) before returning, and do not leave keyUser/keyAuthTime in a session that the index never saw; alternatively clear keyUser on every error path out of SignIn.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-3",
+      "title": "EndSession forgets the session index before destroying the session, so a failed sign-out leaves an unrevocable live session",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/auth/auth.go:210",
+        "internal/auth/auth.go:212",
+        "internal/auth/auth.go:216"
+      ],
+      "evidence": "func (m *Manager) EndSession(ctx context.Context) error {\n\tif m.index != nil {\n\t\tif token := m.sessions.Token(ctx); token != \"\" {\n\t\t\t_ = m.index.Forget(ctx, token)\n\t\t}\n\t}\n\treturn m.sessions.Destroy(ctx)\n}",
+      "why": "The session_subjects row is deleted first and Destroy is called second. If Destroy fails (store error), SignOut returns an error and the handler answers 500, but the session row is still live and scs re-commits it at response end because IdleTimeout>0 forces status=Modified. The only record that maps that token to the account has already been removed, so RevokeSubjectSessions(subject) can no longer reach it - the exact 'session outside the index' the design says must not exist. The ignored Forget error also means an index-delete failure is silent.",
+      "exploit": "A transient DELETE failure on the sessions row during sign-out (statement timeout / pool saturation) leaves the browser cookie valid and the session missing from session_subjects; the user believes they signed out and a subject-scoped Kill Switch cannot remove it. The session then survives until 24h expiry.",
+      "recommendation": "Destroy first, then Forget: an orphan session_subjects row after a successful Destroy is harmless (SweepExpired collects it after the 1h grace), while the current order can orphan a live session. At minimum, do not discard the Forget error without acting on it.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-4",
+      "title": "Concurrent first login of the same identity is reported as signup_failed instead of retrying the lookup",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/auth/auth.go:713",
+        "internal/auth/auth.go:714",
+        "internal/auth/auth.go:716"
+      ],
+      "evidence": "\tcase errors.Is(err, account.ErrNotFound):\n\t\tcreated, _, cerr := h.accounts.CreateWithIdentity(ctx, ident)\n\t\tif cerr != nil {\n\t\t\th.failLogin(w, r, provider, returnTo, codeSignupFailed)\n\t\t\treturn\n\t\t}",
+      "why": "Both stores enforce I-3 with a uniqueness check (MemoryStore.CreateWithIdentity returns ErrIdentityTaken when the key exists; postgres relies on the UNIQUE(provider,subject) constraint and maps a violation to ErrIdentityTaken). Two concurrent callbacks carrying the same identity (double-clicked callback, two tabs, retried redirect) can both observe ErrNotFound, and exactly one then loses the create race. The loser is treated as a generic signup failure even though the account now exists, so a legitimate user sees ?error=signup_failed and must start over.",
+      "exploit": "Double-submit GET /auth/{provider}/callback?code=...&state=... (both requests load the same server-side flow state before either clears it); one response reports success, the other reports signup_failed. No duplicate account is created, but the visible outcome depends on request interleaving.",
+      "recommendation": "Treat account.ErrIdentityTaken from CreateWithIdentity as 'someone else created it concurrently': re-run FindByIdentity and continue the login with the found user (or retry once) before falling back to signup_failed.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-5",
+      "title": "Session referencing a missing account answers 500 instead of tearing the session down",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/httpapi/session_routes.go:27",
+        "internal/httpapi/session_routes.go:29",
+        "internal/httpapi/identity_routes.go:26",
+        "internal/httpapi/export_routes.go:64"
+      ],
+      "evidence": "\trecord, err := s.accounts.GetUser(ctx, user)\n\tif err != nil {\n\t\ts.writeProblem(w, r, http.StatusInternalServerError, \"internal_error\", \"account lookup failed\")\n\t\treturn\n\t}",
+      "why": "account.Store.GetUser/Identities return account.ErrNotFound when the account row is gone, but every session-scoped handler maps any error to 500 internal_error. A session can outlive its account: memory mode cannot revoke an account's sessions (cmd/re0auth/main.go:696-701 warns about exactly this), and in Postgres mode a partial erasure failure before step 4 leaves them too. The result is that the SPA bootstrap (/v1/sessions/current), /v1/identities and /v1/account/export all answer 500 for a cookie that should be discarded, and the client has no way to recover.",
+      "exploit": "In memory mode, erase an account (or lose its row) while keeping the browser cookie: GET /v1/sessions/current returns 500 'account lookup failed' for up to 24h. Not a data disclosure, but the session is neither usable nor clearable through the normal API.",
+      "recommendation": "Map account.ErrNotFound on a session-scoped read to an unauthenticated answer (EndSession + 401 unauthenticated), so a stale cookie is actively cleared instead of producing an opaque 500.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-6",
+      "title": "Admin authorization trusts the session claim without re-checking that the account still exists",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/httpapi/admin_routes.go:62",
+        "internal/httpapi/admin_routes.go:67",
+        "internal/httpapi/server.go:305"
+      ],
+      "evidence": "\tuser, ok := s.sessions.User(r.Context())\n\tif !ok {\n\t\ts.writeProblem(w, r, http.StatusUnauthorized, \"unauthenticated\", \"no active session\")\n\t\treturn false\n\t}\n\tif !s.adminAllowed[user] {\n\t\ts.writeProblem(w, r, http.StatusNotFound, \"not_found\", \"unknown resource\")\n\t\treturn false\n\t}\n\treturn true",
+      "why": "adminAllowed is a static map built once in New() from Config.Admins, and requireAdmin/requireAdminWrite never consult the account store. A live session whose account has been erased therefore keeps full operator authority: it passes the allowlist and, for mutations, the CSRF and reauth (auth_time is in the session) checks. This is reachable in any deployment without a SessionRevoker - the memory-mode default, which the startup path explicitly warns can leave an erased account's sessions alive - and in Postgres mode whenever the erasure fails after the session step.",
+      "exploit": "Memory-mode deployment: an operator's account is erased (self-erasure via DELETE /v1/account, or an operator erases a compromised admin) but its browser session has not been revoked. The session continues to call /v1/admin/clients, /v1/admin/kill_switch and read /v1/admin/audit until the 24h session expiry.",
+      "recommendation": "Have requireAdmin verify the account still exists (s.accounts.GetUser) - cheap and already required for other session handlers - or fail closed when Config.Sessions has no revoker, and treat a missing account as unauthenticated.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-7",
+      "title": "MemoryStore.Identities scans every identity in the process and holds the lock for the whole scan",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/account/account.go:231",
+        "internal/account/account.go:281",
+        "internal/account/account.go:283"
+      ],
+      "evidence": "func (s *MemoryStore) identitiesOfLocked(user UserID) []Identity {\n\tout := make([]Identity, 0, 4)\n\tfor _, ident := range s.identities {\n\t\tif ident.User == user {\n\t\t\tout = append(out, ident)\n\t\t}\n\t}",
+      "why": "Identities() takes an RLock and then walks the entire identities map to filter one user's rows, allocating and sorting the result. Memory mode is a production configuration (cmd/re0auth/main.go:895), and Identities is called on every SPA bootstrap (/v1/sessions/current), on /v1/identities, and on /v1/account/export. Cost is O(total identities) per call and the RLock is held for the whole scan, so login/identity writes (TouchLogin, CreateWithIdentity, LinkIdentity) contend with every reader. Also called twice per bootstrap in the worst case (GetUser does not, but callers routinely pair GetUser+Identities).",
+      "exploit": "With N accounts x M identities, each authenticated page load costs N*M iterations under a shared RLock; a modest 10k-account deployment turns the session bootstrap into a 30k-iteration scan per request, and concurrent logins serialize behind it.",
+      "recommendation": "Keep a secondary index map[UserID][]IdentityID maintained in CreateWithIdentity/LinkIdentity/UnlinkIdentity/DeleteUser, so Identities is O(k) for the user's own k identities.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-8",
+      "title": "Postgres Identities uses an EXISTS round trip before the real SELECT",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/account.go:236",
+        "internal/store/postgres/account.go:244"
+      ],
+      "evidence": "\tvar exists bool\n\tif err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM accounts_users WHERE id = $1)`, string(user)).Scan(&exists); err != nil {\n\t\treturn nil, err\n\t}\n\tif !exists {\n\t\treturn nil, account.ErrNotFound\n\t}\n\n\trows, err := s.pool.Query(ctx,\n\t\t`SELECT ` + accountIdentityCols + ` FROM accounts_identities WHERE user_id = $1 ORDER BY linked_at, id`, string(user))",
+      "why": "Every Identities call performs two pooled round trips (existence probe + list) plus two allocations, on the SPA bootstrap path (/v1/sessions/current) and /v1/identities, for a distinction (ErrNotFound vs empty list) that the single list query plus a zero-row check cannot make anyway. Under pool pressure this doubles the connection time of the most frequent authenticated read.",
+      "exploit": "No attacker trigger; load/performance only. The extra query is paid by every authenticated page load and every identity list.",
+      "recommendation": "Drop the EXISTS probe: run the list query and, if the caller needs ErrNotFound, check it with a single SELECT ... FROM accounts_users LEFT JOIN ... or reuse GetUser at call sites that already fetch the user.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-9",
+      "title": "clearFlow does not remove the OIDC nonce from the session",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/auth/auth.go:44",
+        "internal/auth/auth.go:737",
+        "internal/auth/auth.go:739"
+      ],
+      "evidence": "var flowKeys = []string{keyFlowState, keyFlowProvider, keyFlowMode, keyFlowReturnTo, keyFlowVerifier}",
+      "why": "flowKeys is the list clearFlow removes, and keyFlowNonce is not in it, although handleStart writes it (auth.go:618) and handleCallback reads it (auth.go:654) as part of the same one-shot flow state. After every completed or attempted callback the nonce therefore remains in the server-side session until the next /auth/{provider}/start overwrites it, and it is gob-committed with the rest of the session on that response. The nonce is server-generated and never exposed to the client, so there is no direct exploit; the impact is that the flow-cleanup contract is incomplete and session state that has no remaining consumer is retained.",
+      "exploit": "No exploit path found; a stale nonce is overwritten at the next login start and cannot be read by the browser. Reported as hygiene/correctness against the stated purpose of clearFlow.",
+      "recommendation": "Add keyFlowNonce to flowKeys (or have clearFlow iterate the six documented flow keys), keeping the constant list the single source of truth.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-10",
+      "title": "Kill Switch session revocation is unbounded and not atomic",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/sessions.go:198",
+        "internal/store/postgres/sessions.go:202",
+        "internal/store/postgres/sessions.go:216"
+      ],
+      "evidence": "\ttag, err := s.pool.Exec(ctx, `DELETE FROM sessions`)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\tif _, err := s.pool.Exec(ctx, `DELETE FROM session_subjects`); err != nil {\n\t\treturn tag.RowsAffected(), err\n\t}",
+      "why": "The Kill Switch's session half is two unbounded DELETE statements outside any transaction, unlike SweepExpired which is deliberately batched (sessionSweepBatchSize) precisely so a large backlog cannot exceed the pool's statement_timeout. On a large sessions table, `DELETE FROM sessions` (target 'all') can hit the statement timeout and revoke nobody, which is the one moment the operator most needs it; a failure of the second statement leaves session_subjects rows behind while the first statement's deletion is already committed. RevokeSubjectSessions has the same unbounded/UNION-subselect shape.",
+      "exploit": "Incident response on a deployment with a large sessions table: admin.kill_switch target=all times out inside the timeout window and returns an error with 0 sessions revoked; retries behave the same while the table stays large.",
+      "recommendation": "Batch both deletes (LIMIT ... ctid IN (SELECT ...)) like SweepExpired, loop until drained, and run the sessions + session_subjects deletes in one transaction so the reported count matches the outcome.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S03-11",
+      "title": "core.App.Remove races with an in-flight load, allowing a removed fiber to be marked active without its scope",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/core/app.go:99",
+        "internal/core/app.go:105",
+        "internal/core/app.go:334"
+      ],
+      "evidence": "\tif f.state == StateActive {\n\t\tf.state = StateUnloading\n\t}\n\ta.mu.Unlock()\n\n\ta.requestReconcile() // dependents unload first\n\ta.forceUnload(f)     // then this fiber's own inverses run",
+      "why": "step() releases a.mu while Apply runs (f.state == StateLoading). Remove() only transitions to StateUnloading when it observes StateActive, so it splices the fiber out and forceUnload disposes the context underneath the running Apply. When Apply returns nil, step re-acquires a.mu and unconditionally sets f.state = StateActive (app.go:334-341), reviving a fiber that is no longer in a.fibers and will never be reconciled again. Effects installed after the dispose window are added to an already-disposed scope (so they run immediately), but the fiber's visible state and any capability bound by it can be observed as Active while torn down. Note: internal/core is used only by internal/wiring, which nothing in cmd/ imports, so this is latent today.",
+      "exploit": "Concurrent App.Use/App.Remove during a component's Apply (a future supervisor, test harness, or anything that reloads components at runtime) can leave a removed fiber reported Active; Fiber.State() and Capabilities() then disagree with reality and dependents may resolve a binding that is being withdrawn.",
+      "recommendation": "Make the state transition in step conditional (only set StateActive if f.state is still StateLoading for this activation, e.g. carry an activation generation counter), and have Remove set StateUnloading regardless of whether the fiber is currently Active or Loading.",
+      "already_mitigated": false
+    }
+  ],
+  "coverage": [
+    "internal/auth/auth.go",
+    "internal/account/account.go",
+    "internal/httpapi/session_routes.go",
+    "internal/httpapi/account_routes.go",
+    "internal/httpapi/identity_routes.go",
+    "internal/core/app.go",
+    "internal/core/context.go",
+    "internal/core/component.go",
+    "internal/core/scope.go",
+    "internal/core/key.go",
+    "internal/core/errors.go",
+    "internal/core/doc.go",
+    "internal/httpapi/server.go",
+    "internal/httpapi/middleware.go",
+    "internal/httpapi/admin_routes.go",
+    "internal/httpapi/authorization_routes.go",
+    "internal/httpapi/device_routes.go",
+    "internal/httpapi/export_routes.go",
+    "internal/httpapi/idp_routes.go",
+    "internal/httpapi/federation_routes.go (bind start/callback, session binding)",
+    "internal/httpapi/clientaddr.go",
+    "internal/httpapi/responses.go",
+    "internal/store/postgres/account.go",
+    "internal/store/postgres/sessions.go",
+    "internal/admin/admin.go",
+    "internal/lifecycle/lifecycle.go",
+    "internal/ratelimit/ratelimit.go",
+    "internal/safeurl/safeurl.go",
+    "idp/idp.go",
+    "cmd/re0auth/main.go (session/account wiring, login hook, memory-mode storage)",
+    "third-party: github.com/alexedwards/scs/v2@v2.9.0 (session.go, data.go) read to establish commit/Destroy/RenewToken semantics"
+  ],
+  "notes": "No critical or high-impact privilege-escalation / authentication-bypass defect was found in the S03 surface: the login flow uses server-side one-shot state, PKCE, nonce and id_token azp verification; every session-scoped write checks CSRF; handles are Bound+OwnerMatches; safeurl.RelativePath correctly closes scheme-relative/backslash/control-byte open redirects; the session cookie is __Host-prefixed and Secure whenever the issuer is https (cmd/re0auth/config.go:482-497); and there is no CORS. The highest-impact issue is S03-3 (unauthenticated unbounded session-state amplification), rated high for resource exhaustion rather than confidentiality. Findings S03-2/S03-3 depend on a store error mid-sign-out/sign-in and are fail-open only on error paths. S03-11 is latent because internal/core is imported solely by internal/wiring, which no production binary imports. Uncertainties: (1) I could not exercise the Postgres paths against a live database, so multi-statement atomicity/timeout claims rest on the SQL and the surrounding bounded-sweep comments; (2) the exact per-request session-store write amplification caused by scs IdleTimeout>0 (auth.go:93-97) is real but I did not file it as a finding because sliding idle expiry inherently requires rewriting the row; (3) downstream rendering of provider-supplied DisplayName/Email/AvatarURL (identityViews) is a frontend concern and was not assessed here."
+}

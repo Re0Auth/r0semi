@@ -1,0 +1,110 @@
+{
+  "scope": "S10",
+  "title": "HTTP edge: middleware, server, rate limit, compression, client addr",
+  "findings": [
+    {
+      "id": "S10-1",
+      "title": "In-flight per-client cap is keyed per (plane, client), so one address can occupy the entire process-wide concurrency cap",
+      "severity": "high",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/httpapi/middleware.go:434",
+        "internal/httpapi/middleware.go:459",
+        "internal/httpapi/middleware.go:466",
+        "internal/httpapi/middleware.go:491"
+      ],
+      "evidence": "sem := make(chan struct{}, s.maxInFlight)\n\tperClient := s.maxInFlight / 2\n...\n\t\tkey := s.bucketKey(r)\n\t\tmu.Lock()\n\t\tif active[key] >= perClient {\n\t\t\tmu.Unlock()\n\t\t\trefuse(w, r)\n\t\t\treturn\n\t\t}\n\t\tactive[key]++\n...\nfunc (s *Server) bucketKey(r *http.Request) string {\n\treturn planeOf(r.URL.Path).String() + \"|\" + aggregateClientKey(s.clientKeyOf(r))\n}",
+      "why": "The comment above withInFlightLimit states the guarantee: \"one (plane, client) may hold at most half of it, and the other half is headroom every other client draws from\". That guarantee holds only per key, and the key includes the plane (planeOf(...).String()). The shared semaphore is process-wide but the per-client counter is per (plane, client): a single source address that touches two namespaces gets two independent maxInFlight/2 allowances whose sum is the whole cap. With the shipped defaults (defaultMaxInFlightMemory = 512, cmd/re0auth/config.go:359) and maxInFlight/2 = 256, 256 concurrent requests under /oauth plus 256 under a non-protocol path (browser or /v1) fill all 512 slots. The rate limiter does not prevent this: it bounds arrivals over time, not slots held; probes are exempt from both, so /healthz and /readyz stay green while the whole service answers 503 \"server busy\" to every other client. This is exactly the single-address denial of service the per-client split was added to prevent.",
+      "exploit": "One source IP opens 256 connections to /oauth/token and trickles each form body (approximately 2 KiB/s) so each handler blocks reading for the 30 s ReadTimeout (cmd/re0auth/main.go:117), and 256 connections to a large SPA asset under /app/_app/immutable/ that are never read, so the handlers block on Write for up to the 60 s WriteTimeout. Every slot in the global semaphore is then held by that one address; all non-probe traffic from every other client receives 503 problem+json/OAuth temporarily_unavailable until the attacker stops. (An authenticated account can substitute slow JSON bodies on /v1 endpoints for the asset half.)",
+      "recommendation": "Enforce the half-cap on the client identity alone rather than on the (plane, client) key: keep a second map keyed by aggregateClientKey(s.clientKeyOf(r)) for the concurrency counter (or reserve a global emergency pool that per-plane keys cannot consume), so the sum of one address's slots across planes cannot exceed maxInFlight/2. Add a test that saturates two planes from one peer and asserts other peers are still admitted.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S10-2",
+      "title": "A panic in the readiness probe wedges /readyz at \"checking\" (503) forever",
+      "severity": "medium",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/httpapi/health.go:183",
+        "internal/httpapi/health.go:194"
+      ],
+      "evidence": "\tc.running = true\n\tc.settled = make(chan struct{})\n\tsettled := c.settled\n\tc.mu.Unlock()\n\n\tprobeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readinessTimeout)\n\tdefer cancel()\n\terr := probe(probeCtx)\n\n\tc.mu.Lock()\n\tc.running = false\n\tclose(settled)",
+      "why": "readinessCache.check sets c.running = true before invoking the probe and clears it only on the normal return path, after probe(probeCtx). If the probe panics, control leaves check with c.running still true, c.settled never closed, and c.state still readinessUnknown. Every later caller takes the `fresh || c.running` branch, sees state == readinessUnknown and settled != nil, waits readinessColdStartWait, re-reads state and returns unknown; handleReady then answers 503 \"checking\" (health.go:133-138). The recoverer installed by httpapi (recoverBrowser, server.go:647) converts the one panicking request into a 500 but cannot repair the cache, so the instance is permanently marked not-ready and removed from rotation (single-instance deployments simply stop serving). The same wedge occurs for any probe that ignores the context deadline and blocks: running is never cleared and settled is never closed.",
+      "exploit": "Any panic inside the configured ReadinessProbe (a nil dereference or a panic in a dependency client is enough) — or a probe call that blocks past readinessTimeout without honouring probeCtx — permanently turns GET /readyz into 503 \"checking\" on that replica. The orchestrator drains the replica and never routes to it again; a deployment with one replica is down for all traffic.",
+      "recommendation": "Make the state transition unconditional: defer a cleanup immediately after setting running (recover any panic inside it, close settled exactly once, set running=false, and record readinessNotReady for a panic); or wrap the probe call in a func with its own recover. Add a test where the probe panics and a following /readyz must still return a fresh verdict rather than \"checking\" forever.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S10-3",
+      "title": "Compression writer is never closed or pooled when a handler panics after compression starts",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/compress/compress.go:160",
+        "internal/compress/compress.go:162"
+      ],
+      "evidence": "\t\tcw := &responseWriter{ResponseWriter: w, c: c, coding: coding, status: http.StatusOK}\n\t\tnext.ServeHTTP(cw, r)\n\t\tcw.finish()",
+      "why": "finish() is the only path that calls c.release(w.coding, w.enc), which calls WriteCloser.Close() and returns the writer to the per-coding sync.Pool (compress.go:292-297, 416-424). If next.ServeHTTP panics, finish() is skipped; the writer acquired by startCompress (compress.go:389) is abandoned. This service deliberately assumes handlers can panic — it installs recoverProtocol/recoverBusiness/recoverBrowser for exactly that — so the panic path is a supported control path, not an impossible one. For gzip the loss is a pooled buffer; for zstd the encoder's internal buffers are dropped and its shutdown path (Close) never runs, so it is garbage-collected instead of reused, and a new encoder is built on the next request. Repeated panics on compressible responses therefore convert the pool into an allocation-per-response churn.",
+      "exploit": "Not externally triggerable on its own; it is a resource-lifecycle defect that amplifies whenever a handler panics after writing at least DefaultMinSize (1024) bytes of a compressible response, which the existing per-plane recoverers are designed to absorb.",
+      "recommendation": "Replace `next.ServeHTTP(cw, r); cw.finish()` with `defer cw.finish()` placed immediately after constructing cw, and make finish idempotent (guard on a done flag / nil enc) so nothing is released twice.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S10-4",
+      "title": "Business-plane responses carrying the session CSRF token are compressed (BREACH-style compression oracle)",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "internal/httpapi/server.go:353",
+        "internal/compress/compress.go:336",
+        "internal/httpapi/session_routes.go:42",
+        "internal/httpapi/device_routes.go:75",
+        "internal/auth/auth.go:240"
+      ],
+      "evidence": "Eligible: func(r *http.Request) bool {\n\t\t\treturn planeOf(r.URL.Path) != planeProtocol\n\t\t},\n...\n\tcase hasNoTransform(h.Get(\"Cache-Control\")):\n\t\tw.skip = true\n\tcase !w.c.compressib(h.Get(\"Content-Type\")):\n\t\tw.skip = true\n...\n\twriteJSON(w, http.StatusOK, map[string]any{\n\t\t\"user_id\":             string(record.ID),\n\t\t\"primary_identity_id\": string(record.PrimaryIdentity),\n\t\t\"csrf_token\":          s.sessions.CSRFToken(ctx),\n...\n\twriteJSON(w, http.StatusOK, map[string]any{\n\t\t\"state\":      \"pending\",\n\t\t\"user_code\":  auth.UserCode,\n\t\t\"client\":     map[string]string{\"id\": auth.Client.ID, \"name\": auth.Client.Name},\n\t\t\"scopes\":     s.scopeViews(uniqueScopes(auth.Scopes)),\n\t\t\"expires_at\": auth.ExpiresAt,\n\t\t\"csrf_token\": s.sessions.CSRFToken(ctx),\n\t})",
+      "why": "The server deliberately excludes the protocol plane from compression to keep token responses out of BREACH (server.go:344-355 comment), but the predicate is plane-based and the business plane is eligible. writeJSON sets Cache-Control: no-store, not no-transform, and compressibleContentType (compress.go:476-500) returns true for application/json, so /v1/sessions/current and /v1/device/verification are gzip/zstd-compressed while containing a secret that is stable for the life of the session: Manager.CSRFToken stores and returns one token per session (auth.go:240-247). /v1/device/verification additionally reflects attacker-supplied input in the same body (user_code is echoed after NormalizeUserCode, device_routes.go:75-82). A response body that mixes a stable secret with attacker-chosen text and is compressed into a size-varying representation is the classic precondition for recovering the secret byte-by-byte from response length/timing.",
+      "exploit": "An attacker who can get a signed-in victim to issue many requests (for example cross-origin navigations/image loads to /v1/device/verification?user_code=<guess>) and who can observe relative response sizes for each guess can in principle narrow the compressed payload and recover the CSRF token, then use it to authorise writes such as /v1/sessions/sign_out or /v1/device/decision. Exploitation requires a response-size oracle for the victim's authenticated requests, which browsers do not expose directly, so this is a latent/protocol-level weakness rather than an immediately practical one; confidence in the mechanism is high, confidence in practicality is medium.",
+      "recommendation": "Opt secret-bearing responses out of compression: have writeJSON (or the handlers that emit csrf_token) set Cache-Control: no-transform, since the compressor already treats no-transform as a skip signal, or extend Config.Eligible to exclude CSRF-bearing endpoints. Replacing the CSRF token with per-request tokens would also remove the stable secret the oracle needs.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S10-5",
+      "title": "Limiter.Check heap-allocates a *rate.Reservation on every request",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/ratelimit/ratelimit.go:289",
+        "internal/ratelimit/ratelimit.go:295"
+      ],
+      "evidence": "\tif reservation := b.limiter.ReserveN(now, 1); reservation.OK() {\n\t\tv.Reset = reservation.DelayFrom(now)\n\t\t// CancelAt(now), not Cancel: Cancel cancels at a fresh time.Now(), and\n\t\t// when the bucket still had a token the reservation's timeToAct is `now`\n\t\t// itself — already in the past by then, so CancelAt refuses to run and\n\t\t// the reserved token silently leaks out of the bucket.\n\t\treservation.CancelAt(now)\n\t}",
+      "why": "golang.org/x/time/rate's ReserveN returns *Reservation (it takes the address of a local and returns it: rate.go:227-230 in x/time@v0.16.0), so the pointer escapes and every Check allocates one Reservation on the heap. Check is on the path of every request on both planes (withRateLimit calls it unconditionally, middleware.go:384), so this is one allocation plus GC pressure per request purely to compute the RateLimit-Reset hint — in a function whose neighbouring shardFor comment explicitly avoids allocation ('written out rather than taken from hash/fnv so that a per-request call allocates nothing'). It also takes the bucket's internal mutex four times per call (AllowN, TokensAt, ReserveN, CancelAt), though the shard lock already serialises the key.",
+      "exploit": "No direct exploit; it is steady-state GC pressure on the hottest middleware in the service, on the request path of every plane.",
+      "recommendation": "Compute Reset without a reservation: after AllowN, the wait for one more token is 0 when TokensAt(now) >= 1 and otherwise durationFromTokens(1 - tokens), which the shard already knows from the configured limit/burst. Alternatively expose/hold one Reservation value (non-pointer) per call. Either removes the allocation and the two extra mutex acquisitions.",
+      "already_mitigated": false
+    }
+  ],
+  "coverage": [
+    "internal/httpapi/middleware.go",
+    "internal/httpapi/server.go",
+    "internal/httpapi/clientaddr.go",
+    "internal/httpapi/responses.go",
+    "internal/httpapi/health.go",
+    "internal/ratelimit/ratelimit.go",
+    "internal/compress/compress.go",
+    "internal/compress/encodings.go",
+    "oauth/bodylimit.go (cross-ref: withBodyLimit)",
+    "internal/webui/webui.go (cross-ref: security headers / SPA CSP)",
+    "internal/observability/observability.go:280-313,621-661 (cross-ref: metrics middleware and statusRecorder in the edge chain)",
+    "internal/auth/auth.go:225-257 (cross-ref: CSRF token lifetime)",
+    "internal/httpapi/session_routes.go (cross-ref: CSRF-bearing response)",
+    "internal/httpapi/device_routes.go (cross-ref: reflected input + CSRF token)",
+    "cmd/re0auth/config.go:340-402,510-624,1029-1051 (cross-ref: shipped limits, validation, trusted proxies)",
+    "cmd/re0auth/main.go:103-151,218-230,781-798 (cross-ref: server timeouts, limiter construction)"
+  ],
+  "notes": "Primary files were read in full. zzprobe/, _audit/, audit/, scratchpad/, AUDIT-ISSUES.md and docs/security-audit-* were not consulted. S10-1's severity rests on the code's own stated headroom guarantee being defeated by the plane component of the key; the exact slow-request mechanism depends on handler behaviour outside this scope (confirmed only that /oauth/token and large SPA assets are reachable without a session and that ReadTimeout=30s/WriteTimeout=60s bound them). S10-4 is a latent compression-oracle concern; its severity is deliberately low because a cross-origin response-size oracle is not directly obtainable, even though the no-no-transform/compressibility facts are certain. Two spots were checked and found correctly mitigated and are therefore not reported as findings: (a) limiter.Check's use of CancelAt(now) instead of Cancel(now) is correct against x/time@v0.16.0 (CancelAt returns early only when timeToAct.Before(t), and ReserveN's timeToAct is always >= now, so the token is restored); (b) rate_limit NaN/Inf is refused at config load (cmd/re0auth/config.go:519-526), so the limiter never sees a non-finite limit despite having no internal guard. No PostgreSQL/Docker was needed; analysis is static."
+}

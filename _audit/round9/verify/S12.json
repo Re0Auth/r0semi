@@ -1,0 +1,91 @@
+{
+  "scope": "S12",
+  "verified": [
+    {
+      "id": "S12-1",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Read api.ts:332-369. fetch() is awaited at 336 and resolves on headers; clearTimeout(timer) at 354 runs immediately after that await and before `await res.text()` at 369, so the only AbortController deadline is disarmed before the body is consumed. A server/proxy that returns status+headers and then stalls the body leaves res.text() pending with no client-side deadline; callers (currentSession gates every page, getAuthorizationRequest gates consent) keep their loading state indefinitely. If the socket later closes, the rejection is a bare DOMException rather than an ApiError, but before that it is an unbounded hang. No guard found elsewhere.",
+      "evidence_checked": "web/src/lib/api.ts:334,354,369; callers web/src/routes/+page.svelte:44, web/src/routes/consent/+page.svelte (getAuthorizationRequest)"
+    },
+    {
+      "id": "S12-2",
+      "status": "rejected",
+      "final_severity": "info",
+      "reason": "The code observation is right (vite.config.ts:27-28 compares the full req.url, so '/?error=...' does not match), but the stated impact is false: Vite's own base middleware (node_modules/vite/dist/node/chunks/node.js:16429-16432) matches on the query-stripped pathname and answers pathname === '/' with `302 Location: base + url.slice(pathname.length)`, i.e. it carries the query. I ran the dev server (node node_modules/vite/bin/vite.js dev --port 5199) and probed it: GET / -> 302 /app/ (the custom plugin), GET /?error=access_denied -> 302 /app?error=access_denied -> 308 /app/?error=access_denied -> 200 SvelteKit shell with the query intact (x-sveltekit-normalize). GET /foo -> 404, so a 404 only happens for unrelated paths. The failed-login landing the plugin exists to prevent therefore works, and the SPA's onMount sees window.location.search. No impact.",
+      "evidence_checked": "web/vite.config.ts:27-28; node_modules/vite/dist/node/chunks/node.js:16418-16445; live probe of vite dev on :5199 (302/308 chain, query preserved)"
+    },
+    {
+      "id": "S12-3",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Read +page.svelte:40-41,241 and the Go return_to path. SignIn's returnTo is `${page.url.pathname}${page.url.search}` (line 241), so a visitor on /app/?error=access_denied forwards return_to=/app/?error=access_denied. auth.go:612 applies safeurl.RelativePath, which (safeurl.go:34-52) keeps path and query verbatim; the value is stored (616) and re-read on callback (652) and the success path redirects to it (707 for link, and the equivalent success redirect after 729). The app then re-runs onMount, sets authError from the stale query, and with phase==='signed_in' renders it at +page.svelte:244-248. The alert title for that branch is '身份操作没有完成' rather than '登录没有完成' as the finding says, but the substance — a successful login still shown as a failure — holds. Reloading keeps it until the query is removed.",
+      "evidence_checked": "web/src/routes/+page.svelte:40-41,241,244-248; internal/safeurl/safeurl.go:34-52; internal/auth/auth.go:612,616,652,707,729+"
+    },
+    {
+      "id": "S12-4",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "authErrorMessage's default branch (web/src/routes/+page.svelte:81-82) interpolates the raw ?error value into the brand-styled danger Alert. Svelte escapes text nodes, so this is not XSS, but it is attacker-controlled copy rendered inside the application's trust surface with no length cap. The query is reachable with a single GET: server.go:574-583 deliberately forwards r.URL.RawQuery into /app/ (and the live dev probe shows the same). A social-engineering/phishing-lure payload is rendered verbatim. Low, as stated.",
+      "evidence_checked": "web/src/routes/+page.svelte:41,63-83,234-238; internal/httpapi/server.go:574-583"
+    },
+    {
+      "id": "S12-5",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Read +page.svelte:152-174 and api.ts:468. exportAccount performs no shape check (unlike currentSession at api.ts:401-410 and getAuthorizationRequest at 414-426), so `data.profile.user_id` at line 162 dereferences unvalidated JSON; a 200 whose envelope is missing makes the TypeError message (via messageOf, errors.ts:15-21) the rendered alert text. The synchronous URL.revokeObjectURL(url) right after a.click() is the documented immediate-revoke hazard: browsers may start the download task after the current task, and this is observable in Firefox/Safari. Both defects are real; the download part is browser-dependent, hence low rather than higher.",
+      "evidence_checked": "web/src/routes/+page.svelte:157-164; web/src/lib/api.ts:468,401-426; web/src/lib/errors.ts:15-21"
+    },
+    {
+      "id": "S12-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "restoreFocus (web/src/lib/a11y.ts:33-35) interpolates its argument directly into document.querySelector. Call sites build the selector from server/config data: sources/+page.svelte:182,187 uses `[data-disconnect=\"${key(binding)}\"]` where key = game + '/' + source, and grants/+page.svelte:73 uses `[data-revoke=\"${clientId}\"]`. federation.NewRegistry (federation.go:141-146) only requires game/name non-empty, so a TOML config name containing a double quote, backslash or ']' produces a selector SyntaxError. The call sites use `void restoreFocus(...)`, so it becomes an unhandled rejection and focus is not restored. Requires an operator-supplied name with such a character, so low as stated.",
+      "evidence_checked": "web/src/lib/a11y.ts:33-35; web/src/routes/sources/+page.svelte:76,180-188; web/src/routes/grants/+page.svelte:71-74; internal/federation/federation.go:141-150"
+    },
+    {
+      "id": "S12-7",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The algorithmic observation is real: resourcesFor (sources/+page.svelte:81-83) is a linear scan over `available` invoked twice per binding (288,290), and connectable (87-91) is filter(available) x some(bindings); cost is O(available x bindings) per recomputation. But the impact claim is wrong for two reasons. (1) Svelte 5 compiles each template expression to its own effect, so `confirming`, `outcome` and `working` updates do not re-run the {#if resourcesFor(...)} block or the $derived connectable — only a change to `available`/`bindings` invalidates them, which happens once on load, not on every click. (2) The magnitudes are unrealistic: a deployment's federation catalogue is the operator's configured source list and an account's bindings list, not thousands each; even at 1,000 x 1,000 the work is one pass of string comparisons, far below a perceptible frame. Recommend the Map/Set cleanup, but no user-visible delay is supported.",
+      "evidence_checked": "web/src/routes/sources/+page.svelte:81-91,288-290; Svelte 5 fine-grained effect compilation (each block/derived dependencies)"
+    },
+    {
+      "id": "S12-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified empirically with a Go probe against webui.Handler(webui.FS()) for the shipped internal/webui/dist build: GET /app/ returns status=200, len=3304, Last-Modified=\"\", ETag=\"\", Cache-Control=\"no-cache\"; sending If-Modified-Since: 2099 or If-None-Match still returns 200, never 304. embed.FS file infos have a zero ModTime, http.ServeContent therefore emits no Last-Modified, and no ETag is generated anywhere (webui.go:147-153 only sets Cache-Control). So `no-cache` forces an unconditional re-download of the shell and its CSP/hash parsing on every full load — the intended safe-revalidation cannot happen. Real but small (3.3 KB shell, gzip smaller); low.",
+      "evidence_checked": "internal/webui/webui.go:128,147-153; live httptest probe of webui.Handler (headers + conditional requests); internal/webui/dist/index.html"
+    },
+    {
+      "id": "S12-9",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The code behavior is real: api.ts:358-362 `continue`s on a retryable 502/503/504 without calling res.body.cancel()/reading the body, so up to two response bodies per logical GET are abandoned; the HTTP/1.1 connection cannot be reused and is only reclaimed on reset/GC. But the stated impact ('amplifying the outage it is trying to survive', two abandoned sockets per request re-dialing') is not supported: the number of sockets is bounded by MAX_ATTEMPTS and the concurrent GETs on a page, browsers close/reset abandoned bodies rather than pinning them to the retry, and the retry still reuses the connection pool for the new dial. A one-line `await res.body?.cancel()` is still worth adding, but this is housekeeping, not an outage amplifier, hence info.",
+      "evidence_checked": "web/src/lib/api.ts:304-305,332-363"
+    },
+    {
+      "id": "S12-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed the asymmetry: call<T> (api.ts:322-393) only casts the parsed JSON; currentSession (401-410) and getAuthorizationRequest (414-426) add runtime guards, every other wrapper (e.g. exportAccount:468, listAdminClients:480-481) does not. A 200 with a missing/renamed envelope therefore stores undefined (admin/+page.svelte:72 `clients = res.data`, sources/+page.svelte:57-58, grants/+page.svelte:37) and the failure surfaces later during an each/derived render. +error.svelte:9-15 renders page.error.message verbatim (except 'Not Found'), so the internal JS message becomes the user-facing headline. The trigger requires a captive portal/proxy/partial backend returning 200 with the wrong shape, which is why this stays low.",
+      "evidence_checked": "web/src/lib/api.ts:322-393,401-426,468,480-481; web/src/routes/admin/+page.svelte:69-89; web/src/routes/+error.svelte:8-15"
+    },
+    {
+      "id": "S12-11",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Static path counts are right: webui.go:106 Built() -> fs.Stat(fsys, \"index.html\"); webui.go:119 isFile() -> fs.Stat(fsys, name); then webui.go:133 http.ServeFileFS -> ServeContent opens and f.Stat()s the same name again. That is three embedded lookups (plus path.Clean/prefix work) per JS/CSS asset request, while Built() and the file set are invariant for the process because the embed is immutable. Real per-request overhead on the hottest responses; no exploit, so info as stated.",
+      "evidence_checked": "internal/webui/webui.go:64-67,99-140; net/http.ServeFileFS -> ServeContent open+stat"
+    },
+    {
+      "id": "S12-12",
+      "status": "rejected",
+      "final_severity": "info",
+      "reason": "The fragment premise is unreachable. provider.start_url is not an operator-configured authorization URL: idp_routes.go:27-38 builds it as s.issuer + \"/auth/\" + provider + \"/start\" with a fixed path, for every provider including custom OIDC ones. There is no configuration field that injects a fragment into that string. The only way SignIn.svelte:49-53 could append return_to after a '#' is a deployment issuer that itself contains a fragment (config.go:479-480 only checks the http(s) prefix), and such an issuer is already globally broken: the start URL would resolve to the origin root with the fragment never sent, so the login never reaches /auth/{provider}/start and there is no successful login whose return_to could be lost. The string-concat vs URL-API style difference is real but has no reachable impact; reject rather than keep as a finding. (The same constructed start_url is also fragment-free, and safeurl.RelativePath on the server would still protect return_to.)",
+      "evidence_checked": "internal/httpapi/idp_routes.go:27-38; cmd/re0auth/config.go:477-480; web/src/lib/components/SignIn.svelte:49-54; internal/safeurl/safeurl.go:34-52"
+    }
+  ],
+  "summary": "12 findings verified by re-reading every cited site and, where testable, by running the code. 8 confirmed at their stated severity: S12-1 (medium, body read escapes the 15s timeout), S12-3 (stale ?error= survives a successful login), S12-4 (attacker-controlled ?error= echoed in the branded alert), S12-5 (unvalidated export profile field + synchronous blob revoke), S12-6 (selector built from unescaped config/ids), S12-8 (no-cache shell with no ETag/Last-Modified — empirically no 304), S12-10 (envelope validation only on two endpoints; +error.svelte prints the raw message), S12-11 (info, three embedded-FS stats per asset). 2 downgraded to info: S12-7 (Svelte 5 per-expression effects mean the O(available x bindings) work is not re-run on confirming/outcome changes, and the 'thousands x thousands on every click' magnitude is unsupported) and S12-9 (abandoned 5xx bodies are real but the outage-amplification claim is not). 2 rejected: S12-2 (Vite's own base middleware handles '/?error=...' — live dev probe gives 302 /app?error -> 308 /app/?error -> 200 shell with the query intact, so the claimed 404 does not occur) and S12-12 (provider.start_url is built as issuer + fixed /auth/{provider}/start; no fragment-bearing authorization URL is configurable, and a fragment-bearing issuer breaks the login before return_to matters). No new severe findings were identified.",
+  "_probe_artifacts": "Live vite dev (node vite.js dev --port 5199, Accept: text/html) and a temporary Go httptest program against webui.Handler(webui.FS()); both were removed after use."
+}

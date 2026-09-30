@@ -1,0 +1,90 @@
+{
+  "scope": "S14",
+  "verified": [
+    {
+      "id": "S14-1",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "Code is exactly as claimed: ApproveDevice/DenyDevice take s.mu with a deferred unlock and call s.record while still holding it (oidc.go:1308-1327, 1334-1349), and s.record calls audit.Logger.Record synchronously (oidc.go:349-360), whose contract says it must block until durable (audit/audit.go:35-39). The stated impact does not follow in the shipped composition: the memory OIDCStore is constructed ONLY in the no-DATABASE_URL branch of openStorage, and that branch wires audit.NewMemoryLogger() (cmd/re0auth/main.go:892-916); openOIDC passes that same logger to memory.NewOIDCStore (main.go:381, 1352-1360). MemoryLogger.Record is a bounded in-process ring append under its own mutex (audit/audit.go:143-158), not durable I/O. The blocking durable sink (postgres.AuditLogger, internal/store/postgres/audit.go:55-85) is wired only with the Postgres OIDCStore (main.go:934-949, 1344-1351), never with the memory store. So 'global OIDC mutex held across a durable audit write' is unreachable without a custom embedder-supplied slow Logger; residual contention is bounded by MemoryLogger append/Events copy cost (~microseconds, <=10k events). The inconsistency with the other write paths (CreateAccessToken :544-547, CreateAccessAndRefreshTokens :613-660, DeleteAuthRequest :508-527, CompleteLogin :1254-1282) is real and worth fixing, hence low, not medium.",
+      "evidence_checked": "internal/store/memory/oidc.go:349-360,508-529,544-547,613-661,1049-1134,1253-1284,1308-1349; audit/audit.go:35-39,143-158; internal/store/postgres/audit.go:54-86; cmd/re0auth/main.go:381,890-916,934-949,1301-1372"
+    },
+    {
+      "id": "S14-2",
+      "status": "confirmed",
+      "final_severity": "high",
+      "reason": "Confirmed and no guard was missed. CompleteBind performs storeBindingSecret (vault Enroll under BindingIdentity = user|game.source, version-independent) and then an unconditional bindings.Put with no s.locks.lock anywhere (bind.go:180-217); MemoryBindingStore.Put overwrites by key regardless of Version (binding.go:181-187). Every other credential writer takes the per-binding keyedMutex for its whole critical section: Unbind (unbind.go:41-51), CascadeRevoke (revocation.go:128-133), shredBinding (killswitch.go:196-202), refreshBinding (refresh.go:40-41, 111-128). Because CompleteBind does not, the interleaving Unbind(vault.Revoke; bindings.Delete) -> CompleteBind(storeBindingSecret; bindings.Put) re-creates both a live vault secret and a binding row after the removal already returned success, and the row/key use the same identity so the resurrected credential is usable. This is reachable: the bind callback (federation_routes.go:410-423) and federation Unbind (binding_routes.go:135-153) are independent HTTP paths with no per-user serialization, and the flow single-use check only prevents replaying one CompleteBind, not overlapping it with an Unbind. Kill Switch reaches the same removal via CascadeRevoke/Unbind/shredBinding (killswitch.go:160-192). Severity kept at high because this bypasses an explicit, user- or operator-requested revocation control; the concurrency preconditions (two overlapping authorized operations for one binding) are the only reason it is not higher, but they are not privileged and the window is real.",
+      "evidence_checked": "internal/federation/bind.go:157-218; internal/federation/binding.go:75-94,159-212; internal/federation/unbind.go:37-98; internal/federation/revocation.go:117-165; internal/federation/killswitch.go:158-208; internal/federation/refresh.go:39-131; internal/httpapi/federation_routes.go:395-430; internal/httpapi/binding_routes.go:135-153"
+    },
+    {
+      "id": "S14-3",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Verified line by line. MemoryRepo.ListPage ignores the cursor for materialisation: it calls r.List(context.Background()) (repo.go:233), which clones and sorts ALL records under RLock (repo.go:202-217), then applies recordAfter as a post-filter (repo.go:237-247). MemoryBindingStore.ListAllPage likewise copies and sortBindings the entire map under RLock before filtering (binding.go:255-279). The cursor therefore does not reduce work, and the page loops call it ceil(N/page) times: vault.Rotate pages 200 (rotate.go:42-60, rotatePageSize at :96), Kill Switch pages 500 (killswitch.go:56-75, killSwitchPageSize at :99). That is O(N^2 log N) comparisons plus an O(N) copy per page, with the store's RLock held across each sort so Enroll/Revoke/Delete (vault) and Put/PutIfVersion/Delete (bindings) stall. Call frequency is low (operator key-rotation / incident Kill Switch), but the cost is self-inflicted during exactly the incident these operations must be fast for, and these are the stores used in the no-DATABASE_URL deployment (main.go:897-898). Confirmed medium.",
+      "evidence_checked": "vault/repo.go:196-261; vault/rotate.go:34-96; internal/federation/binding.go:241-311; internal/federation/killswitch.go:41-101; cmd/re0auth/main.go:884-916"
+    },
+    {
+      "id": "S14-4",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The code behaves as claimed: the store is a single map keyed by user|game|source, so List iterates every binding in the deployment, filters by user, and sorts the (small) per-user slice while holding RLock (binding.go:159-233); every MemoryBindingStore writer uses the same mu, so a listing blocks Put/PutIfVersion/Delete. Call frequency is genuinely high (handleListBindings, binding_routes.go:53, and account export, export_routes.go:94). However the cost is a single linear map scan with a microsecond-scale filter, and the sort is only over the caller's own matches, not the whole table; this is not quadratic and it affects only the in-memory (no-DATABASE_URL) store, whose population is bounded by process memory and where the durable Postgres adapter uses real keyset pagination. The 'hot authenticated read path scans the whole deployment' claim is accurate but its practical impact is bounded, so medium overstates it; low is the honest severity.",
+      "evidence_checked": "internal/federation/binding.go:159-233; internal/httpapi/binding_routes.go:53; internal/httpapi/export_routes.go:94; cmd/re0auth/main.go:897-898"
+    },
+    {
+      "id": "S14-5",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed as an atomicity gap in the oauth.Service path. Refresh does ConsumeRefresh, then on the reuse branch RevokeRefreshFamily, then on the success branch issue() (as.go:264-308); issue performs SaveAccess and SaveRefresh as two separate lock acquisitions (as.go:418-423) and MemoryStore's ConsumeRefresh, RevokeRefreshFamily, SaveAccess and SaveRefresh each take/release s.mu independently (tokens.go:365-371, 407-413, 434-451, 470-499). Interleaving: the holder of a stolen token wins ConsumeRefresh; the victim's later presentation of the same value finds the tombstone and runs RevokeRefreshFamily, which finds no saved generation yet; the winner then SaveRefresh with the SAME FamilyID and mints a live generation that survives the theft response. Symmetrically, a revocation landing between SaveAccess and SaveRefresh leaves a live refresh token of a family whose access token was deleted. This is exactly RFC 9700 4.14.2 failing. Reachability is limited: cmd/re0auth does not construct oauth.Service (it runs the OP store) — the path is used by internal/wiring/oauth.go and the reference/kit servers — which is already reflected in the medium rating. The OP store path (internal/store/memory/oidc.go:613-658) does claim+revoke+writes under one lock, so the finding is correctly scoped.",
+      "evidence_checked": "oauth/as.go:238-309,388-432; oauth/tokens.go:365-371,407-413,434-499; oauth/as.go:35-59,72-82; internal/wiring/oauth.go:13-37; cmd/re0auth/main.go:884-949,1301-1372"
+    },
+    {
+      "id": "S14-6",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "revokeFamilyLocked does full-map scans of refreshTokens and refreshTombstones under s.mu (oidc.go:716-732), and it is reached while s.mu is held from TokenRequestByRefreshToken on a replayed spent refresh token (oidc.go:671-701, caller-supplied input) and from CreateAccessAndRefreshTokens when a tombstone names an unheld token (oidc.go:613-628). TokenRequestByRefreshToken itself scans both maps for idHash (oidc.go:664-701 as cited at :787/:806 region). s.mu is the single mutex behind all OP operations, so each replay blocks issuance/refresh/introspection/userinfo for a duration proportional to the entire live-token + tombstone table; tombstones persist for the refresh TTL (default 30 days, oidc.go:334) and are only trimmed by the periodic sweep. The package explicitly indexes by subject (oidc.go:330-333) but has no family or idHash index, so the claim that these two reverse lookups are the remaining unindexed scans is accurate. An attacker needs a spent refresh-token value, which is a real but nontrivial precondition, and the request is rate-limitable; medium is appropriate.",
+      "evidence_checked": "internal/store/memory/oidc.go:326-337,566-732; cmd/re0auth/main.go:1353-1371"
+    },
+    {
+      "id": "S14-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "StoreDeviceAuthorization unconditionally calls purgeExpiredDevicesLocked(s.now()) under s.mu on every call (oidc.go:1049-1064), and purgeExpiredDevicesLocked iterates the whole devices map (oidc.go:1122-1134). There is no cap on s.devices at insert. The per-request cost therefore grows with outstanding device authorizations; they are bounded in practice by the device-code TTL and any per-client rate limiting, so low is correct. Note the map is also trimmed by the ticker-driven SweepExpired (oidc.go:1195), which keeps steady-state size modest.",
+      "evidence_checked": "internal/store/memory/oidc.go:1043-1064,1122-1134,1153-1197"
+    },
+    {
+      "id": "S14-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "MemoryDeviceStore implements only SaveDevice/GetDevice/GetDeviceByUserCode/RecordPoll/RecordDecision (device.go:139-219); none deletes from byDev or byUser, and the DeviceStore interface has no delete/sweep seam (device.go:124-137). oauth.NewService defaults to NewMemoryDeviceStore when cfg.Devices is nil (as.go:57-59) and nothing starts or exposes a sweep, unlike oauth.MemoryStore.SweepExpired (tokens.go:285-328) which is documented as caller-driven. Records for approved/denied/expired device codes therefore live for the process lifetime. Reachability is limited to the oauth.Service library/kit path (internal/wiring, reference servers), not cmd/re0auth, so low is right.",
+      "evidence_checked": "oauth/device.go:124-219; oauth/as.go:35-59; oauth/tokens.go:285-328"
+    },
+    {
+      "id": "S14-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: readinessCache.check clears c.running and closes c.settled only on the normal return path (health.go:183-195); there is no recover/defer around probe(probeCtx) at health.go:190. A panicking probe unwinds past the unlock, leaving running=true and settled non-nil-open while state stays readinessUnknown; subsequent callers take the c.running branch, see state==unknown with a non-nil settled channel, wait readinessColdStartWait, and return unknown (health.go:161-181), which handleReady renders as 503 'checking' (health.go:130-138) permanently. The panic itself is only caught above this function (recoverProtocol, httpapi/middleware.go:621-651; server.go:331), so the latch persists. A panicking probe requires a dependency-handle/driver bug, hence low, but the latch is unrecoverable without a restart. The cold-start waiters do allocate a time.After timer per request (health.go:175), a small bounded cost.",
+      "evidence_checked": "internal/httpapi/health.go:116-213; internal/httpapi/middleware.go:621-651; internal/httpapi/server.go:331"
+    },
+    {
+      "id": "S14-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed: Registry has no mutex; Register writes r.byScope (scope.go:185-197) while Resolve reads it (scope.go:217-236) and Descriptors ranges over it (scope.go:206-213); Get does too. A post-start Register racing a request is a Go 'concurrent map writes' throw, not merely a data race. In-repo the registry is built once at composition (cmd/re0auth/main.go:1318) and never mutated afterwards, and the package documents Register as composition-time, so this is an API-contract hazard rather than a live production bug; low is correct.",
+      "evidence_checked": "oauth/scope.go:160-236; cmd/re0auth/main.go:1318-1322"
+    },
+    {
+      "id": "S14-11",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Confirmed: serveOAuth acquires bw (oidchttp.go:636), calls h.provider.ServeHTTP(bw, r) (:637), flushes (:716) and releases (:717) with no defer. If ServeHTTP panics, releaseBufferedWriter is skipped and the pooled bufferedWriter (body capacity up to 64 KiB, maxPooledResponseBytes at :1612) is dropped to the GC; sync.Pool reuse is defeated but no other request sees the buffer and correctness is unaffected. The panic is recovered by httpapi's recoverProtocol wrapper, so the process survives. Pool-efficiency nit only, info is appropriate.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:630-718,1598-1627; internal/httpapi/middleware.go:621-651"
+    },
+    {
+      "id": "S14-12",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The observation is accurate and self-reported as mitigated, so it is not a live defect. refreshBinding holds the per-binding keyedMutex across both PutIfVersion and storeBindingSecret (refresh.go:40-41,111-128), and the same key is taken by Unbind, CascadeRevoke and shredBinding, so the row/secret divergence window this finding flags is closed on the refresh path; the residual is only a reader briefly using the token that was valid a moment ago (trySource), which is not a lost update. The finding's own exploit field states it is not exploitable via this path. Downgraded to info because the cited code is already mitigated; the only actionable part is the cross-reference to S14-2.",
+      "evidence_checked": "internal/federation/refresh.go:39-131,214-248; internal/federation/unbind.go:41-51; internal/federation/revocation.go:128-133; internal/federation/killswitch.go:196-202"
+    }
+  ],
+  "summary": "All 12 S14 findings re-read against the cited code. 9 confirmed (S14-2 high; S14-3/S14-5/S14-6 medium; S14-7/S14-8/S14-9/S14-10 low; S14-11 info), 3 downgraded (S14-1 medium->low because the shipped no-DATABASE_URL path pairs the memory OIDCStore only with non-durable audit.NewMemoryLogger, so lock-over-durable-I/O is unreachable without custom wiring; S14-4 medium->low because it is a single O(N) map scan on the memory-only store, not quadratic; S14-12 low->info because it is already mitigated and non-exploitable per its own analysis), 0 rejected. The strongest real defect is S14-2: CompleteBind is the one binding writer that skips the per-binding keyedMutex that Unbind, CascadeRevoke, shredBinding and refreshBinding all hold, so its unconditional vault write + bindings.Put can resurrect a just-revoked binding and credential; no guard was missed and the bind callback and Unbind are independent HTTP paths. S14-5 is a genuine RFC 9700 family-revocation race but only on the oauth.Service library/kit path (not built by cmd/re0auth), and S14-3/S14-6 are real quadratic/linear-in-state costs under the store lock on the memory backends. No new severe finding was identified."
+}

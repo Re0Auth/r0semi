@@ -1,0 +1,182 @@
+{
+  "scope": "S08",
+  "title": "Config parsing, startup secrets, wiring (cmd/re0auth, internal/config, internal/wiring, internal/lifecycle)",
+  "findings": [
+    {
+      "id": "S08-1",
+      "title": "Vault KEK resolution hardcodes RE0AUTH_KEK ahead of vault.kek_env, silently ignoring a renamed key",
+      "severity": "high",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "cmd/re0auth/config.go:729-743",
+        "cmd/re0auth/config.go:471",
+        "scripts/backup-keys.sh:74-77"
+      ],
+      "evidence": "kekValue := os.Getenv(\"RE0AUTH_KEK\")\nif kekValue == \"\" {\n\tif f.Vault.KEKEnv == \"\" {\n\t\treturn settings{}, errors.New(\"the vault KEK is required: set RE0AUTH_KEK or vault.kek_env\")\n\t}\n\tresolved, err := config.Secret(f.Vault.KEKEnv, \"vault.kek_env\")\n\tif err != nil {\n\t\treturn settings{}, err\n\t}\n\tkekValue = resolved\n}\ncfg.KEK, err = decodeKEK32(kekValue)",
+      "why": "The file convention the package documents is that a config NEVER holds a secret and instead names the environment variable holding it; every other setting resolves as FirstNonEmpty(env, file) or through a dedicated RE0AUTH_ override, and -print-secret-env / scripts/backup-keys.sh read the KEK's variable NAME out of vault.kek_env. This one site inverts that: it reads the hardcoded RE0AUTH_KEK first and only falls back to the file-declared name when RE0AUTH_KEK is empty. A deployment that renames the variable (the documented rotation recipe: kek_env = \"RE0AUTH_KEK_2\" + a bumped kek_id) but still has RE0AUTH_KEK in its environment runs with the OLD key material under the NEW kek_id and logs nothing about the choice. Existing records still carry kek_id \"kek-1\", so once the old key is no longer configured as retired they fail with vault: \"... was wrapped by key \\\"kek-1\\\", which is not configured\"; anything enrolled meanwhile is wrapped with the old key but labeled kek-2 and becomes unreadable when the environment is corrected. Backup tooling enumerates the file-declared name, so it backs up a key the process never used.",
+      "exploit": "Operator follows the shipped rotation instructions: vault.kek_env = \"RE0AUTH_KEK_2\", kek_id = \"kek-2\", RE0AUTH_KEK_2 holds the new key, and the orchestrator still injects the old RE0AUTH_KEK. The server starts, seeds the client, and serves; the first credential enrolled succeeds (wrapped by the old key, labeled kek-2) and every pre-existing binding fails to unwrap. backup-keys.sh backs up RE0AUTH_KEK_2, which is not the key in use, so the backup is useless for the records that matter.",
+      "recommendation": "Resolve the KEK exactly like every other secret: if vault.kek_env names a variable, read that variable and make RE0AUTH_KEK only the default when the file declares nothing (or fail hard when both are set and name different material). Do not let a hardcoded environment variable silently win over the file's declaration.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-2",
+      "title": "storage.dsn_env is never resolved when driver is inferred in the config loading logic",
+      "severity": "high",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "cmd/re0auth/config.go:680-710",
+        "cmd/re0auth/config.go:472",
+        "cmd/re0auth/config.go:722-724",
+        "cmd/re0auth/config.go:749-759",
+        "cmd/re0auth/main.go:892-917"
+      ],
+      "evidence": "driver := config.FirstNonEmpty(strings.TrimSpace(os.Getenv(\"RE0AUTH_STORAGE_DRIVER\")), f.Storage.Driver)\nswitch driver {\ncase \"\":\n\tif f.Storage.DSNEnv != \"\" || cfg.DatabaseURL != \"\" {\n\t\tdriver = \"postgres\"\n\t} else {\n\t\tdriver = \"memory\"\n\t\tcfg.StorageReason = \"no DATABASE_URL is configured\"\n\t}\ncase \"memory\":\n\tdriver = \"memory\"\n\tcfg.StorageReason = \"storage.driver is memory\"\ncase \"postgres\":\n\tif cfg.DatabaseURL == \"\" {\n\t\tdsnEnv := f.Storage.DSNEnv\n\t\tif dsnEnv == \"\" {\n\t\t\tdsnEnv = \"DATABASE_URL\"\n\t\t}\n\t\tdsn, err := config.Secret(dsnEnv, \"storage.dsn_env\")\n\t\tif err != nil {\n\t\t\treturn settings{}, err\n\t\t}\n\t\tcfg.DatabaseURL = dsn\n\t}\ndefault:\n\treturn settings{}, fmt.Errorf(\"storage.driver %q must be \\\"memory\\\" or \\\"postgres\\\"\", driver)\n}",
+      "why": "cfg.DatabaseURL is pre-loaded only from the literal DATABASE_URL (config.go:472). When Driver is empty and dsn_env names some other variable, the switch sets driver = \"postgres\" but never calls config.Secret on that name, so DatabaseURL stays empty. openStorage then takes the memory branch (main.go:892) even though StorageDriver says postgres. The consequences of that silent downgrade are broad: RE0AUTH_AUDIT_KEY is not required (config.go:749 gates on cfg.DatabaseURL), the audit sink is the non-tamper-evident in-memory ring buffer, sessions/bindings/OP state disappear on restart, max_in_flight is sized for memory rather than the pool (config.go:723), and reportDurability prints because=\"\" (StorageReason was never set). The declared-but-unset variable that should be a hard \"names an environment variable that is not set\" error instead becomes ephemeral storage. A secondary manifestation of the same hardcoded-name preference: with an explicit driver = \"postgres\", a stale DATABASE_URL in the environment wins over the file's dsn_env and the process connects to the wrong database.",
+      "exploit": "config/re0auth.toml contains [storage] dsn_env = \"RE0AUTH_DSN\" with no driver, and RE0AUTH_DSN is set; DATABASE_URL is not. The server starts with an in-memory store, silently, and a restart after a deploy loses every session, binding, pending request and audits record. If DATABASE_URL is also leaked in from a base image, it instead overrides the operator's declared variable and points at whatever database that URL names.",
+      "recommendation": "Resolve the DSN in the inferred branch with the same code the explicit branch uses (dsnEnv := f.Storage.DSNEnv; if empty, use DATABASE_URL; config.Secret it), so DatabaseURL is non-empty whenever driver resolves to postgres. Treat the declared-but-unset variable as a startup error, and stop reading the literal DATABASE_URL ahead of the file's dsn_env.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-3",
+      "title": "DeleteAccount writes an outcome=ok record claiming the pseudonym key was destroyed before Destroy runs, and the correcting record is best-effort",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/lifecycle/lifecycle.go:262-271",
+        "internal/lifecycle/lifecycle.go:277-291",
+        "internal/lifecycle/lifecycle.go:299-302"
+      ],
+      "evidence": "res.PseudonymDestroyed = d.cfg.Pseudonyms != nil\n\n// The record is written after every store is clear, so it can state the result\n// rather than a promise...\nif err := d.record(ctx, actor, subject, audit.OutcomeOK, res, \"\"); err != nil {\n\treturn res, err\n}\n\nif d.cfg.Pseudonyms != nil {\n\tif err := d.cfg.Pseudonyms.Destroy(ctx, string(subject)); err != nil {\n\t\tres.PseudonymDestroyed = false\n\t\treturn d.fail(ctx, actor, subject, \"pseudonym\", fmt.Errorf(\n\t\t\t\"lifecycle: the account was erased but its audit history is still linkable: %w\", err), res)\n\t}\n}\n---\nfunc (d *Deleter) fail(ctx context.Context, actor, subject account.UserID, step string, cause error, res Result) (Result, error) {\n\t_ = d.record(ctx, actor, subject, audit.OutcomeError, res, step)\n\treturn res, cause\n}",
+      "why": "The success event is written to an append-only sink with pseudonym_destroyed=true BEFORE the destroy step runs; the only thing that can contradict it is a second event written by fail(), whose error is deliberately discarded. The order itself is justified in the comments (writing after Destroy would make the sink mint a fresh subject key and re-create the link), but the compensating record being best-effort means there is a reachable state where the log permanently contains only a false success: outcome=ok, pseudonym_destroyed=true, while the account's audit history is still linkable. The caller does receive the error from DeleteAccount, but the audit trail itself - the artefact the erasure exists to leave behind - is wrong and cannot be rewritten.",
+      "exploit": "The durable audit sink fails during Pseudonyms.Destroy (DB error, pool exhaustion, or the audit append path itself down) and the same failure condition makes the follow-up record fail too. An operator later reads the log, finds a clean account.delete outcome=ok with pseudonym_destroyed=true, and never learns that the unlinkability promise was not kept.",
+      "recommendation": "Do not let the correction be silent. At minimum propagate the record failure to the caller (return cause plus the correction error) and record a metric/alert so the false success is detectable, and consider writing the first event with pseudonym_destroyed=false plus an explicit pending marker so the only record that ever claims true is the one written after a successful Destroy.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-4",
+      "title": "DeleteAccount reports success and writes outcome=ok when the binding sweep has Failed>0 local removals",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/lifecycle/lifecycle.go:200-206",
+        "internal/lifecycle/lifecycle.go:313-315",
+        "internal/federation/killswitch.go:140-146",
+        "internal/federation/killswitch.go:180-183"
+      ],
+      "evidence": "if d.cfg.Bindings != nil {\n\toutcome, err := d.cfg.Bindings.RevokeUserBindings(ctx, subject)\n\tif err != nil {\n\t\treturn d.fail(ctx, actor, subject, \"bindings\", err, res)\n\t}\n\tres.Bindings = outcome\n}\n---\nresult, err := s.Unbind(ctx, b.User, b.Game, b.Source)\nif err != nil {\n\treturn bindingOutcome{failed: 1}\n}\n---\nsummary.Failed += outcome.failed",
+      "why": "federation.RevokeUserBindings returns an error only when it cannot enumerate bindings; a binding whose LOCAL removal failed (vault.Revoke or bindings.Delete returned an error - Unbind only returns err for those two paths, upstream failures are folded into result.Upstream) is counted as summary.Failed with a nil error. DeleteAccount treats a nil error as \"the step succeeded\", proceeds through the remaining steps, writes outcome=ok with bindings_failed=N in Detail, and returns nil - which the HTTP layer turns into 200 OK. Unlike every other step, a per-binding failure never stops the erasure, and the audit record's outcome is ok. The secret for the surviving binding is usually shredded by the following Vault.DeleteSubject, but the binding row (user/game/source metadata) and any upstream token whose local cut failed remain, orphaned from an account that no longer exists, and nothing retries.",
+      "exploit": "A transient DB error during one binding's Delete makes Unbind fail. The user's DELETE /v1/account returns 200 with result.bindings.failed=1; the binding row survives. The endpoint is session-scoped and the erasure revoked the session, so the caller cannot retry, and the audit trail calls the erasure ok.",
+      "recommendation": "Treat res.Bindings.Failed > 0 as a stop: return the failure (or at least record outcome=error naming \"bindings\") so an erasure that left rows behind is never presented as a successful one. Keep the counts in Result, but do not fold them into outcome=ok.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-5",
+      "title": "Universal trusted-proxy list check only matches a single /0 prefix, so two /1 entries bypass the acknowledgement",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "cmd/re0auth/config.go:1016-1023",
+        "cmd/re0auth/config.go:589-601"
+      ],
+      "evidence": "func hasUniversalPrefix(prefixes []netip.Prefix) bool {\n\tfor _, p := range prefixes {\n\t\tif p.Bits() == 0 {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}",
+      "why": "The guard exists to force an explicit acknowledgement (server.trusted_proxies_any / RE0AUTH_TRUSTED_PROXIES_ANY) whenever the trust list is universal, because a universal list makes every peer trusted and hands the rate-limit bucket key back to the caller. It only recognises a single prefix of length zero. [\"0.0.0.0/1\", \"128.0.0.0/1\"] covers the whole IPv4 space with no Bits()==0 entry, and [\"::/1\", \"8000::/1\"] does the same for IPv6, so the same universal trust is obtained with the acknowledgement check silently skipped. The configuration is byte-for-byte as dangerous as the one that is refused.",
+      "exploit": "An operator (or a generated config templating a /1 split) lists the two halves. Startup accepts it without trusted_proxies_any, and X-Forwarded-For attribution degrades exactly as the guarded case - every peer is inside the trust list.",
+      "recommendation": "Base the check on coverage rather than the length of one entry: e.g. detect that the union of the list contains 0.0.0.0/0 or ::/0 (split into halves and test containment), or simply require acknowledgement when the list contains any prefix that covers a full address family half-space.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-6",
+      "title": "-print-secret-env echoes whatever is in an *_env name slot verbatim, disclosing a value pasted into the wrong field",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "cmd/re0auth/config.go:424-431",
+        "cmd/re0auth/config.go:441-445",
+        "cmd/re0auth/main.go:276-290"
+      ],
+      "evidence": "add := func(role, name string) {\n\tif strings.TrimSpace(name) != \"\" {\n\t\tlines = append(lines, role+\"=\"+name)\n\t}\n}\nadd(\"vault.kek_env\", f.Vault.KEKEnv)\nfor i, retired := range f.Vault.Retired {\n\tadd(fmt.Sprintf(\"vault.retired[%d].kek_env\", i), retired.KEKEnv)\n}",
+      "why": "The flag prints role=value with no shape check, and the *_env slot is exactly where the documented mistake (pasting the secret instead of the variable name) lands; config.Secret was hardened not to echo the configured string, but this exit prints it. The output is machine-read by scripts/backup-keys.sh:73-77, so it also lands in shell variables and in whatever captures the binary's stdout (CI logs, terminal transcripts). Note that dsn_env is not enumerated by this function, so the DSN slot is not covered by this exit - that one is covered by the name-resolution bug in S08-2.",
+      "exploit": "An operator writes kek_env = \"<the base64 KEK>\" by mistake; running the documented backup command re0auth -print-secret-env prints the KEK to stdout and into the CI/build log.",
+      "recommendation": "Validate that every declaration is shaped like an environment-variable name and refuse with an actionable error naming the field, or explicitly document and accept this disclosure exit.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-7",
+      "title": "Graceful-shutdown drain budget (30s) is shorter than dataPlaneTimeout (45s), so shutdown cuts the request the design says must get a readable refusal",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "medium",
+      "locations": [
+        "cmd/re0auth/main.go:128",
+        "cmd/re0auth/main.go:116-150",
+        "cmd/re0auth/main.go:854-866"
+      ],
+      "evidence": "// dataPlaneTimeout is how long ONE data-plane request may take, end to end,\n// across every outbound call it makes in series... It is passed to the federation\n// service and must stay BELOW writeTimeout, so that the refusal is a response\n// the caller can read rather than a closed connection.\ndataPlaneTimeout = 45 * time.Second\n---\nshutdownTimeout = 30 * time.Second\n---\n\tdrainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)\n\tdefer cancel()\n\tvar err error\n\tfor _, ep := range endpoints {\n\t\tif e := ep.server.Shutdown(drainCtx); e != nil {\n\t\t\tslog.Error(\"graceful shutdown did not finish; closing connections\", \"err\", e)\n\t\t\t_ = ep.server.Close()",
+      "why": "The comment pins dataPlaneTimeout against writeTimeout so that a slow data-plane request is refused with a 504 the caller can read, never with a dropped connection. The signal path introduces a third, shorter bound that the invariant does not account for: on SIGTERM the drain gets shutdownTimeout (30s), so a data-plane request that would reach its own 45s deadline at t+45 is force-closed at t+30 by server.Close(), producing exactly the no-response outcome the timeout was chosen to avoid. Deployment-level, terminationGracePeriodSeconds is 45s = 5s endpoint wait + 30s drain + 10s audit drain, so there is no headroom either.",
+      "exploit": "A rolling deploy sends SIGTERM while a data-plane read is waiting on a slow upstream (e.g. 40s). The client gets a dropped connection rather than the federation 504/error body, and the client cannot distinguish that from a network failure.",
+      "recommendation": "Make the bounds consistent: either raise the drain budget to at least dataPlaneTimeout (and the pod grace period with it), or state and enforce the intended relationship (e.g. dataPlaneTimeout must be below shutdownTimeout) with an assertion like the existing TestDataPlaneTimeoutFitsInsideTheWriteTimeout.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-8",
+      "title": "An explicitly configured max_upstream_buffer_bytes = 0 is silently replaced by the 64 MiB default",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "medium",
+      "locations": [
+        "cmd/re0auth/config.go:553-571",
+        "cmd/re0auth/main.go:523",
+        "internal/federation/service.go:382-383"
+      ],
+      "evidence": "bufferedBytes := -1\nif f.Server.MaxUpstreamBufferBytes != nil {\n\tbufferedBytes = *f.Server.MaxUpstreamBufferBytes\n}\nbufferedBytes, err = config.Int(\"RE0AUTH_MAX_UPSTREAM_BUFFER_BYTES\", bufferedBytes)\nif err != nil {\n\treturn settings{}, err\n}\nif bufferedBytes < -1 {\n\treturn settings{}, errors.New(\n\t\t\"server.max_upstream_buffer_bytes cannot be negative (there is no unbounded setting: \" +\n\t\t\t\"that is the state which reaches the container's memory limit)\")\n}\nif bufferedBytes == -1 {\n\tbufferedBytes = defaultMaxUpstreamBufferBytes\n}\ncfg.MaxUpstreamBufferBytes = bufferedBytes\n---\nif cfg.MaxBufferedBytes == 0 {\n\tcfg.MaxBufferedBytes = defaultMaxBufferedBytes\n}",
+      "why": "The field is a pointer specifically so \"absent\" (take the default) is distinguishable from a chosen value, and -1 is documented as \"not chosen\". A configured 0 (file or RE0AUTH_MAX_UPSTREAM_BUFFER_BYTES=0) passes validation as a chosen value, reaches federation.NewService as 0, and is coerced back to the 64 MiB default there. So the operator's value is neither applied nor refused, which is the \"setting that looks applied and is not\" failure the surrounding validation is built to prevent. (newBufferBudget would otherwise treat a 0 limit as fail-closed, so the two layers disagree about what 0 means.)",
+      "exploit": "An operator writes max_upstream_buffer_bytes = 0 expecting the budget to be disabled/tightened; the process runs with the 64 MiB house default and logs nothing.",
+      "recommendation": "Either refuse 0 at the config boundary with an explicit message (as the negative branch does), or make federation.NewService stop re-defaulting a value the composition root has already resolved.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S08-9",
+      "title": "A custom OIDC provider's issuer is not required to be https, so the token exchange can run in cleartext",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "cmd/re0auth/config.go:855-890",
+        "idp/idp.go:530-548"
+      ],
+      "evidence": "if strings.TrimSpace(section.Issuer) == \"\" {\n\treturn fmt.Errorf(\n\t\t\"idp.%s: unknown provider (known: %s); a custom provider must set issuer\",\n\t\tname, strings.Join(knownNames(knownIdP), \", \"))\n}\nprovider = idp.Provider(name)",
+      "why": "For a custom provider, loadIdP validates only that issuer is non-empty; the idp layer parses it as a URL and pins discovered endpoints to the same scheme+host, but never requires https. A provider registered as issuer = \"http://idp.example\" is accepted, and the authorization redirect, discovery, JWKS fetch and the token exchange (which carries the client secret and the authorization code) all run over plaintext, with no acknowledgement switch of the kind used for expose_internal or allow_private_addresses. Unlike the server's own issuer, where the scheme is checked and drives cookie_secure, an upstream IdP scheme is never surfaced at startup.",
+      "exploit": "A typo (http:// for https://) or a generated config for a self-hosted IdP makes every login send the client secret and authorization code in cleartext on the network.",
+      "recommendation": "Refuse a non-https custom issuer unless an explicit acknowledgement is set, or at minimum log a prominent startup warning naming the provider and its scheme.",
+      "already_mitigated": false
+    }
+  ],
+  "coverage": [
+    "cmd/re0auth/config.go",
+    "cmd/re0auth/main.go",
+    "internal/config/config.go",
+    "internal/config/logging.go",
+    "internal/wiring/keys.go",
+    "internal/wiring/oauth.go",
+    "internal/lifecycle/lifecycle.go",
+    "config/re0auth.example.toml",
+    "config/audit.local.toml",
+    "scripts/backup-keys.sh",
+    "deploy/k8s/base/configmap.yaml",
+    "deploy/k8s/base/deployment.yaml",
+    "internal/httpapi/account_routes.go",
+    "internal/federation/killswitch.go",
+    "internal/federation/unbind.go",
+    "internal/federation/service.go (NewService validation, read)",
+    "internal/oidcstore/oidcstore.go (signer validation, read)",
+    "internal/store/postgres/postgres.go (Open/poolConfig, read)",
+    "idp/idp.go (issuer pinning, read)"
+  ],
+  "notes": "No Docker/PostgreSQL available: behavior was reasoned from code, not executed against a real DB. Test files were skimmed only to confirm which behaviors are pinned; the inferred-driver + renamed dsn_env path (S08-2) and the KEK precedence path (S08-1) have no test coverage in cmd/re0auth/main_test.go. internal/wiring is intentionally not part of production assembly (documented in SECURITY.md/architecture.md), so its being unreferenced by cmd/re0auth is not reported as a finding. Two lower-confidence items were considered and dropped rather than padded: config.Bool/Float/Int echo an offending env value in their error text (all such keys are non-secret scalars, and the same class in a secret slot is already fixed), and StorageDriver is set but never consumed by the composition root (it is superseded by store.durable). S08-7 and S08-9 carry medium confidence because the current behavior might be a deliberate trade-off (fast shutdown; local plaintext IdPs)."
+}

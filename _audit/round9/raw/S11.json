@@ -1,0 +1,201 @@
+{
+  "scope": "S11",
+  "title": "Admin plane, audit log API, export, observability",
+  "findings": [
+    {
+      "id": "S11-1",
+      "title": "Admin audit detail stores the raw operator account id in Detail[\"actor\"], defeating pseudonym-key destruction",
+      "severity": "high",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/admin/admin.go:485",
+        "internal/admin/admin.go:490",
+        "audit/audit.go:73",
+        "audit/audit.go:84"
+      ],
+      "evidence": "internal/admin/admin.go:485-497\nfunc (s *service) record(ctx context.Context, actor, action, subject, outcome string, detail map[string]string) {\n\tmerged := make(map[string]string, len(detail)+1)\n\tfor k, v := range detail {\n\t\tmerged[k] = v\n\t}\n\tmerged[\"actor\"] = actor\n\tif err := s.audit.Record(ctx, audit.Event{\n\t\tTime:     s.now().UTC(),\n\t\tAction:   action,\n\t\tSubject:  subject,\n\t\tProvider: \"admin\",\n\t\tOutcome:  outcome,\n\t\tDetail:   merged,\n\t}); err != nil {\n\naudit/audit.go:73-85 (the durable sink only pseudonymises Event.Subject; Detail is stored verbatim)\n\tsubject, err := l.pseudonymize(ctx, e.Subject)\n\tif err != nil {\n\t\treturn err\n\t}\n\n\treturn l.batch.enqueue(ctx, auditRow{\n\t\tOccurredAt: when,\n\t\tAction:     e.Action,\n\t\tSubject:    subject,\n\t\tProvider:   e.Provider,\n\t\tOutcome:    e.Outcome,\n\t\tDetail:     detail,\n\t})\n\nCallers pass the session subject as actor, e.g. internal/httpapi/admin_routes.go:142\n\treg, err := s.adminSvc.Register(r.Context(), string(user), admin.RegisterRequest{",
+      "why": "The durable sink replaces Event.Subject with a keyed pseudonym so that destroying the per-subject key (audit_subject_keys row) unlinks an account's audit history. Detail[\"actor\"] bypasses that mechanism entirely: it holds the literal `usr_...` account id, is stored as-is in audit_events.detail, is covered by the chain hash, and is returned verbatim by the audit read API. This is precisely the hazard the codebase calls out and fixes elsewhere: internal/lifecycle/lifecycle.go:305-308 says 'No account id goes in Detail ... a raw `usr_...` in a detail value would survive the pseudonymisation AND the key destruction'. Every admin.client.*/admin.kill_switch event therefore permanently re-links the acting operator to their name after that operator erases their own account.",
+      "exploit": "An operator performs any admin action (e.g. POST /v1/admin/clients/{id}/suspend). The durable audit row carries detail={\"actor\":\"usr_<operator>\", ...}. Later the operator erases their own account (DELETE /v1/account): lifecycle destroys the subject pseudonym key, so Event.Subject becomes unlinkable, but the same account id remains in plain text in every admin row's detail. Anyone with DB read access (or an admin using GET /v1/admin/audit) can still recover which account operated, even though the erasure was reported successful (pseudonym_destroyed=true).",
+      "recommendation": "Do not put a raw account id in Detail. Record the actor as a shape (as lifecycle.record does with detail[\"self\"]) or place it only in Event.Subject, which the sink pseudonymises. If a distinction between operator and target is required, add a boolean (actor_is_subject) rather than the id. Add a regression guard that no admin.* event carries a `usr_`-prefixed value in any Detail value.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-2",
+      "title": "Kill Switch silently reports sessions_revoked=0 when the deployment has no session revoker, with no unavailability marker",
+      "severity": "high",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/admin/admin.go:351",
+        "internal/admin/admin.go:167",
+        "internal/admin/admin.go:169",
+        "cmd/re0auth/main.go:618",
+        "cmd/re0auth/main.go:903"
+      ],
+      "evidence": "internal/admin/admin.go:167-178 (Report has a BindingsUnavailable marker but none for sessions)\ntype Report struct {\n\tTokensRevoked    int             `json:\"tokens_revoked\"`\n\tSessionsRevoked  int64           `json:\"sessions_revoked\"`\n\tClientsSuspended int             `json:\"clients_suspended\"`\n\tFlowsPurged      int             `json:\"flows_purged\"`\n\tBindings         *BindingOutcome `json:\"bindings,omitempty\"`\n\tBindingsUnavailable bool `json:\"bindings_unavailable,omitempty\"`\n}\n\ninternal/admin/admin.go:348-368\n\t// Sessions. `all` clears everyone; `subject` clears one account, which works\n\t// only where a session index exists. `client` and `bindings` never touch a\n\t// session: a session belongs to a person, not to a client.\n\tif s.sessions != nil && (target.All || target.Subject != \"\") {\n\t\t...\n\t\trep.SessionsRevoked = n\n\t}\n\ncmd/re0auth/main.go:618 wires the optional port from the storage bundle; in memory mode it is nil (cmd/re0auth/main.go:903 `sessions: nil,` and storage.sessionRevoker is never set):\n\t\t\tSessions: store.sessionRevoker,",
+      "why": "The Report design explicitly refuses to let 'no bindings existed' and 'this deployment cannot sweep bindings' look identical (BindingsUnavailable). Sessions get exactly that treatment: when s.sessions is nil the condition is skipped, SessionsRevoked stays 0, and the endpoint answers 200 with sessions_revoked: 0. A memory-mode deployment (the documented default when DATABASE_URL is unset) therefore reports a successful 'all' or 'subject' kill switch while no browser session was signed out. An incident responder reads the number as 'there were no sessions left' and stops looking.",
+      "exploit": "Run without DATABASE_URL (memory store, auth.Manager uses its in-process session store). As an admin call POST /v1/admin/kill_switch {\"target\":\"subject\",\"subject\":\"usr_victim\"}. Response: {\"tokens_revoked\":N,\"sessions_revoked\":0,...}. The victim's browser session cookie remains valid and the account stays signed in, while the report implies it was signed out.",
+      "recommendation": "Add a SessionsUnavailable bool (mirroring BindingsUnavailable) set when the target includes a session dimension and s.sessions == nil, and document it in the Report. Alternatively refuse a session-bearing target in a deployment with no session revoker. Either way the response must distinguish 'swept zero' from 'cannot sweep'.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-3",
+      "title": "Kill Switch `all` cannot purge in-flight bind flows and does not say so, allowing access to be re-created after the sweep",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/admin/admin.go:399",
+        "internal/admin/admin.go:404",
+        "internal/federation/bind.go:47"
+      ],
+      "evidence": "internal/admin/admin.go:399-413\n\t// In-flight bind flows. Only a `subject` sweep: a pending flow is a capability\n\t// that outlives the binding -- completing it creates a new binding and a new\n\t// upstream token -- so a sweep that cuts one account's bindings must remove it,\n\t// exactly as an erasure does. `all` has no per-account flow port, so it does not\n\t// touch them here.\n\tif target.Subject != \"\" && s.flows != nil {\n\t\tpurged, err := s.flows.PurgeUserFlows(ctx, target.Subject)\n\t\t...\n\t\trep.FlowsPurged = purged\n\t}\n\nThe FlowPurger port only exposes a per-subject purge (internal/admin/admin.go:80-82):\n\tPurgeUserFlows(ctx context.Context, subject string) (int, error)",
+      "why": "The code itself states that a pending bind flow is a live capability: completing it creates a new binding and a new upstream credential. A global sweep (target=all) revokes tokens, sessions and bindings, but leaves every pending flow in the store. Because flows have a multi-minute TTL, a flow started just before the sweep can be completed after it, re-creating a binding and an upstream token for an account the operator believed was fully cut. The report carries no marker for this (FlowsPurged is omitted when zero), so 'all' overstates its reach.",
+      "exploit": "Attacker/user begins a bind flow (GET /bind?game=g&source=s) and stalls before the callback. Admin runs the Kill Switch with {\"target\":\"all\"}; response shows bindings_revoked and no flows marker. The stalled callback is then completed (/auth/upstream/{game}/{source}/callback), creating a fresh binding and upstream token after the global kill switch.",
+      "recommendation": "Add a global flow purge (e.g. PurgeAllFlows, or the store's SweepExpired) and call it for target=all, and/or set a FlowsUnavailable marker when target=all so the report states the limitation. At minimum report the count of pending flows left behind.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-4",
+      "title": "Kill Switch returns a bare 500 on a partial failure, discarding the counts of what was already revoked",
+      "severity": "medium",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/admin/admin.go:361",
+        "internal/admin/admin.go:388",
+        "internal/httpapi/admin_routes.go:281"
+      ],
+      "evidence": "internal/admin/admin.go:361-366\n\t\tif err != nil {\n\t\t\ts.record(ctx, actor, \"admin.kill_switch\", target.auditSubject(), audit.OutcomeError, map[string]string{\n\t\t\t\t\"tokens_revoked\": strconv.Itoa(rep.TokensRevoked),\n\t\t\t})\n\t\t\treturn rep, err\n\t\t}\n\ninternal/httpapi/admin_routes.go:281-287\n\tcase err != nil:\n\t\ts.writeProblem(w, r, http.StatusInternalServerError, \"internal_error\", \"the kill switch could not complete\")\n\tdefault:\n\t\ts.metrics.ObserveAdminAction(observability.AdminKillSwitch)\n\t\ts.metrics.ObserveRevocation(observability.RevocationKillSwitch)\n\t\ts.metrics.ObserveTokensRevoked(observability.RevocationKillSwitch, report.TokensRevoked)\n\t\twriteJSON(w, http.StatusOK, report)",
+      "why": "The Kill Switch runs several irreversible steps in sequence (suspend client, revoke tokens, revoke sessions, revoke bindings, purge flows). A failure in any later step returns an error, and the handler maps every non-target error to 500 with no body, so the partially-complete Report -- the number of tokens/sessions already cut -- is thrown away. The endpoint's stated purpose is to tell an incident responder how much was cut; on the one code path where the situation is most confusing, it tells them nothing. The audit row that is written records only tokens_revoked, not sessions/bindings progress.",
+      "exploit": "A subject sweep revokes 10k tokens and all sessions, then the binding store returns a transient error. The operator gets 500 'the kill switch could not complete'. They cannot tell whether the tokens are dead, so they may retry blindly or, worse, assume nothing happened and abandon the response.",
+      "recommendation": "Return the partial Report alongside the failure. Either write it in the error response (with the failing step named) or answer 207/500 with the report body, and record the full progress (sessions_revoked, bindings_*) in the audit detail on every failure path.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-5",
+      "title": "Kill Switch `client` target aborts before token revocation when the client row is gone, so its live tokens survive",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/admin/admin.go:324",
+        "internal/admin/admin.go:326",
+        "internal/httpapi/admin_routes.go:277"
+      ],
+      "evidence": "internal/admin/admin.go:324-332\n\t// Suspension happens before the token purge, so a failure in the purge cannot\n\t// leave the client able to mint more tokens.\n\tif target.ClientID != \"\" {\n\t\tif err := s.clients.SetStatus(ctx, target.ClientID, oauth.ClientSuspended); err != nil {\n\t\t\ts.record(ctx, actor, \"admin.kill_switch\", target.auditSubject(), audit.OutcomeError, nil)\n\t\t\treturn rep, err\n\t\t}\n\t\trep.ClientsSuspended = 1\n\t}\n\nClients.SetStatus reports an absent id as ErrClientNotFound (internal/store/postgres/oauth.go:796-798), and DeleteClient deliberately deletes the row before revoking tokens (internal/admin/admin.go:286-293):\n\tdeleteErr := s.clients.Delete(ctx, clientID)\n\tremoved, revokeErr := s.tokens.RevokeTokens(ctx, oauth.TokenFilter{ClientID: clientID})\n\nadmin_routes.go maps only ErrInvalidTarget/ErrBindingsUnavailable; ErrClientNotFound falls through to 500:\n\tcase err != nil:\n\t\ts.writeProblem(w, r, http.StatusInternalServerError, \"internal_error\", \"the kill switch could not complete\")",
+      "why": "DELETE /v1/admin/clients/{id} removes the registration first and purges tokens second. If the token purge fails, the operator gets a 500 with the client row already gone and live tokens remaining. The natural recovery attempt -- POST /v1/admin/kill_switch {\"target\":\"client\",\"client_id\":...} -- calls SetStatus on the missing row, receives ErrClientNotFound, and returns before RevokeTokens. The result is a permanent 500 and tokens that can never be cut through the operator plane, even though DeleteClient's own retry would purge them. The intent of the ordering ('a purge failure cannot leave the client able to mint more tokens') does not hold for a client that no longer exists.",
+      "exploit": "Operator: DELETE /v1/admin/clients/cli_X -> client row deleted, token purge fails -> 500. Retry as kill_switch client -> 500, tokens untouched. The tokens stay valid and authenticated until natural expiry, and the operator has no working endpoint to revoke them (ClientID kill switch is the documented tool for exactly this).",
+      "recommendation": "For the client target, treat ErrClientNotFound (oauth.ErrClientNotFound) as 'no row to suspend' and continue to RevokeTokens, or map it to 404 while still running the token purge. Token revocation must not be gated on the existence of the registration it was issued for.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-6",
+      "title": "/v1/admin/audit/verify runs a full-table chain walk synchronously with no concurrency bound, holding a pooled DB connection up to 45s",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/httpapi/audit_routes.go:171",
+        "internal/store/postgres/auditchain.go:220",
+        "internal/store/postgres/auditchain.go:264"
+      ],
+      "evidence": "internal/httpapi/audit_routes.go:175-185\n\tv, err := s.auditReader.Verify(r.Context())\n\tif err != nil {\n\t\ts.metrics.ObserveAuditVerify(observability.VerifyError)\n\t\ts.writeProblem(w, r, http.StatusInternalServerError, \"internal_error\", \"could not verify the audit log\")\n\t\treturn\n\t}\n\ninternal/store/postgres/auditchain.go:220 (bound is per transaction, not per request concurrency)\nconst verifyStatementTimeout = 45 * time.Second\n\ninternal/store/postgres/auditchain.go:264-272 (streams every chained row inside the open transaction)\n\trows, err := tx.Query(ctx, `\n\t\tSELECT id, occurred_at, action, subject, provider, outcome, detail,\n\t\t       prev_hash, row_hash, signature\n\t\t  FROM audit_events\n\t\t ORDER BY id`)\n\tif err != nil {\n\t\treturn audit.Verification{}, fmt.Errorf(\"postgres: audit: verify query: %w\", err)\n\t}\n\tdefer rows.Close()",
+      "why": "Verify opens a transaction, raises statement_timeout to 45s and scans the entire audit_events table, holding one pooled connection for the whole walk. There is no per-endpoint concurrency limit and no cache of the result, so an operator (or anyone who steals an admin session) can issue the request repeatedly: the default pool is 16 connections (postgres.DefaultPoolOptions MaxConns=16), so ~16 concurrent verify calls monopolise the pool for up to 45s each while every other request waits for a connection. The same walk is already run every 6h by auditVerifyLoop, so the HTTP path adds no new information beyond on-demand checking; it only adds the ability to pin connections.",
+      "exploit": "From an admin session, fire 16+ concurrent GET /v1/admin/audit/verify (the default limiter allows 50 rps per address). Each holds a connection for the full table scan (up to 45s on a large log). Subsequent normal requests time out waiting on the pool while /healthz and /readyz stay green.",
+      "recommendation": "Bound concurrent verifies with a semaphore/once-per-interval guard, return the last background-loop result instead of re-walking on demand, add a LIMIT/keyset batching to the walk, and/or lower verifyStatementTimeout. At minimum, take a dedicated (non-pool) connection or reduce the pool pressure by refusing a verify while one is already running.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-7",
+      "title": "Audit subject filter performs an uncached negative DB lookup per distinct subject and leaks 'has pseudonym key' timing",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "internal/store/postgres/auditpseudo.go:69",
+        "internal/store/postgres/auditread.go:67",
+        "internal/store/postgres/auditpseudo.go:144"
+      ],
+      "evidence": "internal/store/postgres/auditread.go:62-79\n\tif q.Subject != \"\" {\n\t\tkey, err := l.loadKey(ctx, q.Subject)\n\t\tif err != nil {\n\t\t\treturn audit.Page{}, err\n\t\t}\n\t\tif key == nil {\n\t\t\treturn audit.Page{Entries: []audit.Entry{}, Limit: limit}, nil\n\t\t}\n\t\tadd(\"subject\", \"=\", pseudonymOf(key, q.Subject))\n\t}\n\ninternal/store/postgres/auditpseudo.go:69-91 (a miss is not cached; only hits are remembered, and the cache is dropped wholesale at 4096)\nfunc (l *AuditLogger) loadKey(ctx context.Context, subject string) ([]byte, error) {\n\tl.mu.Lock()\n\tcached, ok := l.cache[subject]\n\tl.mu.Unlock()\n\tif ok {\n\t\treturn cached, nil\n\t}\n\tvar key []byte\n\terr := l.pool.QueryRow(ctx,\n\t\t`SELECT key FROM audit_subject_keys WHERE idx = $1`, l.subjectIndex(subject)).Scan(&key)\n\t...\ninternal/store/postgres/auditpseudo.go:144-151\n\tif len(l.cache) >= pseudoCacheMax {\n\t\tl.cache = make(map[string][]byte, 64)\n\t}",
+      "why": "Two issues, both operator-gated. (1) The read path's stated goal is to avoid 'a one-bit account-existence oracle about an arbitrary subject' (auditread.go:71-79), but the response shape is not where the oracle lives: a subject with a pseudonym key costs two DB round trips (the key lookup plus the filtered SELECT), while a subject without one returns after a single lookup. Timing distinguishes the two. (2) A miss is never cached (only hits are), so an operator can force one indexed SELECT per distinct subject string, and hitting pseudoCacheMax evicts the entire hot cache. The bound prevents unbounded growth but does not prevent the round-trip amplification.",
+      "exploit": "Purely an admin-side information leak / load amplifier: query GET /v1/admin/audit?subject=X for many guessed ids and use latency to learn which subjects have ever been audited (i.e. exist as accounts), or loop over random strings to force a steady stream of audit_subject_keys lookups and periodic full cache flushes.",
+      "recommendation": "Cache negative lookups with a short TTL (or a bounded negative set) so the response time is uniform, and/or always issue the filtered SELECT (returning empty) so both branches do the same number of round trips. Keep the cache eviction but do not let arbitrary read-side subjects flush the write-path cache wholesale.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-8",
+      "title": "Account export claims to be everything held about the account but omits sessions, issued tokens and audit history, while the notice only disclaims credentials",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "medium",
+      "locations": [
+        "internal/httpapi/export_routes.go:10",
+        "internal/httpapi/export_routes.go:30",
+        "internal/httpapi/export_routes.go:39"
+      ],
+      "evidence": "internal/httpapi/export_routes.go:10-31\n// accountExport is the whole of GET /v1/account/export: everything Re0Auth holds\n// about the signed-in account, in one document.\ntype accountExport struct {\n\tExportedAt string `json:\"exported_at\"`\n\tProfile    struct {\n\t\tUserID          string `json:\"user_id\"`\n\t\tPrimaryIdentity string `json:\"primary_identity_id\"`\n\t\tCreatedAt       string `json:\"created_at\"`\n\t} `json:\"profile\"`\n\tIdentities []identityView `json:\"identities\"`\n\tBindings   []bindingView  `json:\"bindings\"`\n\tGrants     []grantView    `json:\"grants\"`\n\tNotice exportNotice `json:\"notice\"`\n}\n\ninternal/httpapi/export_routes.go:36-46\n// exportNotice ... records, in the document itself, what is deliberately not here and why.\ntype exportNotice struct {\n\tCredentialsExcluded bool   `json:\"credentials_excluded\"`\n\tReason              string `json:\"reason\"`\n}",
+      "why": "The comment promises 'everything Re0Auth holds about the signed-in account', but the document contains only profile, identities, bindings and grants. It omits the account's audit history (which is personal data about the account, resolvable through the pseudonym key while the account is live and exposed by the operator API) and its active sessions/tokens. The Notice says only that credentials are excluded, so a reader reasonably concludes the rest is complete. For a GDPR/PIPL data-portability response this is an overstatement of the export's completeness.",
+      "exploit": "A data subject exercises access/portability via GET /v1/account/export and receives a document that omits their audit trail; the Notice reinforces the impression of completeness. The omission only surfaces if the subject knows to ask an operator for /v1/admin/audit.",
+      "recommendation": "Either include the account's audit entries (the read path can already resolve them by subject) and session metadata in the export, or extend exportNotice with explicit fields (e.g. audit_excluded, sessions_excluded) and reasons, so the document no longer claims completeness it does not have.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S11-9",
+      "title": "GET /v1/admin/clients returns every client with no pagination or cap",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/httpapi/admin_routes.go:100",
+        "internal/store/postgres/oauth.go:732"
+      ],
+      "evidence": "internal/httpapi/admin_routes.go:104-116\n\tclients, err := s.adminSvc.ListClients(r.Context())\n\tif err != nil {\n\t\ts.writeProblem(w, r, http.StatusInternalServerError, \"internal_error\", \"could not list clients\")\n\t\treturn\n\t}\n\tviews := make([]adminClientView, 0, len(clients))\n\tfor _, c := range clients {\n\t\tviews = append(views, newAdminClientView(c))\n\t}\n\twriteJSON(w, http.StatusOK, map[string]any{\n\t\t\"data\":       views,\n\t\t\"csrf_token\": s.sessions.CSRFToken(r.Context()),\n\t})\n\ninternal/store/postgres/oauth.go:732-735\nfunc (s *Clients) List(ctx context.Context) ([]oauth.Client, error) {\n\trows, err := s.pool.Query(ctx, `\n\t\tSELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at\n\t\t  FROM oauth_clients ORDER BY id`)",
+      "why": "The admin client list has no limit parameter, no keyset cursor and no cap: the store materialises the entire oauth_clients table with pgx.CollectRows and the handler builds a second full slice plus JSON. The same class of endpoint (the audit read API) deliberately caps pages at 100/1000 for exactly this reason, and operator registration has no ceiling, so the response and its allocations grow without bound as clients accumulate.",
+      "exploit": "An operator (or a script holding an admin session) creates clients in a loop, then GET /v1/admin/clients encodes all of them in one response, allocating proportional memory on every call; the audit-read page bounds that exist on the neighbouring endpoint are absent here.",
+      "recommendation": "Give List a page bound and expose limit/cursor parameters (mirroring audit.Query's default 100 / max 1000), or cap the number of clients an operator may register.",
+      "already_mitigated": false
+    }
+  ],
+  "coverage": [
+    "internal/admin/admin.go",
+    "internal/httpapi/admin_routes.go",
+    "internal/httpapi/audit_routes.go",
+    "internal/httpapi/export_routes.go",
+    "internal/httpapi/binding_routes.go",
+    "internal/observability/observability.go",
+    "audit/audit.go",
+    "internal/httpapi/server.go",
+    "internal/httpapi/responses.go",
+    "internal/httpapi/middleware.go",
+    "internal/httpapi/grants_routes.go",
+    "internal/httpapi/identity_routes.go",
+    "internal/httpapi/session_routes.go",
+    "internal/httpapi/authorization_routes.go",
+    "internal/httpapi/federation_routes.go",
+    "internal/httpapi/device_routes.go",
+    "internal/store/postgres/auditread.go",
+    "internal/store/postgres/auditchain.go",
+    "internal/store/postgres/auditpseudo.go",
+    "internal/store/postgres/auditbatch.go",
+    "internal/store/postgres/audit.go",
+    "internal/store/postgres/oauth.go",
+    "internal/store/postgres/postgres.go",
+    "internal/store/memory/oidc.go",
+    "internal/store/postgres/oidc.go",
+    "oauth/client.go",
+    "cmd/re0auth/main.go",
+    "cmd/re0auth/config.go",
+    "internal/federation/federation.go",
+    "internal/federation/service.go",
+    "internal/federation/unbind.go",
+    "internal/federation/revocation.go",
+    "internal/federation/bind.go",
+    "internal/auth/auth.go",
+    "internal/lifecycle/lifecycle.go",
+    "vault/rotate.go",
+    "vault/service.go"
+  ],
+  "notes": "Scope S11. All six primary files were read completely, plus the cross-package sinks they reach (audit sink/chain/pseudonym/read, responses/middleware/routing, oauth client registry, postgres client store, federation service, composition root). Findings are grounded in current production code; tests were only skimmed to confirm invariants and are never the source of a claim. Items examined and found already mitigated: (a) admin/metrics label cardinality -- ObserveLogin provider is forced through registry.Get (internal/auth/auth.go:582,636) and ObserveUpstreamFetch game/source come only from registry candidates (internal/federation/service.go:501-558), so neither is caller-controlled; (b) request-id / method / status / grant_type / oauth-error labels are normalized (internal/observability/observability.go:562-596); (c) internal pprof/metrics listener is shape-checked at startup (non-loopback requires server.expose_internal, must differ from server.addr; cmd/re0auth/config.go:640-661); (d) audit read access is admin-gated and, for the subject filter, correctly refuses to answer an existence oracle in the response shape and correctly avoids minting a pseudonym key on read; (e) export Content-Disposition uses %q and the account id is server-minted, so header injection is not reachable; (f) audit.verify returns 200 with ok:false rather than a 5xx, which is the honest contract. Performance observation not filed as a finding: observability.statusRecorder does not implement io.ReaderFrom/Hijacker, but no current handler uses io.Copy or hijacking, and Unwrap covers http.ResponseController. Uncertainty: S11-5's impact depends on tokens outliving a deleted client row, which the DeleteClient ordering (delete-then-revoke, errors joined) makes reachable; S11-7 is a timing side channel whose signal is small relative to network noise. No Docker or PostgreSQL was available, so DB-backed paths (Verify, Query, chain batching) were audited by code reading only, not executed."
+}

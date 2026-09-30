@@ -48,7 +48,9 @@
 12. **设备流接受标准 OIDC scope**（`openid`/`profile`/`email`/`offline_access`）：展示只渲染
     catalogue scope，协议 scope 保留进 grant；并按 RFC 8628 §3.5 实现轮询节流（`slow_down`）。
 13. **`auth_time` 取会话真实登录时间**，不是同意决策时间。会话在 `SignIn` 时记录，登录 hook
-    写回授权请求。
+    写回授权请求；`prompt=login` / `max_age` 要求新鲜认证而会话不满足时，登录边界先经 IdP
+    重新登录，`CompleteLogin` 只在记录时间满足该请求时才完成，否则 `login_required`——同意
+    决策本身不算一次认证，绝不把决策时钟写进 `auth_time`（第九轮 S02-1）。
 14. **签名密钥集启动即校验**：至少 2048 位、kid 非空且不重复；否则拒绝启动。
 15. **缓存策略显式化**：内省与 userinfo `no-store`；JWKS 与 discovery `public, max-age=300`。
 

@@ -1,0 +1,224 @@
+{
+  "scope": "S09",
+  "title": "PostgreSQL store, migrations, audit chain and sweep",
+  "findings": [
+    {
+      "id": "S09-1",
+      "title": "DSN (with password) can reach logs on the migration-down path: withMigrationLock never redacts the driver's parse error",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "internal/store/postgres/postgres.go:378",
+        "internal/store/postgres/postgres.go:399",
+        "internal/store/postgres/postgres.go:402",
+        "internal/store/postgres/postgres.go:240",
+        "internal/store/postgres/postgres.go:452"
+      ],
+      "evidence": "sqlDB, err := sql.Open(\"pgx\", dsn)\n...\nconn, err := sqlDB.Conn(connCtx)\ncancel()\nif err != nil {\n\treturn fmt.Errorf(\"postgres: migrate: connect: %w\", err)\n}\n\n--- and the pool path it diverges from (postgres.go:237-240): ---\ncfg, err := pgxpool.ParseConfig(dsn)\nif err != nil {\n\treturn nil, fmt.Errorf(\"postgres: parse dsn: %w\", redactDSNParseError(err))\n}\n\n--- redactDSNParseError's own justification (postgres.go:263-278): ---\n// pgconn quotes the input it could not parse and redacts it only in the positions\n// its own heuristics recognise (\"necessarily best effort\", pgconn/errors.go). A\n// userinfo with no '@', or a keyword/value pair missing its '=', comes back\n// verbatim — password included — and postgres.Open hands that to the caller, which\n// logs it at stage=storage (Z19V-1).",
+      "why": "poolConfig redacts the driver's parse error, but withMigrationLock — used by Migrate and, crucially, by MigrateDown (which calls it directly, without ever going through poolConfig) — wraps the raw pgx.ParseConfig error. sql.Open only records the DSN; the parse happens in connector.Connect -> pgx.ParseConfig(dc.name) (pgx stdlib sql.go:381 in v5.11.0), so a malformed DSN whose password pgconn fails to redact is returned verbatim inside the wrapped error. The store's own comment asserts this exact class of leak exists and was fixed on the pool path only.",
+      "exploit": "Operator runs `re0auth -migrate-down --dsn 'postgres://app:se cret@db/tenants'` (userinfo without '@', or a keyword/value typo). pgconn cannot redact it, sqlDB.Conn returns the string verbatim, withMigrationLock wraps it, MigrateDown returns it, and the caller logs it at startup/storage. The database password lands in log aggregation.",
+      "recommendation": "Run every DSN through the same redaction as poolConfig: call redactDSNParseError on the error returned by sqlDB.Conn (and on sql.Open failures), or have MigrateDown/Migrate parse the DSN with poolConfig first. Alternatively make redactDSNParseError handle pgx.ParseConfigError as well and apply it inside withMigrationLock.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-2",
+      "title": "Tokens.RevokeTokens is not transactional although revokeMatching documents that it is, so a bulk Kill Switch/erasure can half-apply",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/oauth.go:466",
+        "internal/store/postgres/oauth.go:471",
+        "internal/store/postgres/oauth.go:517",
+        "internal/store/postgres/oidc.go:1503"
+      ],
+      "evidence": "// oauth.go:466-478 (legacy engine tables)\nfunc (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {\n\ttotal, err := revokeMatching(ctx, s.pool, []string{\"oauth_access_tokens\", \"oauth_refresh_tokens\"}, f)\n\tif err != nil {\n\t\treturn total, err\n\t}\n\tclause, args := revokePredicate(f)\n\tfor _, table := range []string{\"oauth_codes\", \"oauth_refresh_tombstones\"} {\n\t\tif _, err := s.pool.Exec(ctx, `DELETE FROM `+table+clause, args...); err != nil {\n\t\t\treturn total, err\n\t\t}\n\t}\n\treturn total, nil\n}\n\n--- oauth.go:517-521, the contract it violates ---\n// It takes the shared handle rather than the pool so a caller can run it inside\n// its own transaction — RevokeTokens does, because a bulk revocation that applied\n// half of itself and reported a count is not something a retry can distinguish\n// from success.\n\n--- oidc.go:1503-1535, the OP counterpart that does it correctly ---\ntx, err := s.pool.Begin(ctx)\n...\ntotal, err := revokeMatching(ctx, tx, []string{\"oidc_access_tokens\", \"oidc_refresh_tokens\"}, f)",
+      "why": "revokeMatching is called on s.pool (autocommit, one transaction per statement) and two further DELETEs run on the pool. The doc comment on revokeMatching explicitly claims RevokeTokens wraps it in one transaction; the OIDCStore.RevokeTokens does, so this is a drift from the stated invariant, not a design decision. A failure after the access/refresh deletes but before the oauth_codes delete leaves unspent authorization codes (redeemable capabilities) alive after a Kill Switch/erasure that reported failure; the retry then re-runs the same deleting statements and can keep failing at the same step while tokens are already gone.",
+      "exploit": "Operator suspends a client / erases a subject with the legacy engine's tables large enough that the `DELETE FROM oauth_codes ...` statement hits the pool's 30s statement_timeout (or the pool connection drops) after the oauth_access_tokens/oauth_refresh_tokens deletes committed. The call returns an error, tokens are gone, and every code minted before the switch survives; redeeming one after the revocation returns a fresh access and refresh token, which the revocation was supposed to make impossible.",
+      "recommendation": "Begin a pgx.Tx in Tokens.RevokeTokens and pass it to both revokeMatching and the oauth_codes/oauth_refresh_tombstones deletes, committing once (mirroring OIDCStore.RevokeTokens). Same treatment for PurgeLegacySubject (oauth.go:495-511), which also runs two autocommit deletes.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-3",
+      "title": "UnlinkIdentity masks any database error as ErrNotFound because ownership is checked before err",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/account.go:199"
+      ],
+      "evidence": "var owner string\nerr = tx.QueryRow(ctx, `SELECT user_id FROM accounts_identities WHERE id = $1`, string(identity)).Scan(&owner)\nif noRows(err) || account.UserID(owner) != user {\n\treturn account.ErrNotFound\n}\nif err != nil {\n\treturn err\n}",
+      "why": "When Scan fails for any reason other than no-rows (connection loss, statement_timeout, context cancellation), owner keeps its zero value \"\"; the second disjunct `account.UserID(\"\") != user` is therefore true whenever user is non-empty, so the function returns account.ErrNotFound before the `if err != nil` check can run. A real infrastructure failure is reported to the caller as \"this identity does not belong to this user\", which is the same answer as a genuine missing row; callers that treat ErrNotFound as idempotent success will believe an unlink happened that did not, and an operator sees no 5xx to alert on.",
+      "exploit": "During a database failover, an admin request to unlink identity id_X from usr_1 fails the SELECT; the API answers 404 (identity not found) while the FOR-UPDATE lock and the DELETE never ran. The identity remains linked and the account page still shows it, but the response said it is not there.",
+      "recommendation": "Check err first, then ownership: `if err != nil { if noRows(err) { return ErrNotFound }; return err }` followed by `if account.UserID(owner) != user { return account.ErrNotFound }`.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-4",
+      "title": "ConsumeRefresh claims expired values (no expires_at predicate) although the Store contract says \"live\", unlike the OP store's rotation claim",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/oauth.go:242",
+        "internal/store/postgres/oidc.go:514",
+        "oauth/as.go:289",
+        "oauth/tokens.go:168"
+      ],
+      "evidence": "--- oauth.go:242-245 (legacy store) ---\nrows, err := tx.Query(ctx, `\n\t\tDELETE FROM oauth_refresh_tokens\n\t\t WHERE token_hash = $1\n\t\tRETURNING client_id, subject, scopes, family_id, issued_at, expires_at`, hash)\n\n--- oidc.go:514-519 (OP store, for contrast) ---\nerr := tx.QueryRow(ctx, `\n\t\t\tDELETE FROM oidc_refresh_tokens\n\t\t\t WHERE token_hash = $1 AND expires_at > $2\n\t\t\tRETURNING family_id, id_hash, client_id, subject, expires_at`,\n\t\t\thashValue(currentRefreshToken), now).\n\n--- oauth/tokens.go:168-172 (the contract) ---\n// ConsumeRefresh claims a live refresh value atomically and retires it. A\n// live value returns its record; a value this store already consumed returns\n// a *RefreshReuseError carrying that value's FamilyID; only a value never\n// issued returns ErrTokenNotFound.\n\n--- oauth/as.go:289 (the expiry judgement happens AFTER the destructive claim) ---\nif !s.now().Before(rt.ExpiresAt) {\n\treturn TokenResponse{}, protocolError(\"invalid_grant\", \"refresh token has expired\")\n}",
+      "why": "The legacy Tokens.ConsumeRefresh deletes the row regardless of expiry, arms a tombstone whose expires_at is already in the past, and only then does the service check rt.ExpiresAt. Two stores implementing the same interface disagree on what a claim is, and an expired (but still known) refresh token is destroyed by a request whose RFC-mandated answer is invalid_grant. Because ListBySubject is documented to return expired rows too (oauth.go:361-365), a single expired-token presentation silently removes the grant from the user's grants view.",
+      "exploit": "A client whose clock was wrong, or a retry with a just-expired refresh token, POSTs it to /token. ConsumeRefresh deletes the oauth_refresh_tokens row and inserts an already-expired tombstone; the service then returns invalid_grant. The user's grants page no longer lists that refresh grant, and the row is unrecoverable; the paired access token is not revoked (only the refresh row was deleted).",
+      "recommendation": "Add `AND expires_at > $2` to the DELETE and bind s.clock(), returning ErrTokenNotFound (or a distinct expired error) without writing a tombstone, matching OIDCStore.CreateAccessAndRefreshTokens. If expiry must stay the service's judgment, the service must read/validate before the destructive claim (as it already does for ownership via TokenOwner).",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-5",
+      "title": "Rolling back migrations 0024/0025 silently drops refresh-family tombstones and replay detection; the MigrateDown guard only covers 13/14",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/postgres.go:469",
+        "internal/store/postgres/postgres.go:496",
+        "internal/store/postgres/migrations/0024_refresh_token_family.sql:50",
+        "internal/store/postgres/migrations/0025_oauth_refresh_family.sql:59"
+      ],
+      "evidence": "--- postgres.go:469-472, 496-498 ---\nconst (\n\tmigrationAuditChain      = 13\n\tmigrationAuditPseudonyms = 14\n)\n...\nif version != migrationAuditChain && version != migrationAuditPseudonyms {\n\treturn nil\n}\n\n--- migrations/0024_refresh_token_family.sql:50-53 (Down) ---\n-- +goose Down\nDROP TABLE IF EXISTS oidc_refresh_token_tombstones;\nDROP INDEX IF EXISTS oidc_refresh_tokens_family_id_idx;\nALTER TABLE oidc_refresh_tokens DROP COLUMN IF EXISTS family_id;\n\n--- migrations/0025_oauth_refresh_family.sql:59-64 (Down) ---\n-- +goose Down\nDROP TABLE IF EXISTS oauth_refresh_tombstones;\nDROP INDEX IF EXISTS oauth_access_tokens_family_id_idx;\nDROP INDEX IF EXISTS oauth_refresh_tokens_family_id_idx;\nALTER TABLE oauth_access_tokens DROP COLUMN IF EXISTS family_id;\nALTER TABLE oauth_refresh_tokens DROP COLUMN IF EXISTS family_id;",
+      "why": "refuseAuditChainRollback deliberately protects the two migrations whose Down destroys integrity state, but migrations 0024/0025 drop the only pointer from a spent refresh token to its family (the tombstones) and the family_id columns. Re-applying Up cannot reconstruct the tombstones: migration 0024/0025 backfill live rows to \"each is its own family\", so a replay of any token spent before the rollback degrades to ErrTokenNotFound instead of *RefreshReuseError, and RFC 9700 §4.14.2 family revocation never fires. The rollback is accepted without the refusal an operator gets for 13/14, and nothing in the migration files or the guard states this security regression.",
+      "exploit": "A bad deploy is rolled back with `-migrate-down` twice (0026 then 0025, or 0024 for the OP tables). Existing refresh tokens keep working for the victim, but a stolen-and-already-rotated token presented by the thief now returns invalid_grant as an ordinary unknown token; the thief's live generation is never revoked, and the audit trail shows no reuse event. The loss is invisible: the store reports the rollback succeeded.",
+      "recommendation": "Extend the version-guarded refusal to 24/25 (and future family/tombstone migrations): refuse Down while oidc_refresh_token_tombstones/oauth_refresh_tombstones (or any live refresh row with a non-empty family) exist, or document and enforce restore-from-backup for them exactly as 0013/0014 are handled.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-6",
+      "title": "Verify reads audit_chain.head_hash as a witness but never compares it to the walked chain, so tail truncation is not detected even though the anchor is in hand",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/auditchain.go:259",
+        "internal/store/postgres/auditchain.go:346"
+      ],
+      "evidence": "var head []byte\nif err := tx.QueryRow(ctx, `SELECT head_hash FROM audit_chain WHERE only_row`).Scan(&head); err != nil {\n\treturn audit.Verification{}, fmt.Errorf(\"postgres: audit: verify head: %w\", err)\n}\n...\nif v.Chained == 0 && len(head) != 0 {\n\t// The head advanced, so rows were chained, yet none of them read as\n\t// chained. That is exactly what clearing the chain columns produces, and\n\t...\n\treturn v, nil\n}\nv.OK = true\nreturn v, nil",
+      "why": "head is read and used only for the \"all chain columns cleared\" witness. After the walk, the final row hash (prev) is discarded and never compared with head, so deleting the chained tail rows from audit_events leaves every surviving row self-consistent: Verify returns OK=true while audit_chain.head_hash names a row that no longer exists. The migration comment calls this \"invisible without an external anchor\", but the anchor is present in the same statement stream. The reason a naive comparison is unsafe is the READ COMMITTED snapshot: head and rows are read at different snapshots, so a concurrent append between the two reads would make a correct chain look truncated; a fix must read both in one snapshot (single statement or REPEATABLE READ).",
+      "exploit": "An attacker with DELETE on audit_events (but no key) removes the most recent N chained rows — e.g. the records of their own credential theft. GET /admin/audit/verify still answers intact/O K, and the only mismatch (head vs last row) is never checked; an external anchor is the only detector.",
+      "recommendation": "Read the head and the last chained row in one snapshot (e.g. a single query, or SET TRANSACTION ISOLATION LEVEL REPEATABLE READ inside the verify transaction) and fail with a distinct reason when the final walked hash does not equal head. Keep the existing zero-chained witness.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-7",
+      "title": "Database outages are collapsed into protocol 'not found' on the authorization-code and device-poll paths, unlike every refresh/revocation path",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/oidc.go:327",
+        "internal/store/postgres/oidc.go:1210",
+        "internal/store/postgres/oidc.go:660"
+      ],
+      "evidence": "--- oidc.go:327-331 (AuthRequestByCode) ---\nif err := tx.QueryRow(ctx,\n\t`DELETE FROM oidc_codes WHERE code_hash = $1 AND expires_at > $2 RETURNING request_id`,\n\thashValue(code), s.now()).Scan(&requestID); err != nil {\n\treturn nil, errors.New(\"postgres: authorization code is unknown or expired\")\n}\n\n--- oidc.go:1213-1219 (deviceState) ---\nrows, err := s.pool.Query(ctx, `\n\t\tSELECT client_id, scopes, expires_at, done, denied, subject, auth_time\n\t\t  FROM oidc_devices WHERE `+where, args...)\nif err != nil {\n\treturn nil, errors.New(\"postgres: device authorization not found\")\n}\nrow, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[deviceStateRow])\nif err != nil {\n\treturn nil, errors.New(\"postgres: device authorization not found\")\n}\n\n--- oidc.go:660-665, the contrasted behaviour (TokenRequestByRefreshToken) ---\nif err != nil {\n\t// The database did not answer, so this is not \"unknown token\". The library\n\t// hardcodes invalid_grant on this path ...\n\treturn nil, fmt.Errorf(\"postgres: load refresh token: %w\", err)\n}",
+      "why": "TokenRequestByRefreshToken and RevokeToken (oidc.go:787-789) deliberately preserve the cause of a database failure so an outage is not reported as \"unknown\", but AuthRequestByCode and deviceState replace any error with a sentinel. A cancelled context, connection failure or statement timeout during code redemption becomes invalid_grant, and during device polling becomes the device-not-found error the library maps to access_denied. Operators lose the outage signal and clients treat a transient store failure as a permanent protocol error.",
+      "exploit": "A failover window hits POST /token: the DELETE in AuthRequestByCode errors, the method returns \"authorization code is unknown or expired\", the library emits 400 invalid_grant, and the RP aborts the login. Nothing in the audit trail or metrics distinguishes this from a genuinely invalid code, so the store outage is invisible.",
+      "recommendation": "Return the wrapped error for non-noRows failures (as TokenRequestByRefreshToken does) and reserve the sentinel for pgx.ErrNoRows. The library may still map the wire answer the same way, but the composition root keeps the cause for counting and alerting.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-8",
+      "title": "Several multi-statement deletes run without a transaction, leaving orphaned session index rows and post-revocation replay tombstones",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/sessions.go:197",
+        "internal/store/postgres/sessions.go:211",
+        "internal/store/postgres/oauth.go:290",
+        "internal/store/postgres/oauth.go:495"
+      ],
+      "evidence": "--- sessions.go:197-205 (RevokeAllSessions) ---\ntag, err := s.pool.Exec(ctx, `DELETE FROM sessions`)\nif err != nil {\n\treturn 0, err\n}\nif _, err := s.pool.Exec(ctx, `DELETE FROM session_subjects`); err != nil {\n\treturn tag.RowsAffected(), err\n}\n\n--- oauth.go:290-297 (DeleteRefresh) ---\nif _, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tokens WHERE token_hash = $1`, hash); err != nil {\n\treturn err\n}\n_, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tombstones WHERE token_hash = $1`, hash)\nreturn err\n\n--- oauth.go:500-509 (PurgeLegacySubject) ---\nfor _, q := range []string{\n\t`DELETE FROM oauth_codes WHERE subject = $1`,\n\t`DELETE FROM oauth_device_authorizations WHERE subject = $1`,\n} {\n\ttag, err := s.pool.Exec(ctx, q, subject)",
+      "why": "Each of these methods promises that two pieces of state go together, but every statement is autocommit. On failure the second half stays: RevokeAllSessions can leave session_subjects rows whose sessions are gone (a later RevokeSubjectSessions finds nothing to revoke, and the sweep only clears them after the 1-hour grace); DeleteRefresh can leave a tombstone that keeps reporting the explicitly revoked token as a replay and lets a later presentation trigger family revocation; PurgeLegacySubject can leave oauth_device_authorizations rows for an erased subject. The stated invariants in the method comments hold only when nothing fails.",
+      "exploit": "A Kill Switch run receives a transient error on the second DELETE (e.g. the pool is momentarily exhausted). Sessions/index rows are half-deleted and DeleteRefresh leaves a live replay tombstone for a token the operator explicitly revoked; a subsequent legitimate presentation of a token value now reported as reuse can revoke an unrelated live family.",
+      "recommendation": "Wrap each pair in one pgx.Tx (as DeleteBySubjectClient, RevokeGrant and OIDCStore.RevokeTokens already do) and commit once.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-9",
+      "title": "Audit pseudonym cache is dropped wholesale at 4096 entries, so bursts over distinct subjects put 1-3 extra queries on the vault fail-closed path",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/auditpseudo.go:144",
+        "internal/store/postgres/auditpseudo.go:115",
+        "internal/store/postgres/auditpseudo.go:69"
+      ],
+      "evidence": "func (l *AuditLogger) remember(subject string, key []byte) {\n\tl.mu.Lock()\n\tdefer l.mu.Unlock()\n\tif len(l.cache) >= pseudoCacheMax {\n\t\tl.cache = make(map[string][]byte, 64)\n\t}\n\tl.cache[subject] = key\n}\n\n--- auditpseudo.go:115-141 (miss path: SELECT, maybe INSERT, then re-SELECT) ---\nfunc (l *AuditLogger) subjectKey(ctx context.Context, subject string) ([]byte, error) {\n\tkey, err := l.loadKey(ctx, subject)\n\tif err != nil || key != nil {\n\t\treturn key, err\n\t}\n\t...\n\tINSERT INTO audit_subject_keys (idx, key) VALUES ($1, $2)\n\t\tON CONFLICT (idx) DO NOTHING\n\t...\n\tif err := l.pool.QueryRow(ctx, `SELECT key FROM audit_subject_keys WHERE idx = $1`, idx).Scan(&key); err != nil {",
+      "why": "When the working set of distinct audited subjects exceeds pseudoCacheMax, every new subject evicts the entire map, so subsequent writes for subjects already seen miss again. AuditLogger.Record is the vault's fail-closed precondition (a credential is not handed over until the row is committed), and each miss costs one to three pool round trips before the batcher is even reached. The bound itself is correct; the all-or-nothing eviction is what turns a large subject burst into a persistent cache-miss regime.",
+      "exploit": "A deployment-wide Kill Switch or bulk erasure audits thousands of distinct subjects in a short window; each Record for a fresh subject resets the 4096-entry cache. Under pool pressure (16 connections) the extra lookups queue behind the same connections the audit append and the vault read need, extending the data-plane stall the batcher was introduced to bound.",
+      "recommendation": "Use a bounded eviction policy that keeps the hot set (e.g. LRU/LFU, or simply do not clear on overflow until a second bound is reached) so a burst degrades to a miss for the touched subject rather than for all of them.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S09-10",
+      "title": "OP token issued_at is written by the database's now(), not the store clock the rest of OIDCStore uses",
+      "severity": "info",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/store/postgres/oidc.go:429",
+        "internal/store/postgres/oidc.go:573",
+        "internal/store/postgres/migrations/0009_oidc_token_issued_at.sql:5",
+        "internal/store/postgres/oidc.go:41"
+      ],
+      "evidence": "--- oidc.go:429-432 ---\n\tif _, err := s.pool.Exec(ctx, `\n\t\tINSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)\n\t\tVALUES ($1,$2,$3,$4,$5)`,\n\n--- oidc.go:573-576 ---\n\tif _, err := tx.Exec(ctx, `\n\t\tINSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)\n\t\tVALUES ($1,$2,$3,$4,$5)`,\n\n--- migrations/0009_oidc_token_issued_at.sql:5-6 ---\nALTER TABLE oidc_access_tokens  ADD COLUMN issued_at timestamptz NOT NULL DEFAULT now();\nALTER TABLE oidc_refresh_tokens ADD COLUMN issued_at timestamptz NOT NULL DEFAULT now();\n\n--- oidc.go:41-47, the stated policy ---\n// now is the clock every deadline this store writes is written with — and\n// judged with, in SQL as well as in Go.",
+      "why": "Every token INSERT omits issued_at, so the column takes the migration's DEFAULT now() — the database's clock — while expires_at comes from s.now(). Grants reads both back and merges them into one record (oidc.go:1408-1413), so under clock skew or WithClock the displayed issue time mixes clocks with the expiry it is compared against, and two replicas can order the same token differently. issued_at is not a security deadline, so the impact is limited to the grants view and any operator reasoning from it.",
+      "recommendation": "Bind issued_at explicitly from s.now().UTC() in both INSERTs (and the refresh INSERT at oidc.go:579-584), or use a DEFAULT that the application clock feeds, so one clock produces every timestamp the store writes.",
+      "already_mitigated": false
+    }
+  ],
+  "coverage": [
+    "internal/store/postgres/account.go",
+    "internal/store/postgres/audit.go",
+    "internal/store/postgres/auditbatch.go",
+    "internal/store/postgres/auditchain.go",
+    "internal/store/postgres/auditpseudo.go",
+    "internal/store/postgres/auditread.go",
+    "internal/store/postgres/federation.go",
+    "internal/store/postgres/oidc.go",
+    "internal/store/postgres/oauth.go",
+    "internal/store/postgres/postgres.go",
+    "internal/store/postgres/sessions.go",
+    "internal/store/postgres/sweep.go",
+    "internal/store/postgres/vault.go",
+    "internal/store/postgres/migrations/0001_init.sql",
+    "internal/store/postgres/migrations/0002_vault.sql",
+    "internal/store/postgres/migrations/0003_federation.sql",
+    "internal/store/postgres/migrations/0004_sessions.sql",
+    "internal/store/postgres/migrations/0006_grants.sql",
+    "internal/store/postgres/migrations/0007_audit.sql",
+    "internal/store/postgres/migrations/0008_oidc.sql",
+    "internal/store/postgres/migrations/0009_oidc_token_issued_at.sql",
+    "internal/store/postgres/migrations/0010_client_status.sql",
+    "internal/store/postgres/migrations/0011_session_subjects.sql",
+    "internal/store/postgres/migrations/0012_indexes.sql",
+    "internal/store/postgres/migrations/0013_audit_chain.sql",
+    "internal/store/postgres/migrations/0014_audit_pseudonyms.sql",
+    "internal/store/postgres/migrations/0015_session_index_age.sql",
+    "internal/store/postgres/migrations/0016_oidc_device_last_poll.sql",
+    "internal/store/postgres/migrations/0017_oidc_devices_expires_idx.sql",
+    "internal/store/postgres/migrations/0018_oidc_refresh_tokens_id_hash_idx.sql",
+    "internal/store/postgres/migrations/0019_session_subjects_created_at_idx.sql",
+    "internal/store/postgres/migrations/0020_audit_events_occurred_at_idx.sql",
+    "internal/store/postgres/migrations/0021_token_client_indexes.sql",
+    "internal/store/postgres/migrations/0022_bulk_revoke_client_indexes.sql",
+    "internal/store/postgres/migrations/0023_oidc_auth_request_freshness.sql",
+    "internal/store/postgres/migrations/0024_refresh_token_family.sql",
+    "internal/store/postgres/migrations/0025_oauth_refresh_family.sql",
+    "internal/store/postgres/migrations/0026_oidc_refresh_nonce.sql",
+    "oauth/tokens.go (interface contract, read for S09-2/S09-4)",
+    "oauth/as.go (Refresh order of ConsumeRefresh vs expiry, read for S09-4)",
+    "oauth/device.go (NormalizeUserCode, read to confirm device-code lookups)",
+    "oauth/client.go (RestoreClientWithStatus/Authenticate, read for registry invariants)"
+  ],
+  "notes": "Static review only: no Docker and no local PostgreSQL, so nothing was executed against a live database and no migrations were applied; line-level conclusions come from the production sources plus the pinned dependency sources (pgx v5.11.0 stdlib sql.go:381, zitadel/oidc v3.51.3 pkg/op/token_refresh.go:72 and pkg/op/token_intospection.go) where a library call order mattered. S09-1's severity depends on pgconn failing to redact the malformed DSN; the production comment asserts that failure mode, but the exact redaction behaviour was not executed. Deliberately not reported (checked and found adequately handled): batch/queue shutdown races in auditbatch.go (send-before-recheck plus buffered done channels make the accepted-but-never-answered window unreachable); audit chain fork prevention (SELECT ... FOR UPDATE on the single head row, one writer goroutine); single-clock policy for deadlines (sessions, sweep.go, and all OIDC deadlines do use the store clock; only issued_at is DB now(), S09-10); SQL injection (all identifiers are compile-time constants, all values parameterised, including revokePredicate and sweep.go); N+1 client-name lookups (Clients.ClientNames uses one id = ANY($1) query); err-first ordering bugs of the S09-3 shape elsewhere (LinkIdentity, GetUser and identityByKey all check noRows before the generic error correctly); device user-code lookup (the HTTP layer normalises with oauth.NormalizeUserCode before every store call, so the SQL expression's lack of TRIM has no reachable caller). The 0005 gap in migration numbering is harmless for goose (versions are ordered numerically, not required contiguous)."
+}

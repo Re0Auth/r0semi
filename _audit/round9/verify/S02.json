@@ -1,0 +1,83 @@
+{
+  "scope": "S02",
+  "verified": [
+    {
+      "id": "S02-1",
+      "status": "confirmed",
+      "final_severity": "high",
+      "reason": "Mechanism independently confirmed end to end. (1) The library's Authorize always calls RedirectToLogin for a request that is not Done, with no session branch (pkg/op/auth_request.go:145-150,442), so a live session still goes to the login hook. (2) cmd/re0auth/main.go:1331-1342's login hook only binds the request and copies sessions.AuthenticatedAt via SetAuthTime; it never reads prompt/max_age and never forces a credential prompt. (3) The consent API response (internal/httpapi/authorization_routes.go:109-115) carries only id/client/scopes/missing_bindings/csrf_token, so the SPA cannot learn the freshness requirement either. (4) CompleteLogin reacts to RequiresReauthentication==true by overwriting AuthTime with the store clock (memory/oidc.go:1274, postgres/oidc.go:1269); the id_token's auth_time is then taken from request.GetAuthTime() (pkg/op/token.go:211). So prompt=login / max_age never trigger a re-authentication, and the signed auth_time reports the consent-click time for an authentication that did not occur. I ran the in-tree probe TestZ02MaxAgeAndPromptLoginAreIgnored (audit6 tag) and it passed: with a 2h-old session, prompt=login, max_age=0 and max_age=1 all complete and the id_token's auth_time is the decision time (the control asserts a plain request keeps the stale sign-in). OIDC Core §3.1.2.1 requires an attempt to re-authenticate for max_age; prompt=login is at minimum a SHOULD, and a fail-closed login_required is the permitted alternative. A borrowed/stolen 24h session (IdleTimeout 2h) can satisfy an RP's step-up bound that the OP falsely attests. High retained.",
+      "evidence_checked": "internal/oidcstore/oidcstore.go:226-248; internal/store/memory/oidc.go:1232-1284,396-430; internal/store/postgres/oidc.go:1227-1286,181-204; cmd/re0auth/main.go:1331-1342; internal/httpapi/authorization_routes.go:109-115; internal/oidchttp/oidchttp.go:1718-1783; github.com/zitadel/oidc/v3@v3.51.3/pkg/op/auth_request.go:145-150,442; pkg/op/token.go:195-211; internal/zzprobe/audit6/z02protocoltoken/idtoken_test.go:25-171 (executed, PASS)"
+    },
+    {
+      "id": "S02-2",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed. validateAuthorize only refuses prompt=none when there is no session (oidchttp.go:991-1004); with a live session it falls through, the library creates a fresh undoned AuthRequest and calls client.LoginURL (auth_request.go:145-150,442), and the login hook returns /app/consent?id=... (main.go:1341). Re0Auth has no remembered consent: CreateAuthRequest (memory/oidc.go:396-430, postgres/oidc.go:181-204) never consults existing grants/prior decisions and every record starts not-Done, so a signed-in prompt=none request can never be satisfied non-interactively. The user agent therefore gets a 302 into the consent SPA, and webui/the edge set Content-Security-Policy: frame-ancestors 'none' (internal/webui/webui.go:45, middleware.go:61), so an RP's hidden silent-auth iframe is blocked and receives no OAuth response at all instead of consent_required. No security payoff for this OP, but a real OIDC Core §3.1.2.1 violation that breaks every RP using prompt=none; medium retained as a protocol-conformance/interop defect.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:973-1005,934-1076; cmd/re0auth/main.go:1331-1342; internal/store/memory/oidc.go:396-430; internal/store/postgres/oidc.go:181-204; internal/webui/webui.go:43-45; internal/httpapi/middleware.go:49-61; github.com/zitadel/oidc/v3@v3.51.3/pkg/op/auth_request.go:145-150,442"
+    },
+    {
+      "id": "S02-3",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed. validateDeviceAuthorization unescapes the Basic username (oidchttp.go:1114) but passes the paired secret raw to deviceClientAuthenticated (1152,1175-1184), which hashes it verbatim via oauth.Client.Authenticate (oauth/client.go:108-113). The library's own ClientBasicAuth runs url.QueryUnescape on BOTH halves and then AuthorizeClientIDSecret compares the unescaped secret (pkg/op/client.go:114-129; internal/store/memory/oidc.go:901-913) — the same correct decode the repo already has in oauth.ClientCredentials (oauth/http.go:33-45) but does not use here. The pre-flight runs before the provider (oidchttp.go:576-580) and answers 401 invalid_client, so a spec-compliant confidential client whose secret contains a character QueryEscape rewrites (space, '+', '%', '/', '=') is refused at POST /oauth/device_authorization while the same Basic credentials succeed at /oauth/token and /oauth/introspect. Availability/interop only, no auth bypass; medium retained for a hard failure of RFC 6749 §2.3.1-conformant requests.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:1106-1184,576-580; oauth/client.go:99-114; oauth/http.go:14-45; pkg/op/client.go:109-130; internal/store/memory/oidc.go:901-913; cmd/re0auth/main.go (RE0AUTH_CLIENT_SECRET-sourced operator secrets) "
+    },
+    {
+      "id": "S02-4",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed. ValidateSigner enforces the 2048-bit floor only on s.key.N (oidcstore.go:69-71); the retired loop checks only empty id, nil public key and duplicate kid (73-84), so an rsa.PublicKey of any size is accepted. WithRetired/KeySet then publish every retired key in the JWKS (53-56,97-105) via retiredPublicKey.Key() (121), and cmd/re0auth/main.go:1495-1525 loads them from RE0AUTH_OIDC_RETIRED_SIGNING_KEYS. A weak retired key is therefore advertised as a signature key; anyone who factors its modulus can mint a JWS under that kid that JWKS-trusting verifiers (including this OP's own id_token_hint/access-token verification over op.OpenIDKeySet) accept. The precondition is operator-supplied key material, which the guard exists precisely to reject, so the incomplete validation is a genuine defense-in-depth failure with high impact when hit; medium retained (not raised, because a weak retired key must first be configured).",
+      "evidence_checked": "internal/oidcstore/oidcstore.go:33-121; cmd/re0auth/main.go:1314-1326,1492-1525"
+    },
+    {
+      "id": "S02-5",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "Code behavior is exactly as described but unreachable in the shipped product, so low is still too strong. serveDiscovery caches the rendered document per path for the handler's life (oidchttp.go:294-317,342-366) while the issuer, when Config.Issuer is empty, is op.IssuerFromHost(\"\") derived per request from Forwarded/Host (193-196), so the first Host fixes every later client's issuer and endpoint URLs. However cmd/re0auth/config.go:476-478 rejects an empty server.issuer/RE0AUTH_ISSUER, and main.go passes cfg.Issuer into oidchttp.New, so only tests/embeddings that leave Issuer blank can hit it. The discovery's own exploit text concedes this ('Not reachable from the shipped config today'). Downgraded to info as a latent embedding/test-only hazard.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:193-196,294-317,342-366; cmd/re0auth/config.go:467-481; cmd/re0auth/main.go:1376-1394"
+    },
+    {
+      "id": "S02-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. writeOAuthJSONError sets only WWW-Authenticate (for 401), Content-Type and Cache-Control (oidchttp.go:1354-1362) — it never sets Allow — and every protocol-plane 405 goes through it: the discovery branches (256-259, 263-266) and serveOAuth (478-481). The business plane computes and sets Allow (internal/httpapi/server.go:680-703). RFC 9110 §15.5.6 requires Allow on a 405, so a client probing e.g. GET /oauth/token cannot discover POST, and the two planes disagree. No security impact; low correctness retained.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:256-266,478-481,1352-1362; internal/httpapi/server.go:680-703"
+    },
+    {
+      "id": "S02-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed by tracing the routing. serveDiscovery clones the request and rewrites only clone.URL.Path, leaving RawPath stale (oidchttp.go:300-301). go-chi v5.3.2 routeHTTP prefers r.URL.RawPath whenever it is non-empty (mux.go:454-458), and the provider router only registers /.well-known/openid-configuration (pkg/op/op.go:138, oidc.DiscoveryEndpoint). Go's ServeMux matches on the escaped path (net/http/server.go:2711-2715), so /.well-known/oauth%2Dauthorization-server (or openid%2Dconfiguration) is not caught by the literal GET patterns and falls to root.Handle(\"/.well-known/\", s.oidc) (internal/httpapi/server.go:519-531) with Path decoded and RawPath escaped. Handler.ServeHTTP then matches the decoded Path, rewrites Path to the OIDC document, and chi matches no route because it reads the escaped RemainingPath, so the wrapper forwards chi's 404 and the document is never served. Non-200 is not cached (314-316), so the miss repeats. No security impact; low correctness retained.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:253-268,294-317; internal/httpapi/server.go:519-531; github.com/go-chi/chi/v5@v5.3.2/mux.go:447-462; github.com/zitadel/oidc/v3@v3.51.3/pkg/op/op.go:136-148; C:\\Program Files\\Go\\src\\net\\http\\server.go:2711-2745"
+    },
+    {
+      "id": "S02-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. Handler.Introspect maps ANY error from SetIntrospectionFromToken to oauth.TokenInfo{Active:false}, nil (oidchttp.go:1677-1683), and the postgres store returns the identical generic error for a pool.Query/CollectOneRow failure and for a missing/expired row (postgres/oidc.go:1034-1047). internal/httpapi withBearer turns Active=false into 401 error=invalid_token (middleware.go:673-680), so a database outage or pool exhaustion is indistinguishable from a revoked token on the business plane's only bearer path. The refresh path has an outage metric (storemetrics.go:90-101) but introspect has no ObserveStoreUnavailable equivalent. Fail-closed is correct; the defect is the collapsed classification and missing observability. Low reliability retained (requires an in-store outage, and the client-visible result is still 'do not use this token').",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:1664-1695; internal/store/postgres/oidc.go:1034-1054; internal/httpapi/middleware.go:673-680; internal/oidchttp/storemetrics.go:86-101"
+    },
+    {
+      "id": "S02-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed and the call frequency is as claimed. sanitizeTokenResponse is called on every token-endpoint 200 (oidchttp.go:669-671) and unconditionally does json.Unmarshal into map[string]json.RawMessage; ApproveAuthorization always appends offline_access via withOfflineAccess (oidchttp.go:1775-1779) and CompleteLogin persists it, so the token response's scope contains offline_access, withoutField returns stripped=true and the body is re-marshalled on essentially every authorization_code/device issuance. isOAuthErrorBody additionally unmarshals every >=400 (693, 761-771). That is a real extra full decode + map allocation + encode per issuance, but it is tens of microseconds against the RSA-2048 id_token signature, AES-GCM token encryption and store writes on the same path, so it is a micro-inefficiency rather than a throughput defect. Low performance retained.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:1532-1562,663-695,759-771,1718-1782; internal/oidcstore/oidcstore.go:393-413"
+    },
+    {
+      "id": "S02-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. validateAuthorize bounds code_challenge to 43-128 unreserved characters (oidchttp.go:1046-1058) but never inspects state or nonce; both are stored verbatim (memory/oidc.go:409-420; postgres/oidc.go:181-204 INSERTs req.State/req.Nonce) and later echoed (state into every authorization response via oauth.BuildRedirect; nonce into the id_token via GetNonce). Other caller-chosen identifiers are bounded (internal/httpapi/middleware.go:326-338, maxRequestIDBytes=128), while the request line cap is MaxHeaderBytes (cmd/re0auth/main.go:796, 64 KiB), so one request can persist ~60 KB and repeat it through every derived id_token for the 30-minute request TTL. Rate limiting and the header cap bound the amplification, matching the discovery's own assessment. Low reliability retained.",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:934-1076; internal/store/memory/oidc.go:396-430; internal/store/postgres/oidc.go:178-205; internal/httpapi/middleware.go:326-338; cmd/re0auth/main.go:796,1350-1359; cmd/re0auth/config.go:343-349"
+    },
+    {
+      "id": "S02-11",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Confirmed and correctly self-assessed. DenyAuthorization has no *http.Request and calls withIssuer(redirect, h.issuer) (oidchttp.go:1794-1799); h.issuer is strings.TrimRight(cfg.Issuer, \"/\") (237) and is empty whenever Config.Issuer is empty, and withIssuer returns the location untouched for an empty issuer (1466-1470). The HTTP handlers use issuerFor, which falls back to provider.IssuerFromRequest (1444-1452), so in a dynamic-issuer embedding the denial redirect lacks iss while success/error responses carry it, contradicting authorization_response_iss_parameter_supported=true. cmd/re0auth/config.go:476-478 makes an issuer mandatory, so the shipped binary cannot take that branch. Info retained (latent, tests/embeddings only).",
+      "evidence_checked": "internal/oidchttp/oidchttp.go:1785-1802,1441-1478,232-241; cmd/re0auth/config.go:467-481"
+    }
+  ],
+  "summary": "Re-read every cited location and traced callers, guards and the active op library path (op.NewProvider/free Authorize/CompleteLogin, not the legacy server). 11 findings reviewed: 10 confirmed (1 high, 3 medium, 5 low, 1 info), 1 downgraded (S02-5 low -> info), 0 rejected. S02-1 is real and high: Authorize always calls LoginURL with no session branch, the login hook only copies sessions.AuthenticatedAt into SetAuthTime, the consent API carries no prompt/max_age, and both stores overwrite AuthTime with the decision clock when RequiresReauthentication is true, so the signed auth_time is false; I executed the in-tree audit6 probe TestZ02MaxAgeAndPromptLoginAreIgnored and it passes on a 2h-old session, confirming the mechanism. S02-2 and S02-3 are confirmed by code and by the library's own ClientBasicAuth/AuthorizeClientIDSecret contrast; S02-4's missing 2048-bit check on retired keys is real with an operator-config precondition. Key cross-checks: chi v5.3.2 does prefer RawPath and Go's ServeMux routes the escaped discovery alias to the /.well-known/ catch-all, so S02-7's 404 is reachable; the postgres SetIntrospectionFromToken really collapses a pool error into the not-found error class, so S02-8 holds; sanitizeTokenResponse really re-marshals on essentially every token 200 because ApproveAuthorization always injects offline_access. S02-5 and S02-11 are both gated on Config.Issuer==\"\" and are rejected at startup by cmd/re0auth/config.go:476, so neither is reachable from the shipped binary. No new severe issue was found beyond the cited findings. postgres behavior was read, not executed (no PostgreSQL server available)."
+}

@@ -1,0 +1,70 @@
+{
+  "scope": "S11",
+  "verified": [
+    {
+      "id": "S11-1",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The mechanics are exactly as stated: admin.record merges the raw operator account id into Detail[\"actor\"] (internal/admin/admin.go:485-497), the durable sink pseudonymises only Event.Subject and stores Detail verbatim (internal/store/postgres/audit.go:65-85), and the read API returns Detail unchanged (internal/httpapi/audit_routes.go:141-156). So a raw usr_... does survive Destroy() of the subject key. However the impact is overstated to high: this exact residual is a documented, deliberately retained decision, not an oversight. docs/security-audit-2.md:42-44 says admin events keep the operator usr_... on purpose (operator is outside the trust boundary, and 'who suspended this client' must be answerable), names the residual (the operator erasing their own account), and docs/security-audit-3.md:286-294 records the follow-up decision to keep the id and document it in openapi/admin.md/architecture.md; docs/issues/not-doing.md:173 lists it as accepted. The id that leaks is the acting operator's, not the erased subject's, and reading it needs an admin session or DB read. Also note the finding's citation 'audit/audit.go:73,84' is the wrong file - those lines are audit.Query/Page; the durable sink is internal/store/postgres/audit.go:73-84. Error survives, severity lowered to low (documented accepted residual).",
+      "evidence_checked": "internal/admin/admin.go:485-505; internal/store/postgres/audit.go:65-85; internal/httpapi/audit_routes.go:141-156; internal/lifecycle/lifecycle.go:305-308; docs/security-audit-2.md:42-44; docs/security-audit-3.md:286-294; docs/issues/not-doing.md:173; docs/admin.md:129"
+    },
+    {
+      "id": "S11-2",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "Confirmed mechanically: when s.sessions == nil the `if s.sessions != nil && (target.All || target.Subject != \"\")` branch at internal/admin/admin.go:351-368 is skipped, SessionsRevoked stays 0, and Report (admin.go:167-178) has no session-unavailability marker, while bindings do get BindingsUnavailable. main.go:895-916 leaves sessions: nil in memory mode and main.go:618 wires store.sessionRevoker (nil there); the admin plane is still usable because requireAdmin uses the auth session Manager, so a memory deployment answers 200 with sessions_revoked: 0. But high is overstated: the gap exists only in the explicitly non-durable in-memory deployment, which main.go:696-702 already warns cannot enumerate sessions, and which docs/api-design.md:344 and docs/admin.md:120 document as unable to clear sessions. Durable deployments always wire postgres.Sessions (sessions.go:197-225), so the branch runs. The project already tracks this exact issue as Z10-4 at P3/low (docs/issues/P3-low.md:34). Real reporting gap, but a non-durable-mode-only, documented one.",
+      "evidence_checked": "internal/admin/admin.go:167-178,351-368; cmd/re0auth/main.go:614-622,696-702,890-916; internal/store/postgres/sessions.go:195-225; docs/issues/P3-low.md:34; docs/admin.md:120; docs/api-design.md:344"
+    },
+    {
+      "id": "S11-3",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The code observation is right: flows are purged only for a subject target (internal/admin/admin.go:399-413) and FlowPurger exposes no global purge (admin.go:80-82; internal/federation/bind.go:47-55), so target=all leaves pending bind flows. But the stated impact is overstated and one sub-claim is false. (a) The response does NOT omit the marker when zero: Report.FlowsPurged is `json:\"flows_purged\"` with no omitempty (admin.go:171), so it is always rendered as 0 (also shown by docs/audit-7/findings/Z10-admin-audit-privacy.md:160). (b) The limitation is documented: docs/admin.md:81-86 tabulates `all` = flows untouched, and admin.go:399-403 explains why. (c) It is not a security bypass: completing a stalled callback requires the user to be authenticated again (target=all revoked all sessions) and CompleteBind requires a fresh upstream auth code (bind.go:157-169); re-binding is a normal, always-available operation, and the operator can re-run the sweep (every step is idempotent) or use the subject target, which does purge flows. Residual is a report-design asymmetry, low.",
+      "evidence_checked": "internal/admin/admin.go:80-82,167-178,399-413,462-480; internal/federation/bind.go:47-55,127-152,157-169; docs/admin.md:81-99; docs/audit-7/findings/Z10-admin-audit-privacy.md:160"
+    },
+    {
+      "id": "S11-4",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "Confirmed as code behaviour: on a later-step failure the service returns rep with the error (admin.go:361-366,388-393,407-410) but the handler maps every non-target error to a bodyless 500 (admin_routes.go:281-287), so the already-counted tokens/sessions are not in the response, and the failure-path audit rows record only tokens_revoked (not sessions/bindings progress). Medium is overstated: the counts are not lost - the error-path audit row carries tokens_revoked and the service's own smoke path records the scope - every kill-switch step is idempotent and explicitly safe to re-run (docs/admin.md:109,126), so a blind retry completes the sweep, and this is the codebase's uniform generic-500 policy. The docs promise a 'summary + error' that the HTTP layer does not honour, which is a contract/reliability inconsistency rather than a security failure; the project tracks it as Z10-5 at P3/low (docs/audit-7/findings/Z10-admin-audit-privacy.md:176-199).",
+      "evidence_checked": "internal/admin/admin.go:361-366,388-393,407-410; internal/httpapi/admin_routes.go:274-288; docs/admin.md:106-109; docs/audit-7/findings/Z10-admin-audit-privacy.md:176-199"
+    },
+    {
+      "id": "S11-5",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The bug is real: a client-target kill switch calls SetStatus first (admin.go:326-332), and an absent row is ErrClientNotFound (internal/store/postgres/oauth.go:787-800; oauth/client.go:400-435), so it aborts before RevokeTokens and the handler answers 500. But the stated impact ('tokens that can never be cut through the operator plane') is false. Two working recovery paths exist: (1) re-issuing DELETE /v1/admin/clients/{id} - Delete on an absent row succeeds (oauth.go:802-807) and DeleteClient always runs the token purge afterwards (admin.go:286-293); (2) target=all passes an empty TokenFilter, and revokePredicate returns no WHERE clause for an empty filter (oauth.go:549-563), i.e. it deletes every access/refresh token, including the orphaned client's. So the residue is a delayed selective revocation, not permanent survival. Correctness bug, real but overstated; low.",
+      "evidence_checked": "internal/admin/admin.go:284-293,326-332; internal/store/postgres/oauth.go:787-807,537-563; oauth/client.go:400-435; oauth/tokens.go:235"
+    },
+    {
+      "id": "S11-6",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed, with one correction. Verify opens a transaction, raises statement_timeout to 45s and streams the whole audit_events table inside that transaction (internal/store/postgres/auditchain.go:220,241-272), holding one pooled connection for the walk. The default pool is 16 (postgres.go:136-141) and the only inbound bound is the in-flight cap, whose per-client share is maxInFlight/2 = 64 for the durable default (MaxInFlight = maxConns*8 = 128, config.go:393-402; middleware.go:430-485) - so a single admin address can exceed the pool and starve every other plane for up to the 45s statement timeout. The finding is right that this is operator-gated and that the 6-hourly loop already performs the same walk. Correction: /readyz is not immune - it pings the pool under a 2s timeout (main.go:877-881; health.go:16,188), so pool starvation turns readiness red within roughly a TTL+timeout (~3s), which contradicts the exploit note that probes 'stay green'; that limits the silent-failure window but not the pool-starvation outage itself. Remains medium because the kill-switch/audit endpoints' threat model explicitly includes a stolen operator session, and 45s of total connection starvation on an auth service is significant.",
+      "evidence_checked": "internal/store/postgres/auditchain.go:210-272; internal/httpapi/audit_routes.go:168-193; internal/store/postgres/postgres.go:134-146; cmd/re0auth/config.go:384-402; internal/httpapi/middleware.go:417-486; internal/httpapi/health.go:12-34,148-213; cmd/re0auth/main.go:871-881; cmd/re0auth/main.go:94-101"
+    },
+    {
+      "id": "S11-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed with a correction. The timing oracle is real: auditread.go:62-81 returns early on a key miss (one indexed loadKey query, no filtered SELECT) while a key hit issues the loadKey lookup plus the filtered SELECT, so latency distinguishes 'subject has a pseudonym key' from 'does not', even though the response shape is identical. The one-SELECT-per-distinct-subject amplification is also real (loadKey, auditpseudo.go:69-91). Correction: the second half of the claim is false - a miss is never inserted into the cache (ErrNoRows returns before remember at auditpseudo.go:80-82), so looping random non-existent subjects cannot grow the cache or cause the wholesale 4096 eviction; only subjects that already have a key are cached, so eviction needs 4096 real keyed subjects. Operator-gated, small signal relative to network noise, and the response-shape oracle is genuinely avoided; low as filed.",
+      "evidence_checked": "internal/store/postgres/auditread.go:62-81; internal/store/postgres/auditpseudo.go:69-91,144-151; internal/httpapi/audit_routes.go:64-89"
+    },
+    {
+      "id": "S11-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. accountExport carries only profile, identities, bindings and grants (export_routes.go:10-31,80-116); no sessions, issued tokens or audit history, and the Notice (export_routes.go:36-46) disclaims only credentials. The code comment 'everything Re0Auth holds about the signed-in account' therefore overstates the document's scope. Severity stays low: the published contract is accurate and narrower - docs/api-design.md:234 and 314-329 define the export as exactly profile/identities/bindings/grants and explain the credential exclusion - so this is a misleading in-code comment / missing notice fields rather than exposure of data or a security weakness.",
+      "evidence_checked": "internal/httpapi/export_routes.go:10-46,56-117; docs/api-design.md:234,314-329"
+    },
+    {
+      "id": "S11-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. handleAdminListClients has no limit/cursor parameter and builds a second full slice (admin_routes.go:100-117), and the store runs `SELECT ... FROM oauth_clients ORDER BY id` with pgx.CollectRows and no LIMIT (postgres/oauth.go:730-753); registration has no ceiling, so the response grows with the table. The audit read path clamps to default 100 / max 1000 (auditread.go:17-20), so the neighbouring endpoint's bound is genuinely absent here. Low: operator-gated, and the table can only grow as fast as an operator registers clients, so the amplification is self-inflicted and proportional to that operator's own data.",
+      "evidence_checked": "internal/httpapi/admin_routes.go:100-117; internal/store/postgres/oauth.go:730-753; internal/store/postgres/auditread.go:14-20"
+    }
+  ],
+  "summary": "9 findings verified against current code. 0 rejected, 4 confirmed (S11-6 medium; S11-7/8/9 low), 5 downgraded (S11-1 through S11-5, all to low). The discovery's two 'high' items do not hold at that severity: S11-1 is a documented, deliberately retained residual (operator usr_... in admin audit Detail[\"actor\"], docs/security-audit-2.md:42-44, security-audit-3.md:286-294, not-doing.md:173) where the id is the operator's own, not the erased subject's; S11-2 is a report-marker gap reachable only in the non-durable in-memory deployment, already documented (admin.md:120, api-design.md:344) and tracked as Z10-4 P3/low. The four mediums dropped to low: S11-3's gap is documented in admin.md:81-86, its 'flows_purged omitted when zero' sub-claim is false (the field has no omitempty), and completing a flow needs re-authentication; S11-4's partial counts are preserved in the audit row and every step is idempotent/safe to retry (Z10-5 P3/low); S11-5's 'tokens can never be cut' is false because retrying DELETE purges them and target=all revokes with an empty filter. S11-6 is the one genuine remaining issue: Verify holds a pooled connection for up to 45s and the per-client in-flight share (64) exceeds the pool (16), though the finding's claim that /readyz stays green is wrong (Ping has a 2s timeout). S11-7/8/9 are real but low; S11-7's random-string cache-flush sub-claim is false because misses are never cached.",
+  "comment": "No DB was available, so the S11-6 Verify path was checked by code reading plus pool/in-flight/readiness constants, not executed. All other findings were verified from source and existing project documentation. No new findings added."
+}

@@ -1,0 +1,128 @@
+{
+  "scope": "S13",
+  "adversarial_verification": {
+    "method": "Every cited test file/function was opened and read against the production path it names, and against the round-9 finding's recommendation. The pin-criterion applied is the stated one: 'direct' requires the test to assert behaviour that pins the described defect, i.e. it would FAIL if the code were fixed the way the finding recommends; a test that asserts the corrected/invariant behaviour and passes once the fix lands is 'partial' (same rule applied by the S07 and S10 verifiers). Every 'none' entry was re-checked with an independent repo-wide grep for the key identifier/behaviour, and uncited in-tree tests were searched for on each verdict.",
+    "corrected_semantics": "'corrected' is true when the discoverer's verdict changed, or when a material claim in the entry (the cited test's direction or ability to pin) was factually wrong.",
+    "verdict_changes": [
+      "S13-1: partial -> direct. A defect-pinning test the auditor missed exists in-tree: internal/httpapi/zz_audit9_compress_bypass_test.go TestAudit9Compression406BypassesTheRateLimiter / TestAudit9Compression406BypassesTheInFlightCap assert the 406 short-circuit is answered even with the limiter bucket empty / the only in-flight slot held, and fail the moment the limiter/in-flight wrappers are moved outside the compressor. (Untracked round-9 verification artifact; provenance caveat recorded.)",
+      "S13-3: direct -> partial. The cited probe asserts the O(1) invariant, i.e. the ABSENCE of the defect, and is GREEN once an index is added, so a fix leaves it passing; it does not pin the described defect."
+    ],
+    "verdicts_unchanged": [
+      "S13-4 and S13-5 confirmed direct (defect pins).",
+      "S13-2, S13-7, S13-8, S13-9, S13-10, S13-11 confirmed partial (related test exists, defect not asserted).",
+      "S13-6 confirmed none (independent grep found no 1xx test through compress.Handler)."
+    ]
+  },
+  "findings": [
+    {
+      "id": "S13-1",
+      "verdict": "direct",
+      "corrected": true,
+      "corrected_note": "UPGRADED partial -> direct. The originally cited test (security_headers_test.go TestSecurityHeadersOnCompressorRefusal) only asserts the 406 status plus security headers and X-Request-Id; it never inspects rate-limit or in-flight accounting, so on its own it is partial and the auditor's gap note is right about the cited probes. But the gap note's requested harness already exists in-tree: internal/httpapi/zz_audit9_compress_bypass_test.go (untracked round-9 verification artifact, no build tag, so it runs in the default suite) has TestAudit9Compression406BypassesTheRateLimiter (Server{} with ratelimit.New(0.0001,1); first gzip request 200, second 429 to prove the bucket is empty, then Accept-Encoding: *;q=0 must be 406 and t.Errorf fires if it is 429) and TestAudit9Compression406BypassesTheInFlightCap (maxInFlight=1 with the only slot held; the 406 path must still answer 406, not 503). Both fail the moment withRateLimit/withInFlightLimit are moved outside s.compressor.Handler or the negotiation refusal accounts the request. Verified empirically: `go test ./internal/httpapi/ -run TestAudit9Compression406 -v` PASSES against the defective code. Provenance caveat: the file is untracked (git status '??') and is a verification oracle pinning the buggy behaviour rather than a committed regression guard; if the project convention counts only committed tests the verdict reverts to partial.",
+      "test_path": "internal/httpapi/zz_audit9_compress_bypass_test.go",
+      "test_func": "TestAudit9Compression406BypassesTheRateLimiter",
+      "asserts": "Through the real Server middleware composition c.Handler(s.withInFlightLimit(s.withRateLimit(inner))): one-token limiter (ratelimit.New(0.0001,1)), first gzip request 200, second gzip request 429 (bucket empty), then Accept-Encoding: *;q=0 must answer 406 — 'a 429 here would mean the limiter ran (the finding is that it does not)'. Its sibling TestAudit9Compression406BypassesTheInFlightCap holds the single in-flight slot with a parked gzip request and asserts the *;q=0 request still answers 406 rather than 503. The compressor-first ordering is therefore pinned in both accounting dimensions; the originally cited TestSecurityHeadersOnCompressorRefusal (security_headers_test.go:128-141) plus TestProtocolPlaneIsNeverCompressedNorRefused (plane_test.go:193) and TestZ06CompressionRefusalOnEachPlane (internal/zzprobe/audit6/z06httpedge/compress_test.go:289) pin only the 406's header/plane shape.",
+      "gap_note": "No committed regression guard in the fix's direction: the in-tree pin is an untracked verification oracle asserting the defective behaviour, so it must be rewritten when the ordering is fixed. Needed: an untagged test that a negotiation-refused request consumes a limiter token and/or holds an in-flight slot (e.g. third *;q=0 request answers 429, or a held slot makes it answer 503)."
+    },
+    {
+      "id": "S13-2",
+      "verdict": "partial",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed. Opened internal/zzprobe/perf/memstore_test.go:237-276 (//go:build audit5): TestMemStoreDevicePurgeIsPerInsert's only hard assertion is the anti-vacuity `live >= 20_000`; the growth signal is only t.Logf'd and the branch is `if last <= first { t.Skip(...) }`, so removing purgeExpiredDevicesLocked makes the test SKIP, not fail. Opened internal/zzprobe/audit6/z05memstore/rev2_test.go:74-86: TestRev2ANewDeviceStartPurgesExpiredCodes asserts only that the expired device_code does not mint after another device start — that also holds without the purge because GetDeviceAuthorizatonState refuses past-expiry codes (G-7, internal/store/memory/device_decision_test.go TestApprovedDeviceCodePastExpiryIsNotDone). Independent grep for purgeExpiredDevices/Devices across *_test.go found no test asserting the purge's semantics or cost: TestSweepExpiredKeepsMapsBounded (oidc_sweep_test.go:60-138) drives the sweep, not the insert-path purge, and no test compares expired vs live device counts across one StoreDeviceAuthorization.",
+      "test_path": "internal/zzprobe/perf/memstore_test.go",
+      "test_func": "TestMemStoreDevicePurgeIsPerInsert",
+      "asserts": "Measures memory.OIDCStore.StoreDeviceAuthorization per-call cost at ~200 vs ~20k live device records and only t.Logf's it; the only hard checks are anti-vacuity (live >= 20k). The growth assertion is `if last <= first { t.Skip(...) }`, so removing purgeExpiredDevicesLocked makes the test SKIP, not fail. The device-purge behaviour is only referenced by internal/zzprobe/audit6/z05memstore/rev2_test.go TestRev2ANewDeviceStartPurgesExpiredCodes, whose poll-refused assertion also holds without the purge (G-7/expiry refusal). Probe is behind //go:build audit5.",
+      "gap_note": "No test pins purgeExpiredDevicesLocked's semantics or cost. Needed: plant N expired and M live device authorizations and assert one StoreDeviceAuthorization removes exactly the expired ones (Counts().Devices before/after), or a deterministic scaling assertion that per-insert work does not grow with the live population; and/or a cap test that a bounded store rejects/evicts at the configured limit."
+    },
+    {
+      "id": "S13-3",
+      "verdict": "partial",
+      "corrected": true,
+      "corrected_note": "DOWNGRADED direct -> partial. Opened internal/zzprobe/audit7/z15performancecapacity/performance_probe_test.go:146-210 (//go:build audit7). It does drive exactly the cited path (memory.OIDCStore.DeleteAuthRequest over a codes map of 500 vs 50 000) and its error branch is `if ratio >= 10 { t.Errorf(\"CONFIRMED: O(pending codes) scan...\") }`. That asserts the EXPECTED O(1) invariant — the ABSENCE of the defect — and the auditor's own note records it is 'GREEN once an index is added', so a fix leaves it passing; under the pin-criterion (would it FAIL once the code is fixed the recommended way?) it is a red invariant/regression probe, not a defect pin. Independent grep for DeleteAuthRequest across every *_test.go found no other test: internal/store/memory/oidc_index_test.go:245 calls it inside a random walk that asserts only subject-index consistency, internal/store/memory/oidc_test.go:531 TestDeleteAuthRequestAuditsOnlyARealRefusal asserts audit semantics, and the postgres tests exercise a different backend. No test asserts the O(n) scan or would break when a reverse index is added.",
+      "test_path": "internal/zzprobe/audit7/z15performancecapacity/performance_probe_test.go",
+      "test_func": "TestZ15MemoryDeleteAuthRequestScalesWithEveryPendingCode",
+      "asserts": "Calls memory.OIDCStore.DeleteAuthRequest(ctx, absent-id) at 500 vs 50 000 pending codes and errors when the per-call time ratio grows >=10x while the O(1) Counts() control is flat — exactly the range-over-s.codes-under-s.mu path cited. But the assertion direction is the corrected behaviour: line 203 `if ratio := ...; ratio >= 10 { t.Errorf(\"CONFIRMED: ...\") }` asserts the scan is NOT there, and the test passes as soon as an index removes it. It is RED while the defect exists and GREEN after the recommended fix, so it does not pin the described defect. Behind //go:build audit7, so it does not run in the default suite; the store-level DeleteAuthRequest tests cover audit semantics only.",
+      "gap_note": "No defect-pinning test exists for the O(pending codes) scan. Needed: a test that asserts the defective behaviour directly (e.g. an instrumented codes map proving DeleteAuthRequest visits every pending code, or an assertion that fails once a reverse index is added and the cost goes flat) — the current audit7 probe is the inverse, an invariant guard that would only catch a reintroduction."
+    },
+    {
+      "id": "S13-4",
+      "verdict": "direct",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed. Opened internal/zzprobe/concurrency/store_lock_test.go:53-64 (//go:build audit5). TestApproveDeviceHoldsTheStoreLockAcrossTheAuditWrite uses a blocking audit.Logger and a second goroutine calling Counts() while the audit write is in flight; it t.Error's only when the store lock is NOT held, so it PASSES against today's defective 'record under s.mu' behaviour and FAILS the moment the recommended fix (snapshot -> Unlock -> record) lands. TestDenyDeviceHoldsTheStoreLockAcrossTheAuditWrite is the denial twin, TestAnAuditSinkThatReadsTheStoreDeadlocksUnderTheLock pins the deadlock shape, and TestControlTokenMintAuditsOutsideTheStoreLock is the passing positive control. This is a genuine defect pin, matching the S09-2/S09-6 convention.",
+      "test_path": "internal/zzprobe/concurrency/store_lock_test.go",
+      "test_func": "TestApproveDeviceHoldsTheStoreLockAcrossTheAuditWrite",
+      "asserts": "Uses a blocking audit.Logger and, from another goroutine, calls OIDCStore.Counts() while the audit write is in flight; it errors only when the store lock is NOT held, i.e. it pins the defective 'record under s.mu' behaviour for ApproveDevice, with TestDenyDeviceHoldsTheStoreLockAcrossTheAuditWrite for denial and TestAnAuditSinkThatReadsTheStoreDeadlocksUnderTheLock for the deadlock shape. The paired TestControlTokenMintAuditsOutsideTheStoreLock pins the safe pattern for CreateAccessToken. Fixing S13-4 (snapshot, unlock, then record) breaks these tests. Behind //go:build audit5.",
+      "gap_note": ""
+    },
+    {
+      "id": "S13-5",
+      "verdict": "direct",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed, with a stronger uncited pin recorded. Opened internal/store/memory/oidc_family_test.go:76-111 (default suite, green): TestRefreshTombstonesAreSweptOnTheSpentTokensDeadline asserts one rotation leaves exactly one tombstone (Counts().Tombstones==1), that it survives a 2-hour advance + sweep, and that it is reclaimed only at the spent token's own 30-day refresh TTL. That pins the one-tombstone-per-rotation / spent-token-lifetime semantics the finding names. The stronger, unambiguous pin is uncited and untracked: internal/store/memory/zz_audit9_tombstones_test.go TestAudit9RefreshTombstonesAreUnbounded rotates a live refresh token 2000 times, asserts Counts().Tombstones==2000 and that SweepExpired removes 0 inside the refresh TTL — it fails as soon as the recommended cap/per-family dedup lands. Verified empirically: `go test ./internal/store/memory/ -run TestAudit9RefreshTombstonesAreUnbounded -v` PASSES against the current defective code. Related pins remain as the discoverer described (growth_test.go TestUnauthenticatedAuthorizeGrowsTheStoreWithoutBound, memstore_test.go TestMemStoreSweepStallsConcurrentRequests, oidc_sweep_test.go TestSweepExpiredKeepsMapsBounded).",
+      "test_path": "internal/store/memory/oidc_family_test.go",
+      "test_func": "TestRefreshTombstonesAreSweptOnTheSpentTokensDeadline",
+      "asserts": "Asserts one rotation leaves exactly one tombstone (Counts().Tombstones==1), that it survives a 2-hour advance, and that it is reclaimed only at the spent token's own 30-day refresh TTL — pinning the one-tombstone-per-rotation / 30-day-lifetime growth cited, in a non-tagged green test. Stronger uncited pin: internal/store/memory/zz_audit9_tombstones_test.go TestAudit9RefreshTombstonesAreUnbounded asserts 2000 rotations leave 2000 tombstones and SweepExpired removes 0, which fails under the recommended cap. Related pins: internal/zzprobe/concurrency/growth_test.go TestUnauthenticatedAuthorizeGrowsTheStoreWithoutBound (audit5) asserts authRequests and devices grow 1:1 with unauthenticated requests (no cap); internal/zzprobe/perf/memstore_test.go TestMemStoreSweepStallsConcurrentRequests (audit5) asserts SweepExpired holds the single mutex across the scan and stalls concurrent readers; internal/store/memory/oidc_sweep_test.go TestSweepExpiredKeepsMapsBounded pins sweep deadline semantics.",
+      "gap_note": ""
+    },
+    {
+      "id": "S13-6",
+      "verdict": "none",
+      "corrected": false,
+      "corrected_note": "none confirmed by independent greps. Patterns StatusEarlyHints|StatusContinue|StatusProcessing|http.StatusInformational|WriteHeader(1xx)|informational|1xx over every *_test.go returned no informational-status test (the only '103' hits are unrelated identifiers/comments in zzprobe tests). WriteHeader enumeration in internal/compress found only TestHeadAndNoContentBypass writing http.StatusNoContent (compress_test.go:247-271). compress.code search of all handlers confirms no production handler emits 1xx, so the swallow is latent and untested.",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "No test sends an informational (1xx) status through internal/compress.Handler. compress_test.go covers the 204/304 skip path (TestHeadAndNoContentBypass), 406 refusal, HEAD, Content-Range/no-transform, ETag weakening, Vary merge and pool reuse; spike_gzhttp_test.go compares negotiation outcomes. Grep over all *_test.go finds no 103/100/EarlyHints/Wait informational status.",
+      "gap_note": "Needed: wrap a handler in compress.Handler that calls w.WriteHeader(http.StatusEarlyHints) and then w.WriteHeader(http.StatusOK), and assert the client/recorder sees 200. Today responseWriter latches wroteHeader on the 103 and drops the final 200, so such a test fails."
+    },
+    {
+      "id": "S13-7",
+      "verdict": "partial",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed. Opened internal/observability/observability_test.go:182-208: TestUnknownLabelValuesAreCollapsed drives method/grant_type/error through the real middleware and asserts they collapse to 'other' and that 'FROBNICATE'/'invented_*' never reach the exposition, but its own status assertion is the raw string `status=\"200\"` and the collapse loop never covers the status label. TestMiddlewareRecordsGoldenSignals (lines 55-57) asserts raw 200/404 and internal/zzprobe/startup/startup_probe_test.go:308 asserts raw `status=\"500\"`. Independent grep for re0auth_http_requests_total status labels found no nonstandard/out-of-range status driven through the middleware, and no test calls statusRecorder.WriteHeader with <100/>999.",
+      "test_path": "internal/observability/observability_test.go",
+      "test_func": "TestUnknownLabelValuesAreCollapsed",
+      "asserts": "The label-boundedness guard collapses method, grant_type and error to 'other' and forbids 'FROBNICATE'/'invented_*' from the exposition — but its own status assertions use the raw 'status=\"200\"', and the collapse loop never includes the status label. TestMiddlewareRecordsGoldenSignals asserts raw status 200/404; internal/zzprobe/startup/startup_probe_test.go TestProbeRecoveredPanicIsCountedOnceAndInFlightReturnsToZero asserts raw 'status=\"500\"' for a recovered panic. No test drives an upstream-controlled/nonstandard status through the metrics middleware.",
+      "gap_note": "Needed: exercise federation_routes.go:320's verbatim upstream status (e.g. a raw-proxy source returning 900+n, and an out-of-range code) and assert the re0auth_http_requests_total status label is bounded/classed and that the recorded status equals what the client received after recovery. The statusRecorder panic on <100/>999 and the post-recover recorded status are also uncovered."
+    },
+    {
+      "id": "S13-8",
+      "verdict": "partial",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed. Opened internal/observability/observability_test.go:102-114 (route presence on the internal handler: /metrics, /debug/pprof/, goroutine, cmdline) and TestInternalHandlerRejectsUnknownPaths (non-surface paths 404). Opened cmd/re0auth/zzprobe_startup_test.go:358-398: TestProbeInternalListenerWriteTimeoutTruncatesAProfile requests /debug/pprof/profile?seconds=writeTimeout+1 and asserts the gzip profile arrives intact — it shows a >60s request is not refused, but asserts nothing about a maximum, clamping, or a concurrency/size budget. Independent grep for debug/pprof/profile|trace|heap in *_test.go found only route-existence/public-404 probes (surface_probe_test.go, verify_process_test.go); no test sends a huge seconds value or concurrent profile/trace requests, and MaxRequestsInFlight is never asserted.",
+      "test_path": "internal/observability/observability_test.go",
+      "test_func": "TestInternalHandlerServesMetricsAndPprof",
+      "asserts": "Asserts /debug/pprof/, /debug/pprof/goroutine and /cmdline answer 200 on the internal handler (and TestInternalHandlerRejectsUnknownPaths asserts non-surface paths 404). cmd/re0auth/zzprobe_startup_test.go TestProbeInternalListenerWriteTimeoutTruncatesAProfile requests /debug/pprof/profile?seconds=writeTimeout+1 and asserts the gzip profile arrives intact, which shows a >60s request is not refused but asserts nothing about a maximum, clamping or a concurrency/size budget. No test sends a huge seconds value or concurrent profile/trace requests.",
+      "gap_note": "Needed: send /debug/pprof/profile?seconds=<very large> and concurrent profile/trace/heap requests to the internal handler and assert it clamps/rejects the request and bounds the number of concurrent profilers. Existing pprof tests only assert route presence."
+    },
+    {
+      "id": "S13-9",
+      "verdict": "partial",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed. Opened internal/httpapi/bodylimit_test.go:67-85: TestBodyLimitHandlesAnUndeclaredLength sends a chunked oversized FORM body to /oauth/token and asserts 400 invalid_request; TestBodyLimitOnTheProtocolPlane/TestBodyLimitOnTheBusinessPlane assert the declared-length 413. Opened internal/httpapi/zz_audit_httpapi_test.go:556-598: TestZZA6BodyLimitEdges sends a chunked 200 KiB JSON body to /v1/device/decision and four body shapes, but only t.Logf's the resulting header block — no assertion. internal/zzprobe/audit6/z06httpedge/bodylimit_test.go pins 400 only for the form path (the gzip-bomb JSON case at line 146 asserts merely <500). Independent grep for MaxBytesError across *_test.go found no match, so no test asserts the JSON handlers' 400-vs-413 defect.",
+      "test_path": "internal/httpapi/bodylimit_test.go",
+      "test_func": "TestBodyLimitHandlesAnUndeclaredLength",
+      "asserts": "Asserts a chunked oversized FORM body to /oauth/token returns 400 invalid_request, and TestBodyLimitOnTheProtocolPlane / TestBodyLimitOnTheBusinessPlane assert the declared-length 413. That pins the 'capped but reported as malformed' outcome on the form path, not the cited JSON handlers: internal/httpapi/zz_audit_httpapi_test.go TestZZA6BodyLimitEdges does send a chunked 200 KiB JSON body to /v1/device/decision but only t.Logf's the status; internal/zzprobe/audit6/z06httpedge/bodylimit_test.go pins 400 only for the form path; internal/zzprobe/protocol/kit/kit_probe_test.go TestE6_BodyLimitVariants asserts 413 for the protocol form.",
+      "gap_note": "Needed: POST a chunked body >64 KiB with no Content-Length to a /v1 JSON write endpoint (e.g. /v1/device/decision or an admin route) and assert the 413 problem shape; today those handlers map *http.MaxBytesError to 400 'malformed JSON body', and the io.LimitReader(1<<20) is dead. One shared JSON body helper asserting errors.As(*http.MaxBytesError) would cover all cited routes."
+    },
+    {
+      "id": "S13-10",
+      "verdict": "partial",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed. Opened oauth/tokens_sweep_test.go:52-73: TestMemoryStoreSweepKeepsTheMapsBounded calls SweepExpired after each issued access token and asserts at most one live record; TestMemoryStoreSweepExpired (13-48) pins which records the sweep removes. Both require a caller-driven sweep, so they pass whether or not any in-process janitor exists. Independent grep across *_test.go for MemoryDeviceStore/MemoryClientRegistry/MemoryStore found only fixture usage and correctness tests; the closest growth probe, internal/zzprobe/audit7/z18gohazardsweep/probes_test.go:281, asserts scope-slice aliasing, not growth. No test issues N records without sweeping and asserts retention, and no test asserts a bound/cap on MemoryDeviceStore or MemoryClientRegistry.",
+      "test_path": "oauth/tokens_sweep_test.go",
+      "test_func": "TestMemoryStoreSweepKeepsTheMapsBounded",
+      "asserts": "Calls MemoryStore.SweepExpired after each issued access token and asserts at most one live record remains; TestMemoryStoreSweepExpired pins which records the sweep removes. Both pin that an externally-driven sweep bounds the maps; neither asserts that without a caller-driven sweep the maps grow without bound, that there is no in-process janitor, nor that MemoryDeviceStore/MemoryClientRegistry are uncapped. No growth test exists for oauth.MemoryStore equivalents of the memory-OIDC-store probes.",
+      "gap_note": "Needed: issue N codes/access/refresh/tombstones into MemoryStore, MemoryDeviceStore and MemoryClientRegistry with no SweepExpired call and assert they are all retained (or that a configured bound rejects/evicts), plus an assertion that no internal janitor/interval exists unless one is added."
+    },
+    {
+      "id": "S13-11",
+      "verdict": "partial",
+      "corrected": false,
+      "corrected_note": "Verdict confirmed. Opened cmd/perfreport/main_test.go:168-277: TestMedian pins 1..4 (no zero input), TestComparePairsByNameAndFlagsRenames uses baseline medians of 100 (line 194-198) and pins the +10%/+100% geomean, TestRenderComparisonMarksTheTable pins the +10.0% delta cell, TestRenderIncludesWhatTheReaderCameFor covers the no-baseline dash. No case feeds a baseline bench whose median ns/op is 0. Independent grep for nan/NaN/Inf/zero-median in cmd/perfreport tests returned no match, so the (cur.median()-base.median())/base.median()*100 division and the math.Log1p poisoning of the geomean are never reached.",
+      "test_path": "cmd/perfreport/main_test.go",
+      "test_func": "TestComparePairsByNameAndFlagsRenames",
+      "asserts": "Exercises compare(), median() and render() only with non-zero medians: TestMedian pins 1..4, TestComparePairsByNameAndFlagsRenames uses baseline 100 and pins the +10%/+100% geomean, TestRenderComparisonMarksTheTable pins the rendered delta cell, and TestRenderIncludesWhatTheReaderCameFor covers the no-baseline dash. No case feeds a baseline bench whose median ns/op is 0, so the (cur.median()-base.median())/base.median()*100 division and the math.Log1p poisoning of the geomean are never reached.",
+      "gap_note": "Needed: a compare()/render() case with a baseline bench of samples {0} (and a mixed set) asserting no NaN/Inf delta or geomean — either a guarded 'n/a'/'new' result or an explicit finite value."
+    }
+  ]
+}

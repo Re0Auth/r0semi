@@ -1,0 +1,204 @@
+{
+  "scope": "S05",
+  "title": "Federation / binding / kill-switch (internal/federation)",
+  "findings": [
+    {
+      "id": "S05-1",
+      "title": "Refresh rejection classifies every 400/401/403 as a dead grant and crypto-shreds the binding",
+      "severity": "medium",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/federation/refresh.go:170",
+        "internal/federation/refresh.go:179",
+        "internal/federation/refresh.go:142"
+      ],
+      "evidence": "func isRefreshRejected(err error) bool {\n\tvar re *oauth2.RetrieveError\n\tif !errors.As(err, &re) {\n\t\treturn false\n\t}\n\tif re.ErrorCode == \"invalid_grant\" {\n\t\treturn true\n\t}\n\tif re.Response != nil {\n\t\tswitch re.Response.StatusCode {\n\t\tcase http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}",
+      "why": "A 400/401/403 is treated as a definitively dead grant regardless of the OAuth error code or the response body. refreshRejected then does vault.Revoke (crypto-shreds the upstream token) plus bindings.Delete (refresh.go:151-165). RFC 6749 defines retryable/configuration errors that are returned with these statuses (temporarily_unavailable, invalid_request, unsupported_grant_type, invalid_scope), and an intermediary (WAF, CDN, reverse proxy) can return 401/403 with an HTML challenge body for a token endpoint that is otherwise healthy. The binding and its refresh token are destroyed permanently, the source is never asked to revoke anything, and the user must re-bind.",
+      "exploit": "A source sits behind a CDN. On one deploy the CDN returns 403 with an HTML block page for POST {Issuer}/oauth/token. Any user whose binding is due for proactive refresh (needsRefresh true, or any 401-triggered force refresh) hits refreshBinding -> oauth2 TokenSource -> RetrieveError{StatusCode:403}. isRefreshRejected returns true, refreshRejected calls vault.Revoke and bindings.Delete, and every such user's binding is silently removed with no upstream revocation. When the CDN recovers, the users must re-authorize.",
+      "recommendation": "Only treat a definitive set as dead: ErrorCode == \"invalid_grant\" (the one-time/rotated-token case), and optionally \"invalid_client\"/\"unauthorized_client\" when the body is valid JSON OAuth. For any other 4xx, or when ErrorCode is empty/non-JSON (an intermediary), return a transient error and leave the binding intact so the next attempt can succeed.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-2",
+      "title": "CompleteBind bypasses the per-binding keyed lock, so a completing bind can resurrect a row and secret after Unbind or account erasure",
+      "severity": "high",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "internal/federation/bind.go:157",
+        "internal/federation/bind.go:192",
+        "internal/federation/bind.go:198",
+        "internal/federation/unbind.go:50",
+        "internal/federation/killswitch.go:200"
+      ],
+      "evidence": "\t// The token goes into the vault; the binding store keeps only metadata.\n\tif err := s.storeBindingSecret(ctx, binding, bindingSecret{\n\t\tAccessToken:  token.AccessToken,\n\t\tRefreshToken: token.RefreshToken,\n\t}); err != nil {\n\t\treturn Binding{}, flow, err\n\t}\n\tif err := s.bindings.Put(ctx, binding); err != nil {",
+      "why": "Every removal/mutation path (refreshBinding refresh.go:40, Unbind unbind.go:50, CascadeRevoke revocation.go:132, shredBinding killswitch.go:201) takes s.locks.lock(bindingKey(user,game,source)) so that a refresh cannot write a secret back after a removal. BeginBind/CompleteBind take no lock. Between CompleteBind's vault Enroll and bindings.Put there is an upstream token exchange (a network round trip). An Unbind, a Kill-Switch sweep, or the erasure deleter (lifecycle.DeleteAccount calls RevokeUserBindings then vault.DeleteSubject, lifecycle.go:200-212) running in that window deletes the binding and shreds the secret, and CompleteBind's later Enroll/Put recreates both.",
+      "exploit": "A user starts a bind, the callback reaches CompleteBind and consumes the flow, and the token exchange is in flight. The account is erased (or the user/admin disconnects the source) before the exchange returns. DeleteAccount finishes: RevokeUserBindings removes the row, vault.DeleteSubject deletes the subject's vault records, PurgeUserFlows removes pending flows. CompleteBind then completes: storeBindingSecret re-Enrolls the upstream token pair under BindingIdentity{Subject: usr_..., Provider: game.source} and bindings.Put re-inserts the binding row for the erased subject. A decryptable upstream credential and PII row for an erased account persist, and the source was never told.",
+      "recommendation": "Take the same per-binding keyed lock in CompleteBind for the whole read-exchange-write sequence (or at least around the Enroll+Put pair), and on erasure re-check/delete after the bind paths have quiesced. Also re-read the binding row after acquiring the lock for an existence/tombstone check.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-3",
+      "title": "MemoryBindingStore.List pre-allocates for the whole deployment and ListAllPage re-sorts the whole map on every page",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/federation/binding.go:219",
+        "internal/federation/binding.go:262",
+        "internal/federation/binding.go:255"
+      ],
+      "evidence": "\tout := make([]Binding, 0, len(s.m))\n\tfor _, b := range s.m {\n\t\tif b.User == user {\n\t\t\tout = append(out, b)\n\t\t}\n\t}",
+      "why": "List is the account-page path for one user, but it sizes the result slice by len(s.m), the number of bindings of the entire deployment. For a single-node/no-DB deployment with N bindings, one account list allocates capacity for N Binding structs (~96 bytes each) even though the user holds a handful. ListAllPage separately copies and sortBindings the entire map on every page, so a 1M-binding sweep at page size 500 is 2000 full copies + sorts (O(N*N/limit*log N)) instead of one ordered walk; the memory store backs the supported DatabaseURL=\"\" deployment mode (cmd/re0auth/main.go:892-916).",
+      "exploit": "Repeated GET /v1/bindings (session-scoped, cheap for a caller) on a memory-store deployment with hundreds of thousands of bindings allocates hundreds of megabytes per request for a user who owns two bindings, adding GC pressure and risking the container memory limit; the Kill Switch sweep over the same store pins CPU for an extended period.",
+      "recommendation": "For List, count the user's bindings first or grow the slice with append from a small capacity; for ListAllPage, have the memory store keep a sorted key slice (or sort once and cache it) rather than re-materializing and re-sorting the map per page.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-4",
+      "title": "MissingBindings is O((sources x resources)^2) with a copy+sort per candidate lookup",
+      "severity": "medium",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/federation/missing.go:65",
+        "internal/federation/missing.go:70",
+        "internal/federation/missing.go:74"
+      ],
+      "evidence": "\tfor _, src := range s.registry.AllSources() {\n\t\tfor _, res := range src.Resources {\n\t\t\tif res.Scope == \"\" || !wanted[res.Scope] {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tfor _, cand := range s.registry.Sources(src.Game) {\n\t\t\t\tif cand.Status == StatusRetired {\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t\tif _, ok := cand.Resource(res.Name); !ok {\n\t\t\t\t\tcontinue\n\t\t\t\t}",
+      "why": "registry.Sources(game) copies and sorts the game's source slice on every (source, matching-resource) pair, and cand.Resource(name) is a linear scan of the candidate's resources. A game with S sources of R resources each costs roughly S*R inner iterations, each doing an O(S log S) copy+sort plus O(R) scan, i.e. O(S^2 R^2 log S) work, all inside an authorization/consent request (server.authorization_routes.go:35). AllSources() has already copied and sorted everything once, then the inner loop re-copies per iteration.",
+      "exploit": "A deployment with a few hundred sources per game (or a large registry) drives the consent screen's MissingBindings call into millions of comparisons and thousands of throwaway slice allocations per request, giving an authorization-endpoint CPU/GC amplification that can be exercised by any client starting an authorize request.",
+      "recommendation": "Materialize per-game resource-name -> candidates indexes once (or build them at NewRegistry time), so each resource lookup is a map hit; reuse the AllSources() snapshot rather than re-copying Sources(game) per iteration.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-5",
+      "title": "NewRegistry validates RawBase and token_class but not Status, so an unrecognized status is fail-open",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/federation/federation.go:162",
+        "internal/federation/federation.go:173",
+        "internal/federation/federation.go:637"
+      ],
+      "evidence": "\t\tif s.Status == \"\" {\n\t\t\ts.Status = StatusActive\n\t\t}",
+      "why": "The same validation block refuses an unrecognized token_class precisely because a typo would be read as the wrong capability (federation.go:173-180), but Status accepts any string. Only the exact value StatusRetired is filtered: candidates() checks `if src.Status == StatusRetired { continue }` (federation.go:637), and statusRank gives an unknown status rank 2 (last), so a source the operator meant to retire but misspelled (\"retierd\", \"disabled\", \"Retired\") keeps being selected by the data plane and keeps being bindable. httpapi/binding_routes.go:97 sets Bindable = (src.Status != StatusRetired), so the UI also offers it.",
+      "exploit": "Operator sets `status = \"retiredd\"` on a source that must stop serving. NewRegistry accepts it, candidates() never filters it, and reads continue to go to that source (it is tried after active/degraded sources) and the account page still offers to connect it, defeating the lifecycle control.",
+      "recommendation": "Validate Status in NewRegistry exactly as TokenClass is: accept \"\", StatusActive, StatusDegraded, StatusRetired, and refuse anything else with the offending value in the error.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-6",
+      "title": "Source.Issuer and endpoint overrides are not validated as absolute http(s), unlike RawBase",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/federation/federation.go:144",
+        "internal/federation/federation.go:151",
+        "internal/federation/bind.go:150",
+        "internal/federation/bind.go:235"
+      ],
+      "evidence": "\t\tif s.Game == \"\" || s.Name == \"\" || s.Issuer == \"\" {\n\t\t\treturn nil, errors.New(\"federation: source requires game, name and issuer\")\n\t\t}",
+      "why": "validateRawBase (federation.go:207-220) refuses a RawBase that is not an absolute http(s) URL without query or fragment, with the explicit rationale that such a value silently changes where a token-bearing request goes. Issuer, AuthorizationEndpoint, TokenEndpoint, RevocationEndpoint and CascadeRevocationEndpoint get no such check. AuthorizationEndpoint defaults to Issuer + \"/oauth/authorize\"; oauth2.Config.AuthCodeURL performs no scheme validation (golang.org/x/oauth2 oauth2.go:159-184), so Issuer=\"//evil.example\" yields \"//evil.example/oauth/authorize?...\", and http.Redirect (internal/httpapi/federation_routes.go:388) passes host-relative locations through unchanged, sending the browser off-origin with the client_id, scopes, state and PKCE challenge. Issuer=\"https://api.example/v1?x=1\" makes the derived TokenEndpoint \"https://api.example/v1?x=1/oauth/token\", posting the code and client secret to the wrong endpoint.",
+      "exploit": "A single-character config error (`issuer = \"//idp.example\"`, missing scheme) turns GET /bind?game=..&source=.. into a redirect to an attacker-chosen host, from the trusted Re0Auth origin; a query/fragment in issuer misdirects the token exchange that carries the code and client secret.",
+      "recommendation": "Validate Issuer and every endpoint override with the same rule as validateRawBase (absolute http(s), non-empty host, no query/fragment) at NewRegistry, and refuse a non-absolute AuthorizationEndpoint/TokenEndpoint/RevocationEndpoint/CascadeRevocationEndpoint.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-7",
+      "title": "BeginBind and CompleteBind accept a retired source that the rest of the plane refuses",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/federation/bind.go:127",
+        "internal/federation/bind.go:171",
+        "internal/federation/service.go:637"
+      ],
+      "evidence": "\tsrc, ok := s.registry.Get(game, source)\n\tif !ok {\n\t\treturn BindChallenge{}, ErrUnknownSource\n\t}\n\tif src.ClientID == \"\" || s.baseURL == \"\" {\n\t\treturn BindChallenge{}, ErrBindUnavailable\n\t}",
+      "why": "Neither BeginBind nor CompleteBind checks src.Status. candidates() excludes retired sources (service.go:637-639) and Raw returns ErrSourceRetired (service.go:684), and the account view reports Bindable=false for a retired source (internal/httpapi/binding_routes.go:97) — so an operator who retires a source to stop using it can still be made to walk a user through the upstream consent, store an encrypted upstream token, and show a binding the data plane will never serve.",
+      "exploit": "A source is retired in config; an old bookmarked /bind?game=..&source=.. link (or a crafted one) still starts and completes the flow. The user authorizes the retired source, Re0Auth stores a live upstream token for it, and every read fails with source_retired/404 while the secret sits in the vault until the user unbinds.",
+      "recommendation": "In BeginBind and CompleteBind, refuse src.Status == StatusRetired with ErrSourceRetired (and map it in the handler as the other paths do).",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-8",
+      "title": "revokeUpstream logs a vault error that can embed the raw subject identity",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "internal/federation/unbind.go:124",
+        "vault/service.go:309"
+      ],
+      "evidence": "\t\tslog.Warn(\"upstream revocation could not open the binding secret\", \"source\", src.Name, \"err\", err)",
+      "why": "The error being logged comes from s.useBindingSecret -> vault.Use. vault.Use formats the full identity into its key-not-configured error: fmt.Errorf(\"vault: %s was wrapped by key %q, which is not configured; \"+\"declare it as a retired key if this deployment rotated away from it\", id, rec.KEKID) where Identity.String() is Provider + \":\" + Subject (vault/repo.go:29), i.e. it contains the raw usr_... subject. This contradicts the invariant the package states elsewhere (bind.go:206-209, refresh.go:155-156: \"the subject is deliberately not named\" because a raw usr_ survives the erasure's pseudonym key).",
+      "exploit": "After a KEK rotation leaves the key that wrapped a binding's DEK undeclared, an Unbind or a Kill-Switch sweep hits vault.Use's missing-key branch; the log line records Provider:Subject, putting an account identifier into the process log where the rest of the package is careful to log only game/source.",
+      "recommendation": "Log only a stable classification (e.g. errors.Is(err, vault.ErrNotFound) / a key-unavailable sentinel) rather than %w of the vault error, or have vault avoid embedding Identity in errors that cross the package boundary.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-9",
+      "title": "MemoryBindFlowStore.SweepExpired uses time.Now instead of the service clock",
+      "severity": "info",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/federation/bind.go:112",
+        "internal/federation/bind.go:144",
+        "internal/federation/bind.go:165"
+      ],
+      "evidence": "func (s *MemoryBindFlowStore) SweepExpired() int {\n\tnow := time.Now()",
+      "why": "BeginBind stamps ExpiresAt from the injected s.now() clock (bind.go:144) and CompleteBind enforces it with s.now() (bind.go:165), but the sweeper ignores Config.Now and uses the wall clock. Whenever Now is not time.Now (tests, and any embedding that supplies a logical clock), the sweeper and the enforcement disagree: a flow the service still considers live can be deleted early, or expired flows are never removed, so the map is not actually bounded in that configuration.",
+      "exploit": "A deployment/test that supplies Config.Now far in the past starts flows already expired to the sweeper, which deletes every flow on the next janitor tick while CompleteBind would still accept them; with a future clock the map grows without bound.",
+      "recommendation": "Give MemoryBindFlowStore a clock (constructor or SweepExpired(now time.Time)) and have the composition root pass the same function used by the service.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S05-10",
+      "title": "CompleteBind consumes the flow before the owner check (cross-account DoS), mitigated by the HTTP handler",
+      "severity": "low",
+      "category": "security",
+      "confidence": "medium",
+      "locations": [
+        "internal/federation/bind.go:158",
+        "internal/federation/bind.go:163",
+        "internal/httpapi/federation_routes.go:410"
+      ],
+      "evidence": "\tflow, err := s.flows.Consume(ctx, state)\n\tif err != nil {\n\t\treturn Binding{}, BindFlow{}, err\n\t}\n\tswitch {\n\tcase flow.User != user:\n\t\treturn Binding{}, flow, ErrBindUser",
+      "why": "The single-use flow is deleted from the store before flow.User is compared with the caller, so a caller who knows a state string destroys someone else's pending bind (and its PKCE verifier) even though the call then fails. The only in-tree caller, handleBindCallback, checks sessions.Bound and sessions.OwnerMatches before calling CompleteBind (federation_routes.go:410-416), so this is not reachable through HTTP today; it remains a latent hazard for any future direct caller or refactor.",
+      "exploit": "Not reachable via the shipped HTTP route because the handler rejects a state that the session does not own before CompleteBind runs; a future caller that skips that check would let account B kill account A's in-flight bind.",
+      "recommendation": "Compare flow.User with user before consuming (or restore the flow on ErrBindUser), and keep the handler's owner check as defence in depth.",
+      "already_mitigated": true
+    }
+  ],
+  "coverage": [
+    "internal/federation/bind.go",
+    "internal/federation/binding.go",
+    "internal/federation/binding_cooldown.go",
+    "internal/federation/federation.go",
+    "internal/federation/killswitch.go",
+    "internal/federation/missing.go",
+    "internal/federation/refresh.go",
+    "internal/federation/revocation.go",
+    "internal/federation/service.go",
+    "internal/federation/unbind.go",
+    "internal/httpapi/federation_routes.go",
+    "internal/httpapi/binding_routes.go",
+    "internal/httpapi/authorization_routes.go",
+    "internal/lifecycle/lifecycle.go",
+    "internal/store/postgres/federation.go",
+    "vault/service.go",
+    "vault/repo.go",
+    "oauth/http.go",
+    "httpclient/outbound.go",
+    "internal/safeurl/safeurl.go",
+    "cmd/re0auth/config.go",
+    "cmd/re0auth/main.go",
+    "upstreamkit/server.go"
+  ],
+  "notes": "Scope covered all 10 non-test .go files in internal/federation completely; cross-package call graphs (httpapi bind/unbind routes, lifecycle erasure order, vault Enroll/Use/Revoke, postgres BindingStore/BindFlowStore, httpclient redirect policy, safeurl, upstreamkit cascade handler, config loading) were traced to confirm or reject hypotheses. Test files in internal/federation were skimmed only to confirm intended invariants. Explicitly checked and NOT reported as findings: open-redirect via BindFlow.ReturnTo (sanitized with safeurl.RelativePath at both entry and callback), raw-path traversal/SSRF (rejectEscapingPath decodes up to 4 times and cleanRawPath refuses escaping paths; the outbound client also refuses private addresses and cross-host redirects), unbounded memory in bufferBudget/bindingCooldown/keyedMutex (all provably bounded; keyedMutex cannot hand the same key to two holders), bindPKCE/state entropy (crypto/rand), and token leakage into logs on refresh/token-exchange failures (callers return generic wire errors). Residual uncertainty: S05-2 depends on interleaving and is rated by impact plus a multi-second window rather than a reproduced race; S05-8 depends on which vault error branch is hit (key-not-configured caused by a KEK rotation) and is medium confidence."
+}

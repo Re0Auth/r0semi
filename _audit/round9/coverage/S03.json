@@ -1,0 +1,104 @@
+{
+  "scope": "S03",
+  "findings": [
+    {
+      "id": "S03-1",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/auth/zz_audit9_returnto_test.go",
+      "test_func": "TestAudit9ReturnToLengthIsUnboundedInTheSession",
+      "asserts": "Drives GET /auth/github/start?return_to=/<8192 'a's> through the real handleStart/session path on a counting scs.Store and asserts the largest committed session payload is >= 8192 bytes, i.e. the caller-controlled return_to is persisted verbatim and unbounded (auth.go:612-616). It pins the current defective behaviour, so adding the recommended maxReturnToBytes cap makes it fail. Verified empirically: `go test ./internal/auth/ -run TestAudit9ReturnToLengthIsUnboundedInTheSession -count=1` PASSES against the current defective code, i.e. it asserts the defect as expected behaviour (fail-on-fix direction). The test is in the default suite (no build tag) and the file was updated mid-audit to carry its own audit9Store because the equivalent probe in zz_audit_session_test.go is behind //go:build audit || audit6.",
+      "gap_note": ""
+    },
+    {
+      "id": "S03-2",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/auth/auth_test.go",
+      "test_func": "TestSignInDestroysTheSessionWhenTheIndexFails",
+      "asserts": "SignIn with a failing index.Remember returns an error and writes no live session cookie, i.e. it asserts the adjacent fail-closed branch (auth.go:177-180). TestZZAuditSignInRotatesTheCookieAndKillsTheOldToken (//go:build audit || audit6) asserts the RenewToken *success* path (old token dead, cookie rotated). No test makes RenewToken fail while keyUser has already been Put, so the un-destroyed authenticated session on the auth.go:166-168 early return is never reached. Independent grep for RenewToken across the tree's tests found no failing-store case either.",
+      "gap_note": "Missing failure injection on the session store's Delete during SignIn. Needed: an scs.Store wrapper with working Find/Commit but a failing Delete, a request carrying a valid pre-existing session cookie (so scs RenewToken actually calls Delete instead of skipping it for an empty token), then call SignIn and assert the session was destroyed / keyUser is not readable afterwards and no live cookie is handed out. Today failingDeleteStore doubles in internal/httpapi/account_routes_test.go and internal/zzprobe/verifycrypto/verify_crypto_test.go start from a cookie-less session, so RenewToken never deletes and the branch stays uncovered."
+    },
+    {
+      "id": "S03-3",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/httpapi/account_routes_test.go",
+      "test_func": "TestDeleteAccountDoesNotLogTheRawSubjectWhenSessionCleanupFails",
+      "asserts": "With failingDeleteStore, the erasure path's EndSession returns an error and the handler's warning branch fires; it asserts the raw usr_ id is absent from the log. It exercises EndSession's failing-Destroy branch but asserts only logging, not the Forget-before-Destroy ordering. internal/auth/auth_test.go TestSignInAndSignOutKeepTheSubjectIndex asserts index.Forget is called with the signed-in token on a healthy sign-out, and internal/zzprobe/verifycrypto/verify_crypto_test.go TestVerifySignOutFailsDeterministicallyWhenTheStoreFails asserts EndSession returns the store's error. Nothing asserts that the index entry outlives a failed Destroy.",
+      "gap_note": "No test pins the order index.Forget -> sessions.Destroy or its failure consequence (live session reachable through the cookie but absent from session_subjects). Needed: a manager wired with a failingDeleteStore plus a recording fakeIndex; call SignOut/EndSession; assert the token still resolves to a live session in the store (or is re-committable) while the index forgot it, and that Destroy-first/Forget-later is what a fixed implementation would do. The existing failing-store tests never assert index state."
+    },
+    {
+      "id": "S03-4",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/auth/auth_test.go",
+      "test_func": "TestSecondLoginReusesAccount",
+      "asserts": "TestSecondLoginReusesAccount and TestLoginFlowCreatesAccountAndSession exercise the sequential version of the cited path: FindByIdentity returns ErrNotFound on the first callback and CreateWithIdentity succeeds (auth.go:713-714 happy branch), then a second login finds the existing account. The concurrent race branch - CreateWithIdentity returns account.ErrIdentityTaken after another request won the create, taking the codeSignupFailed fallback - is never executed or asserted. Independent grep confirms ErrIdentityTaken appears in tests only at the account-store level (internal/account/account_test.go, internal/store/postgres/postgres_test.go) and never on the login callback path; no test asserts signup_failed at all.",
+      "gap_note": "No test drives account.ErrIdentityTaken out of CreateWithIdentity on the login callback, and no test interleaves two callbacks holding the same flow state. Needed either an account.Store double whose FindByIdentity returns ErrNotFound once and CreateWithIdentity then returns ErrIdentityTaken (assert the response is NOT ?error=signup_failed and the found user is signed in), or two concurrent GET /auth/{provider}/callback requests sharing one loaded flow state, asserting the loser logs in instead of failing. This only becomes a passing test after the recommended retry/re-lookup is implemented (or is written RED against it)."
+    },
+    {
+      "id": "S03-5",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit7/z07authsessionlifecycle/erasure_test.go",
+      "test_func": "TestZ07ErasureFailureLeavesTheOtherSessionAnswering500",
+      "asserts": "Signs two browsers into one account, erases the account through the first (memory mode, no SessionRevoker), then GETs /v1/sessions/current and /v1/account/export with the second browser's still-live session and t.Errorf's if either answers 500 - i.e. it exercises exactly the cited path (session_routes.go:27-29 and export_routes.go:64 map account.ErrNotFound to internal_error instead of dropping the session and answering 401). Verdict CORRECTED direct -> partial: the probe asserts the finding's RECOMMENDED behaviour (non-500 / session dropped), so applying that fix turns it GREEN rather than red. Verified empirically: `go test -tags audit7 -run TestZ07ErasureFailureLeavesTheOtherSessionAnswering500 ./internal/zzprobe/audit7/z07authsessionlifecycle/ -count=1` FAILS today (erasure_test.go:191 on both 500s the log shows GET /v1/sessions/current and /v1/account/export answered 500). It does not fail if the code were fixed as recommended, so it does not lock the defect in: it is a valid fix-validation regression guard on the exact production path, not a defect pin. Same shape as the direct->partial corrections in _audit/round9/coverage/S02.json (S02-6), S07.json (S07-2), S09.json (S09-6), S11.json (S11-2/S11-4) and S15.json (S15-6). It is behind //go:build audit7 and does not probe the /v1/identities route (identity_routes.go:26) cited in the locations.",
+      "gap_note": "Verifier correction (direct -> partial): the cited test is a currently-RED probe encoding the desired post-fix response (drop the zombie session and answer 401), not a test that witnesses the 500 as expected behaviour. It exercises the exact production path and will validate the fix, but it cannot fail once the fix lands, so the direct bar is not met. A genuine defect-pinning lock would assert that a session naming a missing account still answers 500 (characterization) - none exists, and the answer is expected to change to 401. Residual gaps unchanged: /v1/identities is not probed at all."
+    },
+    {
+      "id": "S03-6",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/zzprobe/audit7/z10adminauditprivacy/allowlist_test.go",
+      "test_func": "TestZ10EveryAdminRouteIsShutToAnonymousAndNonAdmins",
+      "asserts": "Walks every admin route and asserts anonymous callers get 401, signed-in non-admins get the gate's 404, the allowlisted operator reaches the handler, and wrong verbs do not advertise the plane; TestZ10AdminAllowlistIsAnExactMatchNotACaseFoldOrPrefix and internal/httpapi/zzprobe_adminplane_test.go TestZZAdmEveryAdminRouteIsGatedByTheAllowlist cover the same allowlist behaviour. All of them keep the allowlisted account row present, so the finding's specific defect - requireAdmin trusting the session claim after the account was erased - is never exercised, and no test asserts that requireAdmin consults s.accounts at all (the allowlist is a static map built in New). Independent grep for admin + erased/DeleteUser across *_test.go finds nothing.",
+      "gap_note": "Missing erased-account admin test. Needed: build the admin probe/wired env, sign in as the allowlisted operator, remove the account row without revoking the session (account store DeleteUser, memory mode where Sessions has no revoker), then call /v1/admin/clients, /v1/admin/kill_switch and /v1/admin/audit and assert they no longer answer 200 (401/404 after the recommended GetUser re-check). A source-level guard could also pin that requireAdmin/requireAdminWrite consult the account store."
+    },
+    {
+      "id": "S03-7",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/account/account_test.go",
+      "test_func": "TestCreateAndFind",
+      "asserts": "Correctness only: creates one user with one identity and asserts MemoryStore.Identities returns exactly that one row (TestLinkIdentity asserts two rows). It never measures the full-map scan in identitiesOfLocked, the RLock held across it, or contention with login/identity writes; there is no benchmark, scale probe or secondary-index guard for MemoryStore.Identities anywhere in the test tree (independent grep for identitiesOfLocked and Benchmark*Identities in *_test.go returns nothing).",
+      "gap_note": "No harness reaches the O(total identities)-under-RLock behaviour. Needed: a probe seeding N accounts x M identities, asserting Identities is O(k) for the user's own identities (or that it does not touch every row), ideally paired with a contention test showing TouchLogin/LinkIdentity are not serialized behind a large Identities read; a source-level guard requiring a maintained map[UserID][]IdentityID index is the cheap alternative."
+    },
+    {
+      "id": "S03-8",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/store/postgres/postgres_test.go",
+      "test_func": "TestAccountsLinkIsIdempotent",
+      "asserts": "Correctness only (DB-gated): links an identity and asserts Postgres Identities returns one row; TestAccountsUnlinkReassignsPrimary does the same after an unlink. Both assert the returned list, not the number of pooled round trips, so the EXISTS existence probe before the real SELECT (internal/store/postgres/account.go:236-244) is neither counted nor asserted. No pgx query tracer, round-trip counter or source guard for Identities exists (independent grep for QueryTracer/query-count harnesses in *_test.go returns nothing).",
+      "gap_note": "No test observes the extra EXISTS query. Needed: a pgx/tracer-backed or fake-pool harness that counts queries for one Identities call and asserts a single statement, or a source-level guard that the method body contains exactly one SELECT. A DB-backed test would also need local Postgres, which this environment lacks; a query-counting wrapper over pgxpool could run without one if the adapter accepted an interface."
+    },
+    {
+      "id": "S03-9",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/auth/zz_audit_session_test.go",
+      "test_func": "TestZZAuditCallbackLeavesTheNonceInTheSession",
+      "asserts": "Runs a complete github login, dumps the session's key set through a probe route and t.Errorf's if keyFlowNonce survived, explicitly citing flowKeys (auth.go:44) omitting it; it also asserts the five listed flow keys are gone. Verdict CORRECTED direct -> partial: the probe asserts the finding's RECOMMENDED behaviour (nonce removed), so adding keyFlowNonce to flowKeys turns it GREEN rather than red. Verified empirically: `go test -tags audit -run TestZZAuditCallbackLeavesTheNonceInTheSession ./internal/auth/ -count=1` FAILS today - the log shows session keys \"auth_time,flow_nonce,usr\" and zz_audit_session_test.go:417 fires. It therefore does not meet the direct criterion (would fail if the code were fixed as recommended) even though it exercises the exact production path and is a valid fix-validation regression guard. Same shape as the direct->partial corrections elsewhere in _audit/round9/coverage (S02-6, S07-2, S09-6, S11-2/S11-4, S15-6). internal/zzprobe/protocol/rp/e2e_test.go TestRPLoginLeavesNoFlowValuesInTheSession (//go:build audit5) independently dumps the stored session bytes and errors if flow_nonce is present - also a RED probe. Caveat: the auth probe is behind //go:build audit || audit6.",
+      "gap_note": "Verifier correction (direct -> partial): the cited test encodes the desired post-fix cleanup and is currently red because flow_nonce remains; it cannot fail once keyFlowNonce is added to flowKeys, so it does not pin the defect as expected behaviour. A genuine defect lock would assert the nonce is retained after clearFlow (characterization); none exists, and the desired direction is removal. Practical impact of the correction: S03 now has one fail-on-fix (defect-pinning) test (S03-1) and no defect lock for the nonce-retention finding."
+    },
+    {
+      "id": "S03-10",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/zzprobe/pgstore/atomicity_probe_test.go",
+      "test_func": "TestMultiStatementMutationsRunInATransaction",
+      "asserts": "Source-level guard that reads sessions.go and asserts RevokeAllSessions and RevokeSubjectSessions issue >= 2 writes with no Begin call, logging 'CONFIRMED NOT ATOMIC' - adding a transaction makes it fail, so it pins the non-atomicity half of the finding in the fail-on-fix direction (the same test is verdict direct for S09-2, whose finding is purely atomicity). But S03-10's defect is two-part (unbounded AND not atomic), and the guard does not assert boundedness at all: there is no LIMIT/ctid guard for these two methods (only Sessions.SweepExpired has one, in internal/store/postgres/sessions_test.go). Functional DB tests internal/store/postgres/postgres_test.go TestRevokeAllSessionsDeletesEveryRow and TestRememberAndRevokeSubjectSessions exercise the delete-all behaviour (DB-gated).",
+      "gap_note": "The unbounded/batching half is untested and the atomicity half is only asserted statically, not behaviourally, so the finding is only partially pinned. Needed: a source guard (mirroring the SweepExpired LIMIT guard) requiring LIMIT ... ctid IN (...) in RevokeAllSessions/RevokeSubjectSessions, plus a DB-backed test that plants a backlog larger than one batch and asserts one call drains it in bounded batches and that sessions + session_subjects deletes are one transaction (the existing tests all run against a live Postgres, unavailable here)."
+    },
+    {
+      "id": "S03-11",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/core/core_test.go",
+      "test_func": "TestReactiveActivationAndDeactivation",
+      "asserts": "Sequential app.Remove(provider) after activation: it asserts the dependent goes inactive first and the teardown order is dependent-then-provider. internal/wiring/oauth_test.go only checks State()/Capabilities() after a synchronous Use. No test holds Apply in StateLoading while App.Remove runs, so the racing splice-out and the unconditional f.state = StateActive write in step (app.go:334-341) are never exercised (independent grep for StateLoading in *_test.go returns nothing).",
+      "gap_note": "No concurrent Remove-vs-Apply harness. Needed: a component whose Apply blocks on a channel; call app.Remove(fiber) from another goroutine while Apply is parked; release Apply; assert the removed fiber does not report StateActive afterwards (and its capabilities are not resolvable), run with -race. Until the state transition is made generation-conditional this test would be RED, which is the point."
+    }
+  ]
+}

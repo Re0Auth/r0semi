@@ -1,0 +1,83 @@
+{
+  "scope": "S07",
+  "verified": [
+    {
+      "id": "S07-1",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Independently reproduced: tapsign.newRequest/do set X-LC-Id/X-LC-Key and (when session != \"\") X-LC-Session (tapsign/client.go:114-115,124-126); taptapoauth.fetchAccount sets Authorization (taptapoauth/client.go:195). NewService/newClient only require a non-nil Doer and never set CheckRedirect (tapsign/service.go:52-62, taptapoauth/service.go:44-51). Go 1.27.1 net/http (C:\\Program Files\\Go\\src\\net\\http\\client.go:820-841,1017-1039) treats only Authorization/Www-Authenticate/Cookie/Cookie2/Proxy-Authorization/Proxy-Authenticate as sensitive; every other header, including X-LC-*, is copied from the initial request to every redirect hop. An empirical probe (httptest redirector -> target with a plain &http.Client{}) showed X-LC-Id/X-LC-Key/X-LC-Session replayed across a 127.0.0.1 -> localhost (cross-domain) hop, while Authorization was stripped on that hop and kept on a same-host hop. So the claim is exactly right. In-repo the sole wiring (cmd/referencesource/main.go:163-166) sets httpclient.NoCrossHostRedirects, and httpclient.Retry preserves the wrapped *http.Client, so the deployed path is safe; medium (not high) is correct because exploitation now requires an out-of-repo caller or a future wiring that passes a plain/DNS-resolving client.",
+      "evidence_checked": "tapsign/client.go:114-115,124-126; taptapoauth/client.go:195; tapsign/service.go:52-62; taptapoauth/service.go:44-51; cmd/referencesource/main.go:163-166; httpclient/retry.go:112-131; net/http/client.go:820-841,1017-1039; empirical probe _audit/round9/verify/s07probe"
+    },
+    {
+      "id": "S07-2",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Code order verified: vault.Enroll calls s.repo.Put at service.go:245-258, then s.record at 259-267; on audit failure it returns the bare audit error with no repo.Delete/rollback, whereas Use audits before handing over plaintext (service.go:334-339). The audit.Logger contract is synchronous and returns errors (audit/audit.go:35-39), and the Postgres sink really can fail (internal/store/postgres/auditbatch.go:68-69,195, errAuditDrainExpired/errAuditClosed). The federation path is exactly as described: storeBindingSecret -> vault.Enroll (internal/federation/binding.go:81-94); bind.go:192-197 returns immediately on that error, so the rollback at bind.go:198-215 (which runs only when bindings.Put fails) is skipped, leaving an encrypted upstream token with no binding row and no audit event. One correction that does not change severity: the residue is not absolutely unreachable \u2014 a later re-bind of the same (user, game, source) overwrites the record via Enroll, and DeleteSubject clears it \u2014 so bind.go's 'only an account erasure would clear' comment overstates it. Confirmed medium (reliability/data-integrity, unaudited secret at rest during an audit outage).",
+      "evidence_checked": "vault/service.go:245-267,334-339; internal/federation/binding.go:81-94; internal/federation/bind.go:192-215; audit/audit.go:35-39; internal/store/postgres/auditbatch.go:68-69,195"
+    },
+    {
+      "id": "S07-3",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Behaviour and complexity verified: MemoryRepo.ListPage ignores its ctx, calls r.List (repo.go:233), and List materialises and deep-clones every record (WrappedDEK/Nonce/Ciphertext/Meta via cloneRecord) and sorts N identities under an RLock (repo.go:202-217). ListPage is the RecordPager path Rotate takes (rotate.go:42-60) with rotatePageSize=200 (rotate.go:96), so a full rotation is ceil(N/200) whole-store passes: O(N^2/200) clones and O(N^2 log N /200) comparisons. Call-frequency reasoning reduces the impact but not the defect: the only production caller is the operator-run startup action -rotate-keys (cmd/re0auth/main.go:442-443,1204-1205); it is not on any request path. The memory driver is selectable (cmd/re0auth/config.go:686-691, cmd/re0auth/main.go:897), which is the only way this is reachable. Confirmed low.",
+      "evidence_checked": "vault/repo.go:202-217,229-248; vault/rotate.go:42-60,96; cmd/re0auth/main.go:442-443,1204-1205; cmd/re0auth/config.go:686-691"
+    },
+    {
+      "id": "S07-4",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The code divergence is real: Enroll seals under bindingAAD(recordVersion, id.Subject, id.Provider) (service.go:224), Use derives the AAD from the caller's id (service.go:300) while Rotate derives it from rec.Identity (rotate.go:104). But it is not reachable with any shipped Repo: MemoryRepo.Get and Postgres Vault.Get are keyed by the exact (subject, provider), so the returned Record.Identity always equals the requested id. Triggering it requires a third-party Repo implementation that returns a record for a different identity \u2014 i.e. a bug in code outside this repository \u2014 and even then the consequence is fail-closed (Use rejects the swapped ciphertext with an unwrap/decrypt error) plus a confusing signal, not a credential compromise. Overstated as a low production defect; retained as an API-robustness note (reject rec.Identity != id).",
+      "evidence_checked": "vault/service.go:224,300; vault/rotate.go:104; vault/repo.go:175-183; internal/store/postgres/vault.go:41-53,61-81"
+    },
+    {
+      "id": "S07-5",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified literally: data.Interval/data.ExpiresIn are untrusted int64 JSON fields multiplied by time.Second with only a <= 0 fallback (taptapoauth/client.go:81-103). For Interval=9223372036 the product is 9.223372036e18 ns (positive, ~292 years, just under MaxInt64), so no overflow guard is needed to produce an effectively infinite poll interval; larger values wrap negative and are silently replaced by defaults. The consumer is real: referencesource/taptap.go:149-160 uses ExpiresAt to expire attempts and auth.Interval for nextPoll and RetryAfterSeconds. Only the configured TapTap token endpoint (compromised/buggy/DNS-hijacked) controls the values, so low is appropriate.",
+      "evidence_checked": "taptapoauth/client.go:81-103; referencesource/taptap.go:149-160"
+    },
+    {
+      "id": "S07-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified: tapsign.client.Verify sends the decrypted session token upstream (client.go:44-48) and never calls c.finish/audit.Record, unlike Rotate/Revoke/Redeem (client.go:62,74,149,171,197-211). Verify is part of the exported Service interface (tapsign/service.go:31-34) and the package documents itself as a reusable capability, so any consumer that probes credential health produces a credential use with no audit trail. Note for severity: no in-repo production caller exists today (only tests), so the practical exposure is a library-invariant gap rather than a live leak; low stands because the package is an exported API whose other methods all audit.",
+      "evidence_checked": "tapsign/client.go:40-58,197-211; tapsign/service.go:31-34"
+    },
+    {
+      "id": "S07-7",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "boundDetail does only replace \\r/\\n and cap runes (taptapoauth/client.go:337-343), so ESC/NUL/other C0 bytes survive in the error string \u2014 that code behaviour is confirmed. The stated impact, however, does not follow on any reachable in-repo sink: the only production propagation of these errors is referencesource/taptap.go:210-226, which JSON-encodes them (Go's encoding/json escapes control characters as \\uXXXX), and there is no production code that logs err.Error() from taptapoauth (grepped). The log/terminal-forgery scenario therefore needs an out-of-repo caller with a raw sink; completeness hardening only, not a low production defect.",
+      "evidence_checked": "taptapoauth/client.go:314-343; referencesource/taptap.go:210-226; grep for err.Error() in production code"
+    },
+    {
+      "id": "S07-8",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The unguarded dereferences are real (tapsign/client.go:44-48,178,224-227 call drain(resp)/resp.StatusCode after only an err check; taptapoauth/client.go:202,239 close resp.Body with no nil check), and they contrast with httpclient's own guarded drain (httpclient/retry.go:195-201) and Bulkhead's resp.Body==nil branch (httpclient/outbound.go:225-228). But the precondition is an injected Doer that violates the *http.Client contract (Do guarantees a non-nil Response and non-nil Body when err == nil), and every in-repo wiring uses *http.Client or httpclient.Retry over it, which can never return (nil, nil) or a nil Body. A nil-returning Doer is defective operator-supplied code, not attacker-reachable; downgraded to info as defensive-hardening.",
+      "evidence_checked": "tapsign/client.go:44-48,84-88,174-178,224-227; taptapoauth/client.go:198-203,235-240; httpclient/retry.go:195-201; httpclient/outbound.go:225-228"
+    },
+    {
+      "id": "S07-9",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The overwrite is real: Enroll always sets CreatedAt: now (service.go:244-254) and Repo.Put replaces wholesale, with the Postgres adapter doing created_at = EXCLUDED.created_at (internal/store/postgres/vault.go:112-120). But the stated impact is unsupported: no production code reads vault.Record.CreatedAt. The operator/account views the finding cites use account.User.CreatedAt and oauth-client CreatedAt (internal/httpapi/admin_routes.go:48, export_routes.go:84 uses accounts.GetUser, not the vault); the only consumers of vault List/Get are rotation and federation token use, neither of which touches CreatedAt. So it is a latent data-semantics loss, not a current correctness defect; becomes low if any consumer is added.",
+      "evidence_checked": "vault/service.go:244-254; internal/store/postgres/vault.go:109-124; internal/httpapi/export_routes.go:64-84; internal/httpapi/admin_routes.go:25,48; grep for vault Record.CreatedAt consumers"
+    },
+    {
+      "id": "S07-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified: rotate() invalidates the old token upstream and returns the replacement (tapsign/client.go:79-107); Rotate then performs the audit and returns (next, finish(...)) (client.go:60-63), and finish returns a non-nil error when the audit fails even though the rotation succeeded (client.go:197-211). So the caller receives a replacement credential together with a non-nil error, and the idiomatic 'if err != nil { return err }' discards the only live token; a retry with the dead old token yields ErrInvalidCredential and cannot converge. Revoke (client.go:65-75) has the safer mirror shape. Note for severity: no in-repo production caller of Rotate exists (only tests), so this is an exported-API hazard rather than a live outage; low stands because the package is a reusable service interface and the failure mode is a permanent logout.",
+      "evidence_checked": "tapsign/client.go:60-63,65-75,79-107,197-211"
+    },
+    {
+      "id": "S07-11",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "The uint32 truncation described exists (vault/envelope.go:148,150), but it is unreachable: subject/provider would each have to exceed 4 GiB, which would exhaust memory before any store accepted it, and the layout truncation is explicitly documented in the code. The finding already grades it info/no-change; confirmation only records that the code matches the description.",
+      "evidence_checked": "vault/envelope.go:141-153; vault/repo.go:34-42"
+    }
+  ],
+  "summary": "S07: 11 findings verified by re-reading every cited site plus callers, stdlib source and one empirical repro. CONFIRMED 7: S07-1 medium (cross-host redirect replays X-LC-* headers; empirically reproduced on go1.27.1; in-repo caller mitigates, so medium), S07-2 medium (Enroll stores before auditing; federation then aborts before bindings.Put, leaving an encrypted unaudited token), S07-3 low (MemoryRepo.ListPage is O(N) per page, making -rotate-keys O(N^2/200); operator-only path), S07-5 low (unbounded/overflowing interval and expires_in), S07-6 low (exported Verify audits nothing while all peer methods do), S07-10 low (Rotate returns the replacement token with a non-nil audit error), S07-11 info (dead uint32 length truncation). DOWNGRADED 4, all to info for overstated reachability: S07-4 (needs a third-party Repo returning a mismatched identity; shipped repos cannot), S07-7 (control chars survive boundDetail but no in-repo sink logs the raw error; HTTP answers JSON-escape), S07-8 (nil-Response deref needs a Doer that violates the *http.Client contract; in-repo Doers cannot), S07-9 (Enroll overwrites CreatedAt, but no production code reads vault Record.CreatedAt). REJECTED 0. No new severe finding was invented. Discovery totals (0 critical, 0 high, 2 medium, 8 low) overstate four low items by one notch; severity of every reachable finding was otherwise upheld."
+}

@@ -1,0 +1,126 @@
+{
+  "scope": "S14",
+  "verified_by": "adversarial-verifier",
+  "findings": [
+    {
+      "id": "S14-1",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/zzprobe/concurrency/store_lock_test.go",
+      "test_func": "TestApproveDeviceHoldsTheStoreLockAcrossTheAuditWrite; TestDenyDeviceHoldsTheStoreLockAcrossTheAuditWrite",
+      "asserts": "Matched pair of probes (build tag audit5) over memory.OIDCStore. A blocking audit.Logger parks inside Record; while it is parked the test asks the store Counts() (the same s.mu) from another goroutine and asserts the acquisition does NOT complete within 500ms, i.e. it asserts held==true for ApproveDevice and DenyDevice. It pins the defect (the record call inside the critical section), so releasing s.mu before s.record makes both tests fail. The control TestControlTokenMintAuditsOutsideTheStoreLock proves the instrument can distinguish held from not-held, and TestAnAuditSinkThatReadsTheStoreDeadlocksUnderTheLock shows the lock-order consequence.",
+      "verification": "Confirmed by mutation: unlocking s.mu before s.record in ApproveDevice makes TestApproveDeviceHoldsTheStoreLockAcrossTheAuditWrite fail with 'ApproveDevice did not hold the store lock while the audit write was in flight' (store_lock_test.go:62); same assertion shape at lines 75-77 for DenyDevice. lockHeldDuring genuinely probes s.mu via st.Counts(). Direct stands.",
+      "gap_note": ""
+    },
+    {
+      "id": "S14-2",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/zz_audit_race_test.go",
+      "test_func": "TestZZAuditRaceProbeAllPathsAtOnce",
+      "asserts": "Runs BeginBind/CompleteBind, Unbind, CascadeRevoke and RevokeAllBindings concurrently over one MemoryBindingStore/vault under -race, but only asserts that nothing panics or data-races. It never re-reads the store/vault after the run to see whether CompleteBind re-created a row or a live upstream secret that Unbind/CascadeRevoke had just removed, and since the keyedMutex is missing (not merely misused) the race detector cannot observe its absence.",
+      "verification": "Read the whole body: there is no assertion at all after wg.Wait() (lines 103-104). No store/vault post-condition, no lock-acquisition assertion. Partial stands.",
+      "gap_note": "Needs a deterministic interleaving harness: a BindingStore or vault wrapper that hooks the window between CompleteBind's storeBindingSecret and its unconditional bindings.Put, lets a concurrent Unbind/CascadeRevoke/shred finish, then asserts the post-condition (no binding row, no vault secret, no live upstream token). Alternatively a test that asserts CompleteBind acquires the per-binding keyedMutex (e.g. block Put and show a concurrent Unbind waits)."
+    },
+    {
+      "id": "S14-3",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "vault/rotate_page_test.go",
+      "test_func": "TestRotateWalksPagesAndCoversEveryRecord; TestMemoryRepoPagesMatchList",
+      "asserts": "Correctness of the paging walk only: Rotate reads >1 page, calls ListPage and not List, covers every record exactly once with no skip/repeat, and MemoryRepo.ListPage agrees with List in order and length (same shape in internal/federation/binding_page_test.go: TestMemoryBindingStorePagesCoverEverythingOnce / TestRevokeAllBindingsSweepsEveryPage for ListAllPage). None of them measures or asserts the O(N) full copy+sort performed per page, nor the RLock hold time, nor the caller-ctx loss at vault/repo.go:233.",
+      "verification": "Both cited tests exercised and pass on current code; assertions are coverage/order/limit only. vault/repo.go:233 confirmed as `all, err := r.List(context.Background())` inside a method that discards its ctx parameter (`_ context.Context`). Partial stands.",
+      "gap_note": "Needs a scaling/complexity probe (the z15 perCall pattern) that fixes the page size and grows N, asserting the per-page cost does not track N, or a pager wrapper that fails if ListPage internally calls List()/sorts all rows. Also needs a cancelled-ctx test for vault/repo.go:233 (ListPage ignores the caller ctx and passes context.Background())."
+    },
+    {
+      "id": "S14-4",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/zzprobe/audit6/z03crypto/binding_namespace_test.go",
+      "test_func": "TestProbeBindingProviderNamespaceCollides",
+      "asserts": "Calls MemoryBindingStore.List(ctx, user) and asserts the number/identity of the returned rows (namespace-collision fixture; same call in internal/federation/unbind_test.go TestBindingsListsWhatIsConnected and killswitch_test.go TestRevokeUserBindingsLeavesOthersAlone). It asserts correctness of the filter result, not that the lookup is per-user indexed or that it does not scan the whole deployment under RLock.",
+      "verification": "Read the cited test and TestBindingsListsWhatIsConnected: all assert filtered row contents, not scan cost or index presence. No per-user-index invariant exists. Partial stands.",
+      "gap_note": "Needs a two-population scaling probe over MemoryBindingStore.List (perCall at N and kN of other users' bindings) with a flatness control, or an invariant/import probe asserting a per-user index exists and is maintained by Put/Delete. No existing test would fail if a per-user index were added."
+    },
+    {
+      "id": "S14-5",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/refresh_family_test.go",
+      "test_func": "TestRefreshReplayRevokesTheFamilyWithoutOverRevoking; TestRefreshReuseWithAFailingRevocationFailsClosed",
+      "asserts": "Sequential RFC 9700 4.14.2 behavior: the thief rotates first, the legitimate copy is refused invalid_grant, the thief's generation (refresh + access) is revoked, the unrelated family survives, the reuse is audited, and a failing RevokeRefreshFamily fails closed. All calls are serial, so the ConsumeRefresh -> RevokeRefreshFamily / issue non-atomicity is never exercised.",
+      "verification": "Both cited tests read; every call is serial (no goroutines), and the failing-revocation test swaps in a store wrapper but does not interleave. Partial stands.",
+      "gap_note": "Needs a concurrent-interleaving harness: a Store wrapper that parks SaveAccess/SaveRefresh (or RevokeRefreshFamily) so a second Refresh can run between the winner's ConsumeRefresh and its mint, then asserts that no live refresh token of the revoked family survives and that revocation cannot miss the just-minted generation. No existing test would fail if the sequence became atomic."
+    },
+    {
+      "id": "S14-6",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/store/memory/oidc_family_test.go",
+      "test_func": "TestRefreshReplayRevokesTheWholeFamily",
+      "asserts": "Functional result of the full-map family revocation: replaying a spent refresh token returns ErrRefreshTokenSpent, the replacement generation and its paired access tokens are gone, the unrelated family is untouched, and the family's tombstone count is exact. It asserts what revokeFamilyLocked deletes, not that the deletion is proportional to the family (no family index) nor that RevokeToken no longer scans every refresh token/tombstone. oidc_index_test.go only asserts the subject indexes, which is exactly the index this finding says is missing for family/idHash.",
+      "verification": "Read the cited test and oidc_index_test.go; the latter references only accessBySubject/refreshBySubject/requestBySubject, never a familyID or idHash index. Partial stands.",
+      "gap_note": "Needs a scaling probe over the replay path (perCall at N and kN tombstones/live refresh tokens, with a flatness control) or an invariant/import probe asserting a familyID index and an idHash index are maintained by putRefreshLocked/deleteRefreshLocked. Adding those indexes would not fail any current test."
+    },
+    {
+      "id": "S14-7",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/zzprobe/perf/memstore_test.go",
+      "test_func": "TestMemStoreDevicePurgeIsPerInsert",
+      "asserts": "Measures StoreDeviceAuthorization per-call cost at ~200 live devices vs ~20000 live devices and logs 'StoreDeviceAuthorization -> purgeExpiredDevicesLocked'. However the defect-direction check degrades to t.Skip when the per-call cost does not grow (if last <= first), so removing the per-insert purge would make the test skip, not fail; only the '>=20000 live' anti-vacuity is a hard assertion.",
+      "verification": "Read lines 237-276: hard assertion is only `live < 20_000`; the direction check at line 271-275 is `if last <= first { t.Skip(...) }`. Removing the per-insert purge yields a skip, not a failure. Partial stands.",
+      "gap_note": "The probe must assert, not skip: e.g. fail when the per-call cost is flat across populations while a flat control holds, or add a source/invariant assertion that StoreDeviceAuthorization does not call purgeExpiredDevicesLocked per insert. Also no test asserts an upper bound on the devices map."
+    },
+    {
+      "id": "S14-8",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/device_test.go",
+      "test_func": "TestDeviceAuthorizationHappyPath; TestDeviceAuthorizationExpires; TestDeviceAuthorizationDecidedOnce",
+      "asserts": "Drives MemoryDeviceStore through SaveDevice/GetDevice/GetDeviceByUserCode/RecordPoll/RecordDecision and asserts the device-flow state machine (pending, slow_down, approved, denied, expired, single decision). No test asserts that any record is ever deleted or swept, and oauth's SweepExpired tests cover only MemoryStore (oauth/tokens_sweep_test.go), not MemoryDeviceStore.",
+      "verification": "Read all cited tests: they exercise the state machine; none asserts a deletion/sweep or bounded population. Independent grep for SweepExpired/DeleteDevice/RemoveDevice in oauth: oauth/tokens_sweep_test.go and oauth/tokens_reuse_test.go target MemoryStore only. internal/zzprobe/concurrency/growth_test.go exercises internal/store/memory.OIDCStore devices, a different store. Partial stands.",
+      "gap_note": "Needs a growth/leak probe: record N device authorizations (approved/denied/expired), then assert the store's population returns to zero after the expiry window via a sweep or delete-on-decision/consume. Such an assertion requires adding a SweepExpired/delete method (and a DeviceStore seam) first — the current interface exposes no way to observe or bound the population."
+    },
+    {
+      "id": "S14-9",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "No test was found that makes internal/httpapi's ReadinessProbe panic. The existing /readyz probes cover the deliberate readinessTTL staleness, the cold-start fail-open while the first check runs, caller-cancellation poisoning, and the bounded cost of the exempt path (internal/zzprobe/audit6/z06httpedge/readiness_test.go, internal/zzprobe/audit7/z11resiliencedos/readyz_poison_test.go, internal/zzprobe/audit7/z22reconcile/readiness_test.go, internal/zzprobe/audit7/z11verify/readyz_race_test.go) — none sets cfg.Ready to a function that panics, and none asserts that c.running/settled are cleared.",
+      "verification": "Independent greps: `panic(` across all *_test.go finds no match in any readiness test; `ReadinessProbe(func`/`Ready:` sites (health_test.go, z06httpedge, z11verify, z11resiliencedos, z12verify, z18gohazardsweep, z22reconcile, startup_probe_test.go, verifyhttpedge) all return nil/error or block (always return); `readinessCache|.running|.settled` in tests appears only in comments. None verdict stands.",
+      "gap_note": "Harness needed: an httptest server whose httpapi.Config.Ready panics; issue one GET /readyz (recovered by the outer recoverer), then issue subsequent /readyz requests and assert they do not latch at 503 'checking' but re-run the probe or report the previous verdict. Requires the panic-recovery behavior in readinessCache.check that does not exist today."
+    },
+    {
+      "id": "S14-10",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/scope_test.go",
+      "test_func": "TestRegistryRejectsDuplicateAndMalformed; TestRegistryResolve; TestDefaultRegistryHasMVPScopes",
+      "asserts": "Single-threaded behavior of the same methods Register/Get/Resolve/Descriptors: duplicates and malformed scopes are rejected, unknown scopes refused, allowlists honored, the built-in catalog present. All registration happens at composition time before any read, so the unprotected map mutation vs concurrent read is never exercised (no goroutine calls Register alongside Resolve/Descriptors anywhere in the tree).",
+      "verification": "Read the cited tests; `Register(` in tests appears only in oauth/as_test.go:44 (composition-time fixture) and scope_test.go (serial), plus unrelated admin/auth handler Register calls. No goroutine drives Registry.Register against Resolve/Get/Descriptors. Partial stands.",
+      "gap_note": "Needs a race probe: start N goroutines calling Resolve/Descriptors/Get while one or more call Register after serving begins, run under -race; or an invariant/import guard (RWMutex present, Register under write lock). A plain -race run over the package cannot flag the defect because no test mutates a live registry."
+    },
+    {
+      "id": "S14-11",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "No test drives internal/oidchttp's serveOAuth into a panic or inspects the package-level bufferedWriters sync.Pool. No test in the tree references acquireBufferedWriter/releaseBufferedWriter (only two comments mention serveOAuth). internal/httpapi/panic_test.go panics a stub handler at the httpapi recoverer, not the zitadel provider inside serveOAuth, and asserts response shape only, so it cannot observe the unreleased pooled buffer.",
+      "verification": "Independent grep for `acquireBufferedWriter|releaseBufferedWriter|bufferedWriters` returns only production oidchttp.go, comments, and audit docs — no test reference. The only panic in internal/oidchttp tests is a helper `panic(err)` in zz_audit_protocol_test.go:554 (unescape helper), not a provider panic; httpapi panic tests use stub handlers. None verdict stands.",
+      "gap_note": "Harness needed: an injectable provider/panic seam in oidchttp (or a test-only ServeHTTP wrapper) that panics inside serveOAuth after bw is acquired, plus a pool-observation hook (count of outstanding writers / re-acquire identity) to assert releaseBufferedWriter runs. Requires exposing pool state the package does not currently export."
+    },
+    {
+      "id": "S14-12",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/federation/refresh_test.go",
+      "test_func": "TestConcurrentRefreshHappensOnce",
+      "asserts": "Eight goroutines Fetch the same expired binding concurrently; the test asserts the upstream token endpoint was called exactly once (refreshes == 1), which is the per-binding keyedMutex serializing refreshBinding across both its PutIfVersion and storeBindingSecret. Dropping that lock makes concurrent refreshBinding calls enter the CAS->vault-write sequence together and the count exceeds 1, so the test fails if the mitigation this finding describes is removed. (It asserts the lock's serialization effect, not a mid-sequence row/secret observation; the cross-process residual is separately probed in internal/zzprobe/verifyfederation/refresh_test.go.)",
+      "verification": "Confirmed by mutation: commenting out the `s.locks.lock(...)`/`defer unlock()` pair in refresh.go makes the test fail with 'refreshes = 12, want exactly 1' (refresh_test.go:195). Direct stands.",
+      "gap_note": ""
+    }
+  ]
+}

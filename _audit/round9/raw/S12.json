@@ -1,0 +1,251 @@
+{
+  "scope": "S12",
+  "title": "Frontend SPA + embedded webui (web/src, web/static, vite/package config, internal/webui)",
+  "findings": [
+    {
+      "id": "S12-1",
+      "title": "Per-attempt request timeout is disarmed before the response body is read",
+      "severity": "medium",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "web/src/lib/api.ts:334",
+        "web/src/lib/api.ts:354",
+        "web/src/lib/api.ts:369"
+      ],
+      "evidence": "\t\tconst timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);\n\t\ttry {\n\t\t\tres = await fetch(path, {\n\t\t\t\tmethod,\n\t\t\t\theaders,\n\t\t\t\tcredentials: 'same-origin',\n\t\t\t\tsignal: controller.signal,\n\t\t\t\tbody: opts.body === undefined ? undefined : JSON.stringify(opts.body)\n\t\t\t});\n...\n\t\tclearTimeout(timer);\n...\n\tconst text = await res.text();",
+      "why": "fetch() resolves as soon as the response *headers* arrive, but the only deadline in the client is cleared at line 354 before the body is consumed at line 369. The AbortController therefore never fires for a response whose body stalls, so res.text() can remain pending forever. Every caller awaits this promise before it can leave its loading state, so the 15s 'dead end' guard documented at api.ts:303 does not cover the body at all.",
+      "exploit": "A deployment behind a proxy/CDN, or an upstream that returns 200/401 headers and then holds the socket open without finishing the body (slowloris or a stalled upstream), makes api.getAuthorizationRequest() never settle: the consent page sits on '正在读取授权请求…' indefinitely with no error and no timeout, and the only recovery is a manual reload. The same applies to the session probe that gates every page.",
+      "recommendation": "Keep one abort deadline alive for the whole attempt including the body (construct AbortSignal.timeout(REQUEST_TIMEOUT_MS) and do not clearTimeout before `await res.text()`), or read the body inside the timer window and clear only afterwards, wrapping the body read in the same catch so a stall becomes ApiError('network_error').",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-2",
+      "title": "Dev root redirect does not match a request that carries a query string",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "web/vite.config.ts:27",
+        "web/vite.config.ts:28"
+      ],
+      "evidence": "\t\t\t\tconst path = (req as { url?: string }).url;\n\t\t\t\tif (path === '/' || path === '') {\n\t\t\t\t\tres.writeHead(302, { Location: '/app/' });",
+      "why": "req.url is the full request target, so a request to '/?error=access_denied' yields the string '/?error=access_denied', which is neither '/' nor ''. The middleware therefore calls next() and Vite answers that URL itself. The Go plane's root handler deliberately carries RawQuery through into /app/?error=... (internal/httpapi/server.go:574-583), so the dev server does not actually mirror production as this plugin and web/README.md claim.",
+      "exploit": "In development, any failed login that returns the browser to return_to=/ (the default) lands on http://localhost:5173/?error=access_denied and gets Vite's 404 instead of the app's sign-in page with the reason — precisely the broken flow the plugin was written to prevent.",
+      "recommendation": "Compare the pathname, not the whole target: take `path.split('?')[0]` (or match `path === '/' || path?.startsWith('/?')`) and preserve the query when building the Location: `/app/` + (rawQuery ? '?' + rawQuery : '').",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-3",
+      "title": "Stale ?error= is carried through SignIn return_to, so a later successful sign-in still reports failure",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "web/src/routes/+page.svelte:40",
+        "web/src/routes/+page.svelte:241"
+      ],
+      "evidence": "\t\tconst error = new URLSearchParams(window.location.search).get('error');\n\t\tif (error) authError = authErrorMessage(error);\n...\n\t<SignIn returnTo={`${page.url.pathname}${page.url.search}`} />",
+      "why": "A visitor parked on /?error=access_denied gets a SignIn whose return_to is the current pathname *plus search*, so the stale error code is forwarded to the login plane. safeurl.RelativePath keeps path and query intact (it only refuses cross-origin forms), so after a successful authentication the browser is sent back to a URL that still contains ?error=..., and onMount re-raises the same failure alert — now rendered inside the signed-in account view.",
+      "exploit": "Fail or cancel a login once (or hand a victim the /?error=access_denied link), then click a provider and complete the login. The account page still shows '登录没有完成' / '登录已取消…' after a login that in fact succeeded, and reloading keeps it until the query is manually removed.",
+      "recommendation": "Build returnTo from the pathname plus only the parameters that must survive (e.g. the consent id), explicitly dropping `error`; after reading `error`, clear it with history.replaceState so a retry starts from a clean URL.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-4",
+      "title": "Attacker-controlled ?error= is rendered verbatim inside the branded failure alert",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "web/src/routes/+page.svelte:41",
+        "web/src/routes/+page.svelte:82"
+      ],
+      "evidence": "\t\tif (error) authError = authErrorMessage(error);\n...\n\t\t\tdefault:\n\t\t\t\treturn `登录没有完成（${code}）。`;",
+      "why": "The unknown-code branch interpolates the raw query value into a message that is rendered in the genuine, branded danger Alert (title 登录没有完成). Svelte escapes text nodes, so this is not XSS, but it lets an attacker author content inside the application's trust surface, and there is no length cap, so a multi-kilobyte value also distorts the layout. The value is attacker-controllable with a single GET link and no interaction.",
+      "exploit": "Send a target https://issuer/app/?error=<crafted sentence asking them to re-enter credentials at some address>. The real Re0Auth page displays the attacker's sentence as a login-failure reason, under a genuine brand and alert style — useful raw material for a follow-up phishing step.",
+      "recommendation": "Never echo an unrecognised code: return a fixed '登录没有完成，请重试。' for the default branch (or map it to a known code), and if a code must be shown, clamp it to a short length.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-5",
+      "title": "Account export revokes the object URL synchronously and trusts an unvalidated profile field",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "medium",
+      "locations": [
+        "web/src/routes/+page.svelte:162",
+        "web/src/routes/+page.svelte:164"
+      ],
+      "evidence": "\t\t\ta.download = `re0auth-account-${data.profile.user_id}.json`;\n\t\t\ta.click();\n\t\t\tURL.revokeObjectURL(url);",
+      "why": "URL.revokeObjectURL is called in the same task as click(); browsers are allowed to resolve the blob URL when the download manager starts, which is asynchronous, so an immediate revocation can abort the download. Separately, exportAccount returns `call<AccountExport>` with no shape check, so data.profile (or data.profile.user_id) being absent throws a TypeError that the catch renders as the alert body. Both defects live in the same three lines.",
+      "exploit": "On a slower machine or a browser that defers the download (Firefox/Safari behaviour), clicking 导出我的数据 produces no file at all. If a proxy or a partial response omits profile, the user sees 'Cannot read properties of undefined (reading 'user_id')' instead of a useful message.",
+      "recommendation": "Read profile.user_id after a guard (throw ApiError('malformed_response') as currentSession does) and revoke the URL on a later macrotask (setTimeout(..., 0) or after a short delay / download event) rather than immediately after click().",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-6",
+      "title": "Focus restoration builds a CSS selector by string interpolation from server/config ids",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "medium",
+      "locations": [
+        "web/src/lib/a11y.ts:33",
+        "web/src/lib/a11y.ts:35",
+        "web/src/routes/sources/+page.svelte:186",
+        "web/src/routes/grants/+page.svelte:73"
+      ],
+      "evidence": "export async function restoreFocus(selector: string) {\n\tawait tick();\n\tdocument.querySelector<HTMLElement>(selector)?.focus();\n}",
+      "why": "Call sites pass selectors assembled from values the server or deployment config supplies, e.g. `[data-disconnect=\\\"${key(binding)}\\\"]` (key = game + '/' + source) and `[data-unlink=\\\"${identity.id}\\\"]`. Svelte escapes the attribute value so the DOM is correct, but the selector string is not escaped: a value containing a double quote, backslash or ']' makes querySelector throw SyntaxError. The callers use `void restoreFocus(...)`, so the rejection is unhandled and focus simply stays on <body>.",
+      "exploit": "A source or identity identifier containing a quote character (operator-supplied source name, or a future server-generated id) makes 取消 throw a SyntaxError and leaves a keyboard/screen-reader user without the focus return the component promises.",
+      "recommendation": "Do not compose selectors from data; capture the id and query via CSS.escape(`[data-disconnect=\"${id}\"]`) or keep a Map from id to element, and add `.catch(() => {})` at the call sites so a lookup failure cannot become an unhandled rejection.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-7",
+      "title": "Sources page re-runs O(available x bindings) scans on every reactive invalidation",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "web/src/routes/sources/+page.svelte:82",
+        "web/src/routes/sources/+page.svelte:89",
+        "web/src/routes/sources/+page.svelte:288"
+      ],
+      "evidence": "\t\treturn available.find((s) => key(s) === sourceKey)?.resources.map((r) => r.name) ?? [];\n...\n\t\t\tsrc => src.status !== 'retired' && !bindings.some((b) => key(b) === key(src))\n...\n\t\t\t\t\t\t\t{#if resourcesFor(key(binding)).length > 0}",
+      "why": "resourcesFor is a linear scan over the whole catalogue and is invoked twice per binding inside the keyed each (lines 288 and 290), while connectable is filter(available) x some(bindings). Every call also allocates key() strings. All of this is recomputed whenever selected/confirming/outcome state changes, so the cost per render is O(available x bindings), not O(available + bindings).",
+      "exploit": "A deployment offering thousands of federation sources to an account with many bindings re-runs millions of string comparisons on each click of 断开连接/取消/登出全部设备, visibly delaying the confirmations on a mid-range phone.",
+      "recommendation": "Derive a Map<string, FederationSource> and a Set<string> of binding keys once (a $derived over available/bindings), then make resourcesFor and connectable O(1) lookups; call resourcesFor once per binding and reuse the result.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-8",
+      "title": "SPA shell is sent with no cache validator, so Cache-Control: no-cache forces a full body transfer each load",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "medium",
+      "locations": [
+        "internal/webui/webui.go:151",
+        "internal/webui/webui.go:152"
+      ],
+      "evidence": "\tcase name == \"index.html\":\n\t\tw.Header().Set(\"Cache-Control\", \"no-cache\")",
+      "why": "The shell is served through http.ServeFileFS, and embed.FS file infos report a zero ModTime, so ServeContent emits no Last-Modified and no ETag is generated anywhere. `no-cache` means the browser must revalidate before reuse; with no validator it cannot issue a conditional request, so it re-downloads the whole index.html (and re-runs CSP/hash parsing) on every full page load instead of getting a cheap 304. The intent of `no-cache` (safe revalidation) is therefore not achieved.",
+      "exploit": "No attacker trigger; every full navigation/reload pays an unconditional transfer of the shell. On slow mobile links this is measurable waste, and the shell cannot be served from cache even though it is identical between builds.",
+      "recommendation": "Emit a validator: set an ETag derived from the embedded index.html bytes or _app/version.json and answer If-None-Match with 304 (ServeContent already handles If-Modified-Since if a real Last-Modified is supplied from the build).",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-9",
+      "title": "Retried responses are discarded without draining or cancelling the body",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "medium",
+      "locations": [
+        "web/src/lib/api.ts:358",
+        "web/src/lib/api.ts:361"
+      ],
+      "evidence": "\t\tif (method === 'GET' && attempt < MAX_ATTEMPTS && [502, 503, 504].includes(res.status)) {\n\t\t\tconst after = retryAfterSeconds(res) ?? 0;\n\t\t\tawait sleep(Math.min(after * 1000, 2000) + 100 * attempt);\n\t\t\tcontinue;\n\t\t}",
+      "why": "Before `continue`, neither res.body.cancel()/res.body?.cancel() nor a read of the body happens. The 502/503/504 response stream is left un-consumed, so the connection cannot be reused and is only reclaimed by GC; with several concurrent GETs (the app fires listIDPProviders, currentSession, listGrants, listSources etc. in parallel) a load-shedding server sees up to two abandoned sockets per logical request exactly when it is saturated.",
+      "exploit": "A backend returning 503 with a small body while many clients retry leaves each client holding two abandoned response bodies and re-dialing for the retry, amplifying the outage it is trying to survive.",
+      "recommendation": "Cancel the discarded body before sleeping/continuing (`await res.body?.cancel()`), or consume it with res.arrayBuffer() so the stream is released deterministically.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-10",
+      "title": "Response shape validation is applied to only two endpoints; the rest throw inside render and expose the JS error via +error.svelte",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "web/src/lib/api.ts:468",
+        "web/src/lib/api.ts:480",
+        "web/src/routes/admin/+page.svelte:72",
+        "web/src/routes/+error.svelte:9"
+      ],
+      "evidence": "\texportAccount: () => call<AccountExport>('GET', '/v1/account/export'),\n...\n\tlistAdminClients: () =>\n\t\tcall<{ data: AdminClient[]; csrf_token: string }>('GET', '/v1/admin/clients'),\n...\n\t\t\tclients = res.data;\n...\n\tconst message = $derived(\n\t\tpage.error?.message && page.error.message !== 'Not Found'",
+      "why": "currentSession and getAuthorizationRequest validate their JSON at the boundary, but every other wrapper asserts a TypeScript type over parsed JSON. A response whose envelope is missing (no `data`, no `profile`) is accepted, the assignment stores undefined, and the failure then happens during Svelte's render/derivation, which +error.svelte renders using page.error.message — i.e. the raw JS message such as \"Cannot read properties of undefined (reading 'length')\".",
+      "exploit": "A captive portal, a reverse proxy that rewrites a 200 body, or a partial backend response without `data` turns /app/admin into the error boundary with an internal TypeScript/JS message as the user-facing headline instead of a recoverable API error.",
+      "recommendation": "Validate the envelope inside call (e.g. for GETs whose callers index `.data`, require Array.isArray(body?.data)) or add per-endpoint checks in the same style as currentSession, and have +error.svelte show a fixed message rather than page.error.message.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-11",
+      "title": "Every asset request performs three embedded-FS stats",
+      "severity": "info",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/webui/webui.go:106",
+        "internal/webui/webui.go:119",
+        "internal/webui/webui.go:133"
+      ],
+      "evidence": "\t\tif !Built(fsys) {\n...\n\t\tif name == \"\" || name == \".\" || !isFile(fsys, name) {\n...\n\t\thttp.ServeFileFS(w, r, fsys, \"/\"+name) //nolint:gosec // G703: name is cleaned and confined to the embedded fs.FS",
+      "why": "The hot static path stats the embedded FS three times per request: Built() (index.html), isFile() (the requested name), and then ServeFileFS opens/stats the same name again. At steady state a page load is a handful of JS/CSS requests, each paying three embedded lookups plus the clean/prefix work; the values are invariant within a process (the build cannot change) but are recomputed per request.",
+      "exploit": "No direct exploit; this is per-request CPU/allocation overhead on the most frequently served responses.",
+      "recommendation": "Stat once and serve from the opened file (or use fsys.Open + http.ServeContent), and cache the Built() verdict for the process lifetime since the embedded content is immutable.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S12-12",
+      "title": "SignIn appends return_to after a URL fragment, unlike the equivalent link() path",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "medium",
+      "locations": [
+        "web/src/lib/components/SignIn.svelte:50",
+        "web/src/lib/components/SignIn.svelte:52"
+      ],
+      "evidence": "\t\tconst sep = target.includes('?') ? '&' : '?';\n\t\ttarget += `${sep}return_to=${encodeURIComponent(returnTo)}`;",
+      "why": "The provider start URL is mutated by string concatenation, which ignores fragments: if provider.start_url contains '#...', the appended return_to becomes part of the fragment and is never transmitted to the server. +page.svelte's link() builds the same kind of URL correctly with `new URL(...)` and searchParams.set, so the two navigation paths disagree, and the next person to add a fragment to a start URL has no reason to expect login to lose the pending task.",
+      "exploit": "An IdP configured with a fragment-bearing authorization URL (or one that gains one) silently drops return_to, so after signing in from the consent or device page the user is returned to the account page and the authorization/device task is lost.",
+      "recommendation": "Construct the target with `const url = new URL(provider.start_url, window.location.origin); url.searchParams.set('return_to', returnTo); window.location.assign(url.toString());`, matching +page.svelte's link() and preserving any fragment position.",
+      "already_mitigated": false
+    }
+  ],
+  "coverage": [
+    "web/src/app.d.ts",
+    "web/src/app.html",
+    "web/src/app.css",
+    "web/src/lib/index.ts",
+    "web/src/lib/api.ts",
+    "web/src/lib/errors.ts",
+    "web/src/lib/a11y.ts",
+    "web/src/lib/assets/favicon.svg",
+    "web/src/lib/components/SignIn.svelte",
+    "web/src/lib/components/ScopeList.svelte",
+    "web/src/lib/components/ui/Alert.svelte",
+    "web/src/lib/components/ui/Badge.svelte",
+    "web/src/lib/components/ui/Button.svelte",
+    "web/src/lib/components/ui/Card.svelte",
+    "web/src/lib/components/ui/CopyValue.svelte",
+    "web/src/routes/+layout.ts",
+    "web/src/routes/+layout.svelte",
+    "web/src/routes/+page.svelte",
+    "web/src/routes/+error.svelte",
+    "web/src/routes/consent/+page.svelte",
+    "web/src/routes/device/+page.svelte",
+    "web/src/routes/grants/+page.svelte",
+    "web/src/routes/sources/+page.svelte",
+    "web/src/routes/admin/+page.svelte",
+    "web/static/favicon.svg",
+    "web/static/robots.txt",
+    "web/vite.config.ts",
+    "web/package.json",
+    "web/.npmrc",
+    "web/tsconfig.json",
+    "web/.gitignore",
+    "web/README.md",
+    "web/scripts/check-bundle-size.mjs",
+    "web/scripts/restore-dist-placeholder.mjs",
+    "internal/webui/webui.go",
+    "internal/webui/dist/index.html (generated, read as served artifact)",
+    "internal/webui/dist/_app/version.json (generated)",
+    "cross-ref read for call graph/mitigation: internal/httpapi/server.go",
+    "cross-ref read: internal/httpapi/middleware.go",
+    "cross-ref read: internal/httpapi/authorization_routes.go",
+    "cross-ref read: internal/httpapi/admin_routes.go",
+    "cross-ref read: internal/oidchttp/oidchttp.go (ApproveAuthorization)",
+    "cross-ref read: internal/safeurl/safeurl.go"
+  ],
+  "notes": "Independence: no AUDIT-ISSUES.md, docs/security-audit-*.md, internal/zzprobe/**, _audit/**, audit/** or scratchpad/** was opened as a source of conclusions; findings come from the production sources above plus direct cross-package trace of the calls the SPA relies on. No browser or Node execution was possible in this environment, so client findings are static-analysis claims (confidence stated per finding). Mitigations verified rather than reported: (1) all server-supplied navigation targets are same-origin-clamped on the Go side (safeurl.RelativePath rejects //host, backslash, control bytes and non-absolute URLs), so the SPA's verbatim window.location.assign of redirect_to/bind_url is not an open redirect; (2) internal/webui.Handler's path handling is sound — path.Clean confines traversal to the embedded fs.FS and directories fall back to the shell, so no listing/escape was found; (3) nosniff/Referrer-Policy/frame-ancestors are applied globally by internal/httpapi middleware outside the webui handler; (4) no {@html}/innerHTML/eval use exists, and every server string is rendered through Svelte's escaping; (5) all state-changing calls pass the session-bound CSRF token; (6) the consent/device client cannot widen scopes — ApproveAuthorization re-checks scopes against the stored request and only consults `explicit` for descriptors already in the granted set, so the client's inclusion of acknowledged-but-deselected scopes (consent/+page.svelte:104-106, device/+page.svelte:136-140) is inert rather than a privilege bug. The internal/webui/dist tree is a gitignored build artifact (restore-dist-placeholder.mjs writes '*'), read only to confirm the shipped CSP meta tag; performance claims about embed.FS ModTime being zero are based on Go's embed package behaviour (medium confidence, S12-8)."
+}

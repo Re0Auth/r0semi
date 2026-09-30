@@ -1,0 +1,97 @@
+{
+  "scope": "S15",
+  "verified": [
+    {
+      "id": "S15-1",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Claim verified against the code. scripts/backup.sh runs under `set -euo pipefail` (backup.sh:10). The only pre-flight guard is `command -v age` before the dump (backup.sh:28-31); the runtime age invocation at backup.sh:45 is unguarded, so any non-zero exit (bad recipient, full/quota-exhausted volume, short write, interrupt) aborts the script under errexit before line 46 runs `shred -u`/`rm -f`. The plaintext custom-format dump therefore survives at $dir/re0auth-<stamp>.dump. It is 0600 (umask 077 at backup.sh:19) but unencrypted, and docs/operations.md:122-126 documents that the backup volume is copied off-cluster (object store / replicated StorageClass), so the plaintext artifact is replicated. The sibling scripts/backup-keys.sh:117-121 wraps the identical age call in `if ! ...; then rm -f \"$out\" \"$out.age\"; ... exit 1; fi`, proving the guard is the intended pattern and is simply missing here. The impact follows as stated. No mitigating caller/trap exists (no trap in the script).",
+      "evidence_checked": "scripts/backup.sh:10,19,28-31,42-48; scripts/backup-keys.sh:114-124; docs/operations.md:122-126"
+    },
+    {
+      "id": "S15-2",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The code fact is correct: `.github/workflows/ci.yml:34` and `:278` and `.github/workflows/perf.yml:45` use the mutable tag `postgres:16`, while release.yml:20 runs ci.yml verbatim as the tag gate, and every other image in the tree is digest-pinned (Dockerfile:13,49; cronjob.yaml:49) and every remote `uses:` is SHA-pinned (enforced by internal/archtest/workflows_test.go:72-126). But the stated impact is overstated: a GitHub Actions service container is a sibling container, is not injected with GITHUB_TOKEN or job secrets, and receives only the public POSTGRES_* variables plus the well-known TEST_DATABASE_URL DSN (ci.yml:35-48). ci.yml carries workflow-level `permissions: contents: read` (ci.yml:12-13) and its image job builds with `push: false`; the release image job that holds packages:write/id-token:write does not use a Postgres service, so the rejected-image path never executes with those scopes. Exploitation requires compromise or re-push of Docker Hub's official postgres account/image, a remote registry-level precondition, not a repository commit. Real unpinned-supply-chain inconsistency (and unguarded: archtest covers `uses:` and Dockerfile bases, not `services.image`), but low, not medium.",
+      "evidence_checked": ".github/workflows/ci.yml:12-13,32-48,276-292,654-673; .github/workflows/perf.yml:40-51; .github/workflows/release.yml:19-24,33-39; internal/archtest/workflows_test.go:72-126; Dockerfile:13,49; deploy/k8s/backup/cronjob.yaml:49"
+    },
+    {
+      "id": "S15-3",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Verified. deploy/k8s/backup/cronjob.yaml:20-22 sets only `backoffLimit: 2`; there is no `activeDeadlineSeconds` anywhere in the repo (grep across deploy/ finds none), and the inline `pg_dump` at cronjob.yaml:69-70 runs under `set -euo pipefail` with no `timeout`, no `PGOPTIONS`/statement_timeout, and no liveness probe on the job pod. With `concurrencyPolicy: Forbid` (cronjob.yaml:15) and a 15-minute schedule (cronjob.yaml:11), a dump blocked indefinitely (paused on a lock wait behind a queued ACCESS EXCLUSIVE, stalled I/O, wedged network policy) keeps the Job Running forever and the controller skips every later schedule; `startingDeadlineSeconds`/`backoffLimit` only govern missed and failed runs, not a running one. There is no backup-staleness metric or alert in deploy/prometheus/re0auth.rules.yml (read in full: only re0auth_* series plus the three generic runtime rules), and docs/operations.md:118 itself states a failed CronJob 'does not alert anyone'. The <=15 min RPO silently becomes unbounded. Impact follows exactly.",
+      "evidence_checked": "deploy/k8s/backup/cronjob.yaml:11-22,59-77; deploy/prometheus/re0auth.rules.yml:1-413 (grep: no backup rule, no activeDeadlineSeconds); docs/operations.md:112-129"
+    },
+    {
+      "id": "S15-4",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified as a bounded build-context/layer exposure. .dockerignore:39-43 states the rule ('audit workspace ... must not reach the build context or the backend stage's COPY . . layer') but implements only `scratchpad`; `_audit/` is a real tracked audit workspace (git ls-files _audit = 19 files incl. _audit/scriptprobe/*.dump fixtures, and .gitignore:59-62 explicitly re-includes _audit/scriptprobe/**), plus the four tracked docs/security-audit-{2,3,5,7}.md files that .gitleaks.toml:13-20 says quote full JSON token responses. Dockerfile:53 does `COPY . .` into the build stage. The discovery auditor correctly bounds the impact: the runtime image is `FROM scratch` and copies only /out, LICENSE, NOTICE and npm-attribution.json (Dockerfile:79-90), so nothing leaks into the shipped image; the exposure is the build context and the intermediate `build` layer (real with --target build, shared builders, or --cache-to registry). The `*.pem/*.key/*.p12/*.crt` half is hypothetical - no such files are tracked or present - and the `docs/` recommendation is over-broad, so the claim is confirmed at low, not raised. This is a recurrence of the audit-7 Z13V-1 class (internal/zzprobe/audit7/z13verify/z13verify_test.go:246-307) after the scratchpad/go.work/*.out rules were added.",
+      "evidence_checked": ".dockerignore:1-3,39-50; .gitignore:52-62,76-82; Dockerfile:53,79-90; .gitleaks.toml:13-20; `git ls-files _audit` (19 files); internal/zzprobe/audit7/z13verify/z13verify_test.go:246-307"
+    },
+    {
+      "id": "S15-5",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified as an availability-only, deployment-dependent gap. internal/httpapi/clientaddr.go:78-81 returns the peer immediately when the peer is not in TrustedProxies, and forwardedClient (clientaddr.go:104-110) also falls back to the peer when the rightmost hop is unparseable or itself trusted; deploy/k8s/base/configmap.yaml:44 hardcodes `trusted_proxies = [\"10.0.0.0/8\"]` with client_addr_header set at :43. In-cluster the app's peer is the ingress-controller pod, so on a cluster whose pod CIDR is outside 10/8 (Calico 192.168.0.0/16, EKS 172.20/16, etc.) every request keys the rate-limiter bucket on the ingress pod address. I checked the guards the discovery auditor might have missed: cmd/re0auth/config.go:616-624 only refuses a header with an EMPTY trusted_proxies list (fail-closed on a dead setting), and there is no startup warning when the peer falls outside the declared prefixes; it rejects universal prefixes (config.go:589-598) but not a mismatched pod CIDR. docs/operations.md:64-76 documents the shared-bucket fallback for a trusted rightmost hop but never states that trusted_proxies must contain the ingress pod network. Impact is shared-bucket throttling only (no key forgery), so low stays.",
+      "evidence_checked": "deploy/k8s/base/configmap.yaml:35-44; internal/httpapi/clientaddr.go:78-81,104-110,115-135; cmd/re0auth/config.go:577-624; docs/operations.md:48-76"
+    },
+    {
+      "id": "S15-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified. .github/workflows/release.yml:64-80 pushes the image with `push: true` and the metadata tags from release.yml:61-62 (`type=ref,event=tag`), and only afterwards runs the Trivy gate at release.yml:100-107; the `latest` promotion is conditional and happens after the scan (release.yml:114-119). If the scan fails, the workflow (and the `release` job that needs `image`) fails, but the version tag is already present in GHCR and pullable. deploy/k8s/base/deployment.yaml:46 pins exactly that shape of tag (`ghcr.io/re0auth/r0semi:v0.0.0-rc.3`), so the artifact the gate rejected is what the shipped baseline pattern resolves to. The workflow comments (release.yml:56-60) show the push-before-scan is a deliberate tradeoff made only to avoid attaching `latest` early, which does not remove the residual exposure for the version tag. Real, low-severity residual (no reviewer/operator action is forced to consume it).",
+      "evidence_checked": ".github/workflows/release.yml:52-80,91-119; deploy/k8s/base/deployment.yaml:42-47"
+    },
+    {
+      "id": "S15-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified. .github/workflows/release.yml:100-107 mounts `/var/run/docker.sock` from the host into a container running as root-equivalent inside the release `image` job, which holds `packages: write` and `id-token: write` (release.yml:36-39). The scan target is already a registry digest reference (`name@${{ steps.build.outputs.digest }}`, release.yml:107), and the read-only `$HOME/.docker/config.json` mount (release.yml:104) already supplies GHCR credentials, so the daemon socket is not needed for the stated purpose. The Trivy container is digest-pinned (release.yml:105), which is a real mitigation: the exploit needs a compromised/0-day Trivy image or wrong digest provenance, so low is correct and no downgrade is warranted.",
+      "evidence_checked": ".github/workflows/release.yml:33-39,91-107"
+    },
+    {
+      "id": "S15-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified. deploy/prometheus/re0auth.rules.yml:308/323/338 alert on `go_goroutines`, `process_resident_memory_bytes`, `process_open_fds`/`process_max_fds` with no job/instance selector, while the file header (rules.yml:4-7) claims the expressions 'name only re0auth_* series and carry no job/instance selector'. The in-file comments at rules.yml:305-307 and 320-322 acknowledge these are non-request generic collectors, but the rules still fire under Re0Auth alert names/runbook URLs for any Go or process-exporter target scraped by the same Prometheus the header invites loading into; the `for: 30m`/`15m` windows make it sustained. Confirmed at low (operational false paging, not adversarial).",
+      "evidence_checked": "deploy/prometheus/re0auth.rules.yml:4-7,304-348"
+    },
+    {
+      "id": "S15-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified. deploy/k8s/base/namespace.yaml:1-4 is a bare Namespace with no `pod-security.kubernetes.io/enforce` (or audit/warn) label, while deploy/k8s/base/deployment.yaml:29-33 and :108-111 harden the pod (runAsNonRoot/runAsUser 65532/seccomp RuntimeDefault, allowPrivilegeEscalation:false, readOnlyRootFilesystem:true, drop ALL). Nothing cluster-side rejects a later manifest to that namespace that omits the securityContext or adds hostPath/privileged; the base's hardening is only as strong as the next applied manifest. Defense-in-depth gap, low is appropriate.",
+      "evidence_checked": "deploy/k8s/base/namespace.yaml:1-4; deploy/k8s/base/deployment.yaml:29-33,108-111"
+    },
+    {
+      "id": "S15-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified with git. `git ls-tree HEAD scripts/` returns `100644 blob 2ab954cf... scripts/backup-keys.sh`, `100755` for scripts/backup.sh and scripts/restore.sh, so the key-backup script has no executable bit. docs/operations.md:86-95 documents the DR command as `... ./scripts/backup-keys.sh /backups`, which fails with Permission denied on a fresh clone/checkout (POSIX and Git-Bash). The script is the only tool that archives the KEK plus the three unrecoverable keys, and docs/operations.md:84,131-136 states the DB dump is not recoverable without it. Low is appropriate: `bash scripts/backup-keys.sh` is an easy workaround and the failure is loud.",
+      "evidence_checked": "`git ls-tree HEAD scripts/`; scripts/backup-keys.sh:1; docs/operations.md:82-95,131-136"
+    },
+    {
+      "id": "S15-11",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Verified. Makefile dist:160-182 `rm -rf dist`, builds each platform archive, and copies only `config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md` (Makefile:172); the npm licence listing is produced by the separate `npm-attribution: dist` target (Makefile:215-221) whose recipe name is `dist/re0auth_$${VERSION}_npm-attribution.json` - it runs AFTER `dist` has already tarred/zipped the archives, so the archives cannot contain it. The Dockerfile does include the same listing in the image (Dockerfile:86-90, copied at :90), and the JSON is published as a sibling release asset covered by SHA256SUMS (Makefile:226-229, release.yml:215), so a redistributor taking an archive from a mirror lacks the SPA attribution. internal/archtest/workflows_test.go:21-59 checks the Makefile wiring (target exists, is a dependency of checksums/release) and the image, but not archive contents, which is exactly why the gap passes the gate. Compliance gap, low.",
+      "evidence_checked": "Makefile:140-182,205-229; Dockerfile:23-33,86-90; internal/archtest/workflows_test.go:21-59"
+    },
+    {
+      "id": "S15-12",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Verified and properly self-classified. deploy/k8s/backup/cronjob.yaml:59-70 dumps with `pg_dump --format=custom` directly to the PVC with only umask 077, no age/BACKUP_AGE_RECIPIENT path, while the local scripts/backup.sh:44-48 supports age. docs/operations.md:125-126 explicitly records this as an accepted deployment decision (the dump is not encrypted; encrypt at replication or use an object store with SSE), so `already_mitigated: true`/info is accurate; existing mitigations are 0600, runAsNonRoot 65532, readOnlyRootFilesystem and dropped capabilities (cronjob.yaml:36-43,83-86).",
+      "evidence_checked": "deploy/k8s/backup/cronjob.yaml:36-43,59-86; scripts/backup.sh:44-48; docs/operations.md:122-126"
+    },
+    {
+      "id": "S15-13",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Verified. .gitleaks.toml:18-20 defines an allowlist whose `paths = ['''docs/security-audit-\\d+\\.md''']` is an unanchored regex and carries no `regexes`/`condition`, so gitleaks path-allowlists every rule for any path containing that substring (e.g. docs/security-audit-7.md.bak or a nested directory), unlike the later block at .gitleaks.toml:45-49 that scopes the exemption with `condition = \"AND\"` and a specific fixture regex. Landing a real credential in a matching path requires repository write access, and today only the four audit reports (docs/security-audit-2/3/5/7.md) match, so info / residual risk is the correct rating.",
+      "evidence_checked": ".gitleaks.toml:1-6,13-20,41-49; glob docs/security-audit-*.md (4 files)"
+    }
+  ],
+  "summary": "13 findings re-verified by reading every cited file and its surrounding guards/callers. 12 confirmed, 1 downgraded, 0 rejected. Medium: S15-1 (backup.sh aborts on age failure and leaves the plaintext dump; backup-keys.sh:117-121 has the missing guard) and S15-3 (CronJob has no activeDeadlineSeconds and no staleness alert, so Forbid turns a hung pg_dump into permanently silent backup loss). S15-2 downgraded medium->low: the floating postgres:16 service image is real and unguarded by archtest, but the impact statement is overstated - the service container is not injected with GITHUB_TOKEN/job secrets, ci.yml is contents:read, and exploitation needs compromise of Docker Hub's official image. Low (8): S15-4,_audit and the tracked security-audit docs reach the intermediate COPY . . layer while the scratch runtime image is unaffected; S15-5 trusted_proxies=10.0.0.0/8 yields a shared bucket when the pod CIDR differs (availability only; config.go:616-624 only enforces non-empty); S15-6 version tag persists after a failed Trivy gate; S15-7 docker.sock mounted in a packages:write/id-token job though the scan is a registry digest ref; S15-8 three generic go_*/process_* alerts with no job selector; S15-9 namespace lacks PSA enforce labels; S15-10 backup-keys.sh is mode 100644 while documented as ./scripts/backup-keys.sh; S15-11 release archives omit the npm attribution the image includes. Info (2): S15-12 plaintext in-cluster dumps (documented/accepted) and S15-13 unanchored gitleaks path allowlist (residual, needs repo write). No novel high-severity issue found; no performance claims required separate measurement."
+}

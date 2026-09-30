@@ -1,0 +1,95 @@
+{
+  "scope": "S05",
+  "findings": [
+    {
+      "id": "S05-1",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/refresh_test.go",
+      "test_func": "TestFetchRebindsWhenRefreshRejected",
+      "asserts": "Token endpoint answers 400 with body {\"error\":\"invalid_grant\"}; the test asserts Fetch returns ErrNotBound and that both the binding row and the vault secret are deleted. It exercises isRefreshRejected's true branch and refreshRejected, but only through the explicit invalid_grant code. A companion, TestRefreshTransportFailureIsTransientAndKeepsTheBinding (faultinjection_test.go), asserts a non-RetrieveError transport failure keeps the binding.",
+      "gap_note": "No test reaches the defective status-code switch at refresh.go:178-183 with an error code that is NOT invalid_grant. The 400 case used by the existing tests is decided by re.ErrorCode, so a fix that restricts isRefreshRejected to invalid_grant would leave every existing test green. Harness needed: an httptest token endpoint that answers, for a retryable/configuration condition, 403 with a text/html (WAF/CDN) body or 400 with {\"error\":\"temporarily_unavailable\"}; assert Fetch returns a transient error (not ErrNotBound) and that the binding row and vault secret survive. No such test exists in internal/federation or internal/zzprobe."
+    },
+    {
+      "id": "S05-2",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/zz_audit_race_test.go",
+      "test_func": "TestZZAuditRaceProbeAllPathsAtOnce",
+      "asserts": "A -race-only probe (build tag audit || audit6) that concurrently drives Fetch/Raw, Unbind/CascadeRevoke, BeginBind+CompleteBind and RevokeAllBindings over shared bindings, primarily to let the race detector check the per-binding lock / vault window; it makes no assertion about whether a completed bind recreates a row or vault secret after a removal.",
+      "gap_note": "No test drives the specific CompleteBind window (token exchange in flight while Unbind, RevokeAllBindings, or lifecycle.DeleteAccount deletes the row and shreds the secret) and then asserts the resurrected row/secret do or do not exist. The only related coverage is the generic race probe above plus refresh-path residue probes (verifyfederation/refresh_test.go) that cover the lock-protected refresh path, not CompleteBind. Harness needed: a BindingStore/Vault hook that deletes the binding row and vault secret inside the CompleteBind Exchange (or between storeBindingSecret and bindings.Put), then assert no row and no vault record remain for that subject."
+    },
+    {
+      "id": "S05-3",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/binding_page_test.go",
+      "test_func": "TestMemoryBindingStorePagesCoverEverythingOnce",
+      "asserts": "Exercises MemoryBindingStore.ListAll and ListAllPage over 10 bindings and asserts the pages cover every binding exactly once, in the same order as ListAll, at most `limit` per page. It is a correctness test of the paging cursor, not of cost.",
+      "gap_note": "No allocation or complexity assertion on MemoryBindingStore.List (the `make([]Binding, 0, len(s.m))` pre-allocation) or ListAllPage (whole-map copy + re-sort per page). The paging test would pass unchanged if the store kept the same semantics but different cost, and would pass unchanged if the defect were fixed. Harness needed: a store seeded with many other users' bindings, then testing.AllocsPerRun/Benchmark on List(user) asserting capacity/allocation does not scale with len(s.m), and a paged sweep benchmark asserting ListAllPage does not re-sort the entire map per page."
+    },
+    {
+      "id": "S05-4",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/missing_test.go",
+      "test_func": "TestMissingBindingsNamesPreferredSource",
+      "asserts": "A correctness test over 2 sources/1 resource: with nothing connected, MissingBindings returns exactly one requirement naming the preferred source and its scopes. The whole file exercises scope->candidate selection, grouping, retired-skip and resource-name agreement, but makes no cost assertion.",
+      "gap_note": "No test measures the O((sources x resources)^2) cost or the per-iteration registry.Sources(game) copy+sort + cand.Resource(name) linear scan inside MissingBindings. missing_test.go and verifyfederation/scopegate_test.go use one or two sources and assert only the resulting requirement set; they pass unchanged whether or not the inner loops are indexed. The z15 perf probe (internal/zzprobe/audit7/z15performancecapacity/performance_probe_test.go TestZ15RegistryListingCannotMutateTheRegistry) logs Registry.Sources allocations but never calls MissingBindings. Harness needed: a registry with many sources/resources per game and a Benchmark/allocation-count on MissingBindings asserting work does not scale quadratically (e.g. no Sources(game) copy per resource iteration)."
+    },
+    {
+      "id": "S05-5",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/zzprobe/audit7/z09federationdataplane/status_test.go",
+      "test_func": "TestZ09RegistryAcceptsAnyStatusSpelling",
+      "asserts": "Red probe (build tag audit7) that calls NewRegistry with Status values outside the documented vocabulary (\"Retired\", \"retired \", \" RETIRED\", \"disabled\", \"off\", \"Active\", \"DEGRADED\", \"degraded \") and t.Errorf for every one that is accepted, explicitly contrasting the missing check with the token_class validation. It exercises the exact NewRegistry validation gap in federation.go:162-180. Companion tests TestZ09StatusSpellingDecidesWhetherARetiredSourceStillServes and TestZ09AMisspelledRetirementStillDecidesAnotherSourcesGate go further: zzStatusRegistry t.Fatalf's if NewRegistry ever refuses a status, so adding the recommended validation would hard-fail those tests, and they assert a misspelled retirement still serves reads and still decides another source's scope gate. Verified: the cited function is a fix-tolerant red probe (`if err != nil { t.Logf; continue }`), but the two companion tests in the same cited file build their registry through zzStatusRegistry, which t.Fatalf's on any NewRegistry error, so the file as a whole does fail when NewRegistry starts rejecting the spellings.",
+      "gap_note": ""
+    },
+    {
+      "id": "S05-6",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/zzprobe/audit7/z09verify/verify_test.go",
+      "test_func": "TestZ09VerifyASchemeRelativeIssuerWouldRedirectTheBindOffOrigin",
+      "asserts": "Red probe (build tag audit7) that calls NewRegistry with Issuer \"//evil.example\", t.Fatalf's if NewRegistry refuses it, calls BeginBind (exercising oauthConfig -> AuthCodeURL, bind.go:150) and then http.Redirect, and t.Errorf's that the resulting Location names host evil.example, i.e. a trusted-origin 302 to an attacker host. It directly asserts the missing absolute-http(s) validation of Source.Issuer at federation.go:144. Verified: the t.Fatalf on NewRegistry error makes the test fail if the recommended Issuer validation is added. Attacker-controlled query/fragment issuers and non-absolute endpoint overrides are not separately parameterised, and the userinfo variant is covered by internal/federation/zz_audit_issuer_userinfo_test.go (build tag audit || audit6).",
+      "gap_note": ""
+    },
+    {
+      "id": "S05-7",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit7/z09federationdataplane/bind_test.go",
+      "test_func": "TestZ09ARetiredSourceCanStillBeBound",
+      "asserts": "Red probe (build tag audit7) that builds a registry with a StatusRetired and a StatusActive source, confirms the presenter (MissingBindings) offers only the live source and that BeginBind(live) works as controls, then reports the retired source's BeginBind result. It exercises the exact missing status check in bind.go:127-134 (and by implication CompleteBind's identical gap), but it is fix-tolerant: the finding branch is `if err == nil { t.Errorf(...) } else { t.Logf(...) }`, so a fix returning ErrSourceRetired reaches only the t.Logf and the test PASSES. It demonstrates the defect but does not pin it.",
+      "gap_note": "CORRECTED from direct to partial. The sole cited test cannot fail if the finding is fixed: when BeginBind(gone) returns ErrSourceRetired the else branch logs and the test ends green, so it is a red probe rather than a fix-detection guard. No companion test compensates — a repo-wide grep for StatusRetired/BeginBind found no test that asserts BeginBind or CompleteBind refuses a retired source (raw_test.go TestRawRetired and missing_test.go TestMissingBindingsSkipsRetiredSource cover different entry points, and the source_selection tests cover candidates()/Raw). Harness needed: assert unconditionally that BeginBind(gone) (and CompleteBind on an already-started retired flow) returns ErrSourceRetired, e.g. `if !errors.Is(err, ErrSourceRetired) { t.Errorf(...) }`, which stays red today and goes green only after the status check is added."
+    },
+    {
+      "id": "S05-8",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/adversary_test.go",
+      "test_func": "TestAdversarialUnbindReportsAnUnopenableSecret",
+      "asserts": "Injects a brokenVault whose Use returns errors.New(`vault: record was wrapped by key \"kek-0\", which is not configured`) and asserts Unbind reports something other than RevocationNothingToDo. It therefore executes revokeUpstream's unopenable-secret branch and the slog.Warn at unbind.go:124, but it never inspects the log content and its fixture error names only the KEK, not an Identity.",
+      "gap_note": "No test asserts that the subject identity (vault Identity's Subject:Provider) does not reach the process log on this branch. The existing static guard internal/zzprobe/crypto/source_log_guard_test.go matches slog attribute KEYS (user/subject/...) only, so an identity embedded inside err.Error() is invisible to it; a fix that logs a classification instead of %w leaves both tests green. Harness needed: a vault.Use error that formats a real Identity (Subject \"usr_...\", Provider \"game.source\", as vault/repo.go does for a key-not-configured record), capture slog output, and assert neither the Identity string nor the raw subject appears."
+    },
+    {
+      "id": "S05-9",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/federation/bind_test.go",
+      "test_func": "TestMemoryBindFlowStoreSweepsExpiredFlows",
+      "asserts": "Puts one already-expired and one live BindFlow (ExpiresAt built from time.Now()), calls MemoryBindFlowStore.SweepExpired() and asserts exactly the expired one is removed and a second sweep removes nothing. It exercises SweepExpired's time.Now() comparison but never supplies a non-wall clock and never crosses it with the service's Config.Now, so it cannot detect the sweeper/enforcement disagreement.",
+      "gap_note": "No test wires Config.Now to a logical clock and then compares SweepExpired's removals against CompleteBind's expiry enforcement (which uses s.now()). The existing test passes unchanged whether SweepExpired uses time.Now() or an injected clock, and only uses the wall-clock-relative lifetimes where the two clocks agree. Harness needed: a service with Config.Now set to a fixed logical time, flows started by BeginBind, and a direct SweepExpired call, asserting the flow set the sweeper removes matches the set CompleteBind would reject."
+    },
+    {
+      "id": "S05-10",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/httpapi/adversary_test.go",
+      "test_func": "TestAdversarialBindCallbackRejectsAnotherAccount",
+      "asserts": "End-to-end test of the HTTP mitigation (federation_routes.go:410-416): account A starts a bind, account B in the same browser hits A's callback and must get 400, and A must still be able to finish (303). It pins the handler's sessions.Bound/OwnerMatches check. At the federation layer, internal/federation/bind_test.go TestCompleteBindRejectsWrongUser asserts only the ErrBindUser error and the returned ReturnTo.",
+      "gap_note": "No test asserts the specific ordering defect: the flow is Consumed before flow.User != user is checked (bind.go:158-164). TestCompleteBindRejectsWrongUser does not re-check the flow after the mismatch, and the HTTP test fails only if the handler mitigation is removed, not if CompleteBind is reordered. Harness needed: BeginBind as A, call CompleteBind as B directly, assert ErrBindUser AND that A can still CompleteBind successfully (or that the flow is still present); this currently fails because Consume deleted it."
+    }
+  ]
+}

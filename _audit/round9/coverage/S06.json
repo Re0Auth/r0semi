@@ -1,0 +1,104 @@
+{
+  "scope": "S06",
+  "findings": [
+    {
+      "id": "S06-1",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test serves an oversized or gzip-deflated discovery document or JWKS, and no test asserts any size bound on the go-oidc fetches (grep for LimitReader/1<<20 in idp and its probes finds nothing on this path; the only idp size cap, getText, is exercised by TestQQFetchHandlesJSONP but is the unrelated QQ/userinfo path). Cited path (idp.go:298/711/836) is only exercised with small, well-formed documents. Harness needed: a fake OP whose /.well-known/openid-configuration and jwks_uri return an endless body (optionally gzip) or a byte-counting reader, driven through Client.AuthCodeURL / Client.Identity with an injected http.Client, asserting the bytes read stay <= 1 MiB (i.e. a wrapping RoundTripper or bounded fetch exists)."
+    },
+    {
+      "id": "S06-2",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/zzprobe/verifyfederation/addr_test.go",
+      "test_func": "TestVerifyProxyGuardJudgesTheProxyNotTheTarget",
+      "asserts": "Build tag audit5. TestMain installs HTTP_PROXY pointing at a loopback fake forward proxy; the test then drives httpclient.NewOutboundClient{DenyPrivateAddresses:true} at http://10.0.0.5/secret and asserts the dial is refused AND that the error names the PROXY address (127.0.0.1/::1), i.e. exactly S06-2's claim that the guard judged the proxy, not the target. Its guard-off half asserts the same request goes THROUGH the proxy and that the proxy received the absolute target URI 10.0.0.5. If the guard were changed to check/reject the target (or to refuse proxy+guard), the 127.0.0.1 check fails.",
+      "gap_note": ""
+    },
+    {
+      "id": "S06-3",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit7/z18gohazardsweep/probes_test.go",
+      "test_func": "TestZ18ConcurrentLoginIsBlockedByAnotherLoginsDiscovery",
+      "asserts": "Build tag audit7 (currently RED). Points a custom OIDC provider at a fake discovery endpoint whose FIRST request hangs; starts login 1 (AuthCodeURL) so it parks inside oidc.NewProvider while providerMu is held; then starts login 2 on the same provider and t.Errorf's if it has not completed within 400ms, on the premise that the issuer answers later discovery requests immediately. It exercises the exact cited path (Client.AuthCodeURL -> oauthConfig -> oidcProvider), but the assertion is the red probe asserting the NEGATION of the defect (concurrent login completes), not the defect (it is serialised): the test goes green only if the lock is released and every caller still performs its own discovery fetch.",
+      "gap_note": "CORRECTED from direct to partial. It is a pure fixture probe rather than a defect pin: it t.Errorf's while the defect exists and would PASS only once the lock is released without single-flight, so it does not assert the defect and cannot satisfy 'fail once the code is fixed'. No companion test in the file (Z18-1/Z18-3/bulkhead guard) turns red when the lock is fixed. Extra wrinkle found while checking: the finding's own recommended fix is a single-flight, under which login 2 would join login 1's still-hung shared fetch, so this probe would remain red after the recommended fix as well. Harness needed: count discovery requests at the fake OP under N concurrent AuthCodeURL calls and assert exactly one shared attempt (and a bounded negative cache/temporary failure observation after the issuer fails), plus a direct assertion that discovery no longer runs while providerMu is held (e.g. issue a different, cached-provider login concurrently and bound it by wall time)."
+    },
+    {
+      "id": "S06-4",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test floods /login/{provider}/start, and no test observes the size of SocialLogin.states or the O(n) sweepLocked cost. referencesource/social_test.go exercises start+callback once (TestSocialLoginEndToEnd, TestSocialLoginStateIsSingleUse) but never inserts more than a state or two and never asserts a bound; the zzprobe audit7/z14 kit-rp probes do not touch SocialLogin. (reference-source tests are gitignored by the /referencesource build-output rule, so this was re-searched explicitly against referencesource/*_test.go.) Harness needed: inject a clock (TapTapConfig exposes Now; SocialConfig would need the equivalent) or hold StateTTL, issue N start requests, then assert a cap/eviction (or that the sweep is not O(n) per insert) rather than unbounded growth."
+    },
+    {
+      "id": "S06-5",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test floods POST /login/taptap/challenge or inspects TapTapLogin.attempts / sweepLocked. referencesource/taptap_test.go exercises one challenge+poll end to end (TestTapTapLoginEndToEnd, with a fake clock) and internal/zzprobe/audit7/z14kitrptaptap/refsrc_test.go adds cross-browser poll probes, but neither inserts many attempts nor asserts any map cap or non-quadratic sweep. (referencesource/*_test.go is gitignored by /referencesource and was re-searched explicitly.) Harness needed: a fake enroller/clock, N challenge requests, and an assertion that the attempt map is bounded (cap/eviction) or that per-challenge sweep work does not grow with N."
+    },
+    {
+      "id": "S06-6",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "Every existing conformance.Run test serves a 200 /.well-known/oauth-authorization-server (upstreamkit/conformance/conformance_test.go default and its metadata() helper, internal/zzprobe/audit7/z14kitrptaptap/conformance_test.go, internal/zzprobe/audit7/z14verify/fixture_test.go and internal/zzprobe/protocol/kit), so the non-200 branch that returns before defer closeBody(resp) (conformance.go:211-216) is never reached, and no test asserts resp.Body is closed at all. Harness needed: a target whose discovery succeeds but metadata answers 403/500, driven through Run with a body-close-tracking RoundTripper (or a ConnState/connection counter on the httptest server) asserting the response body was closed."
+    },
+    {
+      "id": "S06-7",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit7/z14kitrptaptap/rpconfig_test.go",
+      "test_func": "TestZ14HalfExplicitEndpointIsSilentlyDiscarded",
+      "asserts": "Build tag audit7 (currently RED). Wires a custom OIDC provider with AuthURL set to /real-authorize and TokenURL deliberately empty, then asserts the login URL's path is /real-authorize. Because oauthConfig only short-circuits when BOTH are non-empty, discovery runs and cfg.Endpoint is overwritten, so the login lands on the document's /authorize and the test t.Errorf's, quoting idp/idp.go's AuthURL/TokenURL handling. Paired control TestZ14ControlBothExplicitEndpointsAreHonoured proves both-set skips discovery. It directly exercises the cited oauthConfig branch, but asserts the desired merged behaviour, not the defect.",
+      "gap_note": "CORRECTED from direct to partial. Red probe, not a defect pin: it t.Errorf's while the partial override is discarded and would PASS as soon as the finding is fixed (keep the configured AuthURL and fill only the empty side from discovery), so it does not satisfy 'fail once the code is fixed'. The paired control cannot compensate because it is green before and after the fix (both endpoints explicit still short-circuits). Harness needed: a characterisation test that asserts the discard itself, e.g. that a half-configured pair is overwritten by the discovered endpoint (or, for the recommended rejection fix, that NewRegistry returns an error for a partial override), so the test goes red exactly when the merge/reject fix lands."
+    },
+    {
+      "id": "S06-8",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test asserts that an injected RegistryConfig.HTTPClient must have a Timeout, and none exercises a hung jwks_uri during verifier.Verify to show that client cancellation/deadline cannot release the goroutine. TestExchangeUsesTheConfiguredClient (idp/idp_test.go) does inject a timeoutless &http.Client, but only asserts Exchange used its transport (token endpoint happy path), not the JWKS/cancellation defect; all OIDC tests inject provider.Client() (also timeout 0) but with a responsive JWKS, and idp/*_test.go contains no context cancellation/timeout assertion on this path. Harness needed: inject an http.Client with Timeout 0, serve a jwks_uri that blocks, call Identity with a cancellable context, and assert the call returns once the context/deadline fires (or that NewRegistry rejects/wraps a timeoutless client)."
+    },
+    {
+      "id": "S06-9",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/federation/zz_audit_fallbackclient_test.go",
+      "test_func": "TestZZAuditFallbackExchangeClientHasNoAddressGuard",
+      "asserts": "Build tag audit || audit6. Passes federation.NewService a Doer that is not an *http.Client so the NewOutboundClient(OutboundConfig{}) fallback performs the token exchange, against a loopback token endpoint, and asserts the fallback exchange SUCCEEDS (t.Fatalf if it refuses the loopback endpoint); a second run with an explicit DenyPrivateAddresses:true HTTPClient must fail with an allow_private_addresses error. It thereby pins the guard-off fallback and fails if the fallback is made fail-closed. Exercises internal/federation/service.go's fallback and httpclient.NewOutboundClient exactly.",
+      "gap_note": ""
+    },
+    {
+      "id": "S06-10",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "referencesource/social_test.go",
+      "test_func": "TestSocialLoginEndToEnd",
+      "asserts": "Drives GET /login/google/start?return_to=/ and then the callback, asserting the callback returns state=confirmed and subject=google:oidc-user-1 and that the credential lands in the vault. socialCallback decodes the callback JSON into a struct with only State and Subject fields, so the return_to field written at social.go:189 is exercised but never read or asserted.",
+      "gap_note": "Only the return_to=/ happy path is used (startSocial hardcodes /), and no test passes a hostile return_to (https://evil.example/x, //evil.example, javascript:) or asserts the callback JSON's return_to is sanitized via safeurl.RelativePath. Harness needed: start with a hostile return_to, complete the flow, and assert the echoed return_to is a safe relative path (or rejected), plus a direct test of the store/emit validation."
+    },
+    {
+      "id": "S06-11",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/safeurl/safeurl_test.go",
+      "test_func": "TestRelativePath",
+      "asserts": "Table test over RelativePath asserting '/' for scheme-relative //evil.example and ////, javascript:alert(1), TAB/CR/LF/DEL control bytes, and a backslash anywhere (prefix/middle/alone), while preserving /app/sources with query/fragment, unicode, and explicitly the percent-encoded '/%09/evil.example' and dot-segment '/../..' forms unchanged. That is precisely S06-11's verified claim: scheme-relative, backslash and control-byte escapes are neutralized and percent-encoded/dot-segment forms cannot change origin.",
+      "gap_note": ""
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "scope": "S06",
+  "verified": [
+    {
+      "id": "S06-1",
+      "status": "confirmed",
+      "final_severity": "high",
+      "reason": "Independently confirmed against go-oidc v3.21.0 in the module cache. oidc.NewProvider does `body, err := io.ReadAll(resp.Body)` (oidc/oidc.go:312) with no LimitReader/ContentLength check, and RemoteKeySet.updateKeys does the same (oidc/jwks.go:315). The client the adapter hands over (idp/idp.go:298-301, or an injected one) is a plain *http.Client over httpclient.NewTransport; NewTransport sets no DisableCompression and wraps no byte limit (httpclient/outbound.go:91-110, 304-321), so net/http's transparent gzip is on and io.ReadAll is bounded only by http.Client.Timeout (10s), not by bytes. The adapter's own 1 MiB cap at idp/idp.go:836 applies only to getText/userinfo. A 10 MB gzip bomb at 1000:1 inflates to ~10 GB, and a fast/stalled issuer can deliver that inside the 10s budget; the process OOMs. Discovery is reachable from the unauthenticated GET /auth/{provider}/start -> AuthCodeURL -> oauthConfig -> oidcProvider whenever the 15-min providerTTL has elapsed; the JWKS read (idp/idp.go:648 -> verifier.Verify) re-fires on any kid cache miss. Impact follows; high stands.",
+      "evidence_checked": "idp/idp.go:298,711,836; httpclient/outbound.go:91-110,304-321; go-oidc oidc/oidc.go:312; go-oidc oidc/jwks.go:315"
+    },
+    {
+      "id": "S06-2",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed. NewTransport hard-codes `Proxy: http.ProxyFromEnvironment` (httpclient/outbound.go:92), and the only SSRF control is dialer.Control = denyPrivateAddress (outbound.go:93-101,157-175). With an HTTP(S) proxy configured, net/http dials the proxy: for http requests it sends the absolute-URI to the proxy and for https it CONNECTs through it, so DialContext/Control receive the proxy's address; the target host is never resolved or checked locally. ProxyFromEnvironment does not bypass the proxy for private targets (it only exempts localhost/loopback plus NO_PROXY), so RFC1918/169.254.169.254 remain reachable through the proxy. internal/federation does not add a host allow-list either (federation.go:141-191 only defaults endpoints and validates RawBase), so the dial guard is the only control. Precondition is honestly disclosed (HTTP_PROXY/HTTPS_PROXY set in the deployment plus a source/issuer naming an internal target), which keeps this at medium rather than high, but the guard is genuinely void in that configuration.",
+      "evidence_checked": "httpclient/outbound.go:42,48,92-101,157-175; internal/federation/federation.go:140-191; cmd/re0auth/main.go:458-461,493-509"
+    },
+    {
+      "id": "S06-3",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed verbatim: c.providerMu.Lock()/defer Unlock() encloses oidc.NewProvider (idp/idp.go:706-713), and the early-return cache test uses discoveredAt, which is advanced only on success (idp/idp.go:721-722); retainOnDiscoveryFailure never advances it (idp/idp.go:736-747). So after providerTTL each caller that observes the lock performs its own fetch; there is no single-flight and no negative cache. A hung issuer therefore serializes N admitted logins at up to the 10s client Timeout each. Two honest caveats that hold the severity at medium rather than high: (a) waiters block on Mutex.Lock() and cannot observe their own context cancellation, but once a waiter acquires the lock its already-cancelled request ctx aborts NewProvider's Do quickly, so the full N*10s worst case needs clients that keep waiting; (b) the composition root bounds concurrency with a per-address rate limiter and an in-flight cap (cmd/re0auth/main.go:540, internal/httpapi/server.go:639-641), which caps N. The library-level convoy and the missing negative cache are real.",
+      "evidence_checked": "idp/idp.go:705-724,736-748; internal/httpapi/server.go:639-641; cmd/re0auth/main.go:540"
+    },
+    {
+      "id": "S06-4",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed. handleStart is unauthenticated (referencesource/social.go:81,87-93) and on every request takes l.mu, runs sweepLocked() which scans the entire states map, then inserts (social.go:102-111). States live for the 10-min StateTTL (social.go:63-65,109) and there is no timer, no cap and no rate limiter in the referencesource binary, so n grows with request rate and per-insert cost is O(n) -> O(n^2) total work under the same mutex handleCallback needs (social.go:128-131). Memory is bounded only by rate x TTL, which is not a bound. Medium availability severity stands.",
+      "evidence_checked": "referencesource/social.go:63-65,81,87-111,128-131,193-200; cmd/referencesource/main.go:141-148"
+    },
+    {
+      "id": "S06-5",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "Confirmed and structurally identical to S06-4. POST /login/taptap/challenge (referencesource/taptap.go:107,210-217) is unauthenticated and begin() locks l.mu, sweeps all attempts, then inserts (taptap.go:124-127); each entry retains a full taptapoauth.DeviceAuth. sweepLocked scans the whole map (taptap.go:258-265); expiry is only a.auth.ExpiresAt and there is no cap, no timer, and no limiter in cmd/referencesource. Polls share the same mutex (taptap.go:143-162), so a flood turns into quadratic CPU plus unbounded map growth. The note that each call also does an upstream Start request does not bound the attack, because the map is keyed per challenge and grows even if the visitor abandons the attempt. Medium stands.",
+      "evidence_checked": "referencesource/taptap.go:107,113-136,140-162,210-217,252-265; cmd/referencesource/main.go:141-148,158-188"
+    },
+    {
+      "id": "S06-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. runner.request returns the *http.Response without closing it (conformance.go:134-147); checkOAuthMetadata returns on `err != nil || resp.StatusCode != http.StatusOK` at line 212 before the `defer closeBody(resp)` at line 216, so a transport-success/non-200 answer leaves resp.Body unclosed and the connection unreusable. Every other response in the file registers closeBody. The impact is one leaked conn/goroutine/read-buffer per Run against such a target, not unconditional, so low is right.",
+      "evidence_checked": "upstreamkit/conformance/conformance.go:30,134-147,155,210-216"
+    },
+    {
+      "id": "S06-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. NewRegistry copies AuthURL/TokenURL per-field into def.endpoint (idp/idp.go:345-351); the static short-circuit requires BOTH non-empty (idp/idp.go:507), and the discovery path then overwrites the whole endpoint with the discovered pair (`cfg.Endpoint = endpoint`, idp/idp.go:514-520). So with a custom OIDC provider (issuer set, no static endpoints) and only one of auth_url/token_url configured, the configured value is silently discarded. Note the discovered endpoints are still pinned to the issuer origin (idp/idp.go:517,530-554), so this is a correctness/misconfiguration bug (the operator's proxy endpoint is bypassed and the exchange goes to the issuer), not a cross-origin secret leak. Low stands.",
+      "evidence_checked": "idp/idp.go:345-351,386-396,505-522,530-554"
+    },
+    {
+      "id": "S06-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed, with the cited mechanism slightly imprecise but the conclusion stronger than stated. Provider.Verifier() uses p.remoteKeySet(), and remoteKeySet() builds the key set from context.Background() (go-oidc oidc/oidc.go:154-164) augmented with the configured client; newRemoteKeySet then applies context.WithoutCancel (oidc/jwks.go:74). The Verify ctx passed at idp/idp.go:648 therefore never reaches the JWKS request: it is not cancellable and carries no deadline. The only bound is http.Client.Timeout. The service's own fallback client has a 10s timeout (idp/idp.go:298-301) and both shipped composition roots inject a 10s client (cmd/re0auth/main.go:458-461, cmd/referencesource/main.go:194), so this is only live for an embedder that injects a client with Timeout 0, which is exactly the library-trap the finding describes. Low reliability severity is appropriate.",
+      "evidence_checked": "idp/idp.go:287-302,644-652; go-oidc oidc/oidc.go:132-164; go-oidc oidc/jwks.go:65-75,302-318; go-oidc oidc/verify.go:132-144,334"
+    },
+    {
+      "id": "S06-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. The Doer-only branch installs httpclient.NewOutboundClient(httpclient.OutboundConfig{}) (internal/federation/service.go:368-377); TransportConfig.DenyPrivateAddresses is the zero value false (httpclient/outbound.go:42-48), so the client that posts the code and client secret to the token endpoint has a timeout and redirect policy but no address guard. An existing audit probe already demonstrates the asymmetry (internal/federation/zz_audit_fallbackclient_test.go:27-91: fallback reaches a loopback token endpoint, guarded control is refused). It remains a library-default trap: both composition roots pass an explicit client (cmd/re0auth/main.go:510-517 guarded per cfg.AllowPrivateUpstreams; cmd/referencesource does not use federation.NewService). Low stands. Adjacent gap for the federation/IdP scope, not raised here as a new finding: cmd/referencesource/main.go:194 injects `&http.Client{Timeout: 10s, CheckRedirect: ...}` with NO DenyPrivateAddresses into idp.NewRegistry, i.e. the shipped reference binary itself runs the social/OIDC client unguarded by the SSRF control.",
+      "evidence_checked": "internal/federation/service.go:347-378; httpclient/outbound.go:42-48,304-321; internal/federation/zz_audit_fallbackclient_test.go:27-91; cmd/referencesource/main.go:190-196; cmd/re0auth/main.go:493-517"
+    },
+    {
+      "id": "S06-10",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed. handleStart stores `r.URL.Query().Get(\"return_to\")` raw (referencesource/social.go:108) with no safeurl.RelativePath call (unlike internal/auth/auth.go:612 and internal/httpapi/federation_routes.go:378), and handleCallback echoes it verbatim as JSON `return_to` (social.go:188-190). It is attacker-controlled on the unauthenticated start endpoint (social.go:81). The caveat is real: grep found no in-repo consumer of that referencesource JSON, so the open-redirect/`javascript:` step depends on an out-of-repo frontend navigating to the field, which is why this stays low rather than medium. The validation gap itself is genuine.",
+      "evidence_checked": "referencesource/social.go:81,87-111,188-190; internal/auth/auth.go:612; internal/httpapi/federation_routes.go:378; internal/safeurl/safeurl.go:34-53"
+    },
+    {
+      "id": "S06-11",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Re-verified the negative claim independently. RelativePath (internal/safeurl/safeurl.go:34-53) replaces with \"/\" anything without a single leading slash, anything starting \"//\", anything containing a backslash, and anything url.Parse rejects (TAB/LF/CR). The percent-encoded forms the finding lists (/%%2F%%2Fhost, /%%5Chost, /%%2E%%2E//host) all keep the leading single slash and contain no raw backslash, so they are returned unchanged; because the authority is fixed by the single leading slash and encoded separators are not re-parsed as authority, the resolved origin cannot change. `go test ./internal/safeurl/...` passes. No bypass found; recorded as verified info, already mitigated.",
+      "evidence_checked": "internal/safeurl/safeurl.go:34-53; internal/safeurl tests (go test ok)"
+    }
+  ],
+  "summary": "All 11 S06 findings independently re-verified against the cited code, callers and the go-oidc v3.21.0 module cache: 11 confirmed (1 high, 4 medium, 5 low, 1 info), 0 downgraded, 0 rejected. S06-1 holds (go-oidc reads discovery/JWKS with io.ReadAll and no cap; transport auto-gzips; 10s Timeout bounds time, not bytes; unauthenticated start can trigger discovery after the 15-min TTL). S06-2 holds (ProxyFromEnvironment is unconditional and the dial-time guard is the only SSRF control, so a proxy makes the guard inspect the proxy, not the target); medium because HTTP(S)_PROXY is a stated precondition. S06-3 holds (mutex spans oidc.NewProvider, no single-flight/negative cache); kept medium with the caveats that composition bounds concurrency via limiter/in-flight cap and that cancelled waiters abort quickly. S06-4/S06-5 hold (unauthenticated maps, per-insert full sweep under the shared mutex, no timer/cap/limiter in the referencesource binary). S06-6..S06-10 hold at low (unclosed non-200 body in conformance; partial endpoint override discarded; JWKS fetch is context.Background-based and thus uncancellable when the injected client has no Timeout; federation fallback client has DenyPrivateAddresses off, already demonstrated by an in-repo probe; referencesource echoes unsanitized return_to with no in-repo consumer). S06-11's no-bypass claim is correct. Performance claims were checked by call frequency: discovery/JWKS reads happen only on TTL/kid miss but are still unbounded per occurrence; the social/taptap sweeps run on every unauthenticated start/challenge, giving genuine O(n^2) work. One adjacent gap noted (not a new finding): cmd/referencesource/main.go:194 injects an *http.Client without DenyPrivateAddresses into idp.NewRegistry."
+}

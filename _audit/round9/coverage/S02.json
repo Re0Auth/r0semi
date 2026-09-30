@@ -1,0 +1,106 @@
+{
+  "scope": "S02",
+  "verified_by": "adversarial coverage verifier, round 9",
+  "corrected_verdict_criteria": "direct means the test asserts the DEFECT (it fails if the code is fixed as recommended); partial means a related test exists but does not assert the defect; none means no test could be found.",
+  "findings": [
+    {
+      "id": "S02-1",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/zzprobe/audit6/z02protocoltoken/idtoken_test.go",
+      "test_func": "TestZ02MaxAgeAndPromptLoginAreIgnored",
+      "asserts": "Confirmed. Lines 125-149 drive the real authorize endpoint with a 2h-old session (complete() calls SetAuthTime(ctx,id,stale) exactly as the production login hook does) for prompt=login, max_age=0 and max_age=1, then require the id_token's auth_time to be within one minute of now (authTimeOf + the age>time.Minute check at 143-146). That is precisely the finding's defect: the store OVERWRITES AuthTime with the consent-decision timestamp instead of keeping SetAuthTime authoritative, so the assertion fails if the code is fixed the way the finding recommends (never overwrite AuthTime / keep SetAuthTime authoritative). The control at 153-163 asserts a plain request keeps the stale auth_time, and 167-170 asserts prompt=none still refuses without a session, so the probe is not a general auth_time regression. Companion tagged probe internal/zzprobe/audit6/z01protocolauth/consent_face_test.go TestProbePromptLoginAndMaxAgeDoNotForceReauthentication asserts auth_time >= the authorize instant (same refreshed/fabricated shape). Both are behind the opt-in audit6 tag, not the default suite.",
+      "gap_note": ""
+    },
+    {
+      "id": "S02-2",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/oidchttp/oidchttp_test.go",
+      "test_func": "TestPromptNoneRequiresASession",
+      "asserts": "Confirmed. Lines 283-292 set a live session and assert the prompt=none response does NOT contain error= and DOES contain authRequestID, i.e. it locks in 'with a session it proceeds to consent rather than erroring'. The finding's recommendation is to answer every prompt=none with an error redirect (consent_required when signed in), which would put error= in the Location and fail line 288. The rest of the test asserts the correct login_required/invalid_request halves and the untagged control. This is in the DEFAULT suite (no build tag), so it is the strongest pin in S02. Companion tagged probes assert the fix and currently fail: internal/zzprobe/protocol/discovery_test.go TestProbePromptNoneWithASessionProceeds (audit5) and internal/zzprobe/audit6/z01protocolauth/consent_face_test.go TestProbePromptNoneWithASessionRendersTheConsentUI (audit6).",
+      "gap_note": ""
+    },
+    {
+      "id": "S02-3",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/oidchttp/device_clientauth_test.go",
+      "test_func": "TestDeviceGrantPollAcceptsAdvertisedClientSecretPost",
+      "asserts": "Confirmed partial. The test exercises POST /oauth/device_authorization through startDeviceAuthz (Basic f.webID/'s3cret', lines 24-55) and the device-code poll with client_secret_post/none/wrong-secret, but every secret in the file is 's3cret'/'nsecret'/'not-the-secret' — no character url.QueryEscape rewrites. It therefore never asserts the basicID-unescaped/basicSecret-raw mismatch in deviceClientAuthenticated. Independent greps found no other coverage: oauth/http_test.go:17-66 pins the ClientCredentials helper with secret 's+cr/et= %' but not oidchttp's device pre-flight; internal/zzprobe/protocol/kit/kit_probe_test.go TestG4_BasicPercentDecodingDoesNotCrossAuthenticate (1697-1772) registers 'a+b'/'a b' secrets but drives oauth.Service.AuthenticateClient, not deviceClientAuthenticated; internal/zzprobe/audit7/z14verify/endpoint_test.go:251 QueryEscapes a Basic pair against the upstreamkit cascade endpoint, not this one. The escaped-Basic tests that do exist (audit6 z02protocoltoken/tokenauth_test.go:110-135, introspect_test.go:78-139) escape the client_id and leave the secret raw, at /oauth/token and /oauth/introspect.",
+      "gap_note": "No test registers a confidential client whose secret contains '+', ' ', '%', '/' or '=' and sends the correctly percent-encoded Basic pair (rawBasicHeader(url.QueryEscape(id), url.QueryEscape(secret))) to POST /oauth/device_authorization. Harness: extend the oidchttp fixture with such a client and assert 200 + device_code (currently 401 invalid_client), while the same credentials succeed at /oauth/token. Medium."
+    },
+    {
+      "id": "S02-4",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/oidcstore/oidcstore_test.go",
+      "test_func": "TestValidateSigner",
+      "asserts": "Confirmed partial. TestValidateSigner (lines 64-96) generates the 1024-bit key `small` (line 72) and feeds it only to NewSigner('kid', small) as the CURRENT key (line 84); the only retired key it constructs is `retired`, a 2048-bit key (lines 76, 90, 93). The companion internal/zzprobe/crypto/oidc_keys_test.go TestProbeSignerRejectsAmbiguousKeySets (audit5) likewise generates `small` at line 185 and uses it only in the 'undersized current key' case (211-213); every retired key in every case and in the good control is 2048-bit. No test builds a retired key below the 2048-bit floor, so adding the recommended r.Public bit-length check would leave all existing tests green.",
+      "gap_note": "Missing: NewSigner(good2048).WithRetired(RetiredSigningKey{ID:\"old\", Public:&small1024.PublicKey}) must be rejected by ValidateSigner (it is currently accepted and the key is published by KeySet/JWKS). Harness is trivial: reuse the existing 1024-bit `small` variable at oidcstore_test.go:72 as the retired Public. Medium."
+    },
+    {
+      "id": "S02-5",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/zzprobe/protocol/seam_test.go",
+      "test_func": "TestProbeDiscoveryIsCachedFromTheFirstRequestsHost",
+      "asserts": "Confirmed. Lines 246-301 use the dynamic-issuer shape (newEnv(t, envOptions{}), Config.Issuer empty), fetch /.well-known/openid-configuration with Host: attacker.example, then require a later fetch with Host: re0auth.example to receive the SAME poisoned issuer (271-273) and a jwks_uri containing attacker.example (274-276); they also assert the RFC 8414 alias shares the poisoned cache entry and the response is publicly cacheable (279-298). This asserts the defect as present: freezing the issuer at construction or caching per issuer would make the second fetch return re0auth.example and fail line 272. Build tag audit5 (line 1), so opt-in. Companion internal/oidchttp/zz_audit_protocol_test.go TestZZAudit_DiscoveryCacheIsHostBlind (protocolaudit tag) asserts the expected per-host behavior and currently fails.",
+      "gap_note": ""
+    },
+    {
+      "id": "S02-6",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit6/z06httpedge/routes_test.go",
+      "test_func": "TestZ06WellKnownVerbMatrixCoversEveryDocument",
+      "asserts": "Verdict CORRECTED direct -> partial. The test body is real (lines 129-157): for POST/PUT/DELETE/PATCH/OPTIONS on /.well-known/openid-configuration and /.well-known/oauth-authorization-server (plus oauth-protected-resource) it requires 405 and then requires rec.Header().Get(\"Allow\") to be non-empty, erroring when it is missing (150-152). But that is the FIXED behavior, not the defect: it currently FAILS. I ran it (go test -tags audit6 -run TestZ06WellKnownVerbMatrixCoversEveryDocument ./internal/zzprobe/audit6/z06httpedge/) and all 15 subcases fail with '405 with no Allow header'. Since adding Allow makes it PASS rather than FAIL, it does not pin the missing-Allow defect by the definition used here, so it is downgraded to partial. The untagged internal/oidchttp/adversary_test.go checks only the 405 status/body, never Allow; internal/httpapi/plane_test.go:502 does assert Allow but for the BUSINESS plane; companion internal/zzprobe/audit6/zverify/z06_probe_test.go asserts the same fixed behavior. No test locks in the missing-Allow defect.",
+      "gap_note": "No test asserts that a protocol-plane 405 LACKS Allow (the defect). The existing probes assert the opposite and are currently red. If the audit wants a defect-pinning record, none exists; if it wants a fix-verifying record, this test already provides it."
+    },
+    {
+      "id": "S02-7",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/httpapi/zzprobe_httpedge_test.go",
+      "test_func": "TestZZProbeEncodedAndOddSpellingsKeepTheirPlane",
+      "asserts": "Verdict CORRECTED none -> partial. The discoverer's premise ('no test requests a percent-encoded spelling of either discovery path') is false: this audit5-tagged probe includes /.well-known%2Fopenid-configuration (line 772) and /%2Ewell-known%2Fopenid-configuration (line 773) in its table (767-788) and drives both GET and POST through the real handler. I ran it: both spellings answer 404 application/json {\"error\":\"invalid_request\",\"error_description\":\"unknown OAuth endpoint\"} while the literal path answers 200. However, it asserts only the plane shape via zzAssertPlane (799), not that discovery is served, so it neither pins the defect nor checks 200+document; it just logs the 404. That is related-but-not-asserting, hence partial. None of the discovery tests (internal/oidchttp/oidchttp_test.go TestDiscoveryAndKeys, internal/zzprobe/audit6/z02protocoltoken/discovery_test.go, seam_test.go, audit6 z06 probes) use an escaped spelling.",
+      "gap_note": "Missing: a test that GETs an escaped discovery spelling and asserts 200 + the discovery document. NOTE (independent finding-level observation from a temporary probe that has been removed): the finding's OWN example spellings /.well-known/openid%2Dconfiguration and /.well-known/oauth%2Dauthorization-server actually answered 200 with the discovery document in this harness, so the cited Path-rewritten/RawPath-stale branch did not reproduce for the %2D spelling; the %2F spelling 404s through the outer routing, which is not necessarily serveDiscovery's clone. Whoever owns S02-7 should re-confirm the cited branch before writing a 200-asserting harness. Low."
+    },
+    {
+      "id": "S02-8",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/oidchttp/zz_audit_introspect_seam_test.go",
+      "test_func": "TestZZAudit_IntrospectRejectsAnIDToken",
+      "asserts": "Confirmed partial. Lines 21-51 call Handler.Introspect on an id_token, a live access token, a refresh token and the empty string and require Active=false with nil error for the non-access shapes. This reaches the SetIntrospectionFromToken-error -> oauth.TokenInfo{Active:false} path, but only for unknown/wrong-kind tokens; no test injects or classifies an infrastructure error. Independent grep for SetIntrospectionFromToken/ObserveStoreUnavailable across all test files found only store unit tests (memory/postgres) and internal/oidchttp/storemetrics_test.go TestStoreUnavailableIsCountedOnlyForInfrastructureFailures, which covers the REFRESH wrapper, not introspection. It would still pass after a fix that propagated infra faults on this path.",
+      "gap_note": "Missing: a store whose SetIntrospectionFromToken returns a pool/statement-timeout error, driven through Handler.Introspect and/or withBearer, asserting the outcome the fix should produce (5xx / store-unavailable metric) rather than 401 invalid_token. Harness: an op.Storage test double (the seam test / storemetrics tests already wrap op.Storage) whose introspection method returns an infra error; currently every error collapses to Active=false. Low."
+    },
+    {
+      "id": "S02-9",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/oidchttp/oidchttp_test.go",
+      "test_func": "TestSanitizeTokenResponse",
+      "asserts": "Confirmed partial. Lines 448-472 assert only the output contract of sanitizeTokenResponse (id_token removed without openid, offline_access trimmed, both preserved with openid+offline_access). There is no cost/allocation assertion, so the recommended bytes.Contains fast path or streaming rewrite would not fail it. Independent grep confirmed no testing.AllocsPerRun or allocation-ceiling benchmark targets sanitizeTokenResponse or the token-endpoint 200 path; internal/oidchttp/fuzz_test.go only calls isOAuthErrorBody without measuring it, and internal/oidchttp/bench_test.go only benchmarks BenchmarkIntrospectHandler.",
+      "gap_note": "Missing: an allocation/CPU budget on the token-endpoint 200 (and error) path, e.g. testing.AllocsPerRun around sanitizeTokenResponse/isOAuthErrorBody or a benchmark with -benchmem and an alloc ceiling for a response carrying offline_access. A pure correctness test cannot detect the two extra JSON passes. Low."
+    },
+    {
+      "id": "S02-10",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "Confirmed none. Independent greps for state/nonce length coverage found nothing: no test matches \"(state|nonce)\": {strings.Repeat, no maxState/maxNonce/StateBytes/NonceBytes/stateLength/nonceLength identifiers, and len(state)/len(nonce) appear in no test. The only parameter-size tests are for PKCE (internal/oidchttp/zz_audit_protocol_test.go, adversary_test.go:43-128 challenge, audit6 z01protocolauth regress_test.go long-challenge) and for request-body/header limits (internal/httpapi/bodylimit_test.go, zz_audit_httpapi_test.go). Harness needed: GET /oauth/authorize with state/nonce of ~60 KiB (valid client, redirect, PKCE) and assert the entrance refuses it; today it is accepted and persisted verbatim. Low."
+    },
+    {
+      "id": "S02-11",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/oidchttp/oidchttp_test.go",
+      "test_func": "TestConsentInteraction",
+      "asserts": "Confirmed partial, with a factual correction to the discoverer's note. Lines 529-539 call f.handler.DenyAuthorization and assert the redirect contains error=access_denied and state= and that the request is deleted; they make no assertion about iss. CORRECTION: newFixture (oidchttp_test.go:71-139) does NOT set Config.Issuer, and New stores h.issuer = strings.TrimRight(cfg.Issuer, \"/\") (oidchttp.go:237), so h.issuer==\"\" and DenyAuthorization actually DOES take the dynamic-issuer branch in this test (withIssuer(location, \"\") leaves it without iss) — the branch is reached, the test simply never asserts the presence or absence of iss. The other DenyAuthorization callers (internal/zzprobe/audit6/z01protocolauth/audit_deny_test.go:84, internal/zzprobe/audit7/z20authzisolationmatrix/consent_audit_test.go:93) assert audit events only, and the dynamic-issuer RFC 9207 tests cover discovery/success/error, never denial. Verdict partial stands.",
+      "gap_note": "Missing: deny an authorization on a Handler created with Config.Issuer==\"\" and assert the denial redirect carries (or, per the finding, omits) iss of the request host. The existing TestConsentInteraction already runs in that shape but never checks iss, so a one-line assertion there would close it. Info (latent: cmd/re0auth requires a non-empty issuer)."
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "scope": "S15",
+  "findings": [
+    {
+      "id": "S15-1",
+      "verdict": "partial",
+      "test_path": "internal/zzprobe/audit7/z13verify/z13verify_test.go",
+      "test_func": "TestZ13VKeyBackupLeavesPlaintextWhereTheSiblingLeavesNothing",
+      "asserts": "Runs the real scripts/backup.sh through bash with BACKUP_AGE_RECIPIENT set and no `age` on PATH and asserts the run exits 1 and leaves no *.dump behind; the sibling backup-keys.sh missing-age case is asserted the same way. This covers the pre-flight `command -v age` guard (backup.sh:28-31), not a failing `age --recipient` invocation.",
+      "gap_note": "No test exercises the defect: an `age` that exists but exits non-zero on line 45. Missing harness: put a stub `age` (exit 1) early on PATH, run the real scripts/backup.sh with BACKUP_AGE_RECIPIENT set into an empty temp dir, and assert the *.dump was removed after the non-zero exit. The existing probe would pass whether or not the line-46 shred guard exists.",
+      "corrected": false
+    },
+    {
+      "id": "S15-2",
+      "verdict": "none",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test reaches the CI service-image tags. internal/archtest/workflows_test.go only validates remote `uses:` SHA pinning (and pnpm caching / permissions), and internal/archtest/dockerfile_test.go only validates Dockerfile FROM digests; nothing parses `jobs.*.services.*.image`. The round-9 verifier itself records this as unguarded (archtest covers `uses:` and Dockerfile bases, not services.image). Harness needed: a YAML-decode of every workflow asserting each service image carries @sha256:<digest>, or a mutation test proving the release gate turns red on a floating service tag.",
+      "corrected": false
+    },
+    {
+      "id": "S15-3",
+      "verdict": "partial",
+      "test_path": "internal/archtest/k8s_test.go",
+      "test_func": "TestBackupWorkloadIsSafeToLeaveRunning",
+      "asserts": "Parses deploy/k8s/backup/cronjob.yaml and asserts the schedule, concurrencyPolicy=Forbid, own pod label + NetworkPolicy selection, automountServiceAccountToken=false, runAsNonRoot, digest-pinned image, resources, securityContext and the /backups mount, plus that the inline script contains pg_dump, sha256sum and an -mtime retention guard.",
+      "gap_note": "It never asserts jobTemplate.spec.activeDeadlineSeconds, a `timeout`/PGOPTIONS statement_timeout around pg_dump, or a backup-staleness metric/alert in deploy/prometheus/re0auth.rules.yml — exactly the defect S15-3 describes. Harness needed: extend the existing CronJob parse to require a numeric activeDeadlineSeconds and add a rules-file assertion that no `re0auth_backup_*` staleness rule is silently absent (or that one exists).",
+      "corrected": false
+    },
+    {
+      "id": "S15-4",
+      "verdict": "partial",
+      "test_path": "internal/zzprobe/audit7/z13verify/z13verify_test.go",
+      "test_func": "TestZ13VDockerignoreLeavesGitIgnoredSecretsInTheBuildContext",
+      "asserts": "Implements a .dockerignore pattern matcher, proves it with positive controls (TestZ13VDockerignoreMatchersHavePositiveControls), then asserts the gitignored scratchpad/ keys.env, go.work, *.local.toml, coverage.out and bench.txt are NOT excluded. It is the audit-7 Z13V-1 class and covers the pre-fix list, not this finding's paths.",
+      "gap_note": "No test asserts `_audit`, AUDIT-ISSUES.md, `docs/`, or the key/cert shapes (*.pem/*.key/*.p12/*.crt/id_*) are excluded from the build context. The probe's scratchpad/go.work/*.out assertions now log 'already excluded' and carry no check for the new class. Harness needed: feed those exact paths (and a real tracked _audit file from `git ls-files _audit`) through the same matcher and require exclusion, or assert `COPY . .` was replaced by an explicit package list.",
+      "corrected": false
+    },
+    {
+      "id": "S15-5",
+      "verdict": "partial",
+      "test_path": "internal/httpapi/clientaddr_test.go",
+      "test_func": "TestClientAddrIgnoresForwardedForFromUntrustedPeer",
+      "asserts": "Exercises internal/httpapi/clientaddr.go directly: a peer outside TrustedProxies falls back to the peer address, and TestUndeclaredHeaderCollapsesClientsIntoTheProxy shows every client behind the proxy shares one rate-limit bucket. Both tests hardcode TrustedProxies=10.0.0.0/8 with a peer inside that range (10.1.2.3) or an obviously untrusted test address (203.0.113.7).",
+      "gap_note": "No test reads deploy/k8s/base/configmap.yaml's `trusted_proxies = [\"10.0.0.0/8\"]`, and none asserts the pod-CIDR mismatch or a startup warning when the observed peer is outside the declared prefixes (cmd/re0auth/config.go only refuses an empty list). Harness needed: parse the shipped ConfigMap and link the literal to the clientAddr behavior, e.g. assert the ConfigMap's CIDR contains the pod network or that the loader warns on a peer outside TrustedProxies.",
+      "corrected": false
+    },
+    {
+      "id": "S15-6",
+      "verdict": "partial",
+      "test_path": "internal/zzprobe/audit7/z13deploycisupplychain/z13_test.go",
+      "test_func": "TestZ13ReleasePushesTheReleaseTagBeforeTheScan",
+      "asserts": "Parses the release.yml `image` job step-by-step (order-preserving, not a YAML map), asserts the build-push-action really pushes (`push: true`, tags from type=ref,event=tag), the scan step really is a blocking --exit-code 1 HIGH,CRITICAL gate, and that `latest` is only promoted after the scan. It then t.Errorf's when the build-push step index is below the scan step index (release.yml:64-80 before :100-107): it is a RED-on-defect confirmation probe that passes as soon as the push is reordered after the scan, so it asserts the finding's recommended fix rather than locking in the defect. Caveat: the package is audit7-tagged and is compiled by `go vet -tags audit5,audit6,audit7 ./...` but is NOT in the CI `go test -tags audit7` package allowlist (ci.yml:370-375 runs only z08verify, z16verify, z22reconcile).",
+      "gap_note": "CORRECTED from direct to partial. Applying the finding's recommendation (scan before push / gate the push) turns this test GREEN, so it does not pin the described defect: on the current tree it is simply red because release.yml:64-80 does push first. Same shape as the explicitly downgraded red probes in _audit/round9/coverage/S10.json and S11.json ('applying that fix turns it GREEN rather than red: per the direct criterion it does not lock in the defect and is partial'). It remains a valid regression guard against re-introducing the push-before-scan ordering, but it is not a defect-pinning test, and the audit7 package is not executed by CI.",
+      "corrected": true
+    },
+    {
+      "id": "S15-7",
+      "verdict": "partial",
+      "test_path": "internal/zzprobe/audit7/z13deploycisupplychain/z13_test.go",
+      "test_func": "TestZ13ReleasePushesTheReleaseTagBeforeTheScan",
+      "asserts": "Locates and reads the release.yml `scan the image` step (its run text must contain --exit-code 1 and HIGH,CRITICAL) and the build-push step, but asserts only the gate's strength and ordering.",
+      "gap_note": "Nothing asserts the scan step's `run:` block is free of `-v /var/run/docker.sock:/var/run/docker.sock`, nor that the job's packages:write/id-token:write scopes are separated from the daemon-socket mount. Harness needed: a textual/YAML assertion over the Trivy step that the docker socket is not mounted, plus a control that a re-added `-v /var/run/docker.sock...` line makes the gate fail.",
+      "corrected": false
+    },
+    {
+      "id": "S15-8",
+      "verdict": "partial",
+      "test_path": "internal/observability/artifacts_test.go",
+      "test_func": "TestAlertRulesReferenceDeclaredMetrics",
+      "asserts": "Parses deploy/prometheus/re0auth.rules.yml, enforces the rule structure (alert/record name, non-empty expr, severity critical|warning|info, `for` window, summary + runbook_url) and that every metric matching the `re0auth_[a-z0-9_]+` regex is declared by the live registry; TestEveryRunbookLinkResolves resolves each anchor. The generic go_*/process_* series are outside that regex and are not inspected.",
+      "gap_note": "No test asserts the three generic-metric rules (Re0AuthGoroutineLeak / Re0AuthMemoryHigh / Re0AuthFileDescriptorsHigh) carry a job/instance selector or are scoped to Re0Auth targets, which is the finding. Harness needed: extend the rules parse to require each alert whose expr names go_*/process_* to carry a selector such as {job=~\"re0auth.*\"}.",
+      "corrected": false
+    },
+    {
+      "id": "S15-9",
+      "verdict": "none",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test reads deploy/k8s/base/namespace.yaml. internal/archtest/k8s_test.go parses the base and backup YAML but asserts only Deployment/Service/PDB/NetworkPolicy/ServiceAccount kinds, probes, resources, the pod/container securityContext, and the backup manifests; the Namespace document itself is never loaded (readYAMLDocs sees it in `kinds` but no assertion names it). Harness needed: YAML-parse namespace.yaml and assert pod-security.kubernetes.io/enforce (and audit/warn) = restricted.",
+      "corrected": false
+    },
+    {
+      "id": "S15-10",
+      "verdict": "none",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test inspects git file modes. The only script-related probes (internal/zzprobe/audit7/z13verify and z13deploycisupplychain) shell out to `git check-ignore`, run the scripts via `bash scripts/...` (never `./scripts/...`), or read them as text; internal/archtest/tooling_test.go runs `git ls-files -z` but only for filenames. Nothing runs `git ls-files -s` / `git ls-tree` or os.Stat().Mode(). Harness needed: an archtest that runs `git ls-files -s scripts/*.sh` (or git ls-tree HEAD scripts/) and asserts mode 100755 for every script whose first line is a shebang.",
+      "corrected": false
+    },
+    {
+      "id": "S15-11",
+      "verdict": "partial",
+      "test_path": "internal/archtest/workflows_test.go",
+      "test_func": "TestReleaseShipsNpmAttribution",
+      "asserts": "Asserts the Makefile has the `npm-attribution:` target (pnpm licenses list --json), that it is a prerequisite of `checksums` and `release`, and that the Dockerfile runtime stage copies npm-attribution; internal/zzprobe/dependencies TestProbeShippedFrontendCarriesThirdPartyAttribution adds the same wiring assertions and the non-empty-listing check, and internal/zzprobe/deploy TestReleasedArchivesCarryThePreReleaseWarning only checks the `dist` recipe copies README.md/SECURITY.md.",
+      "gap_note": "No test asserts the `dist` recipe copies the npm attribution JSON into the tar.gz/zip archives, which is the finding (the file is produced by a separate target that runs after `dist`; only the image gets it). The round-9 verifier states this is exactly why the gap passes the gate. Harness needed: parse the `dist` recipe and require it to copy dist/re0auth_${VERSION}_npm-attribution.json (or make `dist` depend on the attribution target and assert the archives contain it).",
+      "corrected": false
+    },
+    {
+      "id": "S15-12",
+      "verdict": "partial",
+      "test_path": "internal/archtest/k8s_test.go",
+      "test_func": "TestBackupWorkloadIsSafeToLeaveRunning",
+      "asserts": "Parses the backup CronJob and asserts the inline script contains `pg_dump`, `sha256sum` and an `-mtime` retention guard, plus non-root/read-only/no-token hardenings; it never inspects encryption.",
+      "gap_note": "No test asserts whether the in-cluster dump is age-encrypted or that BACKUP_AGE_RECIPIENT has no path in the CronJob — the defect is untested (it is a documented/accepted decision per docs/operations.md:125-126, so this is a coverage gap rather than a failing gate). Harness needed: assert the cronjob script either contains an age step writing *.dump.age or carries an explicit documented acknowledgement assertion.",
+      "corrected": false
+    },
+    {
+      "id": "S15-13",
+      "verdict": "none",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No _test.go reads .gitleaks.toml (repo-wide grep: the only references are the CI action in ci.yml's secrets job, docs prose, and the audit reports). The only gitleaks usage in the project is the CI action (ci.yml secrets job) and prose in docs; internal/archtest covers .golangci.yml (gosec allowlist), CODEOWNERS, workflows and the Dockerfile, not the secrets-scanner config. Harness needed: an archtest that parses .gitleaks.toml and asserts every [[allowlists]] block is anchored (^docs/security-audit-[0-9]+\\.md$) or scoped with `condition = \"AND\"` plus a specific regex, and turns red when the unanchored form is restored.",
+      "corrected": false
+    }
+  ]
+}

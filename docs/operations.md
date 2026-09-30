@@ -217,7 +217,8 @@ kubectl apply -k deploy/k8s/backup
   请求携带的 `traceparent` 会被采纳，否则生成一个，便于跨日志关联。
 - 限流：429 带 `Retry-After`，所有带限流的响应带 `RateLimit-Limit/Remaining/Reset`；
   并发打满时 503 带 `Retry-After: 1`。桶键是（平面, 客户端地址），**IPv6 地址归并到 /64**；
-  `max_in_flight` 另按（平面, 客户端）分摊**份额**（上限的一半），单个地址占不满全部槽位。
+  `max_in_flight` 是进程级硬上限，另按**客户端地址**（跨平面合并，不再分平面）分摊**份额**（上限的一半）：
+  单个地址占不满全部槽位，也不能靠“两个平面各占一半”绕开分摊。
 - 常见现象：
   - `/readyz` 503 → Postgres 不可达或连接池耗尽；先看 `DATABASE_URL` 与数据库负载。
   - 大量 429 → 调整 `server.rate_limit` / `rate_limit_burst`，或检查是否有客户端刷接口。

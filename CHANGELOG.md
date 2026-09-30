@@ -6,6 +6,42 @@
 > `docs/*-decision.md` 的 ADR 里。升级步骤见 [docs/operations.md](docs/operations.md)
 > 的「升级」一节，它的第一步就是先读这里与受影响的 ADR。
 
+## Unreleased — 第九轮审计修复（8 条 High + S02-2）
+
+**上线前阻断项已收口。** 逐条修法与证据见
+[docs/security-audit-9.md](docs/security-audit-9.md) 的「修复状态」。
+
+### 协议面行为变化（下游 RP 必须知道）
+
+- **`prompt=login` / `max_age` 现在真的会重新认证**（S02-1）。此前二者被接受但不触发重认证，
+  且 `id_token.auth_time` 会被写成同意决策时刻。现在：会话不满足新鲜度时，登录边界把浏览器送回
+  IdP（`/auth/reauth` → `/auth/{provider}/start?mode=login`），`CompleteLogin` 只在记录到的认证时间
+  满足请求时才完成，否则经 `redirect_uri` 返回 `error=login_required`。**依赖“静默拿到新鲜
+  auth_time”的下游会开始看到 `login_required`**——这是修正，不是回归。
+- **`prompt=none` 有会话时返回 `error=consent_required`**（S02-2）。本 OP 不保存可复用的历史同意，
+  静默请求无法在无 UI 的情况下完成；此前会把同意页（交互 UI）交给 RP，现按 OIDC Core §3.1.2.1
+  经 `redirect_uri` 回 `consent_required`。用 `prompt=none` 做静默 SSO 的 RP 需要处理该错误。
+- **`return_to` 超过 2048 字节时被替换为 `/`**（S03-1）。此前无长度上限且整段写进服务端 session。
+
+### 配置与运维影响
+
+- **`storage.dsn_env` 现在总是被解析**（S08-2）。此前 driver 由 `dsn_env` 推断为 postgres 时并不读该
+  变量，进程会静默退回内存存储并跳过 `RE0AUTH_AUDIT_KEY` 门禁。现在：声明了但变量未设置 →
+  **启动即失败并给出字段名**；文件的 `dsn_env` 指定的变量名优先于字面量 `DATABASE_URL`（不再被环境
+  里残留的 `DATABASE_URL` 遮蔽）。
+- **并发上限的“单客户端份额”改按客户端地址计算，跨平面合并**（S10-1）。此前按（平面, 客户端）
+  各给一半，一个地址可用两个平面合计吃掉整个 `max_in_flight`。限流桶键不变。
+- **内存模式的 refresh tombstone 有上限**（S13-5，默认 65536）：超出后丢弃最旧的条目，重放检测对
+  最近轮换精确、对最早的部分变为尽力而为。
+- 其余修复：OIDC discovery/JWKS 响应体 1 MiB 上限（S06-1）、压缩协商失败不再绕过限流与并发上限
+  （S13-1）、绑定完成与解绑改为按绑定串行（S14-2）。
+
+### 防护网
+
+- CI 新增 `semgrep`（`p/golang` + `p/jwt`，**只报警不阻断**）。
+- CI 新增 `conformance`（OIDF 套件连通性 spike，每晚运行；当前为实验性、非阻断，见
+  [docs/conformance.md](docs/conformance.md)）。
+
 ## v0.0.0-rc.5
 
 **本轮把 P0/P1 全部收掉，并把 P2 分级里 T1（「不修上不了线」）的 9 条一并收掉**

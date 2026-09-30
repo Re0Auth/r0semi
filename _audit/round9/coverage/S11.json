@@ -1,0 +1,86 @@
+{
+  "scope": "S11",
+  "findings": [
+    {
+      "id": "S11-1",
+      "verdict": "direct",
+      "corrected": false,
+      "test_path": "internal/admin/admin_test.go",
+      "test_func": "TestActionsAreAudited",
+      "asserts": "Drives admin.Service.SuspendClient and then asserts, on the recorded admin.client.suspend event, that e.Detail[\"actor\"] == \"usr_admin\". That is exactly the raw operator account id stored verbatim in Detail, so the test pins the defect and would fail if the actor were moved to Event.Subject or reduced to a shape. Verified green on current code; it breaks precisely when the finding's recommendation is applied. A second, build-tag-gated probe (internal/zzprobe/admin/zzadmin_test.go TestZZAdmRegistrationSecretNeverReachesTheAuditDetail, //go:build audit5) also relies on detail[actor] being the raw usr_ id as its non-vacuity control.",
+      "gap_note": ""
+    },
+    {
+      "id": "S11-2",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit7/z10adminauditprivacy/killswitch_report_test.go",
+      "test_func": "TestZ10KillSwitchAllIsSilentAboutAMissingSessionRevoker",
+      "asserts": "Real HTTP POST /v1/admin/kill_switch {\"target\":\"all\"} against a server assembled with no Sessions port: asserts 200, sessions_revoked==0, bindings_unavailable==true as control, and t.Errorf unless report[\"sessions_unavailable\"]==true. Confirmed RED (`go test -tags audit7 -run TestZ10KillSwitchAllIsSilentAboutAMissingSessionRevoker ./internal/zzprobe/audit7/z10adminauditprivacy/` FAILs at killswitch_report_test.go:67). It is a defect-detecting probe that asserts the finding's recommended fix, so applying that fix turns it GREEN rather than red: per the direct criterion (would fail if the code were fixed as recommended) it does not lock in the defect and is partial. It remains a valid fix-validation regression test. (//go:build audit7; the source-level twin is internal/zzprobe/audit7/z10verify/killswitch_source_test.go TestZ10VerifyKillSwitchReportHasNoSessionUnavailableMarker.) The ungated main-suite test internal/admin/admin_test.go TestKillSwitchTouchesNoSessionsWithoutARevoker only asserts sessions_revoked==0 and would still pass after the fix.",
+      "gap_note": "Verifier correction (direct -> partial): the cited test is a currently-RED probe encoding the desired post-fix behavior, not a test that locks the defect in. It exercises the exact production path and will validate the fix, but it does not witness the defect as expected behavior. A genuine direct lock would assert the marker's absence (the shape used by the audit7 source-level twin); no ungated test asserts anything about the session dimension's unavailability."
+    },
+    {
+      "id": "S11-3",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/admin/admin_test.go",
+      "test_func": "TestKillSwitchSubjectPurgesFlows",
+      "asserts": "Wires a fakeFlowPurger and asserts a target=subject sweep calls PurgeUserFlows(\"usr_1\") and that the count reaches rep.FlowsPurged==3. TestKillSwitchAllRevokesEverythingAndDropsSessions separately exercises target=all but with no Flows port. The audit5 probe internal/zzprobe/admin/zzadmin_test.go TestZZAdmKillSwitchHasNoFlowPurgerWhileErasureDoes (lines 191-236) is also subject-target only. Nothing asserts anything about the all-target flow dimension.",
+      "gap_note": "No test wires a Flows port and calls KillSwitch with Target{All:true}, so neither the missing global purge nor the missing unavailability marker is asserted. Harness needed: a FlowPurger fake (and, for the marker, a FlowsUnavailable field that does not exist yet) plus an all-target test asserting either that pending flows were purged or that the report explicitly says it cannot purge them. Today the FlowPurger port exposes only PurgeUserFlows, so an all-target test can only observe absence."
+    },
+    {
+      "id": "S11-4",
+      "verdict": "partial",
+      "corrected": true,
+      "test_path": "internal/zzprobe/audit7/z10adminauditprivacy/killswitch_report_test.go",
+      "test_func": "TestZ10KillSwitchDropsThePartialSummaryWhenASweepFails",
+      "asserts": "Drives a subject sweep whose binding port returns an error after tokens (7) and sessions (2) were already cut: asserts the HTTP response is 500, that every port was called, that the audit row is outcome=error carrying detail tokens_revoked=7, and t.Errorf unless the 500 body contains tokens_revoked. Confirmed RED (`go test -tags audit7 -run TestZ10KillSwitchDropsThePartialSummaryWhenASweepFails ./internal/zzprobe/audit7/z10adminauditprivacy/` FAILs at killswitch_report_test.go:118 on the bare problem+json body). It is a defect-detecting probe asserting the finding's recommended fix, so returning the partial Report turns it GREEN rather than red: per the direct criterion it does not lock in the defect and is partial. (//go:build audit7; source-level twin internal/zzprobe/audit7/z10verify/killswitch_source_test.go TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer. The service-level audit5 probe internal/zzprobe/verifyfederation/killswitch_test.go TestVerifyPartialKillSwitchSummaryIsDiscardedByTheOperatorPlane locks in the bindings-only variant of the loss and would break if the service itself returned the partial outcome.) No ungated test covers the failure path.",
+      "gap_note": "Verifier correction (direct -> partial): the cited test is a currently-RED probe encoding the post-fix response shape, not a test that locks the discarded-summary behavior in. It exercises the exact HTTP failure path and will validate the fix, but it does not witness the defect as expected behavior."
+    },
+    {
+      "id": "S11-5",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "No test drives KillSwitch with Target{ClientID:...}. Independent verification: `grep -rn 'Target{' **/*_test.go` returns only Target{All}, Target{Subject}, Target{Bindings} and one Target{All:true, ClientID:\"cli_a\"} ambiguity check at internal/admin/admin_test.go:259 (expects ErrInvalidTarget); no test anywhere passes a lone ClientID target. The only kill_switch HTTP bodies are {\"target\":\"all\"}, {\"target\":\"bindings\"}, {\"target\":\"subject\"} and the empty/invalid ones. The registry-level ErrClientNotFound-on-SetStatus path is tested at oauth/client_admin_test.go:50 and internal/store/postgres/postgres_test.go:1330, but never through KillSwitch.",
+      "gap_note": "Confirmed none. Harness needed: an admin.Service whose Clients.SetStatus returns oauth.ErrClientNotFound (e.g. oauth.MemoryClientRegistry after Delete, or a stub) while Tokens is non-nil with live tokens, then assert RevokeTokens still runs and the endpoint is not a bare 500. An HTTP-level version would DELETE /v1/admin/clients/{id} so the row is gone, then POST kill_switch {\"target\":\"client\",...} and assert the tokens are revoked."
+    },
+    {
+      "id": "S11-6",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/store/postgres/auditchain_test.go",
+      "test_func": "TestVerifyTimeoutOutlivesThePoolBoundButStaysUnderTheHTTPCeiling",
+      "asserts": "Pins verifyStatementTimeout above DefaultPoolOptions().StatementTimeout and below a literal 60s HTTP writeTimeout. That is a constant-relationship guard, not a concurrency assertion. Other Verify tests (auditread_test.go, auditpseudo_test.go, auditchain_test.go) exercise correctness of the walk only; internal/httpapi/audit_routes_test.go TestAdminAuditVerifyReportsTheChain stubs audit.Reader.Verify and asserts only the reported fields. internal/store/postgres/zzprobe_perf_test.go TestPerfProbeVerifyExtrapolation (//go:build audit5) measures per-row CPU cost against verifyStatementTimeout.",
+      "gap_note": "Nothing asserts a per-endpoint concurrency bound, a single-flight/last-result cache, or that repeated /v1/admin/audit/verify calls cannot pin pooled connections. Harness needed: a DB-backed test (TEST_DATABASE_URL; unavailable here) with MaxConns=N, N concurrent Verify calls holding the pool and a subsequent ordinary query, asserting either a semaphore/once-per-interval guard exists or that the second query is not starved. Postgres is required because the connection hold happens inside the open transaction."
+    },
+    {
+      "id": "S11-7",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/store/postgres/auditread_test.go",
+      "test_func": "TestAdversarialAuditNoKeyPageCarriesTheAppliedLimit",
+      "asserts": "Queries an unknown subject and a key-exists-but-filter-matches-nothing subject and asserts both empty pages carry the same applied default limit, and (in TestAuditQueryOnAnUnknownSubjectIsEmptyAndSideEffectFree) that the miss mints no key. internal/store/postgres/auditpseudo_test.go TestPseudonymCacheIsBounded asserts the cache never exceeds pseudoCacheMax and stays usable after a flush. The audit7 source-shape probes internal/zzprobe/audit7/z10verify/pseudo_source_test.go and reads_source_test.go pin only the cache-read-before-query ordering, and postgres_cache_test.go pins cross-instance cache staleness after an erasure. None of these observe the number of DB round trips or latency.",
+      "gap_note": "No test asserts that loadKey misses are cached or that the hit and miss branches cost the same number of queries; the timing oracle described in the finding is entirely unasserted. Harness needed: an instrumented AuditLogger (or a fake pool / query counter) that counts audit_subject_keys lookups for repeated unknown subjects and asserts a bounded negative cache or uniform round trips, plus a timing-shape assertion if the oracle is to be pinned. DB-backed Postgres is needed for the real path."
+    },
+    {
+      "id": "S11-8",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/httpapi/export_routes_test.go",
+      "test_func": "TestExportAccountSaysCredentialsAreExcluded",
+      "asserts": "Asserts notice.credentials_excluded==true and a non-empty reason. That assertion holds regardless of whether sessions/tokens/audit history are added to the document, so it does not pin the defect. Siblings pin the positive shape (profile/identities/bindings/grants present) and absence of credential-shaped strings; internal/zzprobe/audit7/z10adminauditprivacy/metrics_export_test.go (//go:build audit7) asserts JSON/no-CSV, exactly one usr_ id and credentials_excluded.",
+      "gap_note": "No test asserts that sessions/issued tokens and the account's audit history are omitted, nor that the notice only disclaims credentials. Adding an audit section or audit_excluded/sessions_excluded notice fields would leave every export test green. Harness needed: assertions that the document's notice enumerates each excluded category (audit_excluded, sessions_excluded) or that the audit/session data is present, using the existing newBindEnv/export harness."
+    },
+    {
+      "id": "S11-9",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "internal/httpapi/admin_test.go",
+      "test_func": "TestAdminRegisterListSuspendDelete",
+      "asserts": "Calls GET /v1/admin/clients and asserts 200 with data length 2 (the seeded plus the registered client), plus status transitions in the inventory. It exercises the happy path only; it never inspects limit/cursor fields or response size bounds. Independent grep of internal/httpapi/admin_test.go for Limit|cursor|ListClients returns nothing.",
+      "gap_note": "No test registers more than a handful of clients or asserts a page cap/pagination on the admin client list, so removing/adding a bound is invisible. Harness needed: register more clients than any cap (or assert absence of a cap deliberately) and check the response is bounded and that limit/cursor parameters are honoured; alternatively an in-package test over admin.Service.ListClients asserting a cap or cursor. Storage-backed variant would need Postgres."
+    }
+  ]
+}

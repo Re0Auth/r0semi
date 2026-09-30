@@ -1,0 +1,95 @@
+{
+  "scope": "S09",
+  "findings": [
+    {
+      "id": "S09-1",
+      "verdict": "partial",
+      "test_path": "internal/store/postgres/migrate_down_test.go",
+      "test_func": "TestMigrateDownRollsBackOneStep",
+      "asserts": "Drives the happy path of MigrateDown with a valid TEST_DATABASE_URL DSN: rolls back exactly one goose migration (version decreases) and Migrate re-applies it (version restored). It never supplies a malformed DSN and never inspects the error text returned by MigrateDown/withMigrationLock. DSN redaction is asserted elsewhere, but only on the pool path (postgres.Open/poolConfig: internal/store/postgres/pool_test.go TestPoolConfigDoesNotEchoTheDsnOnAParseFailure and internal/zzprobe/audit7/z19verify/dsnredact_test.go TestZ19VDsnParseErrorRedactionBattery).",
+      "gap_note": "No test reaches the withMigrationLock/MigrateDown DSN-parse-error path the finding is about. Harness needed: call MigrateDown(ctx, malformedDSN, DefaultPoolOptions()) (or Migrate) with a DSN whose password pgconn cannot redact (e.g. \"postgres://user:pw\" or a keyword/value typo), then assert the password substring is absent from the returned error; alternatively add a source guard asserting redactDSNParseError is applied inside withMigrationLock / that MigrateDown parses through poolConfig first.",
+      "corrected": false
+    },
+    {
+      "id": "S09-2",
+      "verdict": "direct",
+      "test_path": "internal/zzprobe/pgstore/atomicity_probe_test.go",
+      "test_func": "TestMultiStatementMutationsRunInATransaction",
+      "asserts": "Classifies legacy oauth.go Tokens.RevokeTokens as an 'unprotected' multi-write method: it must issue >=2 writes (countWrites counts revokeMatching plus the oauth_codes/oauth_refresh_tombstones DELETEs) and must NOT contain '.Begin('; if a transaction is added the test errors 'now opens a transaction'. This exactly pins the current defect (autocommit RevokeTokens): the probe passes today and would FAIL if the recommended fix landed, so it is the fail-on-fix direction the direct bar requires. Build-tagged audit5 and source-level rather than runtime.",
+      "gap_note": "",
+      "corrected": false
+    },
+    {
+      "id": "S09-3",
+      "verdict": "partial",
+      "test_path": "internal/store/postgres/postgres_test.go",
+      "test_func": "TestAccountsUnlinkKeepsLastIdentity",
+      "asserts": "Calls Accounts.UnlinkIdentity against a healthy database: unlinking the last identity returns account.ErrLastIdentity, and TestAccountsUnlinkReassignsPrimary asserts unlinking the primary nominates a survivor. Neither test ever makes the `SELECT user_id FROM accounts_identities` Scan fail with a non-noRows error, so the err-before-ownership ordering bug (account.go:200-206) is not exercised. (account_test.go and httpapi/identities_test.go exercise the same happy paths.)",
+      "gap_note": "No test injects a non-noRows database error into UnlinkIdentity and asserts it is surfaced instead of being mapped to account.ErrNotFound. Harness needed: run UnlinkIdentity on a pool whose statement fails with a non-noRows error (statement_timeout=1ms, cancelled context after Begin, or an unreachable/short-lived connection) and require an error that is NOT account.ErrNotFound / is not errors.Is(err, account.ErrNotFound); or a source guard asserting the account.go:199-206 block checks `err != nil` before the ownership comparison.",
+      "corrected": false
+    },
+    {
+      "id": "S09-4",
+      "verdict": "partial",
+      "test_path": "internal/store/postgres/oauth_refresh_family_guard_test.go",
+      "test_func": "TestTokensConsumeRefreshConsultsTheTombstone",
+      "asserts": "Reads the shipped SQL of *Tokens.ConsumeRefresh and asserts it contains the live claim ('FROM oauth_refresh_tokens'), family_id RETURNING, the tombstone INSERT/SELECT, oauth.RefreshReuseError/oauth.ErrTokenNotFound, 'look up spent refresh token', and wraps the claim and tombstone in one Begin/Commit judged by s.clock(). It says nothing about an expires_at predicate on the live DELETE, and adding `AND expires_at > $2` would leave every assertion green. postgres_test.go TestTokensConsumeIsSingleUse only consumes a NOT-yet-expired value.",
+      "gap_note": "No test asserts that an already-expired oauth_refresh_tokens row is not claimed (RFC-mandated invalid_grant / ErrTokenNotFound without a tombstone). Harness needed: SaveRefresh with ExpiresAt in the past, call Tokens.ConsumeRefresh, and assert the row survives or that no already-expired tombstone is written and no destructive claim occurred; equivalently extend the source guard to require `AND expires_at > $2` in the live DELETE.",
+      "corrected": false
+    },
+    {
+      "id": "S09-5",
+      "verdict": "partial",
+      "test_path": "internal/store/postgres/migrate_down_test.go",
+      "test_func": "TestMigrateDownRefusesToDestroyTheAuditChain",
+      "asserts": "In its own schema, exercises refuseAuditChainRollback at goose versions 12, 13 and 14: allowed at 12 and with no chained rows; refused at 13 and 14 once a row with row_hash IS NOT NULL exists; refusal mentions 13/14, ADR-0008 and backup. It never reaches version 24/25 and never creates a family_id/tombstone state. migrations_test.go TestAuditIntegrityMigrationsCannotBeRolledBack pins the guard string 'version != migrationAuditChain && version != migrationAuditPseudonyms' and the constants migrationAuditChain = 13 / migrationAuditPseudonyms = 14.",
+      "gap_note": "No test covers the 0024/0025 rollback path or asserts that a live family/tombstone state refuses Down. Harness needed: extend the schema-scoped migration harness (as TestMigrateDownRefusesToDestroyTheAuditChain does) to UpTo 24/25, insert a live oidc/oauth refresh row with a non-empty family_id (or a tombstone), then assert refuseAuditChainRollback returns a refusal naming the migration; additionally assert the 0024/0025 Down cannot silently drop oauth/oidc tombstones and family columns while detectable replay state exists.",
+      "corrected": false
+    },
+    {
+      "id": "S09-6",
+      "verdict": "partial",
+      "test_path": "internal/zzprobe/audit7/z10adminauditprivacy/postgres_chain_test.go",
+      "test_func": "TestZ10VerifyDoesNotCheckTheHeadAgainstTheLastRow",
+      "asserts": "Against a live Postgres, records three rows, reads the real head, then UPDATEs audit_chain.head_hash to a planted value no row carries; it asserts logger.Head returns the planted value and then runs logger.Verify and t.Errorf's while v.OK is true. That exercises the cited path and observes the defect, but it is a RED probe, not a fail-on-fix defect pin: the error fires exactly while the defect is present, so the test FAILS today and would PASS once Verify starts comparing the final walked hash with the stored head (the recommendation sets v.OK=false with a distinct Reason and returns a nil error, which trips neither the t.Fatalf on err nor the t.Errorf on v.OK). The discoverer's note that 'the test fails as soon as Verify starts comparing' has the polarity backwards. The bundled normal-suite auditchain_test.go tests middle deletion, metadata strip and injection but never tail truncation or a mismatched head. Downgraded direct -> partial.",
+      "gap_note": "No test pins the head-vs-walked-chain gap in the fail-on-fix direction, and the audit7 probe is absent from the default `go test` run. Harness needed: a characterization/tripwire guard that fails when the fix lands (e.g. assert the shipped Verify still returns OK=true for a planted head, or a source-level guard that the walk compares the final hash against head in one snapshot: single statement or SET TRANSACTION ISOLATION LEVEL REPEATABLE READ).",
+      "corrected": true
+    },
+    {
+      "id": "S09-7",
+      "verdict": "partial",
+      "test_path": "internal/store/postgres/oidc_test.go",
+      "test_func": "TestAuthorizationCodeIsSingleUse",
+      "asserts": "Exercises AuthRequestByCode on a healthy database (first exchange succeeds, second is refused) and TestExpiredAuthorizationCodeIsRefused covers the expired-code branch; TestDeviceCodeIsSingleUse / TestDevicePollingIsThrottled exercise GetDeviceAuthorizatonState. None of them produces a database failure, so the sentinel collapse in AuthRequestByCode's claim (oidc.go:327-331) and deviceState (oidc.go:1210-1219) is never asserted. The contrasted refresh/revocation paths ARE covered: refresh_family_guard_test.go TestRefreshHotPathClassifiesTheDatabaseFailure and internal/zzprobe/audit6/z04pgstore/revocation_error_probe_test.go (RevokeToken/GetRefreshTokenInfo only).",
+      "gap_note": "No test calls AuthRequestByCode or the deviceState read against a failing database and asserts the cause is preserved. Harness needed: build postgres.OIDCStore over the unreachable pool pattern used by internal/zzprobe/audit6/z04pgstore/revocation_error_probe_test.go (127.0.0.1:1) and assert GetDeviceAuthorizatonState (deviceState pool.Query) surfaces a non-sentinel error; AuthRequestByCode cannot be driven to the cited DELETE via an unreachable pool because its Begin fails first, so it needs a real connection plus cancellation/statement_timeout to make the DELETE error, then assert the error is not 'postgres: authorization code is unknown or expired'.",
+      "corrected": false
+    },
+    {
+      "id": "S09-8",
+      "verdict": "partial",
+      "test_path": "internal/zzprobe/pgstore/atomicity_probe_test.go",
+      "test_func": "TestMultiStatementMutationsRunInATransaction",
+      "asserts": "Its unprotected set pins sessions.go RevokeAllSessions, RevokeSubjectSessions and SweepExpired plus oauth.go RevokeTokens and PurgeLegacySubject as issuing >=2 writes with no '.Begin(', and errors if a transaction is added. It does NOT list oauth.go DeleteRefresh, the fourth cited pair (oauth.go:290); oauth_refresh_family_guard_test.go TestTokensLifecycleClearsTheSpentFamilyResidue only asserts DeleteRefresh contains the tombstone DELETE, not that the two deletes are atomic.",
+      "gap_note": "DeleteRefresh's two autocommit deletes are uncovered, and no test exercises the half-applied interleaving claimed for any of the four methods (only the source shape is pinned). Harness needed: add DeleteRefresh to the atomicity probe's unprotected set (or wrap all four in one pgx.Tx) and, where a live DB is available, fail the second statement and assert no orphaned session_subjects row / no leftover tombstone / no leftover oauth_device_authorizations row remains.",
+      "corrected": false
+    },
+    {
+      "id": "S09-9",
+      "verdict": "partial",
+      "test_path": "internal/store/postgres/auditpseudo_test.go",
+      "test_func": "TestPseudonymCacheIsBounded",
+      "asserts": "Calls remember() pseudoCacheMax+50 times with distinct subjects and asserts the map never exceeds pseudoCacheMax, stays non-nil/usable, and returns the value just stored. It explicitly accepts the wholesale drop ('A hit after the drop still works: correctness never depends on warmth') and would still pass under an LRU/LFU policy, so it does not assert the all-or-nothing eviction defect.",
+      "gap_note": "No test asserts the hit-rate/round-trip consequence of clearing the whole map on overflow (records for subjects already seen being evicted). Harness needed: fill the cache to pseudoCacheMax, insert one new subject, then assert a previously-remembered subject is still present (fails today); or a perf/round-trip probe counting subjectKey SELECT/reselect misses during a >pseudoCacheMax distinct-subject burst.",
+      "corrected": false
+    },
+    {
+      "id": "S09-10",
+      "verdict": "partial",
+      "test_path": "internal/store/postgres/oidc_test.go",
+      "test_func": "TestOIDCGrantsAndRevoke",
+      "asserts": "Mints tokens through CreateAccessAndRefreshTokens and asserts the Grants record has non-zero IssuedAt and ExpiresAt with ExpiresAt after IssuedAt. It never compares IssuedAt with the store clock, so an issued_at populated by the migration's DEFAULT now() passes unchanged. clock_test.go TestDeadlinesAreJudgedByTheClockThatWroteThem covers other deadlines (sessions, sweep, AuthRequestByCode, Grants liveness, device AuthTime) but not issued_at, and the clock probes scan Go SQL now(), not migration DDL defaults.",
+      "gap_note": "No test asserts the source of oidc_access_tokens/oidc_refresh_tokens.issued_at. Harness needed: openTestDBWith(DefaultPoolOptions(), WithClock(skewedClock)) (the fixture clock_test.go already uses), mint tokens, read issued_at back via Grants/a raw query, and require it within about a second of the store clock rather than the database's now(); a second replica/clock-skew variant would pin the cross-replica ordering claim.",
+      "corrected": false
+    }
+  ]
+}

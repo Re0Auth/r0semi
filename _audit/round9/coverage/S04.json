@@ -1,0 +1,86 @@
+{
+  "scope": "S04",
+  "findings": [
+    {
+      "id": "S04-1",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/zz_probe_test.go",
+      "test_func": "TestZZProbeDeviceCodeRepeatMint",
+      "asserts": "Exercises exactly the cited path (BeginDeviceAuthorization -> DecideDeviceAuthorization -> PollDeviceAuthorization twice, then RevokeTokens -> third poll) and t.Logf's the second exchange, the post-revocation poll and introspection. It has no assertions at all: it does not fail whether the second poll mints a fresh pair or is refused, and it is excluded from the default build by `//go:build audit5`. No default-build oauth test polls an approved device_code twice. Note: the shipped OP path (a different implementation) is directly covered by internal/store/postgres/oidc_test.go:TestDeviceCodeIsSingleUse and TestRevokingAGrantDeletesItsDeviceAuthorization, and internal/httpapi/device_adversary_test.go, but those do not exercise oauth/device.go.",
+      "gap_note": "Needs an assertion on the oauth.Service path: after one successful token exchange, a second PollDeviceAuthorization with the same approved device_code must return invalid_grant, and a poll issued after RevokeGrant must not mint a new access+refresh pair. A consuming DeviceStore (ConsumeDevice/claim) is the behavior the test must pin; the current zz_probe test would stay green under the fix."
+    },
+    {
+      "id": "S04-2",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/device_test.go",
+      "test_func": "TestDeviceAuthorizationRejectsUnknownClientAndScope",
+      "asserts": "Calls BeginDeviceAuthorization through the oauth.Service and asserts that an unknown client id yields invalid_client and a scope the client may not request yields invalid_scope. Every device test registers ClientPublic clients (TestDeviceAuthorizationHappyPath, device_verify_path_test.go) and none passes a secret or registers a ClientConfidential client for the device grant, so the describeScopes auth=false path (oauth/as.go:445) is never exercised against a confidential client.",
+      "gap_note": "Needs a test that registers a ClientConfidential client with a secret and calls BeginDeviceAuthorization with only client_id plus the registered scope, asserting invalid_client, plus a companion test that HTTP Basic or client_secret_post with the correct secret still succeeds. No existing test would fail if confidential device requests were left anonymous."
+    },
+    {
+      "id": "S04-3",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/device_test.go",
+      "test_func": "TestDeviceAuthorizationExpires",
+      "asserts": "Advances the fake clock past the device TTL (11 minutes) and asserts PollDeviceAuthorization returns expired_token and DescribeDeviceAuthorization/DecideDeviceAuthorization return ErrDeviceNotFound. This pins the service-side deadline check only; it never inspects MemoryDeviceStore's byDev/byUser maps and never calls a sweep, so unbounded accumulation is invisible to it.",
+      "gap_note": "Needs a store-level test asserting that device records past ExpiresAt are released from both maps, e.g. after SaveDevice + clock advance a SweepExpired(now) returns the removed count and the map lengths drop, mirroring oauth/tokens_sweep_test.go:TestMemoryStoreSweepExpired and internal/store/memory/oidc_sweep_test.go for the OP store. No sweep API exists on MemoryDeviceStore today, so a harness must first add/observe one."
+    },
+    {
+      "id": "S04-4",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/grants_test.go",
+      "test_func": "TestGrantsListWhatAClientCanStillDo",
+      "asserts": "Drives svc.Grants (which calls MemoryStore.ListBySubject) and asserts listing correctness: per-subject isolation, ordering by client id, client-name resolution, scope set and has_refresh. oauth/grants_names_test.go additionally pins that names are fetched in one bulk lookup. Neither test asserts the cost shape of ListBySubject: no subject index, mutation of an instrumented store, lock-hold time or scan count is observed, so the O(total live tokens) walk under the store-wide mutex is untested.",
+      "gap_note": "Needs a benchmark or an instrumented-store test that proves the lookup touches only the subject's own hash set (e.g. a counter of rows visited vs a store with many other subjects' tokens), plus a concurrent test showing a grants read does not serialize token issuance. oauth has no grants benchmark; the only grants benchmark (internal/store/memory/oidc_grants_bench_test.go) covers the OP store, not oauth.MemoryStore."
+    },
+    {
+      "id": "S04-5",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/device_test.go",
+      "test_func": "TestDeviceAuthorizationHappyPath",
+      "asserts": "Calls BeginDeviceAuthorization, which internally runs freeUserCode, and asserts a device_code and user_code are issued; TestUserCodeIsHumanFriendlyAndNormalized separately asserts newUserCode's format/entropy and NormalizeUserCode. No test supplies a DeviceStore whose GetDeviceByUserCode returns a non-ErrDeviceNotFound error (or a cancelled context), so the error-conflation path and loss of the error cause are never exercised, and MemoryDeviceStore.SaveDevice's lack of a duplicate user-code check is never tested.",
+      "gap_note": "Needs a fault-injecting DeviceStore (the interleavingDeviceStore in oauth/device_race_test.go embeds DeviceStore but adds no error injection) whose GetDeviceByUserCode returns a generic error, asserting BeginDeviceAuthorization propagates that error rather than the generic 'could not allocate a unique user code'; and a test that SaveDevice/reject-on-write refuses a duplicate user code."
+    },
+    {
+      "id": "S04-6",
+      "verdict": "partial",
+      "corrected": false,
+      "test_path": "oauth/device_test.go",
+      "test_func": "TestDeviceAuthorizationSlowDownThenPending",
+      "asserts": "Asserts the throttle itself on a still-pending code: the immediate second poll returns slow_down and a poll after the 6s advance returns authorization_pending. TestDeviceAuthorizationDenied advances 6s before polling, so no test polls a DeviceDenied/DeviceApproved code inside the interval; no test configures a non-integral or sub-second DevicePollInterval, so the floor-at-1 advertised interval vs untruncated throttle mismatch is untested.",
+      "gap_note": "Needs tests that (a) decide a code denied/approved and poll within the interval, asserting access_denied/tokens precede slow_down, and (b) set Config.DevicePollInterval to e.g. 1500ms and assert the advertised Interval is the same effective value the throttle enforces (no spurious slow_down for a client pacing to the advertised interval)."
+    },
+    {
+      "id": "S04-7",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test reaches writeDecisionError's default branch or the DescribeAuthorization/DenyAuthorization error branches in internal/httpapi/authorization_routes.go. authz_flow_test.go's flowEnvOptions only allows substituting Federation and SessionStore, so the authorization.Interaction cannot be made to fail; TestConsentHandleCannotBeUsedByAnotherAccount and TestAuthorizationHandleIsBoundToBrowser assert the consentHandle ownership 404, which is a different code path. HandleDeviceDecision's classification is unit-tested by device_problem_test.go but that is not the consent path. Harness needed: an injectable authorization.Interaction (or ConsentStore) that returns a generic non-oauth error from DescribeAuthorization, DenyAuthorization and ApproveAuthorization, asserting 500 internal_error (with no leaked text) instead of 404 'authorization request expired'."
+    },
+    {
+      "id": "S04-8",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "oauth/scope_test.go exercises Registry.Register (duplicate/malformed rejection), Get and Resolve only sequentially, as does oauth/as_test.go:43; no test performs a concurrent Register against concurrent Get/Resolve, so the missing sync.RWMutex is invisible to the suite. The other race-style tests in the tree (internal/federation/zz_audit_race_test.go, internal/zzprobe/concurrency) target other components. Harness needed: a -race test that starts serving goroutines calling Get/Descriptors/Resolve while another goroutine calls Register, or an immutability test asserting Register refuses once serving begins."
+    },
+    {
+      "id": "S04-9",
+      "verdict": "none",
+      "corrected": false,
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "Every default-build call to BeginDeviceAuthorization in the oauth tests passes a non-empty scope slice (device_test.go, device_verify_path_test.go); the empty-scope input is never exercised, so the Registry.Resolve(nil) success -> scope-less token pair path is unverified. internal/httpapi/device_routes_test.go:TestDeviceDecisionExplicitEmptyScopesIsRefused tests the decision-time empty approval on the OP-backed route, not an empty-scope BeginDeviceAuthorization on oauth.Service. Harness needed: a test calling BeginDeviceAuthorization with no scopes (and with an empty slice) through oauth.Service, asserting it is refused (invalid_scope/invalid_request), plus a full-flow variant showing no token pair is issued for a zero-scope device authorization."
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+{
+  "scope": "S02",
+  "title": "OIDC provider + discovery + routes",
+  "findings": [
+    {
+      "id": "S02-1",
+      "title": "prompt=login / max_age never re-authenticate: the OP fabricates a fresh auth_time instead",
+      "severity": "high",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/oidcstore/oidcstore.go:226",
+        "internal/oidchttp/oidchttp.go:1006",
+        "internal/store/memory/oidc.go:1274",
+        "internal/store/postgres/oidc.go:1269"
+      ],
+      "evidence": "func (a *AuthRequest) RequiresReauthentication(now time.Time) bool {\n\tif slices.Contains(a.Prompt, oidc.PromptLogin) {\n\t\treturn true\n\t}\n\tif a.MaxAge == nil {\n\t\treturn false\n\t}\n\tat := a.GetAuthTime()\n\tif at.IsZero() {\n\t\treturn true\n\t}\n\tconst maxDurationSeconds = uint64(math.MaxInt64) / uint64(time.Second)\n\tif uint64(*a.MaxAge) > maxDurationSeconds {\n\t\treturn false\n\t}\n\treturn now.Sub(at) > time.Duration(*a.MaxAge)*time.Second\n}\n\n-- call site, internal/store/memory/oidc.go:1274 (identical logic in postgres:1269) --\n\tif now := s.now(); a.RequiresReauthentication(now) || a.AuthTime == nil {\n\t\ta.AuthTime = &now\n\t}\n\n-- oidchttp.go:1006-1014 leaves max_age enforcement entirely to the store --\n\t// OIDC Core §3.1.2.1: `max_age=N` asks the OP to re-authenticate when the\n\t// browser's last authentication is more than N seconds old. The judgement\n\t// itself is made where the session's auth_time and the request meet — the\n\t// login boundary (CompleteLogin) — because the store is what holds both.\n\tif raw := strings.TrimSpace(q.Get(\"max_age\")); raw != \"\" {\n\t\tif _, err := strconv.ParseUint(raw, 10, 64); err != nil {",
+      "why": "RequiresReauthentication is the only place the recorded session age is compared with the request's freshness bound, and its result is never used to force a re-login. cmd/re0auth/main.go's login hook only copies sessions.AuthenticatedAt into the pending request (SetAuthTime) and returns the consent URL; nothing sends the browser to /auth/{provider}/start when a fresh authentication is required, and the consent payload returned by handleGetAuthorizationRequest carries no prompt/max_age/auth_time field so the SPA cannot trigger it either. Both stores react to RequiresReauthentication==true by OVERWRITING AuthTime with the consent-decision timestamp, so the id_token advertises auth_time=now for an authentication that never happened. OIDC Core §2 defines auth_time as the time the End-User authentication occurred; a client that used max_age/prompt=login to force a fresh credential check is told it got one.",
+      "exploit": "An RP protecting a sensitive operation sends /oauth/authorize?...&max_age=300 (or prompt=login) for a user whose browser session is already hours old. The user is taken straight to the consent screen (no credential prompt), clicks approve, and the id_token carries auth_time = the click time. The RP accepts the token as freshly authenticated. An attacker holding a stolen-but-still-valid session cookie (Lifetime 24h / IdleTimeout 2h) can therefore satisfy an RP's step-up requirement without any credential, and the false auth_time claim is signed by the OP so a verifier cannot detect it. The same path satisfies prompt=login, which is documented as 'always requires a fresh authentication'.",
+      "recommendation": "Make the login boundary enforce the requirement instead of relabelling it: when the pending request RequiresReauthentication(now), the authorize/login redirect must send the browser through the IdP sign-in flow again (e.g. /auth/{provider}/start?mode=login&return_to=<resume URL>) and only CompleteLogin after a new SignIn has stamped a fresh auth_time; otherwise never overwrite AuthTime with the decision time. Keep SetAuthTime's value as the authoritative auth_time, and add a regression test that a max_age=0 / prompt=login request with a 2h-old session results in a new authentication (new AuthenticatedAt), not just a new auth_time.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-2",
+      "title": "prompt=none with a live session redirects into the interactive consent UI instead of returning consent_required",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:991",
+        "internal/oidchttp/oidchttp.go:995",
+        "cmd/re0auth/main.go:1341"
+      ],
+      "evidence": "\t\t// A live session satisfies the silent request, so it proceeds to consent.\n\t\t// Nil Sessions (or no session) means it cannot be satisfied without a UI:\n\t\t// fail closed to login_required rather than answering a silent request as\n\t\t// if it were interactive.\n\t\tif !h.signedIn(r) {\n\t\t\tparams := map[string]string{\n\t\t\t\t\"error\":             \"login_required\",\n\t\t\t\t\"error_description\": \"prompt=none requires an existing session\",\n\t\t\t\t\"state\":             q.Get(\"state\"),\n\t\t\t\t\"iss\":               h.issuerFor(r),\n\t\t\t}\n\t\t\thttp.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)\n\t\t\treturn true\n\t\t}\n\t}\n\n-- login hook after validateAuthorize lets the request through (cmd/re0auth/main.go:1341) --\n\t\treturn webui.BasePath + \"/consent?id=\" + url.QueryEscape(id)",
+      "why": "Only the no-session half of OIDC Core §3.1.2.1 is implemented. Re0Auth has no remembered/pre-configured consent: every authorization creates a fresh AuthRequest that only CompleteLogin marks Done, and CreateAuthRequest never consults existing grants. So with a live session the request is always driven to the interactive consent page. OIDC Core §3.1.2.1 requires prompt=none to return an error (consent_required / interaction_required) through the redirect_uri and forbids displaying any authentication or consent UI. The wrapper even sets Content-Security-Policy: frame-ancestors 'none' at the edge, so an RP's hidden silent-auth iframe is blocked outright rather than receiving a protocol answer.",
+      "exploit": "An RP performs silent re-authentication in a hidden iframe: GET /oauth/authorize?prompt=none&... . The browser gets a 302 to /app/consent?id=... (the SPA shell). Because frame-ancestors 'none' is set, the frame is blocked; the RP never receives an OAuth response and its session check hangs or reports a broken iframe instead of a clean consent_required that it could handle by showing a button. No server-side attacker is needed; any OIDC RP using prompt=none reproduces it.",
+      "recommendation": "Because this OP cannot satisfy prompt=none non-interactively, answer every prompt=none request that reaches the authorize endpoint with an error redirect: use consent_required when the browser is signed in and login_required when it is not, and never fall through to the library's RedirectToLogin for prompt=none. If remembered consent is ever added, return it only when a stored grant covers the requested scopes.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-3",
+      "title": "Device authorization endpoint refuses spec-compliant Basic secrets: id is form-unescaped, secret is not",
+      "severity": "medium",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:1114",
+        "internal/oidchttp/oidchttp.go:1152",
+        "internal/oidchttp/oidchttp.go:1175"
+      ],
+      "evidence": "\tif hasBasic {\n\t\t// The library decodes the Basic username with url.QueryUnescape before\n\t\t// it looks the client up (pkg/op/client.go ClientBasicAuth). Comparing\n\t\t// the raw bytes with the form's id — and looking the raw bytes up —\n\t\t// would check one identity while the library records another.\n\t\tdecoded, err := url.QueryUnescape(basicID)\n\t\tif err != nil {\n\t\t\twriteOAuthJSONError(w, http.StatusUnauthorized, \"invalid_client\",\n\t\t\t\t\"malformed client credentials\")\n\t\t\treturn true\n\t\t}\n\t\tbasicID = decoded\n\t}\n...\n\tif client.Type == oauth.ClientConfidential && !deviceClientAuthenticated(form, client, hasBasic, basicSecret) {\n\t\twriteOAuthJSONError(w, http.StatusUnauthorized, \"invalid_client\",\n\t\t\t\"a confidential client must authenticate at the device authorization endpoint\")\n\t\treturn true\n\t}\n...\nfunc deviceClientAuthenticated(form url.Values, client oauth.Client, hasBasic bool, basicSecret string) bool {\n\tif hasBasic {\n\t\treturn client.Authenticate(basicSecret)\n\t}\n\tsecret := form.Get(\"client_secret\")\n\tif secret == \"\" {\n\t\treturn false\n\t}\n\treturn client.Authenticate(secret)",
+      "why": "basicID is decoded with url.QueryUnescape two lines before use, but the paired basicSecret is passed raw to client.Authenticate, which hashes it and compares with the stored SHA-256 of the plaintext secret. RFC 6749 §2.3.1 requires a client to form-urlencode both id and secret before base64 in the Authorization header, and the library (pkg/op/client.go ClientBasicAuth, used on every other endpoint) unescapes both halves before verifying. Here the pre-flight hashes the encoded form. It runs before the provider, so when the check returns false the wrapper answers 401 invalid_client and the library never gets a chance to decode correctly.",
+      "exploit": "A confidential client registered for the device grant whose secret contains any character url.QueryEscape rewrites (a space, '+', '%', '/', '=', ...) and that correctly percent-encodes it in Basic is refused 401 at POST /oauth/device_authorization, while the same credentials succeed at /oauth/token and /oauth/introspect. Generated secrets from internal/admin/admin.go are hex and unaffected, so the failure appears only for operator-supplied secrets (e.g. RE0AUTH_CLIENT_SECRET) or migrated clients whose secret contains a reserved character — an unexplained device-grant outage.",
+      "recommendation": "Decode the secret the same way the library does before verifying: unescape basicSecret with url.QueryUnescape (fall back to the raw value only when it fails, matching pkg/op/client.go) and pass that to deviceClientAuthenticated, or hand the whole client-authentication decision to the library and gate on its result. Add a test with a secret containing '+' or a space authenticated over Basic.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-4",
+      "title": "ValidateSigner enforces the 2048-bit floor on the current key only, not on retired keys published in the JWKS",
+      "severity": "medium",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/oidcstore/oidcstore.go:62",
+        "internal/oidcstore/oidcstore.go:69",
+        "internal/oidcstore/oidcstore.go:73"
+      ],
+      "evidence": "\tif s.key.N.BitLen() < 2048 {\n\t\treturn fmt.Errorf(\"oidcstore: signing key must be at least 2048 bits, got %d\", s.key.N.BitLen())\n\t}\n\tseen := map[string]bool{s.id: true}\n\tfor _, r := range s.retired {\n\t\tif r.ID == \"\" {\n\t\t\treturn errors.New(\"oidcstore: retired signing key id is required\")\n\t\t}\n\t\tif r.Public == nil {\n\t\t\treturn fmt.Errorf(\"oidcstore: retired signing key %q has no public key\", r.ID)\n\t\t}\n\t\tif seen[r.ID] {\n\t\t\treturn fmt.Errorf(\"oidcstore: duplicate signing key id %q\", r.ID)\n\t\t}\n\t\tseen[r.ID] = true\n\t}",
+      "why": "RetiredSigningKey.Public is published by Signer.KeySet() alongside the current key and is used by object ID token hint / access-token verification (op.OpenIDKeySet over the whole KeySet). The guard reason ('a small RSA key is not a defensible signature at this tier') applies only to s.key. A retired 512-/1024-bit key is accepted without a bit-length check even though it is advertised to relying parties as a signature key.",
+      "exploit": "An operator rotating away from a legacy weak RSA key (or a misconfigured key file) starts the service; ValidateSigner passes. The weak public key is published in /oauth/keys. An attacker who can factor the weak modulus mints a JWS with arbitrary claims under that kid; any verifier that trusts this JWKS (an RP validating id_tokens, or this OP's own id_token_hint / access-token JWT verification) accepts the signature. No local attacker is needed once the weak key is advertised.",
+      "recommendation": "Apply the same s.key.N.BitLen() < 2048 check to every r.Public (rsa.PublicKey) in the retired loop, and reject retired keys below the floor with an explicit error naming the kid; optionally also require retired Algorithm to match.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-5",
+      "title": "Discovery documents are cached for the process lifetime while the issuer is derived per request from Host",
+      "severity": "low",
+      "category": "security",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:294",
+        "internal/oidchttp/oidchttp.go:300",
+        "internal/oidchttp/oidchttp.go:193"
+      ],
+      "evidence": "func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path string) {\n\tif doc, ok := h.discovery.get(path); ok {\n\t\tdoc.write(w)\n\t\treturn\n\t}\n\n\tclone := r.Clone(r.Context())\n\tclone.URL.Path = path\n\tbw := acquireBufferedWriter()\n\tbw.header.Set(\"Cache-Control\", \"public, max-age=300\")\n\th.provider.ServeHTTP(bw, clone)\n...\n\tif doc.status == http.StatusOK {\n\t\th.discovery.put(path, doc)\n\t}\n\n-- New(), oidchttp.go:193 --\n\tissuer := op.IssuerFromHost(\"\")",
+      "why": "When Config.Issuer is empty, the library's issuer function is op.IssuerFromHost(\"\"), which builds the issuer from the request's Forwarded/Host header (pkg/op/config.go dynamicIssuer). The rendered discovery body and headers are then cached under the path key for the life of the handler. The first request to /.well-known/openid-configuration fixes the issuer advertised to every later client, and the issuer is echoed into every discovery endpoint URL (authorization_endpoint, token_endpoint, jwks_uri, ...). This is mitigated for the shipped binary because cmd/re0auth/config.go:476 requires server.issuer/RE0AUTH_ISSUER to be non-empty and main.go passes it to oidchttp.Config, so the dynamic-issuer shape is reachable only from tests or an embedding that leaves Issuer blank. Tests are explicitly documented as the users of this shape.",
+      "exploit": "In a deployment (or embedding/test harness) that leaves oidchttp.Config.Issuer empty, an attacker sends GET /.well-known/openid-configuration with Host: attacker.example (and a trusted Forwarded header when the OP trusts one directly, since IssuerFromHost reads Forwarded first). The 200 is cached; every subsequent client learns issuer=https://attacker.example and an attacker-controlled token_endpoint/jwks_uri, enabling endpoint substitution. Not reachable from the shipped config today.",
+      "recommendation": "Freeze the issuer at construction whenever it can be derived dynamically (render and cache the document once at New(), or cache per issuer string rather than per path), and/or reject a discovery request whose request-derived issuer differs from the cached one instead of serving the stale document. Prefer keeping Config.Issuer mandatory in oidchttp.New to match the deployment config.",
+      "already_mitigated": true
+    },
+    {
+      "id": "S02-6",
+      "title": "Protocol-plane 405 responses omit the mandatory Allow header",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:478",
+        "internal/oidchttp/oidchttp.go:256",
+        "internal/oidchttp/oidchttp.go:263"
+      ],
+      "evidence": "\tif !endpointMethods[r.URL.Path][r.Method] {\n\t\twriteOAuthJSONError(w, http.StatusMethodNotAllowed, \"invalid_request\",\n\t\t\t\"this endpoint does not accept \"+r.Method)\n\t\treturn\n\t}\n\n-- discovery branches do the same (oidchttp.go:256-259, 263-266) --\n\t\tif !endpointMethods[RFC8414Path][r.Method] {\n\t\t\twriteOAuthJSONError(w, http.StatusMethodNotAllowed, \"invalid_request\",\n\t\t\t\t\"this endpoint does not accept \"+r.Method)\n\t\t\treturn\n\t\t}",
+      "why": "writeOAuthJSONError sets only Content-Type/Cache-Control (and WWW-Authenticate for 401); it never sets Allow. RFC 9110 §15.5.6 requires an origin server to generate an Allow header in a 405. The business plane (internal/httpapi/server.go:700) does set Allow and advertises HEAD alongside GET, so the two planes disagree about the same rule and a generic client cannot discover the permitted methods from a protocol-plane 405.",
+      "exploit": "No security impact; a conformance/harness failure. A client that probes /oauth/token with GET and follows the 405 contract cannot learn POST is the only method, and an OIDC conformance suite that asserts Allow on 405 fails.",
+      "recommendation": "Have the 405 branches compute Allow from endpointMethods[path] (sorting names, adding HEAD wherever GET is present, mirroring businessPlane) and set it before writeOAuthJSONError, or add a method-aware variant of writeOAuthJSONError. Pin it with a test on every entry of endpointMethods.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-7",
+      "title": "Discovery rewrite mutates URL.Path but not RawPath, so a percent-encoded RFC 8414 alias 404s instead of serving the OIDC document",
+      "severity": "low",
+      "category": "correctness",
+      "confidence": "medium",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:255",
+        "internal/oidchttp/oidchttp.go:300",
+        "internal/oidchttp/oidchttp.go:46"
+      ],
+      "evidence": "\tcase r.URL.Path == RFC8414Path:\n\t\t// O-1: identical content, one source. Rewrite to the OIDC document.\n\t\tif !endpointMethods[RFC8414Path][r.Method] {\n...\n\th.serveDiscovery(w, r, OIDCDiscoveryPath)\n...\n\tclone := r.Clone(r.Context())\n\tclone.URL.Path = path\n\tbw := acquireBufferedWriter()",
+      "why": "serveDiscovery clones the request and rewrites only URL.Path. Go's url.URL sets RawPath whenever the escaped form differs from the default escaping of Path, and go-chi routes on RawPath when it is non-empty (v5.3.2 mux.go:454: `if r.URL.RawPath != \"\" { routePath = r.URL.RawPath }`). A request for /.well-known/oauth%2Dauthorization-server (or any escaped spelling of either discovery path) therefore reaches the provider router with Path rewritten to /.well-known/openid-configuration but RawPath still the escaped alias, so chi matches no route, answers its own 404, and the wrapper serves that 404 instead of the document. RFC 8414's 'same content' contract is broken for exactly the spelling the alias is designed to serve.",
+      "exploit": "No security impact. A client (or an intermediary) that percent-encodes a character in the metadata URL — e.g. /.well-known/openid%2Dconfiguration — receives a plain-text 404 from chi rather than the discovery document, and because discovery is only cached on 200 the miss is recomputed each time.",
+      "recommendation": "When rewriting the clone, clear the stale escape: set clone.URL.RawPath = \"\" (or recompute it for the new Path) before handing the request to the provider, so the router sees one consistent path.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-8",
+      "title": "Handler.Introspect collapses a store outage into Active=false, reporting infrastructure failure to /v1 as an invalid token",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:1677",
+        "internal/oidchttp/oidchttp.go:1664"
+      ],
+      "evidence": "\tresp := new(oidc.IntrospectionResponse)\n\tif err := h.provider.Storage().SetIntrospectionFromToken(ctx, resp, id, subject, \"\"); err != nil {\n\t\t// An unknown or expired token is reported here as an error. Fail closed\n\t\t// and answer \"inactive\": the routine invalid token and a storage fault\n\t\t// are not distinguishable from this call, and the safe answer to both is\n\t\t// to refuse the token.\n\t\treturn oauth.TokenInfo{Active: false}, nil //nolint:nilerr // unknown token means \"inactive\", not \"error\"\n\t}",
+      "why": "The business plane's only bearer authentication path is h.introspect through this method. Every error from SetIntrospectionFromToken — including a database connection failure, failover or statement timeout — becomes TokenInfo{Active:false}, which internal/httpapi/middleware.go withBearer turns into 401 invalid_token. A revoked token and a database outage are indistinguishable to every API client, so during a store outage all /v1 traffic looks like mass token invalidation (clients may discard tokens and enter refresh loops) rather than a 5xx, and there is no outage metric on this hot path (no ObserveStoreUnavailable equivalent to the refresh wrapper in storemetrics.go).",
+      "exploit": "A transient PostgreSQL outage (or connection-pool exhaustion) makes every authenticated /v1 request answer 401 invalid_token instead of 503. Clients that treat 401 as 'my token is dead' discard it and retry refresh, amplifying load against the same failing store, while dashboards/alerts on 5xx see nothing.",
+      "recommendation": "Distinguish the store's not-found/expired classification from other errors (hashed lookup returning oauth.ErrTokenNotFound vs an infrastructure error) inside the store, propagate a server error for the latter, and let withBearer answer 500/503; record a metric for the outage class. At minimum keep the fail-closed inactive answer but count the infrastructure errors so the outage is observable.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-9",
+      "title": "Every successful token response is fully JSON-decoded and re-encoded by sanitizeTokenResponse",
+      "severity": "low",
+      "category": "performance",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:1538",
+        "internal/oidchttp/oidchttp.go:670",
+        "internal/oidchttp/oidchttp.go:761"
+      ],
+      "evidence": "func sanitizeTokenResponse(body []byte) []byte {\n\tvar payload map[string]json.RawMessage\n\tif err := json.Unmarshal(body, &payload); err != nil {\n\t\treturn body\n\t}\n\tvar scope string\n\tif raw, ok := payload[\"scope\"]; ok {\n\t\t_ = json.Unmarshal(raw, &scope)\n\t}\n\tchanged := false\n\tif _, ok := payload[\"id_token\"]; ok && !hasField(scope, \"openid\") {\n\t\tdelete(payload, \"id_token\")\n\t\tchanged = true\n\t}\n\tif clean, stripped := withoutField(scope, \"offline_access\"); stripped {\n\t\tif encoded, err := json.Marshal(clean); err == nil {\n\t\t\tpayload[\"scope\"] = encoded\n\t\t\tchanged = true\n\t\t}\n\t}\n\tif !changed {\n\t\treturn body\n\t}\n\tout, err := json.Marshal(payload)\n\tif err != nil {\n\t\treturn body\n\t}\n\treturn out\n}",
+      "why": "The token endpoint is the busiest protocol path and it is fully buffered (serveOAuth). For every 200 the wrapper allocates a map[string]json.RawMessage over a body that can be a few KB (access_token + refresh_token + id_token), decodes it, then re-marshals it whenever offline_access is present — which Re0Auth's own ApproveAuthorization always injects (withOfflineAccess), so the re-marshal runs on essentially every authorization_code and device response, not just the rare id_token-without-openid case. The same pattern is repeated for error bodies in isOAuthErrorBody (json.Unmarshal on every >=400).",
+      "exploit": "No security impact; throughput/GC cost. Token issuance pays roughly two extra JSON passes plus a map allocation per request, on the endpoint an RP calls most and which RFC 6749 §5.1 already forbids caching, so there is no downstream dedup.",
+      "recommendation": "Avoid the round trip: first do a cheap bytes.Contains scan for `\"offline_access\"` / `\"id_token\"` and return body unchanged when neither key is present; when offline_access must be removed, operate on the scope value only (or use a streaming json.Decoder with UseNumber and rewrite the scope field) so no full map is allocated. For error bodies, read the first `\"error\"` field with a decoder limited to a few hundred bytes instead of unmarshalling the whole body.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-10",
+      "title": "No length cap on state, nonce (or other authorize parameters) at the entrance, unlike PKCE, request-id and handle ids",
+      "severity": "low",
+      "category": "reliability",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:934",
+        "internal/oidchttp/oidchttp.go:1046",
+        "internal/oidchttp/oidchttp.go:1416"
+      ],
+      "evidence": "\t// RFC 7636 §4.1/§4.2: the challenge is 43–128 characters from the unreserved\n\t// set. The library only compares hashes, so a malformed value was accepted and\n\t// stored; rejecting it at the entrance keeps the code record well-formed.\n\tif !validPKCEValue(challenge) {\n\t\tparams := map[string]string{\n\t\t\t\"error\":             \"invalid_request\",\n\t\t\t\"error_description\": \"code_challenge must be 43-128 unreserved characters\",\n\t\t\t\"state\":             q.Get(\"state\"),\n\t\t\t\"iss\":               h.issuerFor(r),\n\t\t}\n\t\thttp.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)\n\t\treturn true\n\t}\n\n-- validateAuthorize never inspects state/nonce length; they are then persisted and echoed --",
+      "why": "validateAuthorize caps the PKCE value (43-128 bytes) and the rest of the codebase caps other caller-chosen identifiers (middleware.go maxRequestIDBytes=128, auth maxBoundHandleBytes=128), but state and nonce are unbounded. They are stored verbatim in oidc_auth_requests (state, nonce columns; CreateAuthRequest passes req.State/req.Nonce straight through) and are later echoed: state into every authorization response via oauth.BuildRedirect and nonce into the id_token's nonce claim via SetUserinfoFromRequest. cmd/re0auth sets MaxHeaderBytes to 64 KiB, so one GET can push ~60 KB into a persisted record and into every subsequent response, and a large nonce inflates every id_token for the life of the grant.",
+      "exploit": "An unauthenticated caller repeatedly issues GET /oauth/authorize for a legitimate client (valid registered redirect, PKCE challenge, allowed scope) with a ~60 KB state or nonce. Each request persists a ~60 KB row and the wrapper buffers and re-emits a response of the same order, multiplying per-request cost and storage by the header budget; the nonce also travels in every id_token derived from that authorization. Bounded and rate-limited, so amplification is modest rather than a denial of service, but it is caller-chosen state.",
+      "recommendation": "Reject (or truncate-and-refuse) state/nonce longer than a documented bound at the entrance — a few hundred bytes is far beyond any real client — using the same fail-through-the-redirect shape as the PKCE refusal, and mirror the check where the values are persisted so a second engine cannot bypass it.",
+      "already_mitigated": false
+    },
+    {
+      "id": "S02-11",
+      "title": "DenyAuthorization uses the static issuer only, so a dynamic-issuer deployment emits a denial without the RFC 9207 iss parameter",
+      "severity": "info",
+      "category": "correctness",
+      "confidence": "high",
+      "locations": [
+        "internal/oidchttp/oidchttp.go:1794",
+        "internal/oidchttp/oidchttp.go:1444"
+      ],
+      "evidence": "\t// RFC 9207 applies to denied responses too.\n\tredirect = withIssuer(redirect, h.issuer)\n\t_ = h.provider.Storage().DeleteAuthRequest(ctx, id)\n\treturn redirect, nil\n\n-- issuerFor, used by the HTTP path instead --\nfunc (h *Handler) issuerFor(r *http.Request) string {\n\tif h.issuer != \"\" {\n\t\treturn h.issuer\n\t}\n\tif h.provider != nil {\n\t\treturn strings.TrimRight(h.provider.IssuerFromRequest(r), \"/\")\n\t}\n\treturn \"\"\n}",
+      "why": "DenyAuthorization has no *http.Request (it is the business-plane Interaction call), so it falls back to h.issuer, which is empty when Config.Issuer is empty. withIssuer(location, \"\") returns the location untouched, so the denial redirect carries no iss while the success and error paths on the HTTP handlers do (they use issuerFor). The discovery document advertises authorization_response_iss_parameter_supported=true for all authorization responses, so a client applying RFC 9207 mix-up defence sees an inconsistency between a denial and every other response. Reachable only in the dynamic-issuer shape; production config requires an issuer.",
+      "exploit": "No practical security impact in the shipped binary (server.issuer is mandatory). In an embedding with Config.Issuer empty, a client that requires iss on every authorization response rejects a denied authorization as malformed instead of reading error=access_denied.",
+      "recommendation": "Store the request-derived issuer on the session/auth request so DenyAuthorization can reuse it (the AuthRequest already persists state and could persist the issuer), or make Config.Issuer mandatory in oidchttp.New so h.issuer is always populated; then h.issuerFor and DenyAuthorization cannot disagree.",
+      "already_mitigated": true
+    }
+  ],
+  "coverage": [
+    "internal/oidchttp/oidchttp.go",
+    "internal/oidchttp/storemetrics.go",
+    "internal/httpapi/discovery.go",
+    "internal/httpapi/idp_routes.go",
+    "internal/httpapi/authorization_routes.go",
+    "internal/httpapi/session_routes.go",
+    "internal/httpapi/v1_routes.go",
+    "internal/oidcstore/oidcstore.go",
+    "internal/httpapi/server.go (cross-package: mounts, plane split, routes)",
+    "internal/httpapi/middleware.go (cross-package: bearer/scope gates, limiter, in-flight cap)",
+    "internal/httpapi/responses.go (cross-package: writers)",
+    "internal/auth/auth.go (cross-package: session User/Bound/OwnerMatches/CSRF, Providers)",
+    "internal/authorization/interaction.go (cross-package: Interaction contract)",
+    "oauth/http.go, oauth/bodylimit.go, oauth/client.go, oauth/scope.go (cross-package: BuildRedirect, ClientCredentials, RegisteredRedirect, Registry.Resolve)",
+    "internal/observability/observability.go (partial: metric label normalisation)",
+    "internal/store/memory/oidc.go (partial: CreateAuthRequest, CompleteLogin, GetClientByClientID, TokenRequestByRefreshToken, RevokeToken, KeySet, GetDeviceAuthorizatonState)",
+    "internal/store/postgres/oidc.go (partial: same methods as memory)",
+    "cmd/re0auth/main.go (partial: openOIDC wiring, login hook, server timeouts/MaxHeaderBytes)",
+    "cmd/re0auth/config.go (partial: issuer validation)",
+    "github.com/zitadel/oidc v3.51.3 pkg/op: server_http.go, client.go, discovery.go, config.go, device.go, op.go, token.go, token_code.go, token_refresh.go, token_request.go, token_revocation.go, token_intospection.go, userinfo.go, auth_request.go, error.go, storage.go, server.go, server_legacy.go, endpoint.go, keys.go",
+    "github.com/go-chi/chi v5.3.2 mux.go (RawPath routing)"
+  ],
+  "notes": "High/medium findings were derived from the current source and the active library code path (op.NewProvider -> CreateRouter -> the free Authorize/Exchange/Introspect/Userinfo/Revoke handlers), not from the legacy op.LegacyServer path. S02-5 and S02-11 share the precondition Config.Issuer == \"\"; cmd/re0auth requires a non-empty server.issuer, so both are latent in the shipped binary and marked already_mitigated. Not covered as findings because they were checked and found mitigated: introspection client authentication (refuseIntrospectionByANonConfidentialClient correctly blocks public clients, assertions and percent-encoded-id confusion; the library's introspection path really does accept Basic only), CORS reflection from the library (stripped by corsFreeWriter at the ServeHTTP boundary), refresh-token aliasing into the store (both stores return deep copies), device poll throttling (both stores enforce DefaultDevicePollInterval and single-use consumption), refresh-store outage metrics (meteredStorage overrides TokenRequestByRefreshToken correctly), JWT-profile/private_key_jwt/assertion paths (GetKeyByIDAndClientID always errors in both stores, and the wrapper refuses assertions at introspection), discovery cache header injection (headers are re-added through corsFreeWriter, which strips CORS on both WriteHeader and Write), and the id_token/offline_access sanitisation itself (SpaceDelimitedArray marshals scope as a JSON string so the decode is correct). Uncertainties: S02-7's reachability depends on Go's URL setting RawPath for the escaped spelling and on the outer ServeMux routing that spelling to the discovery handler; it was verified against go-chi but not executed. S02-1's severity depends on RPs actually consuming auth_time/max_age; the code-level mechanism (no re-login, auth_time overwritten) is certain. No PostgreSQL server was available, so the postgres adapter was read, not executed; the database-dependent behaviours above (CompleteLogin, device consume, revocation ownership) were reasoned from the SQL rather than observed."
+}

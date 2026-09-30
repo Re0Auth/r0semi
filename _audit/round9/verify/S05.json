@@ -1,0 +1,76 @@
+{
+  "scope": "S05",
+  "verified": [
+    {
+      "id": "S05-1",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "isRefreshRejected (refresh.go:170-185) returns true for ErrorCode==\"invalid_grant\" OR any RetrieveError whose Response status is 400/401/403, with no check of the OAuth error code or body. refreshBinding maps that to refreshRejected, which calls vault.Revoke (crypto-shred at refresh.go:151) then bindings.Delete (refresh.go:161); it only preserves the binding if vault.Revoke itself errors or the row version moved. golang.org/x/oauth2 populates RetrieveError.Response for every non-2xx token response, including an intermediary's HTML 403, so a transient/WAF 4xx really does permanently delete the local binding while the upstream refresh token is never revoked. Confirmed at medium: it is a reliability/data-loss defect reachable on the normal proactive- and 401-triggered refresh paths, but the only 'exploit' is an upstream/CDN returning a 4xx, not an attacker-controlled action.",
+      "evidence_checked": "internal/federation/refresh.go:170-185, 87-99, 142-166; internal/federation/refresh.go:39-40"
+    },
+    {
+      "id": "S05-2",
+      "status": "downgraded",
+      "final_severity": "medium",
+      "reason": "The code claim is correct: refreshBinding (refresh.go:40), Unbind (unbind.go:50), CascadeRevoke (revocation.go:132) and shredBinding (killswitch.go:201) all take s.locks.lock(bindingKey(...)), while BeginBind/CompleteBind (bind.go:127-218) take no lock at all. The erasure order is RevokeUserBindings then vault.DeleteSubject (lifecycle.go:200-212), and CompleteBind does Exchange (a network round trip) before storeBindingSecret/Enroll (bind.go:192) and bindings.Put (bind.go:198) with no existence/tombstone re-check, so an Unbind, kill-switch sweep, or erasure that completes during the exchange is overwritten by a fresh row+secret; DeleteAccount's PurgeUserFlows cannot help because CompleteBind already consumed the flow. Downgraded from high to medium because reachability needs two legitimate operations (self/admin erasure or unbind) to land entirely inside the exchange window, and because the subject's sessions and downstream tokens are revoked by the same erasure, so the resurrected binding is unreachable through the data plane: the residue is a live-at-source credential plus a PII row (an erasure-completeness failure), not an attacker-usable path.",
+      "evidence_checked": "internal/federation/bind.go:157-218; internal/federation/refresh.go:40; internal/federation/unbind.go:50; internal/federation/revocation.go:132; internal/federation/killswitch.go:200-207; internal/lifecycle/lifecycle.go:200-235"
+    },
+    {
+      "id": "S05-3",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "Both mechanisms exist exactly as described: List sizes the result by the whole map (binding.go:219 `make([]Binding, 0, len(s.m))`), and ListAllPage copies and fully re-sorts the whole map on every page (binding.go:255-266), making a paged sweep O(N^2/limit). But the impact is overstated. This store is only chosen when DatabaseURL is empty (cmd/re0auth/main.go:892-917), a mode the product explicitly warns is non-durable ('a restart loses sessions, bindings and pending requests'), i.e. dev/small deployments, not a fleet-sized store. /v1/bindings is session-scoped; the allocation is transient and freed each request. The quadratic ListAllPage path is operator-triggered (kill switch) rather than attacker-triggered. Real inefficiency, not a medium-severity DoS.",
+      "evidence_checked": "internal/federation/binding.go:219, 255-266; cmd/re0auth/main.go:892-917; docs/architecture.md:506"
+    },
+    {
+      "id": "S05-4",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The complexity statement is arithmetically right: for each (source, matching-resource) pair the loop re-copies and sorts the game's sources via registry.Sources(src.Game) (federation.go:250-254) and linearly scans each candidate's Resource list, so the cost is ~O(S^2*R^2 log S) with S sources and R resources per game. But the exploit requires 'a few hundred sources per game', which the configured-source deployment model does not represent, and MissingBindings only runs on the authenticated consent-page load (authorization_routes.go:35 called from handleGetAuthorizationRequest), not on every authorize/token request. At realistic registry sizes (single-digit to tens of sources) the whole loop is on the order of thousands of operations. Real but low-impact; the recommendation (prebuilt per-game resource->candidate index) is reasonable cleanup.",
+      "evidence_checked": "internal/federation/missing.go:61-88; internal/federation/federation.go:227-254; internal/httpapi/authorization_routes.go:30-51, 86-107"
+    },
+    {
+      "id": "S05-5",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "NewRegistry validates token_class strictly (federation.go:173-180) and RawBase (federation.go:182-186) but never validates Status; it only maps \"\" to StatusActive (federation.go:162-164). statusRank returns 2 for any unrecognized value (federation.go:53-62), and candidates() excludes a source only on the exact StatusRetired comparison (service.go:636-639), so a misspelled status keeps the source selectable and bindable, and binding_routes.go:97 reports it Bindable. Fail-open lifecycle control, operator-typo precondition; low is appropriate. Note the finding's cited line federation.go:637 is actually service.go:636-639.",
+      "evidence_checked": "internal/federation/federation.go:53-62, 141-190; internal/federation/service.go:636-639; internal/httpapi/binding_routes.go:97"
+    },
+    {
+      "id": "S05-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "Confirmed that Source.Issuer/AuthorizationEndpoint/TokenEndpoint/RevocationEndpoint/CascadeRevocationEndpoint get no absolute-http(s)/no-query validation, unlike validateRawBase (federation.go:207-220), and NewRegistry is the composition root's stated authority for source validity (config.go:924-934), so nothing upstream catches it. With Issuer=\"//evil.example\", AuthCodeURL emits \"//evil.example/oauth/authorize?...\" (x/oauth2 performs no scheme check) and http.Redirect (federation_routes.go:388) writes it as a scheme-relative Location, which the browser resolves to the attacker host: a real open redirect from the trusted origin, though it needs an operator config typo and does not by itself complete a bind. The finding overstates the token-endpoint half: for the same scheme-relative Issuer the Exchange request has no scheme and fails with 'unsupported protocol scheme' rather than posting the code/secret anywhere, and for Issuer=\"https://api.example/v1?x=1\" the wrong-path POST stays on the same host. Still a genuine low-severity validation gap plus phishing vector.",
+      "evidence_checked": "internal/federation/federation.go:144-161, 207-220; internal/federation/bind.go:220-227, 150; internal/httpapi/federation_routes.go:388; cmd/re0auth/config.go:894-934"
+    },
+    {
+      "id": "S05-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "BeginBind and CompleteBind call registry.Get and never inspect src.Status (bind.go:128-134, 171-174), while candidates() excludes retired sources (service.go:636-639) and Raw returns ErrSourceRetired (service.go:684-686). So a bookmarked /bind link to a retired source still completes a full upstream authorization, stores an encrypted token and creates a binding row the data plane will never serve. Confirmed; low (operator lifecycle inconsistency, the stored token is not reachable through the data plane, and the user initiated the flow).",
+      "evidence_checked": "internal/federation/bind.go:127-152, 171-174; internal/federation/service.go:636-639, 684-686; internal/httpapi/binding_routes.go:97"
+    },
+    {
+      "id": "S05-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "revokeUpstream logs the raw error from s.useBindingSecret (unbind.go:124). vault.Use's missing-KEK branch formats the full identity: fmt.Errorf(\"vault: %s was wrapped by key %q...\", id, rec.KEKID) (service.go:309-310), and Identity.String() is Provider+\":\"+Subject = \"<game>.<source>:usr_...\" (repo.go:29). So after a KEK rotation that leaves a wrapping key undeclared, an Unbind or kill-switch sweep writes the raw usr_ subject into the process log, contradicting the explicit 'subject deliberately not named' invariant documented at bind.go:206-209 and refresh.go:155-156. Confirmed; low (requires the specific missing-key branch and log access), consistent with the finding's medium confidence.",
+      "evidence_checked": "internal/federation/unbind.go:104-125; vault/service.go:301-311; vault/repo.go:24-29"
+    },
+    {
+      "id": "S05-9",
+      "status": "confirmed",
+      "final_severity": "info",
+      "reason": "Confirmed: BeginBind stamps ExpiresAt from the injected s.now() clock (bind.go:144) and CompleteBind enforces it with s.now() (bind.go:165), but MemoryBindFlowStore.SweepExpired uses the wall clock time.Now() (bind.go:112) and the store has no clock field (bind.go:58-66). Config.Now is a real injectable clock defaulting to time.Now (service.go:379-381, 405), so a logical-clock embedding gets sweeper/enforcement disagreement. Info is correct: the only in-tree production wiring uses time.Now for both (main.go:893-911 passes no clock), so this is a test/embedding correctness gap, not a shipped defect.",
+      "evidence_checked": "internal/federation/bind.go:58-66, 102-123, 144, 165; internal/federation/service.go:379-381, 405; cmd/re0auth/main.go:893-911"
+    },
+    {
+      "id": "S05-10",
+      "status": "downgraded",
+      "final_severity": "info",
+      "reason": "The code claim is accurate: CompleteBind calls s.flows.Consume(ctx, state) (bind.go:158, single-use delete in MemoryBindFlowStore.Consume at bind.go:77-86 / the durable equivalent) before comparing flow.User != user (bind.go:163), so a caller knowing a state string would destroy another account's pending flow. But the sole in-tree caller, handleBindCallback, checks sessions.Bound AND sessions.OwnerMatches before calling CompleteBind (federation_routes.go:410-415), so it is unreachable through the shipped HTTP surface. Real but purely latent: downgraded to info since 'not reachable' is exactly the overstated-impact case, and the discovery itself marks already_mitigated=true.",
+      "evidence_checked": "internal/federation/bind.go:77-86, 157-169; internal/httpapi/federation_routes.go:393-423"
+    }
+  ],
+  "summary": "10/10 findings re-verified against source. Statuses: 6 confirmed, 4 downgraded, 0 rejected. One high finding (S05-2, CompleteBind does not take the per-binding lock that every removal path holds, so an erasure/unbind completing inside the token-exchange window resurrects the row and secret) is real and code-cited but downgraded to medium: it needs a narrow interleaving of two legitimate operations and the erased subject's sessions/downstream tokens are gone, leaving an unreachable live upstream credential plus PII rather than an attacker-usable path. The high/medium findings above the low band each lose a notch: S05-3 (memory-store List preallocation + per-page full re-sort) is real but only in the explicitly non-durable DatabaseURL=\"\" mode and operator-triggered for the quadratic sweep; S05-4 (MissingBindings O(S^2R^2)) is real but the 'hundreds of sources per game' precondition is unrealistic and it runs once per authenticated consent-page load; S05-2 as above. S05-1 (400/401/403 classified as dead grant, crypto-shredding the binding) is confirmed at medium and is arguably the most practically reachable issue. S05-5/S05-6/S05-7/S05-8 confirmed at their low severities (S05-6's token-secret-exfiltration half is overstated: a scheme-relative token URL simply fails the Exchange). S05-9 confirmed info; S05-10 downgraded to info as latent/unreachable behind the handler's owner check. No new severe findings discovered."
+}

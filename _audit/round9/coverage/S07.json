@@ -1,0 +1,104 @@
+{
+  "scope": "S07",
+  "findings": [
+    {
+      "id": "S07-1",
+      "verdict": "none",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test exercises redirect handling in tapsign or taptapoauth. Every test builds an httptest server that answers in place and passes srv.Client() (CheckRedirect nil is never a variable under test); no test returns a 302 to a second host. httpclient/outbound_test.go TestNoCrossHostRedirectsRefusesASchemeChange only unit-tests the NoCrossHostRedirects helper, not that these packages install or require it. Harness needed: httptest server A answering 302 Location: <server B>, then call tapsign.Verify/Rotate or taptapoauth.Poll with a plain http.Client; assert X-LC-Session/X-LC-Key/Authorization is not delivered to B (or that the call errors).",
+      "corrected": false
+    },
+    {
+      "id": "S07-2",
+      "verdict": "partial",
+      "test_path": "internal/zzprobe/audit6/z03crypto/binding_namespace_test.go",
+      "test_func": "TestProbeBindAuditFailureStrandsTheUpstreamToken",
+      "asserts": "The test body does drive the cited production path: a full BeginBind/CompleteBind through federation.Service over a real vault.Service whose audit sink always fails, then asserts CompleteBind returns an error, no binding row exists, and -- the defect assertion -- the credential IS present and decryptable via useSecret (t.Fatalf \"CONFIRMED: the bind reported failure ... yet stored a decryptable upstream token\"). But the assertion is a red probe, not a defect pin: the switch case `errors.Is(uerr, vault.ErrNotFound)` logs 'the residue is gone' and the test PASSES once Enroll audits before persisting or rolls back on audit failure. It therefore would NOT fail if the code were fixed the way the finding recommends ('Order Enroll like Use: audit before persisting, or on audit failure Delete/Revoke and report the rollback'), so it does not meet the direct bar. It is also //go:build audit6, absent from the default `go test` run. Downgraded direct -> partial.",
+      "gap_note": "No default-suite regression guard for the store-then-audit order. Harness needed: an untagged vault/federation test with a failing audit.Logger asserting Enroll leaves no record (repo has no identity) / no binding row on audit failure -- a test that goes green now only after the fix and would catch a reintroduction. A characterization test asserting the residue as expected would be the only way to actually pin the current defect, and none exists.",
+      "corrected": true
+    },
+    {
+      "id": "S07-3",
+      "verdict": "partial",
+      "test_path": "vault/rotate_page_test.go",
+      "test_func": "TestMemoryRepoPagesMatchList",
+      "asserts": "Pins MemoryRepo.ListPage correctness against List: same (subject, provider) order, no skips/repeats, page size respected (TestRotateWalksPagesAndCoversEveryRecord additionally asserts Rotate reads >=2 pages and calls no List). It measures neither allocations nor elapsed time, and there is no benchmark, AllocsPerRun or MemStats assertion anywhere for MemoryRepo.ListPage.",
+      "gap_note": "Nothing would fail on the O(N^2)/full-store-clone-per-page behaviour. Harness needed: a benchmark or testing.AllocsPerRun/runtime.MemStats test that calls MemoryRepo.ListPage once per page over N records and asserts per-page work/allocations stay bounded (sublinear in N), plus an assertion that ListPage forwards the caller's ctx instead of context.Background().",
+      "corrected": false
+    },
+    {
+      "id": "S07-4",
+      "verdict": "none",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test constructs a Repo whose Get returns a Record with rec.Identity != the requested id. vault/service_test.go TestCiphertextBindsIdentity tampers with rec.Identity but re-Puts and re-Gets through MemoryRepo, so the returned Identity always equals the requested one; Use's choice of AAD source (requested id vs rec.Identity) is unobservable and the test would still pass if Use switched to rec.Identity. TestProbeEnvelopeAADPreventsMovingACiphertext and internal/zzprobe/audit6/z03crypto/use_aad_test.go TestProbeAADRejectsRowTransplants are the same shape (row transplant, identity unchanged), and the hookRepo Get overrides in internal/zzprobe/{crypto,verifycrypto} delegate straight to the inner repo. Harness needed: a stub vault.Repo whose Get(id) returns a record sealed under a different Identity and whose Rotate/ListPage are delegated; assert Use derives the AAD from rec.Identity (and/or returns an explicit identity-mismatch error) so Use and Rotate agree.",
+      "corrected": false
+    },
+    {
+      "id": "S07-5",
+      "verdict": "partial",
+      "test_path": "taptapoauth/client_test.go",
+      "test_func": "TestStartDeviceCode",
+      "asserts": "Asserts a well-formed device-code reply (interval=3, expires_in=300) parses to Interval == 3*time.Second and a non-zero ExpiresAt; the fake device-code endpoint in referencesource/taptap_test.go also returns interval=1/expires_in=300 and advances its fake clock 20 minutes past expiry. Neither sends a huge or overflowing interval/expires_in, and a clamp added to client.go:96-103 would not break either test.",
+      "gap_note": "No upper-bound/overflow assertion. Harness needed: device-code handler returning interval:9223372036 and expires_in:9223372036 (and values near math.MaxInt64/1e9); assert Start clamps Interval to a protocol-sane max (and ExpiresAt to a bounded window) instead of returning ~292-year durations or a wrapped/negative value.",
+      "corrected": false
+    },
+    {
+      "id": "S07-6",
+      "verdict": "partial",
+      "test_path": "tapsign/client_test.go",
+      "test_func": "TestVerifyOK",
+      "asserts": "TestVerifyOK, TestVerifyInvalidCredential and TestVerifyUnexpectedStatusIsNotADeathSignal exercise Verify's credential-bearing GET /users/me and its 200/401/403/500 handling (with TestVerifyOK checking X-LC-Session/X-LC-Id/X-LC-Key on the wire). All three discard the audit.MemoryLogger returned by newTestClient and never assert anything about audit events; only Rotate, Revoke and Redeem assert tapsign.* events. Repo-wide grep finds no reference to a tapsign.verify event anywhere.",
+      "gap_note": "Missing assertion that Verify records (or deliberately does not record) a tapsign.verify event with its outcome. Harness needed: use the logger from newTestClient in a Verify test and assert a tapsign.verify event with outcome ok for 200, denied for 401/403, error otherwise (such a guard would fail today because Verify never calls finish/Record).",
+      "corrected": false
+    },
+    {
+      "id": "S07-7",
+      "verdict": "partial",
+      "test_path": "taptapoauth/client_test.go",
+      "test_func": "TestUpstreamErrorTextIsBounded",
+      "asserts": "Feeds an error_description of 64 KiB plus \"\\nforged log line\" and asserts err.Error() is under 400 bytes, contains no newline, and still carries the machine-readable code invalid_client. It asserts nothing about ESC (\\x1b), NUL or other C0 control bytes; stripping them in boundDetail would still pass this test. (The only ESC/control-char assertion anywhere is internal/zzprobe/startup/startup_probe_test.go, which covers a startup log path, not boundDetail.)",
+      "gap_note": "No control-character assertion. Harness needed: upstream success:false with data.error_description containing \\x1b[2J / \\x1b[31m / NUL / other non-printable runes; assert err.Error() (and the text an operator would slog) contains only printable runes, so boundDetail's CR/LF-only replacement is caught.",
+      "corrected": false
+    },
+    {
+      "id": "S07-8",
+      "verdict": "partial",
+      "test_path": "tapsign/client_test.go",
+      "test_func": "TestVerifyOK",
+      "asserts": "The Verify/Rotate/Revoke/Redeem tests drive drain(resp) and the resp.StatusCode switch with real httptest responses, so the happy-path response handling is exercised, but no test ever supplies a nil response or a response with a nil Body; no test injects a custom Doer at all (newTestClient always passes srv.Client()). The taptapoauth tests likewise use real bodies.",
+      "gap_note": "Missing nil-response guard test. Harness needed: since newClient accepts any httpclient.Doer, inject a stub Doer returning (nil, nil) and (&http.Response{StatusCode: 200, Body: nil}); assert Verify/Rotate/Revoke and taptapoauth Poll return an error instead of panicking (i.e. drain/StatusCode/Close mirror httpclient.drain's resp==nil || resp.Body==nil guards).",
+      "corrected": false
+    },
+    {
+      "id": "S07-9",
+      "verdict": "none",
+      "test_path": "",
+      "test_func": "",
+      "asserts": "",
+      "gap_note": "No test asserts CreatedAt semantics on re-enroll. vault/service_test.go TestEnrollReplacesExisting only asserts the replaced plaintext is readable; no vault test reads Record.CreatedAt at all (repo-wide grep for CreatedAt in _test.go hits only internal/store/postgres/postgres_test.go TestVaultRepoRoundTrip/TestVaultListIsOrderedAndComplete, which round-trip a single Put, internal/store/postgres/erasure_test.go, and a comment in internal/zzprobe/verifycrypto/zzprobe_p11p12_test.go). TestVaultPutReplacesAndDeleteIsIdempotent re-Puts the same identity but never inspects CreatedAt. Harness needed: enroll an identity, capture CreatedAt (or inject an advancing clock), re-enroll, and assert the original CreatedAt survives -- or explicitly pin the documented 'CreatedAt means last write' semantics.",
+      "corrected": false
+    },
+    {
+      "id": "S07-10",
+      "verdict": "partial",
+      "test_path": "tapsign/client_test.go",
+      "test_func": "TestRotateReturnsReplacement",
+      "asserts": "Asserts the happy path: Rotate returns the upstream replacement token/object id and writes exactly one tapsign.rotate event with outcome ok. The audit sink never fails in any tapsign test, so the (next, errors.Join(opErr, auditErr)) partial-success shape at client.go:60-63 / finish() is untested, as is the caller's ability to tell 'rotation happened but audit failed' from 'rotation failed'.",
+      "gap_note": "Missing failing-audit Rotate test. Harness needed: inject an audit.Logger whose Record always errors into newClient (or export a seam), then call Rotate and assert the contract the finding is about: either the replacement is returned with a typed partial-success error documenting that it must be persisted, or the replacement is not returned at all. (Revoke's safer mirror-image already has TestRevokeDiscardsReplacement / TestRevokeIsIdempotentOnInvalid but those are not about the audit write.)",
+      "corrected": false
+    },
+    {
+      "id": "S07-11",
+      "verdict": "partial",
+      "test_path": "vault/zzprobe_crypto_test.go",
+      "test_func": "TestProbeAADIsInjective",
+      "asserts": "Pins that bindingAAD's length-prefixed layout does not collide for short identities ((\"a\",\"bc\") vs (\"ab\",\"c\"), etc.), i.e. injectivity for realistic lengths; vault/envelope_test.go TestEnvelope... uses bindingAAD only as a fixture. No test builds a subject/provider longer than math.MaxUint32, so the uint32 truncation at vault/envelope.go:148/150 is never exercised (consistent with the finding's own already_mitigated=true and no-practical-trigger assessment). //go:build audit5.",
+      "gap_note": "No boundary test; a literal 4 GiB string is impractical. Cheaper harness: refactor the prefix write behind a small helper taking lengths, or (if bindingAAD gains an error return) add a unit case rejecting len > math.MaxUint32; otherwise document that no test can reach the truncation.",
+      "corrected": false
+    }
+  ]
+}

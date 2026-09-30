@@ -1,0 +1,75 @@
+{
+  "scope": "S08",
+  "verified": [
+    {
+      "id": "S08-1",
+      "status": "downgraded",
+      "final_severity": "medium",
+      "reason": "Code behaviour CONFIRMED and reproduced with a temporary in-package probe: with a file declaring vault.kek_env=\"RE0AUTH_KEK_2\" / kek_id=\"kek-2\" while RE0AUTH_KEK still holds the old material, loadConfig returned cfg.KEK[0]=0xaa (the RE0AUTH_KEK material) under KEKID=\"kek-2\". The hardcoded read at config.go:729 precedes the file-declared resolution at :731-738, and backup-keys.sh:69-77 backs up the file-declared name. High is overstated, however: the failure requires a self-inflicted config/environment conflict (the file renamed the variable while the orchestrator still injects the old RE0AUTH_KEK), and the wrapper never triggers without that drift. This is a re-report of round-7 Z12V-1, which was independently classified P3 (low) with 'blast radius close to P2' (docs/issues/P3-low.md:45, docs/security-audit-7.md:422). Also note recovery exists while the old key is still configured (old records remain readable), and the worst irreversible half is records written during the drift window being mislabelled. Kept as a genuine medium operational-integrity footgun rather than high.",
+      "evidence_checked": "cmd/re0auth/config.go:729-743 (read), cmd/re0auth/config.go:471 (read), scripts/backup-keys.sh:64-77 (read), internal/config/config.go Secret (read), docs/issues/P3-low.md:45, docs/security-audit-7.md:422, empirical probe (temp test, removed)"
+    },
+    {
+      "id": "S08-2",
+      "status": "confirmed",
+      "final_severity": "high",
+      "reason": "CONFIRMED and reproduced with a temporary in-package probe. Config [storage] dsn_env=\"RE0AUTH_DSN\" with RE0AUTH_DSN set, DATABASE_URL unset, driver omitted returned driver=\"postgres\", DatabaseURL=\"\", StorageReason=\"\" and no error. The inferred branch at config.go:682-688 sets driver=\"postgres\" but never calls config.Secret on f.Storage.DSNEnv (only the explicit \"postgres\" branch at :692-703 does). openStorage (main.go:892) then takes the memory branch purely on cfg.DatabaseURL==\"\", so StorageDriver says postgres while the process runs in memory. Downstream consequences verified: the durable-audit gate at config.go:749 is skipped (RE0AUTH_AUDIT_KEY not required), the audit sink is the non-tamper-evident memory ring, sessions/bindings/OP state do not survive restart, maxInFlight is sized via defaultMaxInFlightFor(cfg.DatabaseURL != \"\", ...) at :722-723 as memory (512), and reportDurability logs because=\"\" (main.go:995-999). This is precisely the 'setting that looks applied and is not' class the surrounding validation exists to prevent; the file explicitly documents that dsn_env alone selects postgres (config.go:147-150). Secondary observation also true: with an explicit driver, a stale DATABASE_URL pre-loaded at :472 shadows the file's dsn_env at :693 (this is the env>file convention, so I treat it as a lesser note, not the finding's core).",
+      "evidence_checked": "cmd/re0auth/config.go:672-710 (read), cmd/re0auth/config.go:472/722-724/749-759 (read), cmd/re0auth/main.go:884-917, 991-1002 (read), cmd/re0auth/main_test.go:776-845 (read), empirical probe (temp test, removed)"
+    },
+    {
+      "id": "S08-3",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The ordering facts are real: lifecycle.go:262-271 writes outcome=ok with pseudonym_destroyed=true BEFORE Pseudonyms.Destroy at :277-291, and the correcting record goes through fail() at :299-301 which discards its error. But the primary defect this describes (Z07-2, round 7) has already been FIXED in a3de9b9: the failure branch now resets res.PseudonymDestroyed=false and calls d.fail(...) to append a second, truthful account.delete outcome=error naming step \"pseudonym\" (lifecycle.go:288-290). So the residual claim is only that the correction is best-effort: it needs Pseudonyms.Destroy to fail AND the audit append of the correction to fail immediately after the first append at :269 succeeded. On that path the caller still receives a non-nil error naming 'still linkable' (verified by lifecycle_test.go:385-408), and the HTTP layer returns 500 (account_routes.go:54-64). 'Already mitigated' reduces this from the claimed medium to a low residual observability gap, not a silently-lost success record.",
+      "evidence_checked": "internal/lifecycle/lifecycle.go:200-206, 253-302 (read), internal/httpapi/account_routes.go:32-91 (read), internal/lifecycle/lifecycle_test.go:382-408 (read), docs/issues/P1-high.md:12-19 (FIXED a3de9b9)"
+    },
+    {
+      "id": "S08-4",
+      "status": "confirmed",
+      "final_severity": "medium",
+      "reason": "CONFIRMED. Unbind returns an error only for its two local removals (vault.Revoke at unbind.go:91-93, bindings.Delete at :94-96); revokeBinding converts any such error into bindingOutcome{failed:1} with a nil error (killswitch.go:180-183), revokeBindings only accumulates summary.Failed (killswitch.go:137-147), and RevokeUserBindings returns the summary with nil unless it could not List (killswitch.go:78-89). DeleteAccount therefore treats a failed per-binding local removal as a successful step: it continues, writes outcome=ok with bindings_failed=N in Detail (lifecycle.go:200-206, 313-315), returns nil, and handleDeleteAccount returns 200 with the result body (account_routes.go:88-90). A transient DB error during one binding's Delete leaves the binding row behind for an already-erased account, with no automatic retry and the session revoked. Vault.DeleteSubject at lifecycle.go:208 usually shreds the surviving secret, so the concrete residue is the binding row and possibly a live upstream token when revokeUpstream had reported Unavailable, plus the false outcome=ok - matching the stated impact. Medium is appropriate: it is a correctness/erasure-completeness defect, not an attacker-reachable one.",
+      "evidence_checked": "internal/lifecycle/lifecycle.go:200-206, 313-315 (read), internal/federation/killswitch.go:70-92, 119-192 (read), internal/federation/unbind.go:37-98 (read), internal/httpapi/account_routes.go:54-91 (read)"
+    },
+    {
+      "id": "S08-5",
+      "status": "downgraded",
+      "final_severity": "low",
+      "reason": "The mechanical claim is CONFIRMED: hasUniversalPrefix (config.go:1016-1023) only tests p.Bits()==0, and parseTrustedProxies masks but preserves /1 prefixes (:1036-1037), so [\"0.0.0.0/1\",\"128.0.0.0/1\"] (or the IPv6 halves) covers the whole family with no Bits()==0 entry and skips the trusted_proxies_any acknowledgement at :589-601. The stated danger, however, does not follow with the current code: clientAddr/forwardedClient (internal/httpapi/clientaddr.go:69-110) reads only the RIGHTMOST X-Forwarded-For entry and returns the server-observed peer address whenever that hop is trusted. With a universal trusted list every hop is trusted, so the header is ignored and the bucket key is the peer - the caller does NOT get to choose it. The config comment at :582-588 ('the bucket key becomes caller-chosen again') is stale relative to the rewritten forwardedClient (whose own comment at :92-98 describes removing the old leftmost/walking branch). Hence the refused 0.0.0.0/0 case is itself a benign no-op and the /1 split is not 'byte-for-byte as dangerous'; the bypass only skips an administrative acknowledgement. Real guard incompleteness, low/informational security impact.",
+      "evidence_checked": "cmd/re0auth/config.go:573-601, 1013-1051 (read), internal/httpapi/clientaddr.go:46-153 (read)"
+    },
+    {
+      "id": "S08-6",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "CONFIRMED. configSecretEnvNames (config.go:418-448) prints role=name verbatim through add() without any shape validation, and main.go:276-290 prints the lines before logging is configured and before loadConfig would resolve anything, so an operator who pastes the base64 KEK (or a DSN) into the *_env name slot has it echoed to stdout. backup-keys.sh:73-77 consumes that output, so it also lands in shell variables and any CI transcript. This is the residual of the Z19 class: Z19-1/Z19V-1 (FIXED 17914d4) hardened configuration-error messages and config.Secret (internal/config/config.go:57-66) no longer echoes the configured string, but the -print-secret-env exit was not covered. Exploitation requires the same operator typo the *_env convention invites. The finding's own note that storage.dsn_env is not enumerated by this function is also correct. Low is right.",
+      "evidence_checked": "cmd/re0auth/config.go:404-448 (read), cmd/re0auth/main.go:270-291 (read), scripts/backup-keys.sh:64-103 (read), internal/config/config.go Secret (read), docs/issues/P2-medium.md:35"
+    },
+    {
+      "id": "S08-7",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "CONFIRMED. dataPlaneTimeout=45s (main.go:140-150) is asserted only against writeTimeout=60s (main.go:109-118, TestDataPlaneTimeoutFitsInsideTheWriteTimeout in timeouts_test.go:20); shutdownTimeout=30s (main.go:125-128) is an independent, shorter bound. shutdown() waits out endpointRemovalWait=5s and then calls server.Shutdown(drainCtx) with the 30s drain and falls through to server.Close() on expiry (main.go:846-867). A data-plane request still within its own 45s deadline therefore has its connection force-closed at ~t+35 from SIGTERM rather than being allowed to reach its 504, which is the no-response outcome the writeTimeout invariant exists to avoid. The k8s side has no headroom either: terminationGracePeriodSeconds=45 equals the documented serial budget 5+30+10 (deploy/k8s/base/deployment.yaml:28, docs/operations.md:294-300), and TestGracefulShutdownWindowsAgree (internal/zzprobe/deploy/artifacts_test.go:346-398) only checks wait+drain+margin against grace, not dataPlaneTimeout. Real but a narrow rolling-deploy edge case, so low.",
+      "evidence_checked": "cmd/re0auth/main.go:100-151, 840-868 (read), cmd/re0auth/timeouts_test.go:20, deploy/k8s/base/deployment.yaml:28, docs/operations.md:294-300, internal/zzprobe/deploy/artifacts_test.go:346-398 (read)"
+    },
+    {
+      "id": "S08-8",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "CONFIRMED. The pointer field distinguishes absent from chosen, and -1 is 'not chosen' (config.go:553-571): a configured 0 (file or RE0AUTH_MAX_UPSTREAM_BUFFER_BYTES=0) passes the only validation (< -1 refused), so cfg.MaxUpstreamBufferBytes=0 is faithfully carried to federation.NewService at main.go:523. NewService then overwrites it: service.go:382-384 sets cfg.MaxBufferedBytes = defaultMaxBufferedBytes (64<<20) whenever it is 0. The operator's chosen value is neither applied nor refused, and nothing logs it - exactly the 'looks applied and is not' failure the neighbouring validation refuses everywhere else. The layers also disagree on what 0 means: newBufferBudget(0) would make acquire() shed every byte (service.go:95-117), while NewService turns it into the 64 MiB default. Low is right.",
+      "evidence_checked": "cmd/re0auth/config.go:553-571 (read), cmd/re0auth/main.go:510-528 (read), internal/federation/service.go:26-30, 85-118, 380-393 (read)"
+    },
+    {
+      "id": "S08-9",
+      "status": "confirmed",
+      "final_severity": "low",
+      "reason": "CONFIRMED. loadIdP validates only that a non-built-in provider's issuer is non-empty (config.go:855-890); nothing checks the scheme. Registry construction (idp/idp.go:313-397) stores the issuer as-is for a custom provider, oidcProvider calls oidc.NewProvider on it (idp.go:705-711) and endpoints are pinned only to the issuer's own scheme+host (pinToIssuer, idp.go:530-554), so issuer=\"http://idp.example\" is accepted and the authorization redirect, discovery, JWKS fetch and token exchange (which carries the client secret and authorization code) all run over cleartext. No acknowledgement switch exists (unlike expose_internal / allow_private_addresses) and no startup warning names the scheme. The outbound client's transport denies private addresses but does not require https (idp.go:300, httpclient/outbound.go:288), and the test suite itself exercises http issuers. This is a real gap; low is appropriate because it needs the operator to configure or typo a non-https issuer and local/plaintext OIDC providers are a legitimate deployment shape.",
+      "evidence_checked": "cmd/re0auth/config.go:845-892 (read), idp/idp.go:300, 313-397, 505-554, 684-724 (read), idp/idp_test.go:186-196, 280-306 (read)"
+    }
+  ],
+  "summary": "9/9 findings independently re-checked at the cited file:line, with surrounding code, callers and prior-round adjudications. Two high-severity claims were reproduced empirically with a temporary in-package Go probe (since deleted): S08-2 (inferred driver with a renamed dsn_env yields driver=postgres, DatabaseURL empty, reason empty -> openStorage silently runs memory) is CONFIRMED at high; S08-1 (file-declared renamed kek_env ignored because RE0AUTH_KEK is read first, old key material used under new kek_id) is confirmed in behaviour but DOWNGRADED to medium as a misconfiguration-driven footgun and a re-report of round-7 P3 Z12V-1. S08-3 (DeleteAccount success record written before Pseudonyms.Destroy) is DOWNGRADED to low: the primary P1 Z07-2 was fixed by the corrective outcome=error record, leaving only its best-effort nature. S08-5 (hasUniversalPrefix only matches Bits()==0) is DOWNGRADED to low/informational: the guard is genuinely bypassable by a /1 split, but forwardedClient returns the peer address for any trusted hop, so the claimed caller-chosen bucket key does not follow and the guarded universal case is itself a no-op. S08-4 (binding sweep Failed folded into outcome=ok with HTTP 200) is CONFIRMED at medium. S08-6, S08-7, S08-8 and S08-9 are CONFIRMED at low with the cited impact and no missed guard found. No finding rejected; no new severe finding invented. Counts: 6 confirmed, 3 downgraded, 0 rejected.",
+  "counts": {
+    "confirmed": 6,
+    "downgraded": 3,
+    "rejected": 0,
+    "upgrades": 0
+  }
+}
