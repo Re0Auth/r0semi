@@ -60,7 +60,7 @@ func openTestDBWith(t testing.TB, opts PoolOptions, options ...Option) *DB {
 		         sessions, audit_events,
 		         session_subjects,
 		         oidc_auth_requests, oidc_codes, oidc_access_tokens,
-		         oidc_refresh_tokens, oidc_devices,
+		         oidc_refresh_tokens, oidc_refresh_token_tombstones, oidc_devices,
 		         -- The audit chain's head and the subject keys are state OUTSIDE
 		         -- audit_events, so truncating that table alone leaves a stale head:
 		         -- the next appended row carries a non-empty prev_hash and Verify
@@ -268,7 +268,13 @@ func TestTokensConsumeIsSingleUse(t *testing.T) {
 		t.Fatalf("second consume = %v, want ErrTokenNotFound", err)
 	}
 
-	if err := tokens.SaveRefresh(ctx, "rt", oauth.RefreshToken{ClientID: "c", Subject: "s", FamilyID: "fam-rt"}); err != nil {
+	// The token needs a real deadline: the rotation's tombstone inherits it
+	// (ConsumeRefresh), and a replay is recognised only while that tombstone is
+	// unexpired. A zero ExpiresAt would plant a tombstone that expired at the
+	// start of time, so the second consume below would report the spent value as
+	// never issued — an artifact of the fixture, not of the store.
+	expiry := time.Now().Add(time.Hour)
+	if err := tokens.SaveRefresh(ctx, "rt", oauth.RefreshToken{ClientID: "c", Subject: "s", FamilyID: "fam-rt", ExpiresAt: expiry}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tokens.ConsumeRefresh(ctx, "rt"); err != nil {

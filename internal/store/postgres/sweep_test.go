@@ -225,6 +225,12 @@ func TestSweepExpiredRemovesDatedRows(t *testing.T) {
 
 // insertExpiredOAuthCodes plants n already-expired authorization codes in one
 // table, which is the backlog shape Z15-1 reasons about.
+//
+// Every row carries exactly the expiry passed in. The driver encodes that same
+// time.Time identically for the INSERT and for a later comparison, so a "still
+// expired?" count has to be INCLUSIVE (`expires_at <= $1`): with `< $1` the
+// planted rows compare equal to the bound and the count is 0 no matter how many
+// the sweep left behind.
 func insertExpiredOAuthCodes(t *testing.T, db *DB, ctx context.Context, n int, expiry time.Time) {
 	t.Helper()
 	if _, err := db.pool.Exec(ctx, `
@@ -276,7 +282,7 @@ func TestSweepExpiredIsBoundedPerCycle(t *testing.T) {
 			removed, sweepBatchSize)
 	}
 	if got := countSweptRows(t, db,
-		`SELECT count(*) FROM oauth_codes WHERE expires_at < $1`, past); got != beyond {
+		`SELECT count(*) FROM oauth_codes WHERE expires_at <= $1`, past); got != beyond {
 		t.Fatalf("after one cycle %d expired rows remain, want %d", got, beyond)
 	}
 	if got := countSweptRows(t, db, `SELECT count(*) FROM oauth_codes`); got != beyond+1 {
@@ -321,7 +327,7 @@ func TestSweepSurvivesATightStatementTimeout(t *testing.T) {
 		t.Fatalf("a cycle removed %d rows, more than the designed bound %d", removed, maxCycle)
 	}
 	if got := countSweptRows(t, db,
-		`SELECT count(*) FROM oauth_codes WHERE expires_at < $1`, past); got != backlog-int(removed) {
+		`SELECT count(*) FROM oauth_codes WHERE expires_at <= $1`, past); got != backlog-int(removed) {
 		t.Fatalf("oauth_codes holds %d expired rows after the cycle, want %d", got, backlog-int(removed))
 	}
 }

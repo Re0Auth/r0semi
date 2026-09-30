@@ -1159,12 +1159,22 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 	// the new last_poll and updates nothing. One store-clock value both writes
 	// the deadline and judges it — the single-clock policy; the database's now()
 	// would make the interval a race between two clocks.
+	//
+	// The interval is subtracted in Go, and the resulting instant is bound as a
+	// plain timestamptz: SQL interval arithmetic here (`$4 - make_interval(secs
+	// => $3)`) left the parameter untyped enough that PostgreSQL resolved the
+	// subtraction as `interval - interval` and then refused the comparison
+	// ("operator does not exist: timestamp with time zone <= interval"), which
+	// CI's TestDevicePollingIsThrottled caught. staleBefore is the last instant a
+	// previous poll may carry for this one to be admitted; `last_poll IS NULL`
+	// admits the first.
+	staleBefore := now.Add(-oidcstore.DefaultDevicePollInterval)
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oidc_devices
-		   SET last_poll = $4
+		   SET last_poll = $3
 		 WHERE device_code_hash = $1 AND client_id = $2 AND done = false AND denied = false
-		   AND (last_poll IS NULL OR last_poll <= $4 - make_interval(secs => $3))`,
-		hashValue(deviceCode), clientID, oidcstore.DefaultDevicePollInterval.Seconds(), now)
+		   AND (last_poll IS NULL OR last_poll <= $4)`,
+		hashValue(deviceCode), clientID, now, staleBefore)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: record device poll: %w", err)
 	}

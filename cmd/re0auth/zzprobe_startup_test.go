@@ -304,7 +304,12 @@ func TestProbeStartupLogOmitsEverySecuritySwitch(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	if err := run(); err != nil {
+	// -rotate-keys over this probe's in-memory storage can never certify a
+	// rotation: it scans no records, and Z12-2 turned that into a non-zero exit
+	// (cmd/re0auth/main.go's rotationReport). The flag is used here only to run
+	// the pre-listener startup path, so that expected refusal is not this
+	// probe's subject; any other error is.
+	if err := run(); err != nil && !strings.Contains(err.Error(), "cannot certify a rotation") {
 		t.Fatalf("run() = %v", err)
 	}
 

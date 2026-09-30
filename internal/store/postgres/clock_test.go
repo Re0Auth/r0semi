@@ -158,7 +158,12 @@ func TestDeviceDeadlinesAreJudgedByTheClockThatWroteThem(t *testing.T) {
 	if !st.Done {
 		t.Fatal("the approval did not land")
 	}
-	if want := storeClock(); st.AuthTime.Before(want) || st.AuthTime.Sub(want) > time.Second {
+	// The stamp is taken from the store clock inside ApproveDevice, so it lands
+	// within a second of this read on either side. Testing `!AuthTime.Before(want)`
+	// against a clock read AFTER the call would reject every correct stamp (it is
+	// always a few microseconds older than the read); only the two-clock failure,
+	// a stamp two hours ahead, is what this window has to reject.
+	if want := storeClock(); st.AuthTime.Sub(want) > time.Second || want.Sub(st.AuthTime) > time.Second {
 		t.Fatalf("auth_time = %s, want the store clock (%s): a database-clock stamp would run "+
 			"two hours ahead of when the human actually decided", st.AuthTime, want)
 	}
