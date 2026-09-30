@@ -85,4 +85,23 @@ expected='| PASS | milestone 1: ok |
 | WARN | milestone 4b: fallback |'
 [ "${table}" = "${expected}" ] || { printf 'summary table mismatch:\n%s\n' "${table}" >&2; exit 1; }
 
+# The plan-module table the run summary renders from plan-run.json.
+printf '{"modules":[{"testModule":"m-one","status":"FINISHED","result":"SUCCESS"},{"testModule":"m-two","status":"INTERRUPTED","result":"FAILURE"}]}' > "${WORK}/plan-run.json"
+modules="$(
+  "${PYTHON}" - "${WORK}/plan-run.json" <<'PY' | tr -d '\r'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit
+for module in data.get("modules") or []:
+    print("| %s | %s | %s |" % (module.get("testModule", "?"),
+                                module.get("status", "?"),
+                                module.get("result", "?")))
+PY
+)"
+expected_modules='| m-one | FINISHED | SUCCESS |
+| m-two | INTERRUPTED | FAILURE |'
+[ "${modules}" = "${expected_modules}" ] || { printf 'module table mismatch:\n%s\n' "${modules}" >&2; exit 1; }
+
 echo "summary helpers OK"

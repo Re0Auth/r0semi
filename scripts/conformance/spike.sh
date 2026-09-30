@@ -403,6 +403,24 @@ if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
     printf 'Plan: %s%s\n' "${PLAN_STATUS}" "${PLAN_RESULT:+ (${PLAN_RESULT})}"
     echo
     printf 'Suite: %s | issuer %s | seeded redirect_uri `%s`\n' "${SUITE_IMAGE}" "${ISSUER}" "${REDIRECT_URI}"
+    if [[ "${PLAN_STATUS}" != "not-run" && -s "${WORK}/plan-run.json" ]]; then
+      echo
+      echo "### Plan modules"
+      echo
+      echo "| module | status | result |"
+      echo "|---|---|---|"
+      "${PYTHON}" - "${WORK}/plan-run.json" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit
+for module in data.get("modules") or []:
+    print("| %s | %s | %s |" % (module.get("testModule", "?"),
+                                module.get("status", "?"),
+                                module.get("result", "?")))
+PY
+    fi
     if [[ "${PLAN_STATUS}" == "not-run" ]]; then
       echo
       echo "No plan payload was supplied. This run proved connectivity; pick a plan below,"
