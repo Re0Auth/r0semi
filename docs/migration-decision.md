@@ -9,11 +9,14 @@
 
 ## 决策
 
-1. **迁移在启动时执行，由 advisory lock 串行化。**
+1. **迁移在启动时执行，由 goose 的 advisory session locker 串行化。**
    `Open()` 无条件 `Migrate()`：不存在“连上未迁移的库”的受支持路径。多实例启动时，
-   `pg_advisory_lock(migrationLockKey)` 保证同一时刻只有一个实例在迁移；在
-   `maxUnavailable: 0` 的滚动发布下，第二个实例**等待锁**而不是并行迁移。锁与 goose 都跑在
-   一条独立连接上（不是从池里借的），以免继承了属于服务流量的 `statement_timeout`。
+   `goose/v3/lock` 的 Postgres session locker（`pg_try_advisory_lock` + 重试，锁 ID 仍是
+   `migrationLockKey`）保证同一时刻只有一个实例在迁移；在
+   `maxUnavailable: 0` 的滚动发布下，第二个实例**等待锁**而不是并行迁移。等待有上界：
+   5 秒一次、共 60 次（5 分钟），超过即启动失败——不像阻塞式 `pg_advisory_lock` 那样
+   在持锁进程卡住时永久挂起。锁与 goose 都跑在一条独立连接上（不是从池里借的），以免
+   继承了属于服务流量的 `statement_timeout`。
 
 2. **同一版本内只做加法（expand/contract）。**
    一个迁移**不得**在同一个发布里既加列又依赖它的回填，也不得删除仍在被上一版本代码读取的列。
@@ -31,8 +34,8 @@
 4. **新增 `-migrate-down`，只回退一步。**
    `re0auth -migrate-down` 回退最近一次迁移后退出。它是一个**包级函数**
    （`postgres.MigrateDown`），不是 `*DB` 方法：调用它时必须**还没有**打开连接池，因为
-   `Open()` 会向上迁移，先开池再回退会被“开池”这个动作本身抵消。回退同样在 advisory lock 下、
-   在独立连接上执行。
+   `Open()` 会向上迁移，先开池再回退会被“开池”这个动作本身抵消。回退同样在同一个
+   session locker 下、在独立连接上执行。
 
 ## 后果
 

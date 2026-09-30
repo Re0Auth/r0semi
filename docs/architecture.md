@@ -531,7 +531,7 @@ WARNING: no DATABASE_URL; every store is in-memory -- a restart loses sessions, 
 
 | 关注点 | 做法 |
 |---|---|
-| 迁移 | `embed.FS` 内嵌 SQL + goose + `pg_advisory_lock`（多实例同时启动不打架）；兼容性与回滚见 [migration-decision.md](./migration-decision.md)（ADR-0008） |
+| 迁移 | `embed.FS` 内嵌 SQL + goose + goose session locker（advisory lock，等待有上界）；兼容性与回滚见 [migration-decision.md](./migration-decision.md)（ADR-0008） |
 | 令牌落盘 | 全部按键 `sha256(value)`，**明文永不入库**；测试直接查表断言。
   会话 cookie 同理（`sessions.token_hash`）——否则一张表泄露就是一整套可用会话 |
 | 凭据落盘 | 只存不透明密文材料；测试驱动真实信封加密写表，再把整行 dump 出来搜明文（并防空断言） |

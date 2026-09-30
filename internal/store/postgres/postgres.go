@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver goose runs on
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 )
 
 //go:embed migrations/*.sql
@@ -29,6 +30,17 @@ var migrationsFS embed.FS
 // migrationLockKey serializes migrations across instances. Any constant works;
 // this one is arbitrary but stable.
 const migrationLockKey int64 = 0x7230636d6967
+
+// migrationLockPeriod and migrationLockAttempts bound how long a starting
+// instance waits for another instance's migration before giving up: goose's
+// session locker probes pg_try_advisory_lock every 5 seconds, this many times,
+// so five minutes. Waiting for a peer is legitimate and can outlast any request;
+// waiting forever is a startup that never answers, which is what the blocking
+// pg_advisory_lock this used to issue did.
+const (
+	migrationLockPeriod   = 5
+	migrationLockAttempts = 60
+)
 
 // DB owns the connection pool and hands out the port implementations.
 type DB struct {
@@ -313,51 +325,74 @@ func (db *DB) Audit(key []byte) (*AuditLogger, error) {
 	return logger, nil
 }
 
-// withMigrationLock runs fn against a goose provider under the migration advisory
-// lock, so two instances acting at once cannot race, on a connection of its own.
+// withMigrationLock runs fn against a goose provider under goose's Postgres
+// session locker, so two instances acting at once cannot race.
 //
-// The lock is held on a dedicated connection rather than one borrowed from the
-// pool, for two reasons that both come from the pool's statement_timeout:
+// The lock is goose's rather than the hand-written blocking
+// `pg_advisory_lock` this used to issue: goose probes with
+// `pg_try_advisory_lock` in a bounded retry loop (migrationLockAttempts ×
+// migrationLockPeriod) and releases the session-level lock when the connection
+// ends, so a peer that never finishes becomes a startup failure instead of a
+// startup that hangs forever.
 //
-//   - waiting for another instance to finish migrating is legitimate and can take
-//     longer than any request should, so it must not inherit a bound meant for
-//     serving traffic;
+// It is held around fn rather than handed to the provider through
+// goose.WithSessionLocker, because fn also adopts a pre-goose
+// `schema_migrations` table: that read-modify-write has to sit under the same
+// lock as the migration that follows it, and provider.Up/Down would cover only
+// the latter.
+//
+// The lock lives on a connection of its own rather than one borrowed from the
+// pool, for two reasons:
+//
+//   - waiting for another instance to finish migrating is legitimate and can
+//     take longer than any request should, so it must not inherit the pool's
+//     serving-side statement_timeout;
 //   - pgxpool does not reset session state when a connection is released, so a
-//     `SET statement_timeout = 0` here would leak back into the pool and quietly
-//     disable the bound for every later request. A standalone connection has
-//     nothing to leak into, and is closed when the migration finishes.
+//     serving connection must not be used to hold a migration lock. goose runs
+//     its migrations on the handle's other connections, and the lock connection
+//     is closed when the migration finishes.
 //
 // goose itself runs on a database/sql handle (the pgx stdlib driver), because
 // that is the seam it exposes. Both directions of migration share this setup, so
 // up and down cannot drift apart.
 func withMigrationLock(ctx context.Context, dsn string, connectTimeout time.Duration,
 	fn func(context.Context, *sql.DB, *goose.Provider) error) error {
-	connCfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return fmt.Errorf("postgres: migrate: parse dsn: %w", err)
-	}
-	if connectTimeout > 0 {
-		connCfg.ConnectTimeout = connectTimeout
-	}
-	conn, err := pgx.ConnectConfig(ctx, connCfg)
-	if err != nil {
-		return fmt.Errorf("postgres: migrate: connect: %w", err)
-	}
-	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
-		return fmt.Errorf("postgres: migrate: lock: %w", err)
-	}
-	defer func() {
-		// Detached: unlocking must happen even if ctx was cancelled.
-		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
-	}()
-
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return fmt.Errorf("postgres: migrate: open database/sql handle: %w", err)
 	}
 	defer func() { _ = sqlDB.Close() }()
+
+	locker, err := lock.NewPostgresSessionLocker(
+		lock.WithLockID(migrationLockKey),
+		lock.WithLockTimeout(migrationLockPeriod, migrationLockAttempts),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: migrate: locker: %w", err)
+	}
+
+	// Bound acquiring the lock's connection by the same connect budget as any
+	// other startup dial, so an unreachable host fails rather than holds.
+	connCtx := ctx
+	cancel := func() {}
+	if connectTimeout > 0 {
+		connCtx, cancel = context.WithTimeout(ctx, connectTimeout)
+	}
+	conn, err := sqlDB.Conn(connCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("postgres: migrate: connect: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := locker.SessionLock(ctx, conn); err != nil {
+		return fmt.Errorf("postgres: migrate: lock: %w", err)
+	}
+	defer func() {
+		// Detached: unlocking must happen even if ctx was cancelled. If it still
+		// fails, closing the connection releases the session-level lock.
+		_ = locker.SessionUnlock(context.WithoutCancel(ctx), conn)
+	}()
 
 	dir, err := fs.Sub(migrationsFS, "migrations")
 	if err != nil {
