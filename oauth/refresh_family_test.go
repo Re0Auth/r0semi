@@ -246,3 +246,62 @@ func TestRefreshReuseWithAFailingRevocationFailsClosed(t *testing.T) {
 		t.Fatalf("the store failure was dressed as the protocol error %q", protocol.Code)
 	}
 }
+
+// R5-10: ownership is judged before the value is spent. ConsumeRefresh is a
+// DELETE, so checking the client binding afterwards let any authenticated client
+// burn another client's refresh token just by presenting it — the refusal came,
+// but the owner's grant was gone. With family tombstones that got worse: the
+// owner's own retry was then read as a replay and revoked the whole family. This
+// is the guard that the non-destructive ownership read happens first.
+func TestCrossClientPresentationDoesNotSpendTheOwnersToken(t *testing.T) {
+	svc, clients, _, logger, _ := newTestAS(t)
+	registerClient(t, clients, "owner", ClientPublic, "", []Scope{ScopeAccountID})
+	registerClient(t, clients, "thief", ClientPublic, "", []Scope{ScopeAccountID})
+	ctx := context.Background()
+	redirect := "https://app.example/cb"
+	verifier := "owner-verifier-owner-verifier-owner"
+
+	auth, err := svc.Authorize(ctx, AuthorizationRequest{
+		ClientID: "owner", RedirectURI: redirect, Subject: "usr_1",
+		Scopes:        []Scope{ScopeAccountID},
+		CodeChallenge: pkceChallenge(verifier), CodeChallengeMethod: "S256",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "owner", Code: auth.Code, RedirectURI: redirect, CodeVerifier: verifier,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The thief presents the owner's refresh token. Refused, without spending it
+	// and without arming the reuse detector — the token is not a replay, it is
+	// somebody else's property.
+	if _, err := svc.Refresh(ctx, RefreshRequest{ClientID: "thief", RefreshToken: owner.RefreshToken}); protocolCode(t, err) != "invalid_grant" {
+		t.Fatalf("a cross-client presentation answered %v, want invalid_grant", err)
+	}
+	for _, e := range logger.Events() {
+		if e.Action == "oauth.reuse_detected" {
+			t.Fatal("a cross-client presentation was recorded as a detected replay")
+		}
+	}
+
+	// The owner's token must still be spendable: that is the point of the check.
+	rotated, err := svc.Refresh(ctx, RefreshRequest{ClientID: "owner", RefreshToken: owner.RefreshToken})
+	if err != nil {
+		t.Fatalf("the cross-client attempt burned the owner's refresh token: %v", err)
+	}
+	if rotated.RefreshToken == "" || rotated.RefreshToken == owner.RefreshToken {
+		t.Fatalf("the owner's rotation did not mint a new refresh token: %+v", rotated)
+	}
+	// And the family survived: the original access token is still live.
+	info, err := svc.Introspect(ctx, owner.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Active {
+		t.Fatal("the owner's access token was revoked by the cross-client attempt")
+	}
+}

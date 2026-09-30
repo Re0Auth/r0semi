@@ -189,6 +189,27 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 	if err != nil {
 		return TokenResponse{}, err
 	}
+
+	// Ownership is judged BEFORE the value is spent, not after. ConsumeRefresh is
+	// a DELETE: checking the client binding afterwards let any authenticated
+	// client burn another client's refresh token simply by presenting it — the
+	// refusal arrived, but the owner's token was already gone — and, now that a
+	// spent value leaves a family tombstone, the owner's own retry was then
+	// reported as a replay and revoked the whole family. TokenOwner is a read, so
+	// a mismatch costs the caller nothing and takes nothing from the owner.
+	//
+	// An already-spent value is intentionally not resolvable this way (TokenOwner
+	// reports ErrTokenNotFound for it, which keeps RFC 7009 revocation
+	// idempotent); it falls through to ConsumeRefresh below, where the reuse
+	// signal and its family revocation live.
+	owner, err := s.tokens.TokenOwner(ctx, req.RefreshToken)
+	switch {
+	case err == nil && owner != client.ID:
+		return TokenResponse{}, protocolError("invalid_grant", "refresh token was issued to another client")
+	case err != nil && !errors.Is(err, ErrTokenNotFound):
+		return TokenResponse{}, err
+	}
+
 	rt, err := s.tokens.ConsumeRefresh(ctx, req.RefreshToken)
 	var reuse *RefreshReuseError
 	switch {
@@ -217,6 +238,9 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 	if !s.now().Before(rt.ExpiresAt) {
 		return TokenResponse{}, protocolError("invalid_grant", "refresh token has expired")
 	}
+	// Re-asserted on the record this request actually consumed. The pre-check
+	// above already refused a foreign token and a record's owner cannot change,
+	// but the binding is cheap and this is the value about to mint tokens.
 	if rt.ClientID != client.ID {
 		return TokenResponse{}, protocolError("invalid_grant", "refresh token was issued to another client")
 	}
