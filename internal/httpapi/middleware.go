@@ -16,6 +16,8 @@ import (
 
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 	"github.com/Re0Auth/r0semi/oauth"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type ctxKey int
@@ -143,7 +145,7 @@ func (s *Server) withRequestContext(next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Request-Id", id)
 
-		trace := traceIDFromTraceparent(r.Header.Get("traceparent"))
+		trace := remoteTraceID(r)
 		if trace == "" {
 			trace = newTraceID()
 		}
@@ -178,7 +180,7 @@ func requestID(r *http.Request) string { return idsOf(r).request }
 // request.
 func withTrace(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		trace := traceIDFromTraceparent(r.Header.Get("traceparent"))
+		trace := remoteTraceID(r)
 		if trace == "" {
 			trace = newTraceID()
 		}
@@ -188,29 +190,28 @@ func withTrace(next http.Handler) http.Handler {
 	})
 }
 
-// traceIDFromTraceparent parses the version 00 form
-// `00-<32 hex trace-id>-<16 hex span-id>-<2 hex flags>`. Anything else yields "".
-func traceIDFromTraceparent(header string) string {
-	if header == "" {
+// remoteTraceID returns the trace id of the caller's W3C traceparent, or "" when
+// the header is absent, malformed, or carries an invalid context.
+//
+// It parses with the OpenTelemetry propagator rather than by hand, so the rules
+// are the specification's rather than this file's reading of them: lowercase hex
+// only, both the trace id and the span id non-zero, versions up to 0xfe accepted
+// (for version 00 the flags field is constrained too), and a tracestate that is
+// parsed but not used here. The id alone is taken from the extracted context,
+// because this service correlates traces rather than exporting them — the remote
+// span context does not travel any further, and nothing here can observe the
+// tracestate.
+//
+// IsRemote is required so that a span context already in the request context —
+// put there by an enclosing instrumentation, not by a header — is never mistaken
+// for the caller's. Extract marks what it reads from the header remote.
+func remoteTraceID(r *http.Request) string {
+	ctx := propagation.TraceContext{}.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() || !sc.IsRemote() {
 		return ""
 	}
-	parts := strings.Split(header, "-")
-	if len(parts) != 4 || parts[0] != "00" {
-		return ""
-	}
-	traceID, spanID, flags := parts[1], parts[2], parts[3]
-	if len(traceID) != 32 || len(spanID) != 16 || len(flags) != 2 {
-		return ""
-	}
-	for _, s := range []string{traceID, spanID, flags} {
-		if _, err := hex.DecodeString(s); err != nil {
-			return ""
-		}
-	}
-	if traceID == strings.Repeat("0", 32) {
-		return ""
-	}
-	return traceID
+	return sc.TraceID().String()
 }
 
 func newTraceID() string {
