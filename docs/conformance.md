@@ -45,9 +45,15 @@ have caught them on every commit.
 7. when a plan payload is supplied, builds the OP with the `conformance` build tag
    and its auto-login opt-in (see the headless gap below), then runs the suite's own
    flow through `scripts/conformance/run-plan.py`:
-   `POST /api/plan?planName=…&variant=…` → one
-   `POST /api/runner?test=<module>&plan=<id>` per module → poll `GET /api/info/<id>`
-   (milestones 6–7). The payload shape and the ready-made Basic OP file are in
+   `POST /api/plan?planName=…&variant=…` → for each module,
+   `POST /api/runner?test=<module>&plan=<id>`, long-poll
+   `GET /api/runner/<id>/wait-state`, **visit the front-channel URLs** the suite
+   lists (`GET /api/runner/browser/<id>` → real GET → `POST …/visit`) and read the
+   final `GET /api/info/<id>`. Modules run one at a time — creating a whole plan's
+   worth at once interrupts the suite's configuration (30 of 35 modules ended
+   INTERRUPTED on the first real run). Failures carry their `GET /api/log/<id>`
+   reasons into the summary. `max_modules` caps the run for a smoke test (milestones
+   6–7). The payload shape and the ready-made Basic OP file are in
    `scripts/conformance/plans/`.
 
 Every milestone is written to `conformance-artifacts/summary.md`, which the

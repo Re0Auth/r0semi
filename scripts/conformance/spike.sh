@@ -354,7 +354,9 @@ if (( PLAN_REQUESTED )); then
   set +e
   "${PYTHON}" "${ROOT}/scripts/conformance/run-plan.py" \
     --api "${API}" --insecure --payload "${CONFORMANCE_PLAN_JSON}" \
-    --timeout "${CONFORMANCE_PLAN_TIMEOUT_SECONDS:-900}" \
+    --timeout "${CONFORMANCE_PLAN_TIMEOUT_SECONDS:-1800}" \
+    --module-timeout "${CONFORMANCE_PLAN_MODULE_TIMEOUT_SECONDS:-180}" \
+    --max-modules "${CONFORMANCE_PLAN_MAX_MODULES:-0}" \
     > "${WORK}/plan-run.json" 2> "${WORK}/plan-run.err"
   run_rc=$?
   set -e
@@ -429,6 +431,23 @@ for module in data.get("modules") or []:
     print("| %s | %s | %s |" % (module.get("testModule", "?"),
                                 module.get("status", "?"),
                                 module.get("result", "?")))
+PY
+      "${PYTHON}" - "${WORK}/plan-run.json" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit
+lines = []
+for module in data.get("modules") or []:
+    for message in module.get("messages") or []:
+        lines.append("- `%s`: %s" % (module.get("testModule", "?"), message))
+if lines:
+    print()
+    print("### Why modules did not pass")
+    print()
+    for line in lines[:40]:
+        print(line)
 PY
     fi
     if [[ "${PLAN_STATUS}" == "not-run" ]]; then

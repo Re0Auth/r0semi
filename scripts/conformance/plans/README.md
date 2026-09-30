@@ -58,6 +58,12 @@ Dispatch with `plan_json: scripts/conformance/plans/oidcc-basic.json`. It is
 report-only until `require_plan: true` is set, which is the switch to flip once the
 nightly is green.
 
+A full Basic OP pass runs ~35 modules **one at a time** and drives each front-channel
+URL, so start with a smoke run: dispatch with `max_modules: 5`. Then widen to the
+whole plan (or leave it at `0` for the nightly). The runner is
+[`run-plan.py`](../run-plan.py); per-module failure reasons are pulled from
+`GET /api/log/<id>` and appear under *Why modules did not pass* in the run summary.
+
 ## Before you pick a plan
 
 The spike's OP has no identity provider and no automated consent on the ordinary

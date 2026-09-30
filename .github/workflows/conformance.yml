@@ -23,6 +23,10 @@ on:
         description: 'Redirect URI seeded into the OP client; must equal the one the suite generates (blank = the script default)'
         required: false
         default: ''
+      max_modules:
+        description: 'How many modules to run (0 = the whole plan). Small numbers make a fast smoke run.'
+        required: false
+        default: '0'
       require_plan:
         description: 'Fail when the plan does not finish cleanly (use once nightly is green)'
         type: boolean
@@ -37,7 +41,9 @@ permissions:
 jobs:
   spike:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # A plan runs its modules one at a time and drives each front-channel URL, so a
+    # full Basic OP pass is slower than the connectivity milestones.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,6 +61,7 @@ jobs:
           SPIKE_ARTIFACTS: ${{ github.workspace }}/conformance-artifacts
           CONFORMANCE_PLAN_JSON: ${{ inputs.plan_json }}
           CONFORMANCE_REDIRECT_URI: ${{ inputs.redirect_uri }}
+          CONFORMANCE_PLAN_MAX_MODULES: ${{ inputs.max_modules }}
           CONFORMANCE_REQUIRE_PLAN: ${{ inputs.require_plan && '1' || '0' }}
         run: |
           mkdir -p "${SPIKE_ARTIFACTS}"
