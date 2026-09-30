@@ -52,7 +52,23 @@ func openTestDBWith(t testing.TB, opts PoolOptions, options ...Option) *DB {
 	}
 	t.Cleanup(db.Close)
 
-	if _, err := db.pool.Exec(context.Background(), `
+	// Fixture maintenance, not a request: it must not inherit the pool's
+	// statement_timeout. openTestDBWith is also used to open a pool with a
+	// deliberately tight per-request timeout (sweep_test.go and sessions_test.go
+	// pass 250ms), and a 21-table TRUNCATE ... CASCADE is not a bounded request —
+	// on a loaded runner it can exceed that, which fails the test in its own
+	// fixture before the subject is ever exercised. SET LOCAL lifts the timeout for
+	// this transaction only; the pool's connections keep theirs.
+	ctx := context.Background()
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin fixture reset: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
+		t.Fatalf("lift statement_timeout for the fixture reset: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
 		TRUNCATE accounts_users, accounts_identities, oauth_codes,
 		         oauth_access_tokens, oauth_refresh_tokens, oauth_refresh_tombstones,
 		         oauth_device_authorizations, oauth_clients,
@@ -72,9 +88,12 @@ func openTestDBWith(t testing.TB, opts PoolOptions, options ...Option) *DB {
 	}
 	// The chain head row is seeded by migration 0013; truncating removed it, so put
 	// the genesis back.
-	if _, err := db.pool.Exec(context.Background(),
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO audit_chain (only_row, head_hash) VALUES (true, '\x'::bytea)`); err != nil {
 		t.Fatalf("reseed chain head: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit fixture reset: %v", err)
 	}
 	return db
 }
