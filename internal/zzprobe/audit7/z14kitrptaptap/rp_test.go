@@ -127,20 +127,22 @@ func TestZ14ControlTheProviderTTLCacheRetiresARotatedKey(t *testing.T) {
 	}
 }
 
-// TestZ14ProviderTTLIsDefeatedByAFailingRediscovery: the TTL is not an upper
-// bound on how long a retired key verifies.
+// TestZ14ProviderTTLIsDefeatedByAFailingRediscovery: the TTL alone is not an
+// upper bound on how long a retired key verifies — the retain-on-failure branch
+// is, and it has a ceiling now.
 //
-// oidcProvider keeps the cached provider when a re-discovery fails
-// (idp/idp.go:627-631, "Keep serving the cached provider"), and a provider owns
-// its key set — go-oidc only refetches the JWKS when a kid misses the cache
-// (jwks.go:163-179) and its cache never expires. So while the issuer's discovery
-// endpoint is failing, the *last successful* document and every key it ever
-// published keep working indefinitely: the TTL has no effect at all.
+// oidcProvider used to keep the cached provider when a re-discovery failed
+// (idp/idp.go, "Keep serving the cached provider") with no age bound, and a
+// provider owns its key set — go-oidc only refetches the JWKS when a kid misses
+// the cache (jwks.go:163-179) and its cache never expires. So while the issuer's
+// discovery endpoint was failing, the *last successful* document and every key it
+// ever published kept working indefinitely: the TTL had no effect at all.
 //
-// The precondition is an unavailable discovery endpoint — the upstream having a
-// bad minute (the comment's own motivation) is enough, and so is anything that
-// can make that one request fail. The consequence is the full RP-2 shape the
-// TTL was added to close: a leaked/retired private key keeps minting identities.
+// retainOnDiscoveryFailure now serves the cached provider only while it is
+// younger than providerStaleCeiling*providerTTL and refuses it past that, naming
+// the age. With a 1ns TTL the ceiling is 2ns, so every attempt below is refused
+// as soon as discovery fails; restoring discovery then rebuilds the provider and
+// drops the retired key.
 func TestZ14ProviderTTLIsDefeatedByAFailingRediscovery(t *testing.T) {
 	f := newFakeOP(t)
 	c := probeRegistry(t, f, time.Nanosecond)
@@ -181,8 +183,8 @@ func TestZ14ProviderTTLIsDefeatedByAFailingRediscovery(t *testing.T) {
 
 	if accepted > 0 {
 		discovery, _ := f.hits()
-		t.Errorf("the provider cache TTL (time.Nanosecond) elapsed, but a token signed by a key the upstream no longer publishes was accepted %d/3 times while discovery was failing (discovery requests so far: %d).\n"+
-			"idp/idp.go:627-631 returns the stale provider on a failed re-discovery, and its go-oidc key set never expires (oidc.go:154-165, jwks.go:163-179): the \"15 minutes\" bound documented at idp/idp.go:32-35 holds only while discovery keeps succeeding.",
+		t.Errorf("the provider cache TTL (time.Nanosecond) elapsed and 2*TTL is 2ns, but a token signed by a key the upstream no longer publishes was accepted %d/3 times while discovery was failing (discovery requests so far: %d).\n"+
+			"retainOnDiscoveryFailure (idp/idp.go) must serve the cached provider only while it is younger than providerStaleCeiling*providerTTL; past that the never-expiring go-oidc key set (oidc.go:154-165, jwks.go:163-179) keeps a retired key alive for the whole outage.",
 			accepted, discovery)
 	}
 }

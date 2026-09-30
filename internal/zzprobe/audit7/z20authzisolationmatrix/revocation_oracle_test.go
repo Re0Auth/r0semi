@@ -54,18 +54,26 @@ func TestZ20RevocationIsALivenessOracleForForeignTokens(t *testing.T) {
 	}
 }
 
-// TestZ20RevocationRefusesToDeleteAnotherClientsGrant is the guard for the half
-// that does hold: the foreign token is not deleted, and its owner can still
-// revoke it.
+// TestZ20RevocationRefusesToDeleteAnotherClientsGrant is the G-8 guard: a
+// foreign revocation answers the uniform RFC 7009 success (indistinguishable
+// from an unknown string) and deletes nothing, while the owner's own revocation
+// still works. (Before the fix the foreign case answered 401 invalid_client on
+// the deployed plane too; the refusal itself was the liveness oracle.)
 func TestZ20RevocationRefusesToDeleteAnotherClientsGrant(t *testing.T) {
 	e := newZEnv(t, zOptions{ExtraPublicIDs: []string{"cli2"}})
 	tokens := e.mintTokensFor("cli2", zSubject, "account.id")
 
-	if st, body := e.zRevoke(zClientID, "", tokens.AccessToken); st != http.StatusUnauthorized {
-		t.Errorf("another client revoked a foreign access token: %d %s", st, body)
+	if st, body := e.zRevoke(zClientID, "", tokens.AccessToken); st != http.StatusOK {
+		t.Errorf("another client's revocation of a foreign access token answered %d, want the uniform RFC 7009 200: %s",
+			st, body)
 	}
-	if st, body := e.zRevoke(zClientID, "", tokens.RefreshToken); st != http.StatusUnauthorized {
-		t.Errorf("another client revoked a foreign refresh token: %d %s", st, body)
+	if st, body := e.zRevoke(zClientID, "", tokens.RefreshToken); st != http.StatusOK {
+		t.Errorf("another client's revocation of a foreign refresh token answered %d, want the uniform RFC 7009 200: %s",
+			st, body)
+	}
+	// The mismatch guard: neither foreign attempt deleted anything.
+	if st, _, _ := e.zGet("/v1/me", tokens.AccessToken); st != http.StatusOK {
+		t.Errorf("the foreign revocations killed the access token (%d)", st)
 	}
 	// The owner can.
 	if st, body := e.zRevoke("cli2", "", tokens.RefreshToken); st != http.StatusOK {

@@ -279,6 +279,15 @@ func queueKey(kind string) string { return "boundq_" + kind }
 // rewritten on every request. The oldest entry is evicted past the cap.
 const maxBoundHandlesPerKind = 32
 
+// maxBoundHandleBytes is the longest id Bind will track. A bound id is stored in
+// the session and rewritten on every request, and some callers derive it from
+// request input (the device verification page binds the user code it looked up),
+// so the byte length is otherwise priced by whoever sends the request. The
+// service's own handles are far shorter (a user code is 9 bytes, an
+// authorization id is base64 of 16); the cap exists to make "caller-chosen
+// length" impossible rather than to accommodate one (Z07-3).
+const maxBoundHandleBytes = 128
+
 // handleSep separates the ids in a kind's queue. It is the ASCII unit separator,
 // which cannot occur in a handle id: every id in this service is an opaque token
 // the service minted — a base64 value, a device user code, a bind state.
@@ -304,10 +313,12 @@ const handleSep = '\x1f'
 // handles per kind: binding one more evicts the oldest, which is the only way a
 // session cannot be grown without bound by sending a browser to links.
 func (m *Manager) Bind(ctx context.Context, kind, id string) {
-	if id == "" || strings.ContainsRune(id, handleSep) {
+	if id == "" || len(id) > maxBoundHandleBytes || strings.ContainsRune(id, handleSep) {
 		// An id that could not be tracked is not bound at all. Binding it without
 		// a queue entry would put state in the session that nothing can evict,
-		// which is the failure this cap exists to prevent.
+		// which is the failure this cap exists to prevent; an over-long id is
+		// refused for the same reason — a session is rewritten whole, so its
+		// bytes must not be caller-chosen (Z07-3).
 		return
 	}
 	if m.sessions.GetString(ctx, handleKey(kind, id)) == "1" {

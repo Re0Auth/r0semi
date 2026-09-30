@@ -66,6 +66,8 @@ type auditOP struct {
 	tokenURL  string            // overrides the advertised token_endpoint
 	discovery int
 	jwks      int
+	// discoveryStatus, when non-zero and not 200, is what discovery answers with.
+	discoveryStatus int
 }
 
 func newAuditOP(t *testing.T) *auditOP {
@@ -75,8 +77,12 @@ func newAuditOP(t *testing.T) *auditOP {
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		op.mu.Lock()
 		op.discovery++
-		jwksURI, tokenURL := op.jwksURI, op.tokenURL
+		jwksURI, tokenURL, status := op.jwksURI, op.tokenURL, op.discoveryStatus
 		op.mu.Unlock()
+		if status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
 		if jwksURI == "" {
 			jwksURI = op.URL + "/jwks"
 		}
@@ -120,6 +126,13 @@ func (op *auditOP) counts() (discovery, jwks int) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	return op.discovery, op.jwks
+}
+
+// failDiscovery makes the discovery document answer status instead of 200.
+func (op *auditOP) failDiscovery(status int) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	op.discoveryStatus = status
 }
 
 func auditClient(t *testing.T, op *auditOP, name Provider, ttl time.Duration) *Client {
@@ -263,6 +276,68 @@ func TestZZAuditRPDiscoveryIsCachedForTheTTL(t *testing.T) {
 	}
 	if j != 1 {
 		t.Errorf("jwks was fetched %d times inside the TTL, want 1", j)
+	}
+}
+
+// TestZZAuditRPDiscoveryOutageCannotExtendTheKeySetsLife pins the ceiling on the
+// retain-the-cached-provider branch.
+//
+// A failed re-discovery keeps serving the last good provider, and that provider
+// owns a go-oidc key set that never expires on its own. While discovery keeps
+// failing, discoveredAt never advances, so without a ceiling the retired key
+// would verify for the whole outage. retainOnDiscoveryFailure now serves the
+// cached provider only while it is younger than providerStaleCeiling*providerTTL
+// and refuses it past that, naming the age.
+func TestZZAuditRPDiscoveryOutageCannotExtendTheKeySetsLife(t *testing.T) {
+	op := newAuditOP(t)
+	retired := newAuditKey(t, "k-retired")
+	replacement := newAuditKey(t, "k-replacement")
+	op.publish(retired)
+
+	ctx := auditCtx(op)
+
+	// boundedTTL is short enough that 2*TTL is reachable in a test. controlTTL
+	// is long enough that the same wait stays well inside its ceiling, so the
+	// availability control exercises the retain branch rather than the ordinary
+	// cache hit.
+	const boundedTTL = 200 * time.Millisecond
+	const controlTTL = time.Second
+
+	bounded := auditClient(t, op, "auditbounded", boundedTTL)
+	available := auditClient(t, op, "auditavailable", controlTTL)
+
+	tok := idTokenWith(t, retired, op.URL, "n", "cid", nil)
+	for _, c := range []*Client{bounded, available} {
+		if _, err := c.Identity(ctx, tok, "n"); err != nil {
+			t.Fatalf("setup: the published key was rejected: %v", err)
+		}
+	}
+
+	// Upstream retires k-retired and publishes only k-replacement; discovery
+	// starts failing at the same time.
+	op.publish(replacement)
+	op.failDiscovery(http.StatusInternalServerError)
+
+	// Wait past the bounded client's ceiling but still inside the control's.
+	time.Sleep(1200 * time.Millisecond)
+
+	// Availability control, inside the ceiling: discovery fails, the TTL has
+	// elapsed, and the cached key still verifies -- a bad minute upstream must
+	// not become a login outage.
+	if ident, err := available.Identity(ctx, tok, "n"); err != nil {
+		t.Fatalf("control: a cached key was refused inside the ceiling while discovery was failing: %v", err)
+	} else if ident.Subject != "rp-subject" {
+		t.Fatalf("control: sub = %q", ident.Subject)
+	} else {
+		t.Log("control: inside 2*controlTTL the cached key still verified through the failing discovery")
+	}
+
+	// Past 2*boundedTTL the cache is refused rather than served, so the retired
+	// key stops verifying even though discovery is still failing.
+	if _, err := bounded.Identity(ctx, tok, "n"); err == nil {
+		t.Fatal("a token signed by the retired key still verified past 2*TTL while discovery was failing")
+	} else {
+		t.Logf("past 2*TTL the retired key was refused: %v", err)
 	}
 }
 

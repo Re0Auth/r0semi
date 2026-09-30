@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"regexp"
@@ -71,6 +72,63 @@ func TestEverySweptTableHasADeadlineIndex(t *testing.T) {
 				t2.table, t2.column, t2.column)
 		}
 	}
+}
+
+// sweepDeleteTemplateRE captures the body of a backquoted SQL literal that begins
+// with DELETE FROM. The sweep builds its statement from one such template, once
+// per expiredTables entry.
+var sweepDeleteTemplateRE = regexp.MustCompile("(?s)`(DELETE FROM[^`]*)`")
+
+// boundedDelete reports whether a delete statement bounds one cycle's work: it
+// must carry a LIMIT and select its rows through a ctid lookup.
+func boundedDelete(stmt string) bool {
+	return strings.Contains(strings.ToUpper(stmt), "LIMIT") && strings.Contains(stmt, "ctid IN (")
+}
+
+// TestSweepDeletesAreBounded is the database-free half of Z15-1's fix.
+//
+// TestSweepExpiredRemovesDatedRows proves the deletes still work; it cannot see
+// that one of them is unbounded, because an unbounded delete removes the test's
+// handful of rows exactly like a bounded one. An unbounded statement is the
+// defect: on a grown table it can outlive the pool's statement_timeout, roll the
+// single sweep transaction back and leave every tick re-attempting the same,
+// still-growing work (Z15-1, docs/issues/P2-medium.md). This parses the shipped
+// template and asserts every table's statement is bounded.
+//
+// The detector is proven to distinguish the two shapes before it is trusted, so a
+// broken matcher fails here instead of passing vacuously.
+func TestSweepDeletesAreBounded(t *testing.T) {
+	if boundedDelete(`DELETE FROM oauth_codes WHERE expires_at < $1`) {
+		t.Fatal("harness broken: the boundedness detector accepts an unbounded delete")
+	}
+	if !boundedDelete(`DELETE FROM oauth_codes WHERE expires_at < $1 AND ctid IN (SELECT ctid FROM oauth_codes WHERE expires_at < $1 LIMIT $2)`) {
+		t.Fatal("harness broken: the boundedness detector rejects a bounded delete")
+	}
+
+	body, err := os.ReadFile("sweep.go")
+	if err != nil {
+		t.Fatalf("cannot read sweep.go: %v", err)
+	}
+	templates := sweepDeleteTemplateRE.FindAllStringSubmatch(string(body), -1)
+	if len(templates) != 1 {
+		t.Fatalf("found %d DELETE templates in sweep.go, want the one shared by every swept table; "+
+			"the guard reads the wrong construct", len(templates))
+	}
+	if len(expiredTables) == 0 {
+		t.Fatal("harness broken: expiredTables is empty, so the guard below proves nothing")
+	}
+	for _, tc := range expiredTables {
+		// The template carries (table, column, table, column); building each table's
+		// statement is what makes "every delete is bounded" a per-table assertion
+		// rather than one about the template text.
+		stmt := fmt.Sprintf(templates[0][1], tc.table, tc.column, tc.table, tc.column)
+		if !boundedDelete(stmt) {
+			t.Errorf("the delete for %q is unbounded: %q. One cycle must remove at most sweepBatchSize "+
+				"rows through a ctid lookup, so a backlog keeps the statement under the pool's "+
+				"statement_timeout and the next tick continues (Z15-1)", tc.table, stmt)
+		}
+	}
+	t.Logf("sweep.go: %d tables share one bounded DELETE template (LIMIT + ctid IN)", len(expiredTables))
 }
 
 // TestSweepExpiredRemovesDatedRows plants one live and one expired row in every
@@ -165,14 +223,117 @@ func TestSweepExpiredRemovesDatedRows(t *testing.T) {
 	}
 }
 
+// insertExpiredOAuthCodes plants n already-expired authorization codes in one
+// table, which is the backlog shape Z15-1 reasons about.
+func insertExpiredOAuthCodes(t *testing.T, db *DB, ctx context.Context, n int, expiry time.Time) {
+	t.Helper()
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO oauth_codes
+			(token_hash, client_id, subject, scopes, redirect_uri, code_challenge, code_challenge_method, expires_at)
+		SELECT 'z15-1-' || i::text, 'cli', 'usr', '{}', 'https://app/cb', 'ch', 'S256', $1
+		  FROM generate_series(1, $2) AS i`, expiry, n); err != nil {
+		t.Fatalf("plant %d expired oauth_codes: %v", n, err)
+	}
+}
+
+// countSweptRows runs a scalar count, failing the test if it cannot.
+func countSweptRows(t *testing.T, db *DB, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := db.pool.QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("count %q: %v", query, err)
+	}
+	return n
+}
+
+// TestSweepExpiredIsBoundedPerCycle is the database-backed half of Z15-1's fix.
+//
+// It plants more than one batch of expired rows in one table and asserts that one
+// cycle removes exactly the batch, the rest survive, and the next cycle drains
+// them — the bounded-progress property the source guard can only claim. A live row
+// must be untouched by either cycle.
+func TestSweepExpiredIsBoundedPerCycle(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	const beyond = 7
+	past := time.Now().Add(-time.Hour)
+	insertExpiredOAuthCodes(t, db, ctx, int(sweepBatchSize)+beyond, past)
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO oauth_codes
+			(token_hash, client_id, subject, scopes, redirect_uri, code_challenge, code_challenge_method, expires_at)
+		VALUES ('z15-1-live', 'cli', 'usr', '{}', 'https://app/cb', 'ch', 'S256', $1)`,
+		time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("insert live row: %v", err)
+	}
+
+	removed, err := db.SweepExpired(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != sweepBatchSize {
+		t.Fatalf("one cycle removed %d rows, want exactly the batch %d (a cycle must be bounded)",
+			removed, sweepBatchSize)
+	}
+	if got := countSweptRows(t, db,
+		`SELECT count(*) FROM oauth_codes WHERE expires_at < $1`, past); got != beyond {
+		t.Fatalf("after one cycle %d expired rows remain, want %d", got, beyond)
+	}
+	if got := countSweptRows(t, db, `SELECT count(*) FROM oauth_codes`); got != beyond+1 {
+		t.Fatalf("oauth_codes holds %d rows after one cycle, want %d expired + 1 live", got, beyond)
+	}
+
+	// The next cycle continues where the first stopped; the live row survives.
+	removed, err = db.SweepExpired(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != beyond {
+		t.Fatalf("second cycle removed %d rows, want the remaining %d", removed, beyond)
+	}
+	if got := countSweptRows(t, db, `SELECT count(*) FROM oauth_codes`); got != 1 {
+		t.Fatalf("oauth_codes holds %d rows after the backlog drained, want only the live row", got)
+	}
+}
+
+// TestSweepSurvivesATightStatementTimeout is the property the bound exists for: a
+// cycle over a backlog larger than one batch must finish well inside a tight
+// statement_timeout, because each statement is capped, and it must still make
+// progress. Before the fix the same cycle was one unbounded delete per table and
+// the backlog was the whole statement's work.
+func TestSweepSurvivesATightStatementTimeout(t *testing.T) {
+	db := openTestDBWith(t, PoolOptions{StatementTimeout: 250 * time.Millisecond})
+	ctx := context.Background()
+
+	const backlog = int(sweepBatchSize) + 250
+	past := time.Now().Add(-time.Hour)
+	insertExpiredOAuthCodes(t, db, ctx, backlog, past)
+
+	removed, err := db.SweepExpired(ctx)
+	if err != nil {
+		t.Fatalf("a bounded cycle hit the 250ms statement timeout: %v", err)
+	}
+	if removed <= 0 {
+		t.Fatalf("a bounded cycle made no progress: removed %d", removed)
+	}
+	maxCycle := int64(len(expiredTables)) * sweepBatchSize
+	if removed > maxCycle {
+		t.Fatalf("a cycle removed %d rows, more than the designed bound %d", removed, maxCycle)
+	}
+	if got := countSweptRows(t, db,
+		`SELECT count(*) FROM oauth_codes WHERE expires_at < $1`, past); got != backlog-int(removed) {
+		t.Fatalf("oauth_codes holds %d expired rows after the cycle, want %d", got, backlog-int(removed))
+	}
+}
+
 // TestEverySweptReadPathAdjudicatesItsDeadline is the N-01 guard. The sweep's
 // safety argument is "an expired row is one a lookup already refuses"; that is
 // true for most tables but not for all of them, and a table added to
 // expiredTables must not be able to inherit the claim silently. Every swept table
 // needs an explicit entry: a read-path predicate this test can see in the shipped
-// source, or a citation for the service layer that owns the deadline — or, for the
-// two known gaps (G-7, Z07-1), an explicit exemption that has to be deleted when
-// those fixes land.
+// source, or a citation for the service layer that owns the deadline — or, for
+// the remaining known gap (Z07-1), an explicit exemption that has to be deleted
+// when that fix lands.
 //
 // The marker check is a file-level `contains`, so a marker shared by several
 // tables (the `$2` forms) is weaker than a per-method extraction; the entry map is
@@ -196,8 +357,8 @@ func TestEverySweptReadPathAdjudicatesItsDeadline(t *testing.T) {
 		marker string
 		note   string
 		// open names the read method of a known gap. It must NOT yet carry a
-		// deadline predicate: the exemption then goes red the moment G-7/Z07-1
-		// land instead of silently exempting a fixed path.
+		// deadline predicate: the exemption then goes red the moment Z07-1
+		// lands instead of silently exempting a fixed path.
 		open string
 	}{
 		"oidc_codes":                    {"oidc.go", "expires_at > $2", "", ""},
@@ -205,7 +366,7 @@ func TestEverySweptReadPathAdjudicatesItsDeadline(t *testing.T) {
 		"oidc_refresh_tokens":           {"oidc.go", "expires_at > $2", "", ""},
 		"oidc_refresh_token_tombstones": {"oidc.go", "expires_at > $2", "", ""},
 		"oidc_auth_requests":            {"oidc.go", "", "Z07-1: the by-id read judges no deadline yet; delete this exemption when it lands", "AuthRequestByID"},
-		"oidc_devices":                  {"oidc.go", "", "G-7: the consume predicate judges no deadline yet; delete this exemption when it lands", "GetDeviceAuthorizatonState"},
+		"oidc_devices":                  {"oidc.go", "expires_at > $3", "", ""},
 		"oauth_codes":                   {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
 		"oauth_access_tokens":           {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
 		"oauth_refresh_tokens":          {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},

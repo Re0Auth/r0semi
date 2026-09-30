@@ -53,7 +53,12 @@ func (s *Server) handleDeviceVerification(w http.ResponseWriter, r *http.Request
 		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "sign in to continue")
 		return
 	}
-	userCode := r.URL.Query().Get("user_code")
+	// The lookup is case- and separator-insensitive (oauth.NormalizeUserCode), so
+	// the caller's exact bytes must never become the session handle: the
+	// verification page used to bind the spelling it was sent, which made the
+	// bound id as long as the request line. Normalise before looking up and bind
+	// only what comes back (Z07-3).
+	userCode := oauth.NormalizeUserCode(r.URL.Query().Get("user_code"))
 	if userCode == "" {
 		// The frontend renders a code entry form; nothing is bound yet.
 		writeJSON(w, http.StatusOK, map[string]any{"state": "awaiting_code"})
@@ -101,6 +106,12 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
 		return
 	}
+	// The handle was bound under the normalised spelling, so the decision must be
+	// looked up under it too. Without this, a browser that entered the code the
+	// device printed (hyphenated) could never decide the grant the page had just
+	// shown as pending, and two spellings of one code disagreed about whether the
+	// handle exists (Z07-3).
+	body.UserCode = oauth.NormalizeUserCode(body.UserCode)
 	// Both conditions, one answer: the code must have been loaded by this session,
 	// and — since loading it requires a signed-in user — by this same account. A
 	// code loaded before an account switch is not approvable afterwards, for the

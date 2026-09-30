@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -128,7 +129,8 @@ func (s *Sessions) CommitCtx(ctx context.Context, token string, data []byte, exp
 }
 
 // SweepExpired deletes expired rows. Find already removes the sessions it is
-// asked about, so this is for the ones nobody comes back to.
+// asked about, so this is for the ones nobody comes back to. Each of its two
+// statements contributes at most sessionSweepBatchSize rows per cycle.
 //
 // `expiry` is judged by this process's clock, the same one scs wrote it with (see
 // the field comment); the index rows below are judged by the database, because
@@ -140,19 +142,46 @@ func (s *Sessions) CommitCtx(ctx context.Context, token string, data []byte, exp
 // row. Sweeping that window deleted the only record of which account the session
 // belonged to, and nothing rewrote it — a later subject Kill Switch then missed a
 // live session while the sweep looked complete.
+//
+// Both deletes are bounded (LIMIT) and the second runs even when the first fails,
+// with the two errors joined. The orphan index rows are the state nothing else
+// collects, so an unbounded first statement that hit the pool's statement_timeout
+// used to return before the second one, letting orphans accumulate forever
+// (Z15V-1, docs/issues/P2-medium.md). The total reported is what the cycle
+// removed across both statements.
 func (s *Sessions) SweepExpired(ctx context.Context) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE expiry < $1`, s.now())
-	if err != nil {
-		return 0, err
-	}
-	if _, err := s.pool.Exec(ctx, `
+	sessionsTag, sessionsErr := s.pool.Exec(ctx, `
+		DELETE FROM sessions WHERE expiry < $1
+		   AND ctid IN (SELECT ctid FROM sessions WHERE expiry < $1 LIMIT $2)`,
+		s.now(), sessionSweepBatchSize)
+
+	// Deliberately not an early return on sessionsErr: see the method comment.
+	// The anti-join selects the orphan ctids through the created_at index
+	// (0019_session_subjects_created_at_idx) and deletes at most a batch of them.
+	subjectsTag, subjectsErr := s.pool.Exec(ctx, `
 		DELETE FROM session_subjects si
-		 WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash = si.token_hash)
-		   AND si.created_at < now() - $1::interval`, sessionIndexGrace); err != nil {
-		return tag.RowsAffected(), err
+		 WHERE si.created_at < now() - $1::interval
+		   AND si.ctid IN (
+		       SELECT orphan.ctid FROM session_subjects orphan
+		        WHERE orphan.created_at < now() - $1::interval
+		          AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash = orphan.token_hash)
+		        LIMIT $2)`,
+		sessionIndexGrace, sessionSweepBatchSize)
+
+	removed := sessionsTag.RowsAffected() + subjectsTag.RowsAffected()
+	if sessionsErr != nil {
+		sessionsErr = fmt.Errorf("postgres: sweep sessions: %w", sessionsErr)
 	}
-	return tag.RowsAffected(), nil
+	if subjectsErr != nil {
+		subjectsErr = fmt.Errorf("postgres: sweep session_subjects: %w", subjectsErr)
+	}
+	return removed, errors.Join(sessionsErr, subjectsErr)
 }
+
+// sessionSweepBatchSize bounds one cycle of the session sweep, one statement at a
+// time, so a backlog is worked off over the following ticks rather than in a
+// single unbounded delete (Z15V-1, docs/issues/P2-medium.md).
+const sessionSweepBatchSize = 1000
 
 // sessionIndexGrace is how long an index row may be missing its session row before
 // the sweep treats it as an orphan.

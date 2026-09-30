@@ -253,6 +253,127 @@ jobs:
         working-directory: web
         run: E2E_DATABASE_URL="$TEST_DATABASE_URL" pnpm run test:e2e
 
+  probes:
+    # N-04: no tagged probe was in CI. `go test ./...` never compiles a
+    # `//go:build auditN` file, so every audit probe could rot — or never have
+    # compiled at all — while the ordinary suite stayed green. This job runs them.
+    #
+    # The package lists below are EXPLICIT allowlists, not globs and not `./...`:
+    # at the HEAD they were measured on (eeb3e3a) 48 packages were red, and a
+    # probe that is *expected* to be red must not be wired into a gate whose only
+    # signal is pass/fail. A package joins a list only when it is green, or when
+    # its red probes carry an explicit `t.Skip("N-04: <ID> ...")` naming the
+    # finding they document. Never add `continue-on-error` here: that would turn
+    # "the probes were never run" into "the probes were run and ignored", which is
+    # the exact failure this job exists to prevent.
+    #
+    # The Postgres service and TEST_DATABASE_URL serve the audit6 allowlist's
+    # internal/store/postgres: with CI set and no DSN its untagged tests t.Fatal
+    # (postgres_test.go:44) rather than skip, so omitting them would fail the job.
+    # verifyfrontend (audit5) needs the built SPA shell, hence the frontend build.
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: r0semi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/r0semi_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # pnpm before setup-node for the same reason as the `test` job: the node
+      # step's `cache: pnpm` locates the store through the pnpm binary, and the
+      # install below is what creates the store the post step saves.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.8.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: build frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          # verifyfrontend (audit5) refuses to run against the placeholder, which
+          # has no index.html; the check is the same one the `test` job makes.
+          test -f ../internal/webui/dist/index.html || {
+            echo "the frontend did not build; verifyfrontend would fail on the placeholder"
+            exit 1
+          }
+
+      # One pass over every tagged file: it compiles all three tag sets at once,
+      # so a probe that no longer builds fails here even when its package is not
+      # (yet) on an allowlist below.
+      - name: go vet (tagged probes)
+        run: go vet -tags audit5,audit6,audit7 ./...
+
+      - name: go test -tags audit5
+        run: |
+          go test -tags audit5 -count=1 -timeout 600s \
+            ./internal/zzprobe/admin \
+            ./internal/zzprobe/concurrency \
+            ./internal/zzprobe/dependencies \
+            ./internal/zzprobe/deploy \
+            ./internal/zzprobe/federationhttp \
+            ./internal/zzprobe/frontendaudit \
+            ./internal/zzprobe/perf \
+            ./internal/zzprobe/protocol \
+            ./internal/zzprobe/pubaddr \
+            ./internal/zzprobe/verifycm \
+            ./internal/zzprobe/verifycrypto \
+            ./internal/zzprobe/verifydependencies \
+            ./internal/zzprobe/verifyfederation \
+            ./internal/zzprobe/verifyfrontend \
+            ./internal/zzprobe/verifyhttpedge \
+            ./internal/zzprobe/verifyperf \
+            ./internal/zzprobe/verifyprotocol \
+            ./cmd/re0auth \
+            ./internal/ratelimit \
+            ./oauth \
+            ./vault
+
+      - name: go test -tags audit6
+        run: |
+          go test -tags audit6 -count=1 -timeout 600s \
+            ./internal/zzprobe/audit6/z07authsession \
+            ./cmd/re0auth \
+            ./idp \
+            ./internal/federation \
+            ./internal/oidcstore \
+            ./internal/store/postgres
+
+      - name: go test -tags audit7
+        run: |
+          go test -tags audit7 -count=1 -timeout 600s \
+            ./internal/zzprobe/audit7/z08verify \
+            ./internal/zzprobe/audit7/z16verify \
+            ./internal/zzprobe/audit7/z22reconcile
+
   windows-smoke:
     # The release ships windows/amd64 binaries, but until this job no test ever
     # ran on Windows: path handling, signal delivery and the build itself are what

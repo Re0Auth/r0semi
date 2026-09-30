@@ -14,16 +14,14 @@ import (
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
-// Z02-2 (FINDING) — RFC 7009 semantics at /oauth/revoke. An unknown token is
-// 200 (idempotent success, required by §2.1), and an unauthenticated caller is
-// 401. But a token that IS live and belongs to ANOTHER client answers 401
-// invalid_client, which distinguishes it from the unknown-token 200: the
-// endpoint is a liveness oracle for foreign tokens, reachable by any caller
-// that can name a public client id (which the revocation endpoint accepts
-// with no secret at all). oauth/as.go's Revoke comment claims the opposite of
-// what both engines do ("answering 'that is not yours' would turn this
-// endpoint into an oracle for whether a stolen string is a live token" —
-// and invalid_client is exactly that answer).
+// Z02-2 guard — RFC 7009 semantics at /oauth/revoke. An unknown token is 200
+// (idempotent success, required by §2.1), an unauthenticated caller is 401, and
+// — the G-8 correction — a token that IS live and belongs to ANOTHER client is
+// answered with the same uniform success and is NOT revoked. The endpoint must
+// not be a liveness oracle: oauth/as.go's Revoke now follows its own comment
+// (G-8, docs/audit-7/findings/Z20-VERIFIED.md). The guard here is that the
+// foreign attempt leaves the token live, which is what distinguishes a
+// legitimate no-op from an accidental deletion.
 func TestZ02RevocationDistinguishesForeignLiveTokensFromUnknownOnes(t *testing.T) {
 	e := newZoneEnv(t, zoneOptions{issuer: "https://issuer.z02"})
 
@@ -43,48 +41,46 @@ func TestZ02RevocationDistinguishesForeignLiveTokensFromUnknownOnes(t *testing.T
 	// (The victim's token is now dead; mint a fresh one for the probe below.)
 	victim = asTokens(t, e.codeFlow(t, []string{"account.id"}))
 
-	// The finding: the narrow client presents the (live) web token.
+	// G-8: the narrow client presents the (live) web token. The answer is the
+	// same uniform 200 an unknown string gets, and the token is untouched.
 	resp, raw = e.postForm(t, "/oauth/revoke", form("token", victim.AccessToken), e.narrowID, e.narrowSec)
-	if resp.StatusCode == http.StatusOK {
-		t.Fatalf("a foreign client's revocation of a live token was treated as success — the finding does not hold: %s", raw)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("a foreign client's revocation of a live token answered %d, want the uniform RFC 7009 200: %s",
+			resp.StatusCode, raw)
 	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("the foreign-live-token case answered %d, which the mechanism does not predict: %s", resp.StatusCode, raw)
+	if strings.Contains(string(raw), "invalid_client") {
+		t.Errorf("the refusal still advertises the ownership mismatch: %s", raw)
 	}
-	if !strings.Contains(string(raw), "invalid_client") {
-		t.Errorf("the refusal is not invalid_client: %s", raw)
-	}
-	// And the token was NOT revoked by the refusal (the owner can still use it).
+	// The mismatch guard: the foreign attempt deleted nothing.
 	if status, _ := e.userinfo(t, victim.AccessToken); status != http.StatusOK {
-		t.Errorf("the refused revocation still killed the token: %d", status)
+		t.Errorf("the foreign revocation killed the token: %d", status)
 	}
 
-	// The oracle needs no secret: a public client id, form-only, no Basic.
+	// The same shape needs no secret: a public client id, form-only, no Basic.
 	resp, raw = e.postForm(t, "/oauth/revoke", url.Values{
 		"token":     {victim.AccessToken},
 		"client_id": {e.deviceID},
 	}, "", "")
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("a public client's probe of a foreign live token answered %d, want the 401 that distinguishes it: %s",
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("a public client's probe of a foreign live token answered %d, want the uniform 200: %s",
 			resp.StatusCode, raw)
 	}
-	// And the same shape with an unknown token is a 200, so the pair is a
-	// binary oracle.
+	if status, _ := e.userinfo(t, victim.AccessToken); status != http.StatusOK {
+		t.Errorf("the public client's foreign probe killed the token: %d", status)
+	}
+	// The same shape with an unknown token is also a 200: the two answers are
+	// identical, so the pair is no longer an oracle.
 	resp, raw = e.postForm(t, "/oauth/revoke", url.Values{
 		"token":     {"not-a-token-at-all"},
 		"client_id": {e.deviceID},
 	}, "", "")
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("a public client's probe of an unknown token answered %d, want the 200 that completes the oracle: %s",
+		t.Errorf("a public client's probe of an unknown token answered %d, want 200: %s",
 			resp.StatusCode, raw)
 	}
-	t.Errorf("CONFIRMED: /oauth/revoke answers 401 invalid_client for a live foreign token and 200 for an unknown one, " +
-		"so an anonymous caller that can name a public client id can test whether an arbitrary string is a live token " +
-		"(of another client) — the liveness oracle oauth/as.go's comment says this endpoint must not be")
 
 	// A wrong Basic secret is a 401 for a different reason (client auth), which
-	// is indistinguishable from the oracle's answer — the shape is the same,
-	// but at least it requires claiming a confidential id.
+	// is outside the ownership answer.
 	resp, raw = e.postForm(t, "/oauth/revoke", form("token", victim.AccessToken), e.webID, "wrong")
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("a wrong secret was not refused: %d %s", resp.StatusCode, raw)
@@ -132,11 +128,13 @@ func TestZ02RevocationAuthMatrix(t *testing.T) {
 	resp, raw = e.postForm(t, "/oauth/revoke", url.Values{
 		"token": {fresh.AccessToken}, "client_id": {e.deviceID},
 	}, "", "")
+	// G-8: the public client does not own this token, so the endpoint answers
+	// the uniform RFC 7009 success and deletes nothing — the mismatch guard.
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("none (public client) revocation answered %d: %s", resp.StatusCode, raw)
+		t.Fatalf("a foreign none-method revocation answered %d, want the uniform 200: %s", resp.StatusCode, raw)
 	}
-	if status, _ := e.userinfo(t, fresh.AccessToken); status != http.StatusUnauthorized {
-		t.Errorf("the public client's revocation did not take effect: %d", status)
+	if status, _ := e.userinfo(t, fresh.AccessToken); status != http.StatusOK {
+		t.Errorf("the foreign public-client revocation killed the token: %d", status)
 	}
 
 	// A suspended client cannot revoke anything (client resolution fails).
@@ -150,19 +148,19 @@ func TestZ02RevocationAuthMatrix(t *testing.T) {
 	}
 }
 
-// Z02-16 guards — the AS engine's Revoke keeps the same ownership rule
-// (b5f01da's sibling), and its refusal is the invalid_client protocol error
-// rather than a bare 500.
+// Z02-16 guard — the AS engine's Revoke keeps the same ownership rule
+// (b5f01da's sibling): a foreign client cannot delete the grant, and its attempt
+// is the uniform RFC 7009 success rather than an invalid_client refusal (G-8).
 func TestZ02ASEngineRevokeOwnership(t *testing.T) {
 	e := newZoneEnv(t, zoneOptions{issuer: "https://issuer.z02"})
 	svc := e.asEngine(t)
 	ctx := context.Background()
 
 	issued := asEngineToken(t, svc, e)
-	if err := svc.Revoke(ctx, oauth.RevokeRequest{ClientID: e.narrowID, ClientSecret: e.narrowSec, Token: issued.AccessToken}); err == nil {
-		t.Errorf("a client revoked another client's token through the AS engine")
-	} else if oe, ok := err.(*oauth.Error); !ok || oe.Code != "invalid_client" {
-		t.Errorf("the refusal is not invalid_client: %v", err)
+	if err := svc.Revoke(ctx, oauth.RevokeRequest{ClientID: e.narrowID, ClientSecret: e.narrowSec, Token: issued.AccessToken}); err != nil {
+		t.Errorf("a foreign revocation was not the uniform RFC 7009 success: %v", err)
+	} else if info, ierr := svc.Introspect(ctx, issued.AccessToken); ierr != nil || !info.Active {
+		t.Errorf("the foreign revocation deleted the token anyway: %+v (%v)", info, ierr)
 	}
 	if err := svc.Revoke(ctx, oauth.RevokeRequest{ClientID: "unknown-client", Token: issued.AccessToken}); err == nil {
 		t.Errorf("an unknown client revoked a token through the AS engine")

@@ -750,8 +750,13 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	s.mu.Lock()
 	if t, ok := s.accessTokens[h]; ok {
 		if t.clientID != clientID {
+			// RFC 7009 §2.1: verify ownership, do not advertise it. A foreign
+			// live token must answer exactly like an unknown one — the uniform
+			// RFC 7009 success — and delete nothing (G-8,
+			// docs/audit-7/findings/Z20-VERIFIED.md). The old invalid_client
+			// refusal turned this endpoint into a liveness oracle.
 			s.mu.Unlock()
-			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+			return nil
 		}
 		s.deleteAccessLocked(h)
 		// RFC 7009 §2.1: revoking a token should revoke the whole grant. The
@@ -785,8 +790,9 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 			continue
 		}
 		if rt.clientID != clientID {
+			// RFC 7009 §2.1 / G-8: the uniform success, deleting nothing.
 			s.mu.Unlock()
-			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+			return nil
 		}
 		s.deleteRefreshLocked(k)
 		s.deleteAccessLocked(h)
@@ -801,8 +807,9 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	}
 	if t, ok := s.refreshTokens[h]; ok {
 		if t.clientID != clientID {
+			// RFC 7009 §2.1 / G-8: the uniform success, deleting nothing.
 			s.mu.Unlock()
-			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+			return nil
 		}
 		s.deleteRefreshLocked(h)
 		// The paired access token is keyed by the same id hash, and the spent
@@ -1066,6 +1073,15 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(_ context.Context, clientID, devi
 		// still-pending record is left in place for the library to answer.
 		delete(s.devices, h)
 		delete(s.userCodes, normalizeUserCode(d.userCode))
+		// RFC 8628 §3.5: expires_in bounds the device_code as well as the
+		// user_code, so an approved record past its deadline must not be handed
+		// back as a consumable authorization (G-7, docs/issues/P2-medium.md).
+		// The library checks Done BEFORE Expires (zitadel/oidc pkg/op/device.go
+		// CheckDeviceAuthorizationState), so a deleted-but-Done state would still
+		// mint: clearing Done makes the library fall through to expired_token.
+		if !s.now().Before(d.expiresAt) {
+			st.Done = false
+		}
 		return st, nil
 	}
 	d.lastPoll = s.now()
@@ -1112,8 +1128,10 @@ func (s *OIDCStore) purgeExpiredDevicesLocked(now time.Time) int {
 // No goroutine starts here, so a test can call it directly; the composition root
 // runs it on a ticker. Deleting by deadline is the stricter direction, so a sweep
 // can never revoke something still in use — but the "a lookup already refuses it"
-// invariant is NOT yet true for device authorizations (G-7) and auth requests
-// read by id (Z07-1), which only this sweep removes until those fixes land.
+// invariant is not yet true for every path: auth requests read by id (Z07-1)
+// are only removed here until that fix lands, and a pending device authorization
+// is returned with its past deadline for the library to refuse (G-7 adjudicates
+// the approved-consume path, which is the one that mints).
 func (s *OIDCStore) SweepExpired() int {
 	now := s.now()
 	s.mu.Lock()
@@ -1566,8 +1584,13 @@ func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode st
 	if err != nil {
 		return oauth.DeviceAuthorization{}, err
 	}
+	// Return the normalised spelling, never the caller's bytes: the page binds
+	// and echoes this value, and the device record's own spelling is not carried
+	// by op.DeviceAuthorizationState. Normalising here makes the handle identical
+	// for every accepted spelling of one code, so its length is bounded by the
+	// code, not by the request line (Z07-3).
 	return oauth.DeviceAuthorization{
-		UserCode:  userCode,
+		UserCode:  oauth.NormalizeUserCode(userCode),
 		Client:    client,
 		Scopes:    descriptors,
 		ExpiresAt: st.Expires,

@@ -34,6 +34,18 @@ type Provider string
 // key the upstream has retired can keep verifying.
 const defaultProviderCacheTTL = 15 * time.Minute
 
+// providerStaleCeiling bounds how long the cached provider may keep serving after
+// a re-discovery FAILS, as a multiple of providerTTL.
+//
+// A successful rebuild is the only thing that ages the key set out, and a failed
+// discovery does not advance discoveredAt. Without a ceiling, an issuer whose
+// discovery endpoint keeps failing pins the last successful document and every
+// key it ever published forever: the TTL would bound nothing, and a retired or
+// leaked signing key would keep minting identities for as long as the outage
+// lasts. Past the ceiling the cache is refused rather than served, so a long
+// outage costs a login outage instead of silently extending a key's life.
+const providerStaleCeiling = 2
+
 const (
 	GitHub    Provider = "github"
 	Google    Provider = "google"
@@ -262,7 +274,8 @@ type Client struct {
 	// providerTTL bounds the cache. The provider owns its JWKS cache, so
 	// rebuilding the provider is the only way to stop a retired signing key from
 	// verifying without hand-rolling a key set (which docs/dependencies.md
-	// forbids: "OIDC 绝不自己写").
+	// forbids: "OIDC 绝不自己写"). A failed re-discovery may keep the cached
+	// provider only up to providerStaleCeiling times this.
 	providerTTL time.Duration
 }
 
@@ -682,6 +695,13 @@ func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, n
 // token whose key is already cached from verifying). A failed discovery is
 // likewise not cached, so it can be retried on the next call. A document whose
 // jwks_uri fails the pin counts as a failed discovery for the same reason.
+//
+// Serving the cached provider through a failure is bounded by
+// providerStaleCeiling*providerTTL (retainOnDiscoveryFailure): a re-discovery
+// that keeps failing cannot advance discoveredAt, so without that ceiling the
+// never-expiring key set would keep every key the issuer ever published alive for
+// the whole outage. Past the ceiling the cache is refused and the error names the
+// age, which fails closed.
 func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 	c.providerMu.Lock()
 	defer c.providerMu.Unlock()
@@ -690,25 +710,41 @@ func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 	}
 	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, c.http), c.issuer)
 	if err != nil {
-		if c.discovered != nil {
-			// Keep serving the cached provider: the alternative is a login outage
-			// whenever the issuer's discovery endpoint has a bad minute.
-			return c.discovered, nil
-		}
-		return nil, fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err)
+		return c.retainOnDiscoveryFailure(fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err))
 	}
 	if err := c.pinDiscoveredJWKS(provider); err != nil {
-		if c.discovered != nil {
-			// The same retain-the-working-provider rule as a failed fetch: a
-			// re-discovery that names a key set we will not trust must not
-			// downgrade a provider that was already pinned.
-			return c.discovered, nil
-		}
-		return nil, err
+		// The same retain-the-working-provider rule as a failed fetch: a
+		// re-discovery that names a key set we will not trust must not
+		// downgrade a provider that was already pinned.
+		return c.retainOnDiscoveryFailure(err)
 	}
 	c.discovered = provider
 	c.discoveredAt = time.Now()
 	return provider, nil
+}
+
+// retainOnDiscoveryFailure decides whether a failed re-discovery may keep serving
+// the cached provider, and fails closed once that cache is too old to age out.
+//
+// cause is the discovery or pin error; when the cached provider is still within
+// providerStaleCeiling*providerTTL it is returned and cause is dropped, because a
+// bad minute at the issuer must not become a login outage. Past the ceiling the
+// cause is wrapped in an error naming the age and the ceiling: with discovery
+// still failing, discoveredAt cannot advance, so the provider's key set — which
+// never expires on its own — would otherwise keep verifying keys the issuer has
+// retired.
+func (c *Client) retainOnDiscoveryFailure(cause error) (*oidc.Provider, error) {
+	if c.discovered == nil {
+		return nil, cause
+	}
+	age := time.Since(c.discoveredAt)
+	ceiling := providerStaleCeiling * c.providerTTL
+	if age < ceiling {
+		return c.discovered, nil
+	}
+	return nil, fmt.Errorf("idp: %s: discovery has been failing but the cached provider is %s old, "+
+		"past the %s ceiling (%d x the %s TTL); refusing the stale key set: %w",
+		c.provider, age.Round(time.Millisecond), ceiling, providerStaleCeiling, c.providerTTL, cause)
 }
 
 // idTokenVerifier returns a verifier for the issuer's id_tokens.

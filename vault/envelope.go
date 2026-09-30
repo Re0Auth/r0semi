@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -33,6 +34,26 @@ type KeyWrapper interface {
 	Unwrap(ctx context.Context, wrapped, aad []byte) ([]byte, error)
 }
 
+// KeyFingerprint is an OPTIONAL extension of KeyWrapper: a one-way, domain
+// separated digest of the key material, used only to notice that two wrappers
+// hold the same key.
+//
+// It is deliberately not a method on KeyWrapper. A KMS or HSM wrapper lets no
+// material out of the service and has nothing to digest, so requiring this method
+// would break every such implementor to catch a local misconfiguration. A wrapper
+// that cannot answer simply does not implement the interface, and the vault then
+// has nothing to compare rather than a wrong answer.
+type KeyFingerprint interface {
+	Fingerprint() [32]byte
+}
+
+// keyFingerprint derives the digest a KeyFingerprint reports. The prefix is
+// domain separation: the same 32 bytes used as a KEK and as something else must
+// not share a fingerprint, and the trailing NUL makes the prefix unambiguous.
+func keyFingerprint(kek []byte) [32]byte {
+	return sha256.Sum256(append([]byte("r0semi/vault/kek-fingerprint\x00"), kek...))
+}
+
 // LocalKeyWrapper is an in-process AES-256-GCM KeyWrapper.
 //
 // It is what every deployment currently uses, and what it gives is narrower than
@@ -52,6 +73,9 @@ type KeyWrapper interface {
 type LocalKeyWrapper struct {
 	id   string
 	aead cipher.AEAD
+	// fingerprint is a one-way digest of the KEK, kept so the service can tell a
+	// real rotation from a relabelling. It is not the key and does not weaken it.
+	fingerprint [32]byte
 }
 
 // NewLocalKeyWrapper builds a wrapper from a 32-byte KEK.
@@ -70,11 +94,14 @@ func NewLocalKeyWrapper(id string, kek []byte) (*LocalKeyWrapper, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vault: KEK: %w", err)
 	}
-	return &LocalKeyWrapper{id: id, aead: aead}, nil
+	return &LocalKeyWrapper{id: id, aead: aead, fingerprint: keyFingerprint(kek)}, nil
 }
 
 // KeyID implements KeyWrapper.
 func (w *LocalKeyWrapper) KeyID() string { return w.id }
+
+// Fingerprint implements KeyFingerprint.
+func (w *LocalKeyWrapper) Fingerprint() [32]byte { return w.fingerprint }
 
 // Wrap implements KeyWrapper.
 func (w *LocalKeyWrapper) Wrap(_ context.Context, dek, aad []byte) ([]byte, error) {

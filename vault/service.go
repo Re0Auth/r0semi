@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"time"
@@ -108,9 +109,14 @@ func (s *service) observe(operation, result string, start time.Time) {
 // re-wrap, they can be removed from the configuration and discarded.
 //
 // Each retired key must carry the id it had **while it was current**, because
-// that id is what the records remember.
+// that id is what the records remember. Two wrappers that expose a
+// KeyFingerprint must also hold distinct material from the current key and from
+// each other: a "rotation" that only changes the id relabels every record without
+// changing what protects it, and the deployment is refused at startup so it
+// cannot be mistaken for a completed rotation.
 func WithRetiredKeys(keys ...KeyWrapper) Option {
 	return func(s *service) error {
+		added := make([]KeyWrapper, 0, len(keys))
 		for _, k := range keys {
 			if k == nil {
 				return errors.New("vault: a retired KeyWrapper must not be nil")
@@ -123,10 +129,40 @@ func WithRetiredKeys(keys ...KeyWrapper) Option {
 			if _, dup := s.keys[id]; dup {
 				return fmt.Errorf("vault: retired key %q is declared twice", id)
 			}
+			if sameKeyMaterial(k, s.current) {
+				return fmt.Errorf("vault: retired key %q holds the same material as the current key %q; "+
+					"reusing material under a new id is not a rotation, "+
+					"because the envelopes it relabels stay openable by the retired bytes",
+					id, s.current.KeyID())
+			}
+			for _, prev := range added {
+				if sameKeyMaterial(k, prev) {
+					return fmt.Errorf("vault: retired key %q holds the same material as retired key %q; "+
+						"two retired keys that share material are one key under two ids",
+						id, prev.KeyID())
+				}
+			}
 			s.keys[id] = k
+			added = append(added, k)
 		}
 		return nil
 	}
+}
+
+// sameKeyMaterial reports whether two wrappers hold the same key material.
+//
+// It is deliberately conservative: unless BOTH wrappers implement
+// KeyFingerprint there is nothing this package can compare, and it answers false.
+// A KMS/HSM wrapper keeps its material out of the process by design and must not
+// be forced to expose a digest of it, so the check can only ever be a local one.
+func sameKeyMaterial(a, b KeyWrapper) bool {
+	af, aok := a.(KeyFingerprint)
+	bf, bok := b.(KeyFingerprint)
+	if !aok || !bok {
+		return false
+	}
+	afp, bfp := af.Fingerprint(), bf.Fingerprint()
+	return subtle.ConstantTimeCompare(afp[:], bfp[:]) == 1
 }
 
 // Rotation reports what a key rotation examined and changed.

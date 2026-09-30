@@ -483,7 +483,9 @@ func pkce(verifier string) string {
 // closed that with `server.max_upstream_buffer_bytes`, a joint budget counted in
 // bytes (internal/federation's bufferBudget); this probe parks 32 bodies *because
 // the measurement needs them all live at once*, so it raises that budget for
-// itself and keeps measuring the per-request cost.
+// itself and keeps measuring the per-request cost. It also has to clear Z09-4's
+// per-caller share (max(2*maxBody, limit/4)): the 32 bodies belong to one caller,
+// so the explicit budget below is sized so that one caller's share admits all 32.
 func TestProbeInFlightBytesPerDataPlaneRequest(t *testing.T) {
 	if testing.Short() {
 		t.Skip("perf probe: skipped under -short")
@@ -492,9 +494,11 @@ func TestProbeInFlightBytesPerDataPlaneRequest(t *testing.T) {
 	body := exactJSONBody(maxUpstreamBodyOfInterest - 1024)
 
 	gated := newGatedDoer(inFlight, body)
-	// 512 MiB: room for the 32 x 4 MiB this probe holds on purpose. The gated Doer
+	// 1 GiB: the data plane is a joint budget, and Z09-4 also gives each caller a
+	// share of max(2*maxBody, limit/4) — here 256 MiB, comfortably more than the
+	// 32 x (4 MiB + 1) this probe parks for one caller on purpose. The gated Doer
 	// declares no Content-Length, so every read reserves the full cap.
-	env := newProbeEnvWithBudget(t, gated, 512<<20)
+	env := newProbeEnvWithBudget(t, gated, 1<<30)
 	req := httptest.NewRequest(http.MethodGet,
 		"/v1/games/"+probeGame+"/sources/"+probeSource+"/raw/big", nil)
 	req.Header.Set("Authorization", "Bearer "+env.token)

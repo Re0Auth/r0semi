@@ -595,6 +595,30 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// G-10 — the device grant's poll and client_secret_post.
+	//
+	// The library resolves the device poll's client with ClientIDFromRequest,
+	// which counts HTTP Basic or a JWT assertion as authentication only, and
+	// oidc.DeviceAccessTokenRequest has no client_secret field — so a posted
+	// secret is never read. The token endpoint's discovery advertises
+	// client_secret_post, and the code and refresh grants of this same endpoint
+	// genuinely accept it, so only the device branch refused a method it
+	// advertised. Worse, CheckDeviceAuthorizationState consumes the approved
+	// record BEFORE the library's confidentiality check, so the refusal burned
+	// the device_code (G-10, docs/issues/P2-medium.md).
+	//
+	// The correction lives here, at the in-repo boundary, and never touches the
+	// store: a confidential client's missing or wrong posted secret is refused
+	// with the library's own 401 shape before the consume runs, and a correct
+	// one is turned into the Basic header the library does read. Unknown clients
+	// and public/none clients are left to the library unchanged.
+	if r.URL.Path == "/"+pathToken && r.Method == http.MethodPost &&
+		form.Get("grant_type") == string(oidc.GrantTypeDeviceCode) {
+		if h.refuseUnusableDevicePollSecret(w, r, form) {
+			return
+		}
+	}
+
 	const tokenPath = "/" + pathToken
 	// Path-only, not POST-only. `op.Exchange` dispatches on the `grant_type` it
 	// reads from `r.Form`, so a GET is a working code exchange; gating the
@@ -1157,6 +1181,56 @@ func deviceClientAuthenticated(form url.Values, client oauth.Client, hasBasic bo
 		return false
 	}
 	return client.Authenticate(secret)
+}
+
+// refuseUnusableDevicePollSecret corrects client authentication on the device
+// grant's poll (G-10). The library reads a client secret only from HTTP Basic or
+// a JWT assertion there, so a confidential client that negotiated the
+// client_secret_post method advertised by this endpoint was refused — after the
+// approved device_code had already been consumed. This pre-flight decides the
+// one case the library decides wrongly, and does so before the store is touched:
+//
+//   - no Basic and no assertion, a named CONFIDENTIAL client, and a posted secret
+//     that is missing or wrong: answer the library's 401 invalid_client here;
+//   - the same shape with a correct secret: inject the equivalent Basic header
+//     and hand the request to the library, which then authenticates it normally;
+//   - an absent or unknown client id, a public/none client, Basic, or an
+//     assertion: leave the request exactly as it was.
+//
+// It returns true when it has written the response.
+func (h *Handler) refuseUnusableDevicePollSecret(w http.ResponseWriter, r *http.Request, form url.Values) bool {
+	if _, _, hasBasic := r.BasicAuth(); hasBasic {
+		return false
+	}
+	if strings.TrimSpace(form.Get("client_assertion")) != "" {
+		return false
+	}
+	id := strings.TrimSpace(form.Get("client_id"))
+	if id == "" {
+		return false
+	}
+	client, err := h.clients.Get(r.Context(), id)
+	if err != nil {
+		// Unknown is left to the library, which answers the same 401 without
+		// consulting the store.
+		return false
+	}
+	if client.Type != oauth.ClientConfidential {
+		// A public client keeps the "none" method; that is the device grant's
+		// shape and the library serves it.
+		return false
+	}
+	secret := form.Get("client_secret")
+	if secret == "" || !client.Authenticate(secret) {
+		writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
+			"client authentication failed")
+		return true
+	}
+	// pkg/op/client.go ClientBasicAuth runs url.QueryUnescape on BOTH halves of
+	// the Basic credentials, so escaping here is what makes the decoded pair the
+	// identity and secret just verified rather than a raw echo of them.
+	r.SetBasicAuth(url.QueryEscape(id), url.QueryEscape(secret))
+	return false
 }
 
 // refuseIntrospectionByANonConfidentialClient refuses an introspection caller whose

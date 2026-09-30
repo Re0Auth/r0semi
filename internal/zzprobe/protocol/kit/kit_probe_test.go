@@ -1425,8 +1425,14 @@ func TestF1_ConformanceDetectsAnObviousNonConformance(t *testing.T) {
 	}
 }
 
-// A source that declares client_secret_basic in its metadata and then
-// authenticates nobody passes conformance with zero errors.
+// F2 (FIXED) — a source that declares client_secret_basic and then authenticates
+// nobody now FAILS: the suite refuses a token endpoint whose bogus-grant answer is
+// not the invalid_client refusal (token.requires_auth) and a revocation endpoint
+// that answers 2xx to a caller with no credentials (revoke.requires_auth). Both
+// are the Z14-2 assertions.
+//
+// Was: the suite made no assertion about client authentication at all, so this
+// source passed with zero errors while it minted a token for anyone who asked.
 func TestF2_ConformanceIgnoresClientAuthentication(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/re0auth-upstream", func(w http.ResponseWriter, r *http.Request) {
@@ -1472,8 +1478,19 @@ func TestF2_ConformanceIgnoresClientAuthentication(t *testing.T) {
 	findings := conformance.Run(context.Background(), srv.URL, conformance.Options{})
 	errs, warns, _ := logFindings(t, findings)
 	t.Logf("a source that authenticates nobody: errors=%d warnings=%d", errs, warns)
-	if errs != 0 {
-		t.Errorf("expected the auth-free source to pass, got %d errors", errs)
+	if errs == 0 {
+		t.Errorf("the auth-free source passed conformance with zero errors")
+	}
+	for _, want := range []string{"token.requires_auth", "revoke.requires_auth"} {
+		found := false
+		for _, f := range findings {
+			if f.Check == want && f.Level == conformance.LevelError {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected check %s to fire for a source that authenticates nobody", want)
+		}
 	}
 
 	// Prove the server really is unauthenticated, so this is not a vacuous pass.
@@ -1490,7 +1507,6 @@ func TestF2_ConformanceIgnoresClientAuthentication(t *testing.T) {
 	if resp.StatusCode/100 != 2 {
 		t.Fatalf("vacuity: the supposedly auth-free server refused the request (%d)", resp.StatusCode)
 	}
-	t.Errorf("a source that declares client_secret_basic and authenticates nobody passes conformance with zero errors")
 }
 
 // F3 (FIXED) — a source that advertises cascade revocation and answers 200 to an

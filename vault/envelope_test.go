@@ -3,6 +3,7 @@ package vault
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"testing"
 )
 
@@ -55,6 +56,35 @@ func TestLocalKeyWrapperRejectsBadKEKSize(t *testing.T) {
 	}
 	if _, err := NewLocalKeyWrapper("", bytes.Repeat([]byte{0x11}, dekSize)); err == nil {
 		t.Fatal("accepted an empty id")
+	}
+}
+
+// The fingerprint is what lets WithRetiredKeys notice a reused KEK, so it must
+// depend on the material alone (not the id) and must not be an undomain-separated
+// digest of the KEK.
+func TestLocalKeyWrapperFingerprintTracksMaterial(t *testing.T) {
+	material := bytes.Repeat([]byte{0x11}, dekSize)
+	sameA, err := NewLocalKeyWrapper("kek-a", material)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameB, err := NewLocalKeyWrapper("kek-b", material)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := NewLocalKeyWrapper("kek-a", bytes.Repeat([]byte{0x22}, dekSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if sameA.Fingerprint() != sameB.Fingerprint() {
+		t.Error("identical KEKs under different ids produced different fingerprints")
+	}
+	if sameA.Fingerprint() == other.Fingerprint() {
+		t.Error("different key material produced the same fingerprint")
+	}
+	if raw := sha256.Sum256(material); sameA.Fingerprint() == raw {
+		t.Error("the fingerprint is an undomain-separated digest of the KEK")
 	}
 }
 

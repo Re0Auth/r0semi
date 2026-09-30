@@ -943,11 +943,22 @@ func openStorage(ctx context.Context, cfg settings, metrics *observability.Metri
 		sweep: func(ctx context.Context) (int64, error) {
 			// The dated tables (codes, tokens, pending requests) and the sessions
 			// are separate sweeps; sessions also collect their orphan index rows.
+			// Each reports its own removals and failures, so a store that stops
+			// making progress is visible as a metric and not only as a Warn line
+			// (Z15-1 / Z15V-1, docs/issues/P2-medium.md). The methods are nil-safe.
 			expired, err := db.SweepExpired(ctx)
+			if err != nil {
+				metrics.ObserveSweepFailed(observability.SweepDated)
+			}
+			metrics.ObserveSweepRemoved(observability.SweepDated, expired)
 			if err != nil {
 				return expired, err
 			}
 			sessionRows, err := sessions.SweepExpired(ctx)
+			if err != nil {
+				metrics.ObserveSweepFailed(observability.SweepSessions)
+			}
+			metrics.ObserveSweepRemoved(observability.SweepSessions, sessionRows)
 			return expired + sessionRows, err
 		},
 		durable: true,

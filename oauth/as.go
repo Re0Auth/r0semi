@@ -318,10 +318,11 @@ func (s *service) Revoke(ctx context.Context, req RevokeRequest) error {
 	// revoke another client's tokens — and the refresh chain hanging off them —
 	// simply by coming by the value.
 	//
-	// An unknown value stays idempotent success, and a value owned by somebody
-	// else is refused the same way rather than confirmed: answering "that is not
-	// yours" would turn this endpoint into an oracle for whether a stolen string
-	// is a live token.
+	// An unknown value and a value owned by somebody else are answered the same
+	// way: the uniform, idempotent success. Confirming "that is not yours" would
+	// turn this endpoint into an oracle for whether a stolen string is a live
+	// token (G-8, docs/audit-7/findings/Z20-VERIFIED.md). The foreign branch
+	// therefore revokes NOTHING — RFC 7009's verify, then do not advertise.
 	owner, err := s.tokens.TokenOwner(ctx, req.Token)
 	switch {
 	case errors.Is(err, ErrTokenNotFound):
@@ -329,7 +330,7 @@ func (s *service) Revoke(ctx context.Context, req RevokeRequest) error {
 	case err != nil:
 		return err
 	case owner != client.ID:
-		return protocolError("invalid_client", "the token was not issued to this client")
+		return nil
 	}
 
 	// RFC 7009: revocation is idempotent, and the token may be either kind.

@@ -320,7 +320,9 @@ func TestRevokeInvalidatesAccessToken(t *testing.T) {
 // RFC 7009 §2.1: a token may only be revoked by the client it was issued to.
 // Without this check, any registered client that came by another client's token
 // value could revoke it — and the refresh chain hanging off it — which is a
-// denial of service on somebody else's session.
+// denial of service on somebody else's session. G-8: the foreign attempt is
+// answered with the same uniform success an unknown value gets, and revokes
+// nothing, so the endpoint is not a liveness oracle.
 func TestRevokeRefusesATokenIssuedToAnotherClient(t *testing.T) {
 	svc, clients, _, _, _ := newTestAS(t)
 	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})
@@ -336,8 +338,8 @@ func TestRevokeRefusesATokenIssuedToAnotherClient(t *testing.T) {
 		ClientID: "app", Code: auth.Code, RedirectURI: "https://app.example/cb", CodeVerifier: verifier,
 	})
 
-	if err := svc.Revoke(ctx, RevokeRequest{ClientID: "other", Token: tok.AccessToken}); err == nil {
-		t.Fatal("another client revoked a token it does not own")
+	if err := svc.Revoke(ctx, RevokeRequest{ClientID: "other", Token: tok.AccessToken}); err != nil {
+		t.Fatalf("a foreign revocation was not the uniform RFC 7009 success: %v", err)
 	}
 
 	info, err := svc.Introspect(ctx, tok.AccessToken)
@@ -345,12 +347,45 @@ func TestRevokeRefusesATokenIssuedToAnotherClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !info.Active {
-		t.Fatal("the token was revoked anyway")
+		t.Fatal("the foreign revocation killed the token anyway")
 	}
 
 	// The owner still can.
 	if err := svc.Revoke(ctx, RevokeRequest{ClientID: "app", Token: tok.AccessToken}); err != nil {
 		t.Fatalf("the owner could not revoke its own token: %v", err)
+	}
+}
+
+// TestRevokeOracleShapeIsUniform is the G-8 shape guard: revoking a foreign live
+// token and revoking an unknown value must be indistinguishable from the
+// caller's side — both nil, and the foreign token stays live (the mismatch
+// guard). RFC 7009 §2.1 asks the server to verify, not to advertise.
+func TestRevokeOracleShapeIsUniform(t *testing.T) {
+	svc, clients, _, _, _ := newTestAS(t)
+	registerClient(t, clients, "app", ClientPublic, "", []Scope{ScopeAccountID})
+	registerClient(t, clients, "other", ClientPublic, "", []Scope{ScopeAccountID})
+	ctx := context.Background()
+	verifier := "verifier-verifier-verifier-verifier"
+
+	auth, _ := svc.Authorize(ctx, AuthorizationRequest{
+		ClientID: "app", RedirectURI: "https://app.example/cb", Subject: "u",
+		Scopes: []Scope{ScopeAccountID}, CodeChallenge: pkceChallenge(verifier), CodeChallengeMethod: "S256",
+	})
+	tok, _ := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "app", Code: auth.Code, RedirectURI: "https://app.example/cb", CodeVerifier: verifier,
+	})
+
+	foreignErr := svc.Revoke(ctx, RevokeRequest{ClientID: "other", Token: tok.AccessToken})
+	unknownErr := svc.Revoke(ctx, RevokeRequest{ClientID: "other", Token: "not-a-token-at-all"})
+	if foreignErr != nil || unknownErr != nil {
+		t.Fatalf("the two answers differ: foreign=%v unknown=%v", foreignErr, unknownErr)
+	}
+	info, err := svc.Introspect(ctx, tok.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Active {
+		t.Fatal("the foreign revocation deleted the live token")
 	}
 }
 

@@ -182,6 +182,9 @@ type envConfig struct {
 	// service default (64 MiB); a probe that deliberately parks MANY large bodies
 	// at once has to say so, because the default would shed it (that is the
 	// property P0-3 added — see internal/zzprobe/federation/zzprobe_p03_test.go).
+	// Since Z09-4 the joint budget is also divided per caller
+	// (max(2*maxBody, limit/4)), so a probe that parks everything under ONE
+	// subject has to clear that share as well as the global limit.
 	maxBufferedBytes int
 }
 
@@ -439,8 +442,11 @@ func TestVerifyInFlightAttribution(t *testing.T) {
 			// Headroom for the sweep's worst point (32 x 4 MiB = 128 MiB): this
 			// probe is about what io.ReadAll holds, so the budget under test must
 			// not be what ends the measurement. The gated Doer below declares no
-			// Content-Length, so every read reserves the full cap.
-			maxBufferedBytes: 512 << 20,
+			// Content-Length, so every read reserves the full cap. 1 GiB, not the
+			// 512 MiB this used to be: Z09-4 also gives each caller a share of
+			// max(2*maxBody, limit/4), and all 32 parked bodies belong to one
+			// caller, so the share (256 MiB here) must exceed 32 x (4 MiB + 1).
+			maxBufferedBytes: 1 << 30,
 		})
 		req := rawRequest()
 		req.Header.Set("Authorization", "Bearer "+env.token)
@@ -566,6 +572,10 @@ func TestVerifyInFlightWhoHoldsTheBytes(t *testing.T) {
 		binding: bearerBinding(),
 		doer:    gated,
 		scopes:  []string{oauth.ScopeAccountID.String(), verifyScope},
+		// 1 GiB, not the 64 MiB default: Z09-4 gives each caller a share of
+		// max(2*maxBody, limit/4), and all 8 parked bodies belong to one caller,
+		// so the share (256 MiB here) has to exceed 8 x (4 MiB + 1).
+		maxBufferedBytes: 1 << 30,
 	})
 	req := rawRequest()
 	req.Header.Set("Authorization", "Bearer "+env.token)

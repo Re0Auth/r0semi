@@ -167,21 +167,25 @@ func TestAuditRotateGateIsBlindToAnInsertBehindTheCursor(t *testing.T) {
 		uerr, rot.Scanned, rot.Rewrapped, rot.Skipped)
 }
 
-// --- K-2: a retired KEK with the same material under a different id is accepted
+// --- K-2: a retired KEK with the same material under a different id is refused
 
-// TestAuditRetiredKeySharingMaterialIsAcceptedAndRotationIsANoOp is the finding.
+// TestAuditRetiredKeySharingMaterialIsRefused is the property a round-6 finding
+// said did not hold, now pinned in the direction that matters.
 //
-// WithRetiredKeys only refuses a retired key whose *id* equals the current one
-// (vault/service.go:118-122), and main.go builds both wrappers from raw bytes
-// without comparing them (cmd/re0auth/main.go:1131-1149). The KeyWrapper
-// interface deliberately exposes no material, so the service cannot compare
-// either.
+// WithRetiredKeys used to compare ids only (vault/service.go), and main.go built
+// both wrappers from raw bytes without comparing them
+// (cmd/re0auth/main.go:1131-1149). The consequence was a deployment that put the
+// same 32 bytes in RE0AUTH_KEK and in the retired key's variable (a copy-paste
+// during the rotation, a secret manager entry reused): a rotation that reported
+// rewrapped=1 skipped=0 and exited 0, while a credential whose envelope is still
+// openable by the material the operator believes they have rotated away from.
 //
-// Consequence: a deployment that puts the same 32 bytes in RE0AUTH_KEK and in the
-// retired key's variable (a copy-paste during the rotation, a secret manager
-// entry reused) gets a rotation that reports rewrapped=1 skipped=0 and exits 0 —// and a credential whose envelope is still openable by the material the operator
-// believes they have rotated away from.
-func TestAuditRetiredKeySharingMaterialIsAcceptedAndRotationIsANoOp(t *testing.T) {
+// LocalKeyWrapper now exposes a one-way KeyFingerprint of its KEK (optional, so
+// KMS/HSM wrappers are unaffected) and WithRetiredKeys refuses a pair whose
+// material matches -- naming both ids. The positive control below keeps the
+// distinct-material path honest: that pair is still accepted, the rotation is
+// real, and the retired wrapper can no longer open the re-wrapped DEK.
+func TestAuditRetiredKeySharingMaterialIsRefused(t *testing.T) {
 	ctx := context.Background()
 	repo := NewMemoryRepo()
 	logger := audit.NewMemoryLogger()
@@ -206,41 +210,56 @@ func TestAuditRetiredKeySharingMaterialIsAcceptedAndRotationIsANoOp(t *testing.T
 		t.Fatal(err)
 	}
 
-	// WithRetiredKeys accepts the pair: nothing compares the bytes.
-	rotator, err := NewService(repo, newKey, logger, WithRetiredKeys(oldKey))
-	if err != nil {
-		t.Fatalf("WithRetiredKeys refused a retired key with the same material: %v", err)
+	// The fix: the pair is refused at startup, naming both ids, so no operator
+	// can mistake the relabelling for a rotation.
+	_, err = NewService(repo, newKey, logger, WithRetiredKeys(oldKey))
+	if err == nil {
+		t.Fatal("WithRetiredKeys accepted a retired key holding the same material as the current key")
 	}
-	rot, err := rotator.Rotate(ctx)
+	for _, want := range []string{"kek-1", "kek-2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+	t.Logf("the reused material is refused at startup: %v", err)
+
+	// Positive control: distinct bytes under distinct ids are accepted, the
+	// rotation actually moves the record, and the retired wrapper can no longer
+	// open the re-wrapped envelope.
+	ctrlRepo := NewMemoryRepo()
+	ctrlOld := keyFor(t, "kek-1", 0xA1)
+	ctrlNew := keyFor(t, "kek-2", 0xB2)
+	ctrlSeed, err := NewService(ctrlRepo, ctrlOld, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrlSeed.Enroll(ctx, id, []byte("upstream-token"), nil); err != nil {
+		t.Fatal(err)
+	}
+	ctrl, err := NewService(ctrlRepo, ctrlNew, logger, WithRetiredKeys(ctrlOld))
+	if err != nil {
+		t.Fatalf("distinct material was refused: %v", err)
+	}
+	rot, err := ctrl.Rotate(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rot.Rewrapped != 1 || rot.Skipped != 0 {
-		t.Fatalf("rotation = %+v, want the complete-looking rewrapped=1 skipped=0", rot)
+		t.Fatalf("control rotation = %+v, want rewrapped=1 skipped=0", rot)
 	}
-
-	rec, err := repo.Get(ctx, id)
+	ctrlRec, err := ctrlRepo.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.KEKID != "kek-2" {
-		t.Fatalf("kek_id = %q, want the record relabelled to the current id", rec.KEKID)
+	if ctrlRec.KEKID != "kek-2" {
+		t.Fatalf("control kek_id = %q, want kek-2", ctrlRec.KEKID)
 	}
-
-	// The material the operator just "retired" still opens the current envelope.
-	// A wrapper carrying only the old bytes under a third id is enough, which is
-	// the whole threat model of a leaked KEK.
-	leaked, err := NewLocalKeyWrapper("attacker-copy", material)
-	if err != nil {
-		t.Fatal(err)
+	aad := bindingAAD(ctrlRec.Version, id.Subject, id.Provider)
+	if _, err := ctrlOld.Unwrap(ctx, ctrlRec.WrappedDEK, aad); err == nil {
+		t.Fatal("control: the retired key still opened a DEK wrapped under different material")
 	}
-	aad := bindingAAD(rec.Version, id.Subject, id.Provider)
-	if _, err := leaked.Unwrap(ctx, rec.WrappedDEK, aad); err != nil {
-		t.Fatalf("control: the re-wrapped envelope no longer opens under the material: %v", err)
-	}
-	t.Log("CONFIRMED: the rotation reported rewrapped=1 skipped=0 (=> -rotate-keys exits 0) " +
-		"while the envelope is still openable by the material of the retired key: the run is a no-op " +
-		"that looks like a completed rotation")
+	t.Log("control (distinct material): accepted, rotated, and the retired key can no longer " +
+		"open the re-wrapped DEK")
 }
 
 // --- K-3: Scrub does not remove the key's expanded form

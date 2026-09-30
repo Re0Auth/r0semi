@@ -80,6 +80,8 @@ type Metrics struct {
 	storeUnavailable      *prometheus.CounterVec
 	vaultOps              *prometheus.CounterVec
 	vaultLatency          *prometheus.HistogramVec
+	sweepRemoved          *prometheus.CounterVec
+	sweepFailed           *prometheus.CounterVec
 }
 
 // New builds the instrumentation on its own registry. A private registry rather
@@ -140,6 +142,10 @@ func New() *Metrics {
 			"Credential-vault operations, by operation and result.", "operation", "result"),
 		vaultLatency: histogram("vault_operation_duration_seconds",
 			"Credential-vault operation latency in seconds, by operation.", "operation"),
+		sweepRemoved: counter("sweep_removed_total",
+			"Expired rows a background sweep cycle removed, by store.", "store"),
+		sweepFailed: counter("sweep_failed_total",
+			"Background sweep cycles that returned an error, by store.", "store"),
 	}
 	reg.MustRegister(m.requests, m.duration, m.inFlight)
 	reg.MustRegister(
@@ -148,6 +154,7 @@ func New() *Metrics {
 		m.upstreamFetch, m.upstreamFetchDuration, m.upstreamRefresh, m.circuitTransitions,
 		m.storeUnavailable,
 		m.vaultOps, m.vaultLatency,
+		m.sweepRemoved, m.sweepFailed,
 	)
 	// The runtime and process collectors are what make /metrics useful during an
 	// incident that is not a request: a goroutine leak, a GC cliff, an open
@@ -352,6 +359,12 @@ const (
 	VerifyOK     = "ok"
 	VerifyFailed = "failed"
 	VerifyError  = "error"
+
+	// Sweep stores, the closed label set of the sweep counters. The composition
+	// root names one of these when it calls ObserveSweepRemoved/ObserveSweepFailed;
+	// no request value ever reaches the label, so the series set is bounded.
+	SweepDated    = "dated"
+	SweepSessions = "sessions"
 )
 
 // ObserveLogin records one sign-in attempt that reached a terminal outcome.
@@ -399,6 +412,35 @@ func (m *Metrics) ObserveStoreUnavailable(operation string) {
 		return
 	}
 	m.storeUnavailable.WithLabelValues(operation).Inc()
+}
+
+// ObserveSweepRemoved adds the rows one background sweep cycle removed from
+// store. A non-positive count is ignored, so an idle cycle does not create a
+// series that looks like activity, the same policy as ObserveTokensRevoked.
+//
+// store is one of the Sweep* constants. The counter is what turns "the sweep runs
+// every 15 minutes" into an observable rate: a table whose series stays flat while
+// its failures climb is a table that is no longer being cleaned (Z15-1,
+// docs/issues/P2-medium.md).
+func (m *Metrics) ObserveSweepRemoved(store string, n int64) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.sweepRemoved.WithLabelValues(store).Add(float64(n))
+}
+
+// ObserveSweepFailed records one background sweep cycle that returned an error.
+// store is one of the Sweep* constants.
+//
+// Before this counter a persistently failing sweep was a Warn line and nothing
+// else, so a maintenance path that had stopped making progress looked identical to
+// an idle one on the alerting surface (Z15-1 / Z15V-1,
+// docs/issues/P2-medium.md).
+func (m *Metrics) ObserveSweepFailed(store string) {
+	if m == nil {
+		return
+	}
+	m.sweepFailed.WithLabelValues(store).Inc()
 }
 
 // ObserveRevocation records one revocation operation. kind is one of the

@@ -1,21 +1,20 @@
 //go:build audit6
 
-// Finding 05-2: an approved device_code still mints tokens after the lifetime
-// the server advertised has passed.
+// G-7 guard: an approved device_code must not mint past the lifetime the server
+// advertised.
 //
 // The library's CheckDeviceAuthorizationState (pkg/op/device.go:317-326) only
 // judges state.Expires for a PENDING code; a Done code is handed straight to
 // the mint. The store is therefore the only place that can refuse an approved
-// code past its deadline — and neither backend's GetDeviceAuthorizatonState
-// checks expires_at on the done branch:
+// code past its deadline. Both backends now carry the expiry predicate on the
+// done branch, and the memory store additionally clears Done on the consumed
+// record so the library's Done-before-Expires order falls through to a refusal:
 //
-//	memory/oidc.go    GetDeviceAuthorizatonState: `if d.done && !d.denied { delete; return st }`
-//	postgres/oidc.go  `DELETE FROM oidc_devices WHERE ... AND done = true AND denied = false`
+//	memory/oidc.go    GetDeviceAuthorizatonState: expired done record → Done=false
+//	postgres/oidc.go  claim ... AND expires_at > $3, plus the fall-through delete
 //
-// (memory half exercised here; the Postgres half is the same shape by
-// reading — no database is available in this environment.) Until the janitor
-// runs (every 5 minutes in memory mode, 15 for the Postgres sweep), the
-// device_code holder can redeem it after the advertised expiry_in.
+// This probe previously encoded the finding (it FATALed when the poll was
+// refused); it is inverted here into the guard.
 package z05memstore
 
 import (
@@ -28,10 +27,9 @@ import (
 	"time"
 )
 
-// The safe property, asserted at the real token endpoint: after the store's
-// clock passes the device authorization's expiry, redeeming the device_code
-// must be refused (RFC 8628 §3.5 expired_token). It currently mints a full
-// access/refresh pair, so this probe is red.
+// After the store's clock passes the device authorization's expiry, redeeming
+// the device_code must be refused (RFC 8628 §3.5) and the refusal must carry no
+// tokens.
 func TestDeviceCodePastItsAdvertisedExpiryStillMintsTokens(t *testing.T) {
 	e := newEnv(t, nil)
 
@@ -54,33 +52,19 @@ func TestDeviceCodePastItsAdvertisedExpiryStillMintsTokens(t *testing.T) {
 	e.clock.Advance(time.Duration(expiresIn)*time.Second + time.Minute)
 
 	rec := e.devicePoll(deviceCode)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("UNEXPECTED: redeeming an expired device_code was refused: %d %s",
-			rec.Code, rec.Body.String())
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a device_code redeemed %s past its advertised expiry minted a token response: %d %s",
+			time.Duration(expiresIn)*time.Second+time.Minute, rec.Code, rec.Body.String())
 	}
-	// The finding: a 200 with a live token pair minted from an expired code.
+	// A refusal must not smuggle a usable pair in its body.
 	var tok map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &tok); err != nil {
-		t.Fatalf("token response does not parse: %v (%s)", err, rec.Body.String())
+		t.Fatalf("refusal body does not parse as JSON: %v (%s)", err, rec.Body.String())
 	}
-	access, _ := tok["access_token"].(string)
-	refresh, _ := tok["refresh_token"].(string)
-	if access == "" || refresh == "" {
-		t.Fatalf("token response lacks the pair: %v", tok)
+	if tok["access_token"] != nil || tok["refresh_token"] != nil {
+		t.Fatalf("the expired-code refusal still carried tokens: %v", tok)
 	}
-
-	// And the minted access token is a live capability at userinfo: the
-	// expired device code produced a working identity bearer.
-	if req := probeBearer(t, e, access); req.Code != http.StatusOK {
-		t.Fatalf("UNEXPECTED: the minted token was not usable at userinfo: %d %s",
-			req.Code, req.Body.String())
-	}
-
-	// The assertion the guard should satisfy once fixed: redemption past the
-	// deadline must not mint. Red until then.
-	t.Errorf("a device_code redeemed %s past its advertised expiry minted a full "+
-		"access/refresh pair (access_token len=%d) and the access token answered "+
-		"userinfo with 200 — expected expired_token", time.Duration(expiresIn)*time.Second+time.Minute, len(access))
+	t.Logf("expired approved device_code refused: %d %s", rec.Code, rec.Body.String())
 }
 
 // Control: the same flow without advancing the clock mints, so a red probe

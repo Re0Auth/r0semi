@@ -3,20 +3,17 @@
 package z05memstore
 
 // Falsification probes for finding 05-2 (an approved device_code past its
-// advertised expiry still mints). The original probe established the mint
-// through the real token endpoint; these attack the finding's side claims,
-// which a wrong finding would have gotten wrong too:
+// advertised expiry still mints). G-7 landed, so the finding's premise is gone;
+// these probes now pin the fixed behaviour and its surrounding claims:
 //
-//   - the late redemption is still SINGLE USE (c13effa) — if an expired code
-//     could mint twice, the impact write-up would be materially worse;
-//   - the janitor/sweep closes the window — if a swept code still minted, the
-//     window would not be bounded by the sweep interval the report names;
+//   - the expired code mints NOTHING, on the first poll or any later one (the
+//     former "the late redemption is single use" control assumed a first mint,
+//     which no longer exists);
+//   - the janitor/sweep still removes the row;
 //   - a new device authorization start purges expired device records in
-//     memory mode (StoreDeviceAuthorization purges under its own lock), so
-//     the memory window is at most the janitor interval and often shorter.
+//     memory mode (StoreDeviceAuthorization purges under its own lock).
 //
-// All three are expected GREEN today: they pin the claims around the finding,
-// not the finding itself (the original red probe carries that).
+// All three are expected GREEN today.
 
 import (
 	"net/http"
@@ -43,19 +40,21 @@ func rev2ApprovedExpiredCode(t *testing.T, e *env) string {
 	return deviceCode
 }
 
-func TestRev2TheLateRedemptionIsStillSingleUse(t *testing.T) {
+func TestRev2TheLateRedemptionIsRefusedAndNeverMints(t *testing.T) {
 	e := newEnv(t, nil)
 	deviceCode := rev2ApprovedExpiredCode(t, e)
 
+	// G-7: the expired approved code is not handed back as consumable, so the
+	// first poll is refused and there is no pair to replay.
 	first := e.devicePoll(deviceCode)
-	if first.Code != http.StatusOK {
-		t.Fatalf("control failed: the late redemption did not mint, so there is nothing to replay: %d %s",
+	if first.Code == http.StatusOK {
+		t.Fatalf("the expired approved device_code minted on the first poll: %d %s",
 			first.Code, first.Body.String())
 	}
 	second := e.devicePoll(deviceCode)
 	if second.Code == http.StatusOK {
-		t.Error("the expired device_code minted a SECOND token pair: the late redemption is not single use — " +
-			"finding 05-2's impact write-up (c13effa intact) is wrong and the finding is worse than reported")
+		t.Errorf("the expired device_code minted on a later poll: %d %s",
+			second.Code, second.Body.String())
 	}
 }
 

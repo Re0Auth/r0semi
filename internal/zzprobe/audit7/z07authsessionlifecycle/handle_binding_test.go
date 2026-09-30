@@ -12,20 +12,19 @@ import (
 	"github.com/Re0Auth/r0semi/internal/auth"
 )
 
-// TestZ07DeviceVerificationBindsCallerControlledUserCodeBytesIntoTheSession.
+// TestZ07DeviceVerificationBindsCallerControlledUserCodeBytesIntoTheSession is
+// the regression guard for Z07-3.
 //
-// oauth.NormalizeUserCode removes every '-' before the device lookup
-// (oauth/device.go:481-483), so one live user code has unboundedly many accepted
-// spellings. The verification page then hands back the spelling the caller used —
-// `DescribeDeviceAuthorization` returns `UserCode: userCode`, the *input*
-// (internal/store/memory/oidc.go:1365-1368) — and `handleDeviceVerification`
-// binds exactly that string into the browser session
-// (internal/httpapi/device_routes.go:69). `auth.Manager.Bind` rejects only an id
-// containing the unit separator and a cap on how many handles a kind may hold,
-// never on their bytes (internal/auth/auth.go:304-330), and the session is
-// re-committed whole on every request. So a signed-in browser that loads one URL
-// carries a caller-chosen key of up to the request-line limit, for the life of
-// the cookie, and up to 32 of them.
+// oauth.NormalizeUserCode removes every '-' before the device lookup, so one live
+// user code has unboundedly many accepted spellings. The verification page used
+// to hand back the spelling the caller used, and Bind capped how many handles a
+// kind holds (32) but never their bytes, so a signed-in browser that loaded one
+// URL carried a caller-chosen session key of up to the request-line limit.
+//
+// It must now bind and return the normalised code: every accepted spelling has to
+// answer 200 (the lookup stays insensitive — that is the control in the loop) yet
+// come back as the same short value, and the session payload must not grow by the
+// padding.
 func TestZ07DeviceVerificationBindsCallerControlledUserCodeBytesIntoTheSession(t *testing.T) {
 	store := newZ07Store()
 	manager := auth.NewManager(auth.Options{Secure: false, Store: store})
@@ -47,6 +46,7 @@ func TestZ07DeviceVerificationBindsCallerControlledUserCodeBytesIntoTheSession(t
 		norm[:3] + strings.Repeat("-", pad) + norm[3:],
 	}
 	accepted := 0
+	var echoes []string
 	for _, spelling := range spellings {
 		resp := b.get("/v1/device/verification?user_code=" + url.QueryEscape(spelling))
 		body := bodyOf(t, resp)
@@ -63,6 +63,7 @@ func TestZ07DeviceVerificationBindsCallerControlledUserCodeBytesIntoTheSession(t
 		if view.UserCode == spelling {
 			accepted++
 		}
+		echoes = append(echoes, view.UserCode)
 	}
 
 	// One more ordinary request, so the whole session is committed once more.
@@ -72,30 +73,47 @@ func TestZ07DeviceVerificationBindsCallerControlledUserCodeBytesIntoTheSession(t
 	_, _, after := store.counts()
 	t.Logf("session payload after %d crafted verification loads: %d bytes (baseline %d)", len(spellings), after, base)
 
-	if accepted == 0 {
-		t.Fatalf("the page did not echo the caller's spelling, so nothing was bound")
+	// The lookup stays spelling-insensitive (every crafted spelling answered 200
+	// above — the t.Fatalf in the loop is the control), but the handle must not
+	// be: every accepted spelling has to normalise to the same bounded value, so
+	// the caller cannot choose the bytes the session carries.
+	if accepted != 0 {
+		t.Errorf("%d crafted spellings were echoed back verbatim; the verification page must bind and return "+
+			"the normalised code, not the caller's bytes (Z07-3)", accepted)
 	}
-	if after < base+pad {
-		t.Fatalf("the crafted handle did not reach the session store: %d -> %d bytes", base, after)
+	if len(echoes) == 0 || echoes[0] == "" {
+		t.Fatalf("the page reported a live code but echoed no user_code at all")
 	}
-	t.Errorf("%d crafted spellings of one user code — each %d bytes, %d bytes of padding apiece — were echoed "+
-		"back and bound into the browser session as handle ids (%d bytes committed in one session, baseline %d); "+
-		"Bind caps how many handles a kind holds (32) but never their bytes, and the session is rewritten whole on "+
-		"every request, so one navigation carries the bloat for the life of the cookie and 32 spellings multiply it",
-		accepted, pad+len(norm), pad, after, base)
+	for i := 1; i < len(echoes); i++ {
+		if echoes[i] != echoes[0] {
+			t.Errorf("one live code returned %q and %q for two accepted spellings: the handle is "+
+				"spelling-dependent (Z07-3)", echoes[0], echoes[i])
+		}
+	}
+	if len(echoes[0]) > 16 {
+		t.Errorf("the bound user code is %d bytes: the handle's length must come from the code, not from the "+
+			"request line (Z07-3)", len(echoes[0]))
+	}
+	if after >= base+pad {
+		t.Errorf("the crafted spelling reached the session store: %d -> %d bytes; a %d-byte spelling must not "+
+			"be bindable (Z07-3)", base, after, pad)
+	}
+	t.Logf("all %d crafted spellings echoed the same %d-byte code; session payload %d bytes (baseline %d)",
+		len(echoes), len(echoes[0]), after, base)
 }
 
-// TestZ07UserCodeSpellingIsNormalisedForTheLookupButNotForTheHandle.
+// TestZ07UserCodeSpellingIsNormalisedForTheLookupButNotForTheHandle is the
+// regression guard for the second half of Z07-3.
 //
 // The device flow is case- and separator-insensitive on the lookup path
-// (oauth.NormalizeUserCode, oauth/device.go:479-490), and the verification page
-// returns the canonical spelling (device_routes.go:69 binds auth.UserCode). The
-// decision path, however, checks the session handle against the *client's* string
-// verbatim (device_routes.go:108-112), so a caller that echoes the code the user
-// actually typed — the shape RFC 8628 invites — is answered "unknown user code"
-// even though the page had just rendered it as pending. Nothing is approved, so
-// this fails closed; the defect is that two spellings of one code disagree about
-// whether the handle exists.
+// (oauth.NormalizeUserCode), and the verification page returns the normalised
+// spelling. The decision path used to check the session handle against the
+// *client's* string verbatim, so a caller echoing the code the user actually
+// typed — the shape RFC 8628 invites — was answered "unknown user code" even
+// though the page had just rendered it as pending. Both halves must now agree:
+// whatever spelling loads the page, the same grant must be decidable with any
+// accepted spelling, including the canonical one the device authorization
+// endpoint returned.
 func TestZ07UserCodeSpellingIsNormalisedForTheLookupButNotForTheHandle(t *testing.T) {
 	env := newProbeEnv(t, probeOptions{})
 	b := env.newBrowser()
@@ -165,19 +183,16 @@ func TestZ07UserCodeSpellingIsNormalisedForTheLookupButNotForTheHandle(t *testin
 		UserCode string `json:"user_code"`
 	}
 	_ = json.Unmarshal([]byte(loadBody), &secondView)
-	t.Logf("loaded with %q, the page echoed user_code=%q (the request's spelling, not the stored code %q)",
-		typed2, secondView.UserCode, second)
+	t.Logf("loaded with %q, the page echoed the normalised user_code=%q", typed2, secondView.UserCode)
 
-	if got := decide(second); got == http.StatusNotFound {
+	// Loaded with the typed spelling, the same grant must be decidable with the
+	// canonical spelling the device authorization endpoint returned: the handle
+	// is the normalised code, so every accepted spelling addresses it.
+	if got := decide(second); got != http.StatusOK {
 		t.Errorf("the same device grant answered to two spellings: the page loaded %q as pending, but a "+
 			"decision carrying the canonical user_code %q — the value the device authorization endpoint "+
-			"returned and the one RFC 8628 prints — is 404; the handle key is the caller's spelling while the "+
-			"lookup normalises", typed2, second)
-	} else {
-		t.Logf("deciding with the canonical spelling %q = %d", second, got)
-	}
-	if got := decide(secondView.UserCode); got != http.StatusOK {
-		t.Logf("(the page's echoed spelling %q = %d)", secondView.UserCode, got)
+			"returned and the one RFC 8628 prints — is %d; the handle key must be the normalised code (Z07-3)",
+			typed2, second, got)
 	}
 }
 

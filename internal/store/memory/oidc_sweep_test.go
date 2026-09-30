@@ -205,9 +205,14 @@ func TestSweepExpiredKeepsMapsBounded(t *testing.T) {
 // class past its deadline on the fake clock and asserts the READ refuses it while
 // the record is still in the maps — before SweepExpired has run.
 //
-// Two classes are known not to hold yet. They are skipped by name rather than
-// quietly omitted, and the skip is the signal: when G-7 / Z07-1 land, deleting
-// the t.Skip is what turns this guard green and keeps that fix from regressing.
+// One class is known not to hold yet, and one cannot be asserted here at all.
+// Both are skipped by name rather than quietly omitted, and the skip is the
+// signal: Z07-1's skip goes away when that fix lands, while the device class is
+// exempt for a reason that outlives G-7 — its expiry is adjudicated by the
+// library, which also has to tell expired_token from access_denied, so the read
+// is deliberately not where the refusal happens. G-7's own half (an approved
+// code past its deadline must stop reporting Done) is asserted by
+// TestApprovedDeviceCodePastExpiryIsNotDone.
 func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 	// Past every deadline in the table — including the 30-day refresh token and
 	// the tombstone it leaves — so one advance covers every class.
@@ -233,6 +238,10 @@ func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 		// read path does not judge the deadline yet, so the case is skipped with
 		// that finding named.
 		gap string
+		// exempt names why this class cannot be asserted at all — the refusal
+		// lives outside this read — so the skip outlives the finding that
+		// prompted it.
+		exempt string
 		// plant stores one live record and returns the value its read path uses.
 		plant func(t *testing.T, s *OIDCStore) string
 		read  func(t *testing.T, s *OIDCStore, key string) error
@@ -319,7 +328,10 @@ func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 		},
 		{
 			name: "device authorization",
-			gap:  "G-7",
+			exempt: "a pending device's deadline is adjudicated by the library " +
+				"(CheckDeviceAuthorizationState), which must also distinguish expired_token from " +
+				"access_denied, so this read is deliberately not where the refusal happens; the " +
+				"approved-but-expired half G-7 closed is asserted by TestApprovedDeviceCodePastExpiryIsNotDone",
 			plant: func(t *testing.T, s *OIDCStore) string {
 				t.Helper()
 				if err := s.StoreDeviceAuthorization(context.Background(), "cli", "device-code", "BCDF-GHJK",
@@ -337,6 +349,9 @@ func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.exempt != "" {
+				t.Skipf("N-01: %s", tc.exempt)
+			}
 			if tc.gap != "" {
 				t.Skipf("%s: the memory %s read does not judge its deadline yet, so the sweep is still the "+
 					"only thing that removes an expired one; delete this t.Skip when %s lands — the case then "+

@@ -748,7 +748,12 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	switch {
 	case err == nil:
 		if owner != clientID {
-			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+			// RFC 7009 §2.1 / G-8: verify ownership, do not advertise it. A
+			// foreign live token answers exactly like an unknown one — the
+			// uniform RFC 7009 success — and deletes nothing
+			// (docs/audit-7/findings/Z20-VERIFIED.md). The old invalid_client
+			// refusal made this endpoint a liveness oracle.
+			return nil
 		}
 		// RFC 7009 §2.1: revoke the whole grant, not just the presented token. The
 		// refresh token minted with this access token carries the same id_hash.
@@ -775,7 +780,8 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	switch {
 	case err == nil:
 		if owner != clientID {
-			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+			// RFC 7009 §2.1 / G-8: the uniform success, deleting nothing.
+			return nil
 		}
 		if err := s.revokeInOneTx(ctx, []string{
 			`DELETE FROM oidc_refresh_tokens WHERE id_hash = $1`,
@@ -794,7 +800,8 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	switch {
 	case err == nil:
 		if owner != clientID {
-			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
+			// RFC 7009 §2.1 / G-8: the uniform success, deleting nothing.
+			return nil
 		}
 		// The access token goes first; the refresh row is the only place that names it.
 		if err := s.revokeInOneTx(ctx, []string{`
@@ -1102,11 +1109,21 @@ func (r deviceStateRow) state() *op.DeviceAuthorizationState {
 // between two polls cannot be replayed away. A pending or denied record is not
 // touched and falls through to a plain read for the library to answer.
 func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, deviceCode string) (*op.DeviceAuthorizationState, error) {
+	// One store-clock reading judges both the consume claim and the fall-through
+	// below: the single-clock policy the poll UPDATE already follows.
+	now := s.now()
+	// RFC 8628 §3.5: expires_in bounds the device_code as well as the user_code,
+	// so the approved-consume claim carries the same expires_at predicate
+	// AuthRequestByCode's claim does (G-7, docs/issues/P2-medium.md). Without it
+	// the DELETE matched an expired row and handed the library a Done state,
+	// which the library consumes BEFORE it checks Expires
+	// (zitadel/oidc pkg/op/device.go CheckDeviceAuthorizationState).
 	rows, err := s.pool.Query(ctx, `
 		DELETE FROM oidc_devices
 		 WHERE device_code_hash = $1 AND client_id = $2 AND done = true AND denied = false
+		   AND expires_at > $3
 		RETURNING client_id, scopes, expires_at, done, denied, subject, auth_time`,
-		hashValue(deviceCode), clientID)
+		hashValue(deviceCode), clientID, now)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: consume device authorization: %w", err)
 	}
@@ -1124,7 +1141,6 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 	// the new last_poll and updates nothing. One store-clock value both writes
 	// the deadline and judges it — the single-clock policy; the database's now()
 	// would make the interval a race between two clocks.
-	now := s.now()
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oidc_devices
 		   SET last_poll = $4
@@ -1138,6 +1154,21 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 		st, err := s.deviceState(ctx, `device_code_hash = $1 AND client_id = $2`, hashValue(deviceCode), clientID)
 		if err != nil {
 			return nil, err
+		}
+		// The expiry predicate above is why this row reached the fall-through:
+		// it is approved but past its deadline, so it missed the DELETE and the
+		// throttle UPDATE. Consume it here too, and clear Done so the library's
+		// Done-before-Expires order answers expired_token rather than minting
+		// (G-7). deviceState itself stays unfiltered: it is shared with
+		// DeviceByUserCode, where a missing row would surface as access_denied.
+		if st.Done && !st.Denied && !now.Before(st.Expires) {
+			if _, err := s.pool.Exec(ctx,
+				`DELETE FROM oidc_devices WHERE device_code_hash = $1 AND client_id = $2`,
+				hashValue(deviceCode), clientID); err != nil {
+				return nil, fmt.Errorf("postgres: expire device authorization: %w", err)
+			}
+			st.Done = false
+			return st, nil
 		}
 		if !st.Done && !st.Denied {
 			return nil, context.DeadlineExceeded
@@ -1568,8 +1599,13 @@ func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode st
 	if err != nil {
 		return oauth.DeviceAuthorization{}, err
 	}
+	// Return the normalised spelling, never the caller's bytes: the page binds
+	// and echoes this value, and op.DeviceAuthorizationState carries no user code
+	// of its own. Normalising here makes the handle identical for every accepted
+	// spelling of one code, so its length is bounded by the code rather than by
+	// the request line (Z07-3).
 	return oauth.DeviceAuthorization{
-		UserCode:  userCode,
+		UserCode:  oauth.NormalizeUserCode(userCode),
 		Client:    client,
 		Scopes:    descriptors,
 		ExpiresAt: st.Expires,

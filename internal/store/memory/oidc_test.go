@@ -683,7 +683,9 @@ func TestRefreshTokenRevocationRoundTrip(t *testing.T) {
 }
 
 // The revocation must not cross clients: an identifier that resolves is still
-// only revocable by the client it was issued to (RFC 7009 §2.1).
+// only revocable by the client it was issued to (RFC 7009 §2.1). G-8: the
+// foreign client's attempt is the uniform success and deletes nothing, so the
+// endpoint does not confirm ownership to a stranger.
 func TestRefreshTokenRevocationIsScopedToItsClient(t *testing.T) {
 	store, client := testStore(t)
 	ctx := context.Background()
@@ -694,10 +696,17 @@ func TestRefreshTokenRevocationIsScopedToItsClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := store.RevokeToken(ctx, refresh, "usr_1", "some-other-client"); err == nil {
-		t.Fatal("another client revoked a refresh token it does not own")
+	if err := store.RevokeToken(ctx, refresh, "usr_1", "some-other-client"); err != nil {
+		t.Fatalf("a foreign revocation was not the uniform RFC 7009 success: %v", err)
 	}
 	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err != nil {
-		t.Fatalf("the token was revoked anyway: %v", err)
+		t.Fatalf("the foreign revocation deleted the token: %v", err)
+	}
+	// The owner still can.
+	if err := store.RevokeToken(ctx, refresh, "usr_1", client.ID); err != nil {
+		t.Fatalf("the owner could not revoke its own token: %v", err)
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err == nil {
+		t.Fatal("the owner's revocation did not delete the token")
 	}
 }

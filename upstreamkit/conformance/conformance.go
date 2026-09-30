@@ -51,6 +51,13 @@ type Options struct {
 	HTTPClient *http.Client
 	// AccessToken, when set, enables the data-plane checks.
 	AccessToken string
+	// ClientID and ClientSecret, when BOTH are set, enable the token-endpoint
+	// client-authentication checks. They are optional and additive: a run that
+	// supplies neither still asserts that an unknown, credential-less client is
+	// refused, it just cannot observe which method a correct client is accepted
+	// with.
+	ClientID     string
+	ClientSecret string
 }
 
 // Run checks target (a source base URL) and returns its findings.
@@ -77,6 +84,10 @@ func Run(ctx context.Context, target string, opts Options) []Finding {
 	if !ok {
 		return r.findings
 	}
+	// Client authentication is exercised before the metadata document is read,
+	// because the metadata check compares what the suite OBSERVED accepted
+	// against what the document declares.
+	r.checkClientAuthentication(disc)
 	r.checkOAuthMetadata()
 	r.checkAuthorizeRejectsUnknownClient()
 	r.checkTokenRejectsBadGrant()
@@ -93,6 +104,13 @@ type runner struct {
 	opts     Options
 	findings []Finding
 	checks   map[string]bool
+
+	// observedAuthMethod names the client-authentication method the token
+	// endpoint accepted, or "" when the suite did not exercise one (no
+	// credentials were supplied, or the correct ones were refused as
+	// invalid_client). Only a non-empty value lets the metadata comparison run:
+	// nothing was observed, so nothing can contradict the document.
+	observedAuthMethod string
 }
 
 func (r *runner) report(level Level, check, format string, args ...any) {
@@ -180,6 +198,15 @@ func (r *runner) checkDiscovery() (upstreamkit.Discovery, bool) {
 	return disc, true
 }
 
+// checkOAuthMetadata reads the authorization-server metadata document.
+//
+// Besides PKCE and the response type, it compares
+// token_endpoint_auth_methods_supported against the method the suite observed
+// accepted (checkClientAuthentication). The field is optional in RFC 8414, so an
+// ABSENT field is a warning that the claim cannot be checked rather than a
+// conformance error; a PRESENT field that does not contain the accepted method
+// contradicts observable behaviour and is an error. The comparison only runs
+// when something was observed, so a credential-less run is unaffected.
 func (r *runner) checkOAuthMetadata() {
 	resp, err := r.request(http.MethodGet, "/.well-known/oauth-authorization-server", "", nil)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -191,6 +218,9 @@ func (r *runner) checkOAuthMetadata() {
 	var doc struct {
 		CodeChallengeMethods []string `json:"code_challenge_methods_supported"`
 		ResponseTypes        []string `json:"response_types_supported"`
+		// A pointer distinguishes an absent field (nil) from an explicit empty
+		// list, which the absent-field rule depends on.
+		TokenAuthMethods *[]string `json:"token_endpoint_auth_methods_supported"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&doc); err != nil {
 		r.err("oauth.metadata", "invalid metadata JSON: %v", err)
@@ -202,6 +232,104 @@ func (r *runner) checkOAuthMetadata() {
 	if len(doc.ResponseTypes) > 0 && !slices.Contains(doc.ResponseTypes, "code") {
 		r.err("oauth.response_type", "response_types_supported must include code")
 	}
+
+	if r.observedAuthMethod == "" {
+		return
+	}
+	if doc.TokenAuthMethods == nil {
+		r.warn("oauth.token_auth_methods", "the metadata document does not declare "+
+			"token_endpoint_auth_methods_supported, so the %s credentials the token endpoint "+
+			"accepted cannot be checked against it", r.observedAuthMethod)
+		return
+	}
+	if !slices.Contains(*doc.TokenAuthMethods, r.observedAuthMethod) {
+		r.err("oauth.token_auth_methods", "the token endpoint accepted %s, which is not among "+
+			"token_endpoint_auth_methods_supported %v", r.observedAuthMethod, *doc.TokenAuthMethods)
+	}
+}
+
+// checkClientAuthentication exercises the client-authentication half of the token
+// endpoint, which a credential-less run cannot observe.
+//
+// It is deliberately additive. The Z14-2 checks beside it assert that an UNKNOWN
+// client is refused; this one asserts that a CORRECT client is not, and that a
+// WRONG secret is — the pair RFC 6749 §5.2 makes observable without a valid
+// grant. The register's literal "correct credentials yield 200" is not
+// implementable: the suite owns no valid grant, and the interactive flow is
+// explicitly decoupled from these checks (docs/upstream-protocol.md §13), so the
+// refusal-side formulation is the one used here. A correct client with an invalid
+// grant must NOT be answered `401 invalid_client` (400 `invalid_grant` is the
+// expected answer), while a wrong secret must be `401 invalid_client`.
+func (r *runner) checkClientAuthentication(disc upstreamkit.Discovery) {
+	if r.opts.ClientID == "" || r.opts.ClientSecret == "" {
+		r.skip("token.client_auth", "no client credentials supplied; set Options.ClientID and "+
+			"Options.ClientSecret to check client authentication")
+		return
+	}
+
+	endpoint := disc.OAuth.TokenEndpoint
+	parsed, err := url.Parse(endpoint)
+	if endpoint == "" || err != nil {
+		parsed = &url.URL{Path: "/oauth/token"}
+	}
+	path := parsed.RequestURI()
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {"conformance-bogus-code"},
+		"redirect_uri":  {"https://conformance.invalid/cb"},
+		"code_verifier": {"conformance-verifier-conformance-verifier"},
+	}
+
+	// (a) The configured client, correct credentials, an invalid grant. The answer
+	// must not be the invalid_client refusal.
+	status, code, err := r.postToken(path, form, r.opts.ClientID, r.opts.ClientSecret)
+	if err != nil {
+		r.err("token.reachable", "request failed: %v", err)
+		return
+	}
+	if status == http.StatusUnauthorized && code == "invalid_client" {
+		r.err("token.accepts_valid_credentials", "the token endpoint answered 401 invalid_client "+
+			"for the configured client with correct credentials, so it does not accept the client "+
+			"it was told about")
+	} else {
+		// The suite now knows which method the endpoint accepted, and
+		// checkOAuthMetadata compares that against the document's claim.
+		r.observedAuthMethod = "client_secret_basic"
+	}
+
+	// (b) The same client with a WRONG secret must be refused as invalid_client.
+	status, code, err = r.postToken(path, form, r.opts.ClientID, r.opts.ClientSecret+"-wrong")
+	if err != nil {
+		r.err("token.reachable", "request failed: %v", err)
+		return
+	}
+	if status != http.StatusUnauthorized || code != "invalid_client" {
+		r.err("token.rejects_bad_credentials", "a wrong client secret got status %d error %q, "+
+			"want 401 invalid_client", status, code)
+	}
+}
+
+// postToken sends one token request authenticated with HTTP Basic credentials and
+// returns the status and the OAuth error code ("" when the body is not an OAuth
+// error document). The client id and secret are form-encoded before being placed
+// in the Basic value, which is what RFC 6749 §2.3.1 requires and what the kit
+// undoes (oauth.ClientCredentials).
+func (r *runner) postToken(path string, form url.Values, clientID, clientSecret string) (int, string, error) {
+	basic := base64.StdEncoding.EncodeToString([]byte(url.QueryEscape(clientID) + ":" + url.QueryEscape(clientSecret)))
+	resp, err := r.request(http.MethodPost, path, form.Encode(), map[string]string{
+		"Content-Type":  "application/x-www-form-urlencoded",
+		"Authorization": "Basic " + basic,
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	defer closeBody(resp)
+	var body struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body)
+	return resp.StatusCode, body.Error, nil
 }
 
 func (r *runner) checkAuthorizeRejectsUnknownClient() {
@@ -248,8 +376,23 @@ func (r *runner) checkTokenRejectsBadGrant() {
 	if resp.StatusCode/100 == 2 {
 		r.err("token.rejects_bad_grant", "a bogus grant was accepted with status %d", resp.StatusCode)
 	}
+	// The refusal must be the client-authentication one. RFC 6749 §5.2 makes
+	// invalid_client a 401 for a client that authenticated with (or was expected
+	// to authenticate with) credentials, so an unknown client that presented
+	// none must not be answered as though the grant were the only problem: a
+	// source that skips the client check is exactly what a hand-rolled endpoint
+	// ships.
+	if resp.StatusCode != http.StatusUnauthorized {
+		r.err("token.requires_auth", "an unknown client with no credentials got status %d, "+
+			"want 401 invalid_client (RFC 6749 §5.2)", resp.StatusCode)
+	}
 }
 
+// checkRevocationEndpoint checks that the RFC 7009 endpoint exists AND that it
+// authenticates the client, mirroring checkCascadeEndpoint's shape. The probe
+// carries a bogus token, an unknown client id and no credentials, so a 2xx means
+// the endpoint accepted a caller it authenticated nobody for — RFC 7009 §2.1
+// requires client authentication before a revocation is acted on.
 func (r *runner) checkRevocationEndpoint() {
 	form := url.Values{"token": {"conformance-bogus-token"}, "client_id": {"conformance-unknown-client"}}
 	resp, err := r.request(http.MethodPost, "/oauth/revoke", form.Encode(),
@@ -261,6 +404,12 @@ func (r *runner) checkRevocationEndpoint() {
 	defer closeBody(resp)
 	if resp.StatusCode == http.StatusNotFound {
 		r.err("revoke.present", "revocation endpoint is missing")
+		return
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		r.err("revoke.requires_auth", "the revocation endpoint answered %d to an unauthenticated "+
+			"caller (no credentials, unknown client): RFC 7009 §2.1 requires client authentication "+
+			"before a token is revoked", resp.StatusCode)
 	}
 }
 

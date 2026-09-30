@@ -92,11 +92,12 @@ func TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile(t *testing.T) {
 	tmp := t.TempDir()
 	copyRepo(t, src, tmp)
 
-	// A tracked, audit6-tagged file in the repository's own round-6 corpus is
-	// overwritten with a body that calls a function which does not exist. It is
-	// still tagged, still tracked, and no workflow sets that tag.
+	// A tracked, audit-tagged file in the repository's own corpus is overwritten
+	// with a body that calls a function which does not exist. It is still tagged,
+	// still tracked, and no workflow sets that tag (N-04 added audit5/audit6/
+	// audit7, so `audit` is the tag that stays orphaned).
 	broken := filepath.Join(tmp, "internal", "zzprobe", "audit6", "z05memstore", "alias_residual_test.go")
-	if err := os.WriteFile(broken, []byte("//go:build audit6\n\npackage z05memstore\n\n"+
+	if err := os.WriteFile(broken, []byte("//go:build audit\n\npackage z05memstore\n\n"+
 		"import \"testing\"\n\nfunc TestZ16VerifyBrokenProbe(t *testing.T) { _ = noSuchFunctionAnywhere() }\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +109,7 @@ func TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile(t *testing.T) {
 	// The premise: the file really does not compile once the tag it carries is
 	// set. (This is the tagged vet of the whole package; the package's other
 	// files are intact, so a failure here is the fixture's undefined callee.)
-	code, out := run(t, tmp, nil, "go", "vet", "-tags", "audit6", "./internal/zzprobe/audit6/z05memstore/...")
+	code, out := run(t, tmp, nil, "go", "vet", "-tags", "audit", "./internal/zzprobe/audit6/z05memstore/...")
 	if code == 0 {
 		t.Fatalf("the fixture does not even look broken; the tagged vet accepted it")
 	}

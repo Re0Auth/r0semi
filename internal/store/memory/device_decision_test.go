@@ -109,3 +109,48 @@ func TestApproveDeviceRefusesAnUnknownCode(t *testing.T) {
 		t.Fatalf("approving an unknown code = %v, want ErrDeviceNotFound", err)
 	}
 }
+
+// G-7 (docs/issues/P2-medium.md): an approved device authorization must not be
+// handed back as a consumable once its clock passes expires_at. The library
+// checks Done BEFORE Expires (zitadel/oidc pkg/op/device.go
+// CheckDeviceAuthorizationState), so a Done state mints regardless of the
+// advertised lifetime; the store's read is the only place that can refuse it.
+func TestApprovedDeviceCodePastExpiryIsNotDone(t *testing.T) {
+	clock := newTestClock()
+	store := clockedStore(t, clock)
+	ctx := context.Background()
+
+	// Control: approved while live, the read reports Done and consumes it.
+	if err := store.StoreDeviceAuthorization(ctx, "cli", "g7-device-live", "G7CD-0001",
+		clock.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveDevice(ctx, "G7CD-0001", "usr_g7", nil); err != nil {
+		t.Fatalf("approve while live: %v", err)
+	}
+	st, err := store.GetDeviceAuthorizatonState(ctx, "cli", "g7-device-live")
+	if err != nil {
+		t.Fatalf("live read: %v", err)
+	}
+	if !st.Done {
+		t.Fatalf("live approved state not Done: %+v", st)
+	}
+
+	// The same shape, aged past its expires_at.
+	if err := store.StoreDeviceAuthorization(ctx, "cli", "g7-device-expired", "G7CD-0002",
+		clock.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveDevice(ctx, "G7CD-0002", "usr_g7", nil); err != nil {
+		t.Fatalf("approve while live: %v", err)
+	}
+	clock.Advance(11 * time.Minute)
+
+	st, err = store.GetDeviceAuthorizatonState(ctx, "cli", "g7-device-expired")
+	if err != nil {
+		t.Fatalf("expired read: %v", err)
+	}
+	if st.Done {
+		t.Fatalf("an approved device_code past its expires_at is still reported Done: %+v", st)
+	}
+}

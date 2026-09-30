@@ -250,6 +250,47 @@ func (emptyIDKey) Wrap(context.Context, []byte, []byte) ([]byte, error) { return
 
 func (emptyIDKey) Unwrap(context.Context, []byte, []byte) ([]byte, error) { return nil, nil }
 
+// A "rotation" that only changes the kek_id is not a rotation: every record is
+// relabelled, but the bytes that open it are unchanged, so the operator deletes
+// the retired key believing the leak is bounded while it still opens everything.
+// keyFor seeds identical bytes for an identical material byte, which is exactly
+// the copy-paste this catches.
+func TestWithRetiredKeysRejectsReusedKeyMaterial(t *testing.T) {
+	repo := NewMemoryRepo()
+	logger := audit.NewMemoryLogger()
+	current := keyFor(t, "kek-2", 0xB2)
+
+	// The current key's material under the retired id.
+	_, err := NewService(repo, current, logger, WithRetiredKeys(keyFor(t, "kek-1", 0xB2)))
+	if err == nil {
+		t.Fatal("a retired key holding the current key's material was accepted")
+	}
+	for _, want := range []string{"kek-1", "kek-2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+
+	// Two retired keys sharing material are one key under two ids, even though
+	// neither matches the current key.
+	_, err = NewService(repo, current, logger,
+		WithRetiredKeys(keyFor(t, "kek-1", 0xA1), keyFor(t, "kek-3", 0xA1)))
+	if err == nil {
+		t.Fatal("two retired keys holding the same material were accepted")
+	}
+	for _, want := range []string{"kek-1", "kek-3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+
+	// Positive control: distinct material for every id is still accepted.
+	if _, err := NewService(repo, current, logger,
+		WithRetiredKeys(keyFor(t, "kek-1", 0xA1), keyFor(t, "kek-3", 0xC3))); err != nil {
+		t.Fatalf("distinct material was refused: %v", err)
+	}
+}
+
 // A revoked credential is gone; rotating must not bring it back.
 func TestRotateDoesNotResurrectRevokedCredentials(t *testing.T) {
 	repo := NewMemoryRepo()

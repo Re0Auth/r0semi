@@ -567,11 +567,16 @@ func TestOIDCTokenLifecycle(t *testing.T) {
 		t.Fatalf("introspection scopes = %v", intro.Scope)
 	}
 
-	// A revoke from the wrong client is refused while the token still exists.
-	// (After the owner revokes it below, an unknown-token revoke is RFC 7009
-	// success instead — that is tested by the whole-grant assertion after this.)
-	if oidcErr := store.RevokeToken(ctx, refresh, "usr_1", "someone-else"); oidcErr == nil {
-		t.Fatal("wrong client allowed to revoke")
+	// A revoke from the wrong client is the uniform RFC 7009 success and leaves
+	// the grant intact (G-8): the mismatch must not be advertised, and nothing
+	// may be deleted. The owner's revoke below is what removes it. (After the
+	// owner revokes it, an unknown-token revoke is RFC 7009 success again — that
+	// is tested by the whole-grant assertion after this.)
+	if oidcErr := store.RevokeToken(ctx, refresh, "usr_1", "someone-else"); oidcErr != nil {
+		t.Fatalf("wrong client revoke = %v, want the uniform RFC 7009 success", oidcErr)
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, refresh); err != nil {
+		t.Fatalf("the foreign revocation deleted the grant: %v", err)
 	}
 
 	// Revoking the access token makes introspection fail, and cuts the paired
