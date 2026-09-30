@@ -73,12 +73,15 @@ const (
 // the configured number of consecutive successes closes the breaker, and any
 // failure trips it again.
 //
-// Only failures that say something about the upstream count: a transport error
-// the caller did not cause, a 5xx, or a 401 on a call that carried our credential
-// (a token we cannot refresh is a source we cannot use, and without this a
-// permanently-401 source cost a refresh round trip on every request forever). A
-// caller-side cancellation is nobody's fault here, and other 4xx statuses are the
-// request's own business, so neither is recorded.
+// Only failures that say something about the HOST count: a transport error the
+// caller did not cause and a 5xx. A 401 is deliberately excluded (Z09V-1,
+// docs/issues/P2-medium.md). This executor is keyed by host, so treating one
+// caller's rejected credential as host-unhealthy let five reads by ONE account
+// shed every other account's reads of the same source for a cooldown. A 401 says
+// "this caller's credential is dead", not "the host is down"; the per-caller half
+// of that answer is internal/federation's per-binding 401 cooldown. A caller-side
+// cancellation is nobody's fault here either, and every other 4xx is the request's
+// own business, so none of them is recorded.
 //
 // The state machine, the cooldown, the half-open probes and the recording are
 // failsafe-go's circuitbreaker. What remains here is the per-host map — the
@@ -178,21 +181,23 @@ func circuitStateName(state circuitbreaker.State) string {
 	}
 }
 
-// breakerFailure reports whether an attempt says something about the upstream's
-// health. A transport error the caller did not cause, a 5xx, or a 401 does;
-// anything else — another 4xx, or a cancellation — is the request's own business.
+// breakerFailure reports whether an attempt says something about the upstream
+// HOST's health. A transport error the caller did not cause and a 5xx do;
+// anything else — every 4xx, and a cancellation — is the request's own business.
 //
-// **A 401 counts, and it is the one status here that is not obviously the
-// upstream's fault.** The rule the rest of this function follows is "a 4xx is the
-// request's problem", and for a 401 on a call that carries OUR credential that is
-// the wrong way round: the credential is ours, the upstream is answering that it is
-// no longer usable, and the data plane's answer to a 401 is to refresh and try
-// once more — so a source whose tokens cannot be refreshed costs two or four round
-// trips per request, forever, and never trips a breaker that does not count 401.
-// Measuring it: `WithFailureThreshold(5)` is a ratio over the last five attempts,
-// so a healthy refresh (401, then 200) can never open the breaker — the success is
-// in the window. Only a source whose last five attempts were ALL failures opens it,
-// which is exactly the source that should be skipped for a cooldown.
+// **A 401 is deliberately NOT a host failure (Z09V-1, docs/issues/P2-medium.md).**
+// It used to count, for the reason P1-3 recorded: a source whose tokens cannot be
+// refreshed would otherwise cost a refresh round trip on every request, forever.
+// What that reason left unrecorded is that this executor is keyed by HOST (see
+// CircuitBreaker), while a 401 is the state of ONE caller's credential. A stale
+// binding, or a natural expiry on an account whose refresh grant is gone, answers
+// 401 while the source itself is healthy — so five of that account's reads opened
+// the host's breaker and every OTHER account's read of the same source was refused
+// for the cooldown without the source being asked. A 401 cannot distinguish "this
+// caller is dead" from "the host is down", and this function is only allowed to
+// report the latter. P1-3's goal — a permanently-401 source is not paid for
+// forever — is met instead by internal/federation's per-binding 401 cooldown,
+// which is keyed by (user, game, source) and cannot leak across callers.
 func breakerFailure(resp *http.Response, err error) bool {
 	if err != nil {
 		return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
@@ -200,5 +205,5 @@ func breakerFailure(resp *http.Response, err error) bool {
 	if resp == nil {
 		return false
 	}
-	return resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusUnauthorized
+	return resp.StatusCode >= http.StatusInternalServerError
 }

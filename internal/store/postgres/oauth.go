@@ -191,6 +191,32 @@ func (s *Tokens) SaveRefresh(ctx context.Context, value string, t oauth.RefreshT
 	return err
 }
 
+// GetRefresh implements oauth.Store. A SELECT, never a DELETE, mirroring GetCode
+// and GetAccess: a caller resolving which account a token names, before a
+// fallible upstream call, must be able to try again, and only ConsumeRefresh's
+// atomic claim may rotate the token and leave the reuse tombstone.
+//
+// A value already spent has no live row left, so it reports ErrTokenNotFound here
+// exactly like one this deployment never issued. That is deliberate: the
+// *RefreshReuseError theft signal belongs to ConsumeRefresh, the destructive
+// claim, and a read must never be the thing that judges a replay.
+func (s *Tokens) GetRefresh(ctx context.Context, value string) (oauth.RefreshToken, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT client_id, subject, scopes, family_id, issued_at, expires_at
+		  FROM oauth_refresh_tokens WHERE token_hash = $1`, oauth.TokenHash(value))
+	if err != nil {
+		return oauth.RefreshToken{}, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[tokenRow])
+	if noRows(err) {
+		return oauth.RefreshToken{}, oauth.ErrTokenNotFound
+	}
+	if err != nil {
+		return oauth.RefreshToken{}, err
+	}
+	return row.refreshToken(), nil
+}
+
 // ConsumeRefresh implements oauth.Store. Rotation makes the token single-use, and
 // the claim leaves a tombstone so a later replay of the same value is recognised
 // as reuse rather than mistaken for a value that was never issued.

@@ -768,7 +768,7 @@ func TestStorageDriverResolution(t *testing.T) {
 		t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", base64.StdEncoding.EncodeToString(make([]byte, 32)))
 		t.Setenv("RE0AUTH_AUDIT_KEY", "")
 		t.Setenv("RE0AUTH_STORAGE_DRIVER", "")
-		t.Setenv("RE0AUTH_TRUSTED_PROXIES", "")
+		unsetEnv(t, "RE0AUTH_TRUSTED_PROXIES")
 	}
 	emptyFile := func(t *testing.T) string {
 		t.Helper()
@@ -1084,5 +1084,29 @@ func TestServeUntilSignalDrainsEveryEndpoint(t *testing.T) {
 			_ = resp.Body.Close()
 			t.Errorf("listener %s was still accepting after shutdown", addr)
 		}
+	}
+}
+
+// unsetEnv removes variables for the test and restores whatever was there before.
+//
+// t.Setenv(k, "") cannot express "unset", and since Z12-4 the difference matters:
+// an explicitly empty RE0AUTH_TRUSTED_PROXIES / RE0AUTH_ADMIN_SUBJECTS /
+// RE0AUTH_INTROSPECTION_CLIENTS now CLEARS the file's list (config.List uses
+// os.LookupEnv), so a test that means "this variable is not set" must actually
+// unset it — otherwise it silently re-tests the override path it did not mean to.
+func unsetEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		prev, wasSet := os.LookupEnv(key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
+		t.Cleanup(func() {
+			if wasSet {
+				_ = os.Setenv(key, prev)
+				return
+			}
+			_ = os.Unsetenv(key)
+		})
 	}
 }

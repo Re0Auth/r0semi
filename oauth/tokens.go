@@ -93,15 +93,18 @@ type AuthorizationCode struct {
 // Expiry is enforced by the service, not the store, so a store stays a dumb map.
 //
 // BREAKING CHANGE for Store implementers: this interface gained
-// RevokeRefreshFamily, GetCode and redefined ConsumeRefresh, and
+// RevokeRefreshFamily, GetCode, GetRefresh and redefined ConsumeRefresh, and
 // AccessToken/RefreshToken gained a FamilyID field. An implementation in another
-// module must add both methods, keep each spent refresh value's family reachable
-// (tombstone) so a replay is reported as a *RefreshReuseError rather than
-// ErrTokenNotFound, and record the family on both token kinds. The service relies
-// on all of them to satisfy RFC 9700 §4.14.2 and to keep a failed code exchange
-// from spending the code; a store that only implements the old single-use consume
-// silently keeps a detected replay from killing the thief's generation, and one
-// without GetCode cannot serve the exchange's pre-flight read at all.
+// module must add all three methods, keep each spent refresh value's family
+// reachable (tombstone) so a replay is reported as a *RefreshReuseError rather
+// than ErrTokenNotFound, and record the family on both token kinds. The service
+// relies on them to satisfy RFC 9700 §4.14.2, to keep a failed code exchange from
+// spending the code, and to let a caller resolve a session read-only before a
+// fallible upstream call; a store that only implements the old single-use consume
+// silently keeps a detected replay from killing the thief's generation, one
+// without GetCode cannot serve the exchange's pre-flight read at all, and one
+// without GetRefresh forces the caller to spend a refresh token just to learn
+// whose session it names.
 //
 // ConsumeCode and ConsumeRefresh must be atomic: a code is single-use and a
 // refresh token is single-use because it rotates.
@@ -148,6 +151,20 @@ type Store interface {
 	DeleteAccess(ctx context.Context, value string) error
 
 	SaveRefresh(ctx context.Context, value string, t RefreshToken) error
+	// GetRefresh returns the record a refresh value names WITHOUT consuming it, or
+	// ErrTokenNotFound when this store never issued it (or a consume or a
+	// revocation already removed it). It is the read peer of ConsumeRefresh, the
+	// same way GetCode is the read peer of ConsumeCode: a caller that only needs to
+	// resolve which account or session a token belongs to and then attempt a
+	// fallible side effect upstream must not have to spend the token to do it.
+	//
+	// A value already spent by ConsumeRefresh reports ErrTokenNotFound here, not a
+	// *RefreshReuseError: this read is never where a replay is judged, and treating
+	// an unknown and a spent value the same keeps the destructive claim — the one
+	// that rotates the family and arms the reuse tombstone — the single place a
+	// replay can be recognised. It mirrors GetAccess, and, like every other
+	// deadline in this interface, expiry is judged by the service, not the store.
+	GetRefresh(ctx context.Context, value string) (RefreshToken, error)
 	// ConsumeRefresh claims a live refresh value atomically and retires it. A
 	// live value returns its record; a value this store already consumed returns
 	// a *RefreshReuseError carrying that value's FamilyID; only a value never
@@ -393,6 +410,22 @@ func (s *MemoryStore) SaveRefresh(_ context.Context, value string, t RefreshToke
 	s.refresh[TokenHash(value)] = t
 	s.mu.Unlock()
 	return nil
+}
+
+// GetRefresh implements Store. It is a read under the same mutex ConsumeRefresh
+// claims under, with nothing deleted: a caller resolving which account a token
+// names can therefore try again after a failure. A spent value is only a
+// tombstone here, and a tombstone is not returned as a live record — the reuse
+// signal belongs to ConsumeRefresh, whose claim is what makes presenting the
+// value again a theft report.
+func (s *MemoryStore) GetRefresh(_ context.Context, value string) (RefreshToken, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.refresh[TokenHash(value)]
+	if !ok {
+		return RefreshToken{}, ErrTokenNotFound
+	}
+	return t, nil
 }
 
 // ConsumeRefresh implements Store. A live value is claimed and retired in one

@@ -601,6 +601,16 @@ func run() error {
 	// easier to reason about than one wired in two places.
 	apiConfig.AdminReauthWindow = cfg.AdminReauthWindow
 
+	// The effective access-control lists, logged once: their lengths are the
+	// operator-visible answer to "did my environment override take effect?", and
+	// the three bound who may introspect, whose X-Forwarded-For is trusted, and
+	// who may operate. An explicitly empty variable now clears the file's list,
+	// so this line is also where a deliberately disabled surface shows up (Z12-4).
+	slog.Info("access lists resolved",
+		"admin_subjects", len(cfg.adminSubjects),
+		"introspection_clients", len(cfg.IntrospectionClients),
+		"trusted_proxies", len(cfg.TrustedProxies))
+
 	if len(cfg.adminSubjects) > 0 {
 		adminSvc, err := admin.New(admin.Config{
 			Clients:  store.clients,
@@ -620,6 +630,12 @@ func run() error {
 		apiConfig.Admin = adminSvc
 		apiConfig.Admins = admins
 		slog.Info("operator plane enabled", "admins", len(admins))
+	} else {
+		// An explicitly empty RE0AUTH_ADMIN_SUBJECTS clears the file's allowlist,
+		// so the environment can unmount the plane. Say so: a security surface
+		// that disappears silently is the other half of the finding (Z12-4).
+		slog.Info("operator plane disabled",
+			"reason", "no admin subjects are configured (admin.subjects / RE0AUTH_ADMIN_SUBJECTS is empty)")
 	}
 
 	// The audit log's read side. Only the durable sink can answer: the in-memory
@@ -1223,7 +1239,18 @@ func rotationReport(r vault.Rotation) ([]string, bool) {
 		"key rotation run finished: scanned=%d rewrapped=%d already_current=%d skipped=%d",
 		r.Scanned, r.Rewrapped, r.AlreadyCurrent, r.Skipped)}
 	if r.Scanned == 0 {
-		lines = append(lines, "there was nothing to rotate; is the configured storage the one holding credentials?")
+		// A run that scanned no records is not "nothing to do". The documented
+		// gate is "run -rotate-keys again until it reports rewrapped=0
+		// skipped=0", and that gate reads exactly the same on a finished
+		// rotation as on a store that holds no credentials at all — including
+		// the in-memory backend that can never hold one. Exiting 0 there is the
+		// false green the finding names: automation removes the retired key on a
+		// signal that certified nothing. (Z12-2, docs/issues/P2-medium.md)
+		lines = append(lines,
+			"there was nothing to rotate; is the configured storage the one holding credentials?",
+			"a run that scanned no records cannot certify a rotation: check the storage above, then "+
+				"run -rotate-keys again")
+		return lines, true
 	}
 	if r.Skipped > 0 {
 		incomplete := fmt.Sprintf(

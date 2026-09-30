@@ -114,6 +114,14 @@ func deadCredentialUpstream(t *testing.T) (*httptest.Server, *atomic.Int64) {
 // (cmd/re0auth/main.go:492-508).
 func breakerService(t *testing.T, opts httpclient.BreakerOptions, up *httptest.Server) federation.Service {
 	t.Helper()
+	return breakerServiceTuned(t, opts, up, nil)
+}
+
+// breakerServiceTuned is breakerService with a last look at the federation
+// Config, so a probe can shorten the per-binding cooldown (Z09V-1) the way it
+// already shortens the breaker's.
+func breakerServiceTuned(t *testing.T, opts httpclient.BreakerOptions, up *httptest.Server, tune func(*federation.Config)) federation.Service {
+	t.Helper()
 	reg, err := federation.NewRegistry(federation.Source{
 		Game: zzGame, Name: zzSource, DisplayName: "Src", Issuer: up.URL,
 		Resources: []federation.Resource{
@@ -128,19 +136,39 @@ func breakerService(t *testing.T, opts httpclient.BreakerOptions, up *httptest.S
 	enroll(t, store, v, "usr_atk", "dead-token")
 	enroll(t, store, v, "usr_vic", "live-token")
 	hc := httpclient.NewOutboundClient(httpclient.OutboundConfig{Breaker: &opts})
-	svc, err := federation.NewService(federation.Config{
+	cfg := federation.Config{
 		Registry: reg, Bindings: store, Vault: v,
 		Doer: hc, HTTPClient: hc, BaseURL: "https://re0auth.test",
-	})
+	}
+	if tune != nil {
+		tune(&cfg)
+	}
+	svc, err := federation.NewService(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return svc
 }
 
-// The finding, at shipped defaults (5 failures / 30s cooldown): after five reads
-// by ONE account whose upstream credential is dead, an unrelated account's read of
-// the same source is refused WITHOUT the source being asked.
+// fetchErr is fetch when only the error matters.
+func fetchErr(t *testing.T, svc federation.Service, user account.UserID) error {
+	t.Helper()
+	_, err := fetch(t, svc, user)
+	return err
+}
+
+// INVERTED, and the regression guard for the fix (Z09V-1,
+// docs/issues/P2-medium.md). At shipped defaults (5 failures / 30s cooldown):
+// after five reads by ONE account whose upstream credential is dead, an unrelated
+// account's read of the same source must SUCCEED and cost exactly its own upstream
+// call. The name is the defect this guards against; before the fix this test was
+// the RED probe, and it asserted the victim was refused with ErrCircuitOpen and no
+// upstream call.
+//
+// The attacker's own binding still has to pay for its dead credential somewhere:
+// the per-binding cooldown (internal/federation) sheds the SIXTH read without
+// dialing, which is asserted here so the inversion did not simply move the cost to
+// the source.
 func TestZ09VerifyOneAccountsDeadCredentialShedsAnothersRead(t *testing.T) {
 	up, calls := deadCredentialUpstream(t)
 	svc := breakerService(t, httpclient.BreakerOptions{}, up)
@@ -162,63 +190,103 @@ func TestZ09VerifyOneAccountsDeadCredentialShedsAnothersRead(t *testing.T) {
 	t.Logf("baseline victim read ok (%d upstream calls); 5 attacker reads produced %d upstream calls; attacker errors = %v",
 		baselineCalls, afterAttacker-baselineCalls, atk)
 
-	// The finding: the victim's read, whose own credential the source accepts.
+	// The property under guard: the victim's read, whose own credential the source
+	// accepts, is served — a 401 is one caller's credential state, not the host's
+	// health, so it must not shed the source for anybody else.
 	res, err := fetch(t, svc, "usr_vic")
 	shedCalls := calls.Load()
 	t.Logf("after the attacker's reads: victim read = %+v err=%v, upstream calls added = %d",
 		res, err, shedCalls-afterAttacker)
 
-	if err == nil {
-		t.Fatalf("the victim's read still succeeded (%+v); the breaker did not open at the shipped threshold, "+
-			"so re-derive this probe", res)
+	if err != nil {
+		t.Fatalf("the victim's read was refused (%v) after five 401s by a DIFFERENT account: a per-host "+
+			"breaker is still reading one caller's dead credential as the source being down", err)
 	}
-	if !errors.Is(err, httpclient.ErrCircuitOpen) {
-		t.Fatalf("the victim's read failed with %v, want ErrCircuitOpen: this probe is about the shared breaker", err)
+	if shedCalls != afterAttacker+1 {
+		t.Fatalf("the victim's read produced %d upstream calls, want exactly 1 (it was not shed, and it did "+
+			"not fan out)", shedCalls-afterAttacker)
 	}
-	if shedCalls != afterAttacker {
-		t.Fatalf("the victim's request reached the upstream (%d calls added) yet failed: not the breaker",
-			shedCalls-afterAttacker)
+	if string(res.Data) != `{"served_by":"src"}` {
+		t.Fatalf("the victim's read returned %q, want the source's payload", res.Data)
 	}
-	t.Errorf("an account that source has never rejected was refused (ErrCircuitOpen, %d upstream calls added: 0) "+
-		"because five reads by a DIFFERENT account carried a credential that source had already rejected. The breaker is "+
-		"per upstream HOST and shared by every caller (cmd/re0auth/main.go:492-508); breakerFailure classifies a 401 as "+
-		"host-unhealthy (httpclient/circuitbreaker.go:196-204). A 401 on a read is the CALLER's credential state, not the "+
-		"host's health: one account — a stale binding, or a natural token expiry — can therefore shed the source for every "+
-		"account for Cooldown (30s shipped). This is P1-3's fix carrying a cross-user consequence it did not record.",
-		err)
+
+	// The cost of the attacker's own dead credential is now its OWN binding's
+	// cooldown: the sixth read is refused without asking the source.
+	beforeCooldown := calls.Load()
+	if _, err := fetch(t, svc, "usr_atk"); !errors.Is(err, federation.ErrBindingCooldown) {
+		t.Fatalf("the attacker's sixth read = %v, want ErrBindingCooldown: the per-binding cooldown did not "+
+			"take over from the breaker's 401 rule", err)
+	}
+	if added := calls.Load() - beforeCooldown; added != 0 {
+		t.Fatalf("a cooling binding was still dialed (%d upstream calls added)", added)
+	}
+	t.Logf("the attacker's sixth read was shed by the per-binding cooldown with no upstream call")
 }
 
-// The recovery control: the victim is refused only for the cooldown, and the very
-// same read succeeds as soon as the breaker admits a trial. The cooldown is
-// shortened so the test does not sleep 30s; the FAILURE THRESHOLD is still the
-// shipped 5.
+// The recovery control, re-derived for the fix (Z09V-1, docs/issues/P2-medium.md).
+//
+// It used to assert the victim got ErrCircuitOpen after the attacker's five reads
+// and recovered when the HOST breaker half-opened. The victim is never inside the
+// attacker's breaker now, so the assertion is the opposite: the victim is served
+// throughout, and what sheds and recovers is the ATTACKER'S OWN binding, on the
+// per-binding cooldown. The cooldown is shortened (Config.BindingCooldown) so the
+// test does not sleep the shipped 30s; the failure threshold is still the shipped 5.
 func TestZ09VerifyTheVictimRecoversWhenTheBreakerHalfOpens(t *testing.T) {
-	up, _ := deadCredentialUpstream(t)
-	svc := breakerService(t, httpclient.BreakerOptions{
+	up, calls := deadCredentialUpstream(t)
+	svc := breakerServiceTuned(t, httpclient.BreakerOptions{
 		Cooldown: 250 * time.Millisecond, HalfOpenSuccesses: 1,
-	}, up)
+	}, up, func(cfg *federation.Config) {
+		cfg.BindingCooldown = 250 * time.Millisecond
+	})
 
 	if _, err := fetch(t, svc, "usr_vic"); err != nil {
 		t.Fatalf("baseline victim read = %v", err)
 	}
 	for i := 0; i < 5; i++ {
-		_, _ = fetch(t, svc, "usr_atk")
+		if _, err := fetch(t, svc, "usr_atk"); err == nil {
+			t.Fatalf("attacker read %d accepted the dead credential", i+1)
+		}
 	}
-	if _, err := fetch(t, svc, "usr_vic"); !errors.Is(err, httpclient.ErrCircuitOpen) {
-		t.Fatalf("victim read after the attacker = %v, want ErrCircuitOpen", err)
-	}
-	time.Sleep(400 * time.Millisecond)
+	// The victim is not punished for another binding's credential.
 	if _, err := fetch(t, svc, "usr_vic"); err != nil {
-		t.Fatalf("victim read after the cooldown = %v; the shed above was not the breaker", err)
+		t.Fatalf("victim read after the attacker = %v, want success: a 401 is not host health", err)
+	}
+	// The attacker's own binding is cooling: refused without an upstream call.
+	before := calls.Load()
+	if _, err := fetch(t, svc, "usr_atk"); !errors.Is(err, federation.ErrBindingCooldown) {
+		t.Fatalf("attacker read after the threshold = %v, want ErrBindingCooldown", err)
+	}
+	if added := calls.Load() - before; added != 0 {
+		t.Fatalf("the cooling binding was still dialed (%d upstream calls added)", added)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	// The cooldown has lapsed, so the source is asked again (and answers 401).
+	before = calls.Load()
+	err := fetchErr(t, svc, "usr_atk")
+	if errors.Is(err, federation.ErrBindingCooldown) {
+		t.Fatalf("attacker read after the cooldown = %v; the cooldown did not lapse", err)
+	}
+	if err == nil {
+		t.Fatalf("attacker read after the cooldown succeeded; the dead credential should still be rejected")
+	}
+	if added := calls.Load() - before; added != 1 {
+		t.Fatalf("after the cooldown the upstream call count moved by %d, want 1", added)
+	}
+	// The victim's read never depended on any of this.
+	if _, err := fetch(t, svc, "usr_vic"); err != nil {
+		t.Fatalf("victim read after everything = %v; the per-binding cooldown leaked", err)
 	}
 }
 
-// The bound on V1, measured rather than assumed: failsafe's countingStats is a
-// rolling window of the last failureThresholdingCapacity (5) executions and the
-// circuit opens only when ALL of them are failures, so an interleaved success by
-// anybody keeps it closed. This is what the code comment
-// (httpclient/circuitbreaker.go:192-195) claims, and it is the reason V1 is a
-// burst/"quiet source" attack rather than a guaranteed one.
+// The bound on V1 as it was measured: failsafe's countingStats is a rolling
+// window of the last failureThresholdingCapacity (5) executions and the circuit
+// opened only when ALL of them were failures, so an interleaved success by anybody
+// kept it closed — which is why V1 was a burst attack rather than a guaranteed
+// one. After Z09V-1 the shared breaker does not see a 401 at all, so this test is
+// now two controls at once: the interleaved victim read stays green (nothing about
+// the host opened), and the attacker's own binding is what eventually stops being
+// dialed (its per-binding cooldown, counted separately from the victim's reads).
 func TestZ09VerifyAnInterleavedSuccessKeepsTheSharedBreakerClosed(t *testing.T) {
 	up, calls := deadCredentialUpstream(t)
 	svc := breakerService(t, httpclient.BreakerOptions{}, up)

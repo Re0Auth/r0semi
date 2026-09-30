@@ -144,12 +144,27 @@ func TestZ12FileConfiguredListsCannotBeClearedFromTheEnvironment(t *testing.T) {
 	}
 
 	path := writeConfig(t, "admin.toml", serverOnly+"\n[admin]\nsubjects = [\"usr_operator\"]\n")
-	got := runBinary(t, env, "-config", path)
-	if !strings.Contains(got.out, "operator plane enabled") {
-		t.Fatalf("the run never reached the operator-plane mount, so this probe observed nothing:\n%s", got.out)
+
+	// Control: with the variable unset the file's allowlist does mount the plane,
+	// so the empty environment is what changed the outcome.
+	fileOnly := serveEnv()
+	if withFile := runBinary(t, fileOnly, "-config", path); !strings.Contains(withFile.out, "operator plane enabled") {
+		t.Fatalf("control failed: the file's allowlist did not mount the operator plane:\n%s", withFile.out)
 	}
-	t.Errorf("RE0AUTH_ADMIN_SUBJECTS=\"\" did not clear the file's allowlist: the operator plane is "+
-		"still mounted for usr_operator. There is no spelling that turns it off from the environment\n%s", got.out)
+
+	got := runBinary(t, env, "-config", path)
+	if strings.Contains(got.out, "operator plane enabled") {
+		t.Fatalf("RE0AUTH_ADMIN_SUBJECTS=\"\" did not clear the file's allowlist: the operator plane is "+
+			"still mounted for usr_operator\n%s", got.out)
+	}
+	// A surface that is unmounted by configuration must be announced, or the two
+	// outcomes look the same in the log (Z12-4).
+	if !strings.Contains(got.out, "operator plane disabled") {
+		t.Fatalf("the cleared operator plane was not announced at startup:\n%s", got.out)
+	}
+	if !strings.Contains(got.out, "access lists resolved") {
+		t.Fatalf("the effective access lists were not logged:\n%s", got.out)
+	}
 }
 
 // stageOf pulls the stage= field out of a startFailure log line, for messages.

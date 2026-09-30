@@ -1,32 +1,31 @@
 //go:build audit7
 
-// Z11-2: the upstream byte budget is released before the body is written out,
-// so it does not bound "in flight x body size".
+// Z11-2: the upstream byte budget is released before the response body is written
+// out, so it does not bound "in flight x body size".
 //
 // P0-3 ("在途请求数 × 响应体没有联合上限 → OOMKill") was answered with
 // Config.MaxBufferedBytes: "the joint budget for upstream response bodies held in
 // memory at once, across every in-flight read on BOTH data-plane paths"
-// (internal/federation/service.go:46-54), and deploy/k8s/base/configmap.yaml
-// states it is "what actually caps 'in flight x body size'".
+// (internal/federation/service.go), and deploy/k8s/base/configmap.yaml states it
+// is "what actually caps 'in flight x body size'".
 //
-// The implementation reserves in rawFetch (service.go:725-729) and releases with
-// `defer s.buffers.release(reserve)` — which runs when rawFetch RETURNS, i.e.
+// The implementation reserved in rawFetch and released with
+// `defer s.buffers.release(reserve)` — which ran when rawFetch RETURNED, i.e.
 // before the caller writes the body. handleGameRaw then does
-// `w.Write(result.Body)`, and a slow-reading client blocks that write for up to
-// the server's writeTimeout (60s), holding the whole 4 MiB slice. Every such
-// request is invisible to the budget. The shipped manifest runs
-// max_in_flight = 128 against a 512Mi container limit: 128 x 4 MiB = 512 MiB of
-// live bodies with the budget reporting itself free.
+// `w.Write(result.Body)`, and a slow-reading client blocks that write while the
+// whole 4 MiB slice is still live. Every such request was invisible to the budget.
 //
-// This is NOT Z09-4 (the budget is global first-come-first-served, so sleepers
-// shed another user's read). Z09-4 is about who gets the reservation while a read
-// is IN PROGRESS; this is about the reservation being gone while the body is
-// still held. Both are consequences of the same accounting, and the fix for one
-// does not touch the other.
+// This test is INVERTED for the fix (Z11-2, docs/issues/P2-medium.md): the
+// reservation is transferred to RawResult.Release and returned after w.Write, so a
+// handler parked inside Write holds the budget and a further full-cap read must be
+// SHED (503). It used to assert the opposite, and the extra read being shed was
+// the failure.
 //
-// The probe drives the real HTTP surface with the budget set to exactly one raw
-// reservation, holds N bodies in their write phase, and shows the budget admits
-// yet another read.
+// The write window is parked IN PROCESS (parkingWriter) rather than with a
+// socket-slow client, because whether a socket write blocks is a property of the
+// host's buffers: heldbody_live_test.go (the Linux confirmation) measures 48/48
+// handlers returning on a Windows host. The deterministic in-process park is what
+// makes this test platform-independent.
 package zzprobe_z11resiliencedos
 
 import (
@@ -35,7 +34,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -70,12 +68,60 @@ func zzUpstream(t *testing.T, release <-chan struct{}, stalled *int64) *httptest
 	return up
 }
 
-// TestZ11ABodyOutlivesTheReservationThatAdmittedIt is red while the budget is
-// released before the response is written.
+// parkingWriter is an http.ResponseWriter that parks inside Write after recording
+// what the handler handed it. The "entered" signal is closed from inside Write, so
+// "the handler is inside Write" is observed rather than assumed.
+type parkingWriter struct {
+	header  http.Header
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+
+	mu      sync.Mutex
+	status  int
+	written int
+}
+
+func newParkingWriter() *parkingWriter {
+	return &parkingWriter{
+		header:  make(http.Header),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (w *parkingWriter) Header() http.Header { return w.header }
+
+func (w *parkingWriter) WriteHeader(code int) {
+	w.mu.Lock()
+	w.status = code
+	w.mu.Unlock()
+}
+
+func (w *parkingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.written += len(p)
+	w.mu.Unlock()
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return len(p), nil
+}
+
+func (w *parkingWriter) unblock() { close(w.release) }
+
+func (w *parkingWriter) state() (status, written int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.status, w.written
+}
+
+// TestZ11ABodyOutlivesTheReservationThatAdmittedIt is the inverted guard for
+// Z11-2: a body parked inside the handler's Write keeps its reservation, so a
+// further full-cap read is shed; once the write completes the reservation is back.
 func TestZ11ABodyOutlivesTheReservationThatAdmittedIt(t *testing.T) {
 	// The budget under test is exactly ONE raw reservation (maxBody + 1). If it
 	// bounded the bodies held by in-flight requests — as its documentation says —
-	// then only one of the readers below could be mid-write at a time.
+	// then only one full-cap body could be mid-write at a time.
 	const budget = zzMaxBody + 1
 
 	release := make(chan struct{})
@@ -98,8 +144,7 @@ func TestZ11ABodyOutlivesTheReservationThatAdmittedIt(t *testing.T) {
 	// The stall read is driven from a goroutine because the server does not write
 	// ANY response header until its handler has the whole body: a synchronous
 	// client would block until the handler returns and the two requests would
-	// never overlap, which is exactly what an earlier version of this probe got
-	// wrong (it measured 40s of sequential time and a 504 control).
+	// never overlap.
 	stallDone := make(chan int, 1)
 	go func() {
 		req, err := http.NewRequest(http.MethodGet, stallURL, nil)
@@ -136,75 +181,60 @@ func TestZ11ABodyOutlivesTheReservationThatAdmittedIt(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// ---- the finding: N bodies held, budget free -------------------------
-	const n = 8
-	held := make([]*http.Response, 0, n)
-	defer func() {
-		for _, resp := range held {
-			_ = resp.Body.Close()
-		}
+	// ---- the fix: the write window holds the reservation -----------------
+	// Drive the REAL handler with a writer that parks inside Write. The whole body
+	// has been handed to Write by then, which is exactly the window this finding is
+	// about.
+	handler := srv.Config.Handler
+	bw := newParkingWriter()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest(http.MethodGet, "/v1/games/"+zzGame+"/sources/src/raw/big", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		handler.ServeHTTP(bw, req)
 	}()
 
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-
-	for i := 0; i < n; i++ {
-		// Start the read, wait until its first body byte arrives — which proves
-		// rawFetch already returned and released its reservation — and then stop
-		// reading. The handler is now inside `w.Write(result.Body)`, holding the
-		// whole 4 MiB slice, and the client is a slow reader by construction.
-		resp := startRaw(t, srv.Client(), bigURL, token, true)
-		held = append(held, resp)
+	select {
+	case <-bw.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the raw handler never entered Write; the fixture cannot park it")
 	}
-	runtime.ReadMemStats(&after)
-	liveMiB := float64(after.HeapAlloc-before.HeapAlloc) / (1 << 20)
-	t.Logf("%d raw reads are each blocked mid-write holding a %d-byte body (%d MiB total); "+
-		"the joint budget is %d bytes (%.1f MiB) and the heap grew by %.1f MiB",
-		n, zzMaxBody, n*zzMaxBody>>20, budget, float64(budget)/(1<<20), liveMiB)
+	status, written := bw.state()
+	if status != http.StatusOK || written < zzMaxBody {
+		t.Fatalf("the handler is inside Write with status=%d and %d bytes, want 200 and the whole %d-byte body",
+			status, written, zzMaxBody)
+	}
+	select {
+	case <-done:
+		t.Fatalf("the handler returned while Write was parked, so the writer is not blocking")
+	default:
+	}
+	t.Logf("one handler is parked inside Write holding %d bytes; the joint budget is %d bytes (%.1f MiB)",
+		written, budget, float64(budget)/(1<<20))
 
-	// The budget is free while those bodies are live: a read that needs the
-	// WHOLE budget completes.
-	code, _, body := getAuth(t, srv.Client(), bigURL, token)
-	t.Logf("with %d x 4 MiB bodies held by in-flight requests and a %d-byte budget, one more full-cap read = %d (%d bytes)",
-		n, budget, code, len(body))
+	// The defect, inverted: the held body must spend the budget, so a further
+	// full-cap read is refused.
+	code, _, _ = getAuth(t, srv.Client(), bigURL, token)
+	t.Logf("with that body held inside Write and a %d-byte budget, one more full-cap read = %d", budget, code)
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("the extra read was ADMITTED (%d) while a handler is parked inside Write holding the whole "+
+			"%d-byte body: the reservation is released when rawFetch returns, before the body is written, so the "+
+			"budget still bounds the READ phase and not the held body (Z11-2). With max_in_flight readers each "+
+			"parked in w.Write the live bodies are unbounded by MaxBufferedBytes.", code, zzMaxBody)
+	}
+
+	// Control: completing the write returns the reservation, so the 503 above is
+	// attributable to the held body and not to a permanently spent budget.
+	bw.unblock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the parked handler never returned after the writer was unblocked")
+	}
+	code, _, _ = getAuth(t, srv.Client(), bigURL, token)
+	t.Logf("after the parked write completed, the same read = %d", code)
 	if code != http.StatusOK {
-		t.Errorf("the extra read was shed (%d): the budget did notice the held bodies — re-derive the probe", code)
-		return
+		t.Errorf("after the write completed the read = %d, want 200: the shed above was not the held reservation", code)
 	}
-
-	live := int64(n) * zzMaxBody
-	if live <= int64(budget) {
-		t.Fatalf("the probe's premise is wrong: %d bytes held vs a %d-byte budget", live, budget)
-	}
-	t.Errorf("the byte budget bounds READS, not bodies HELD: %d bodies of %d bytes (%.0f MiB) are alive inside "+
-		"in-flight handlers, the budget reports itself free (a further full-cap read was admitted), and the "+
-		"declared invariant `held <= MaxBufferedBytes` is violated by %.0fx. With the shipped manifest "+
-		"(max_in_flight = 128, 512Mi limit) the same shape is 512 MiB of live bodies with the budget untouched.",
-		n, zzMaxBody, float64(live)/(1<<20), float64(live)/float64(budget))
-}
-
-// startRaw issues an authenticated GET to the raw proxy and returns once the
-// response is usable. When firstByte is set it also reads one body byte, which
-// proves the server has left rawFetch (and released its reservation) and is
-// inside the response write.
-func startRaw(t *testing.T, c *http.Client, url, token string, firstByte bool) *http.Response {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := c.Do(req)
-	if err != nil {
-		t.Fatalf("GET %s: %v", url, err)
-	}
-	if !firstByte {
-		return resp
-	}
-	var one [1]byte
-	if _, err := io.ReadFull(resp.Body, one[:]); err != nil {
-		t.Fatalf("first body byte of %s: %v", url, err)
-	}
-	return resp
 }

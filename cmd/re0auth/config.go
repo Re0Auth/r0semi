@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -515,6 +516,14 @@ func loadConfig(path string) (settings, error) {
 	}
 	cfg.RateLimit, cfg.RateLimitBurst = limitValue, burstValue
 	switch {
+	case math.IsNaN(cfg.RateLimit) || math.IsInf(cfg.RateLimit, 0):
+		// NaN and ±Inf parse fine (`strconv.ParseFloat` accepts "nan"/"inf", and
+		// lowercase `nan`/`inf` are legal TOML floats) and every comparison below
+		// is false for them, so the value reached the limiter and admitted
+		// everything. Refuse at load, naming the field and never the spelling
+		// (Z12-6, docs/issues/P2-medium.md).
+		return settings{}, errors.New(
+			"server.rate_limit must be a finite number (use 0 to disable the limiter)")
 	case cfg.RateLimit < 0:
 		return settings{}, errors.New("server.rate_limit cannot be negative (use 0 to disable the limiter)")
 	case cfg.RateLimit == 0:
@@ -562,14 +571,11 @@ func loadConfig(path string) (settings, error) {
 	cfg.MaxUpstreamBufferBytes = bufferedBytes
 
 	// Trusted proxies. The environment overrides the file, like every other
-	// setting. Absent means no proxy is trusted, which is the safe default: the
-	// peer address is then the client, and a fabricated X-Forwarded-For is
-	// ignored.
-	proxyValues := f.Server.TrustedProxies
-	if env := strings.TrimSpace(os.Getenv("RE0AUTH_TRUSTED_PROXIES")); env != "" {
-		proxyValues = strings.Split(env, ",")
-	}
-	cfg.TrustedProxies, err = parseTrustedProxies(proxyValues)
+	// setting, and an explicitly empty value clears the file's list (config.List).
+	// Absent means no proxy is trusted, which is the safe default: the peer
+	// address is then the client, and a fabricated X-Forwarded-For is ignored.
+	cfg.TrustedProxies, err = parseTrustedProxies(
+		config.List("RE0AUTH_TRUSTED_PROXIES", f.Server.TrustedProxies))
 	if err != nil {
 		return settings{}, err
 	}
@@ -655,12 +661,9 @@ func loadConfig(path string) (settings, error) {
 	}
 
 	// Introspection policy. The environment overrides the file, like every other
-	// setting. Empty is the safe default: a client sees only its own tokens.
-	introspectionValues := f.Server.IntrospectionClients
-	if env := strings.TrimSpace(os.Getenv("RE0AUTH_INTROSPECTION_CLIENTS")); env != "" {
-		introspectionValues = strings.Split(env, ",")
-	}
-	for _, raw := range introspectionValues {
+	// setting, and an explicitly empty value clears the file's list (config.List).
+	// Empty is the safe default: a client sees only its own tokens.
+	for _, raw := range config.List("RE0AUTH_INTROSPECTION_CLIENTS", f.Server.IntrospectionClients) {
 		if id := strings.TrimSpace(raw); id != "" {
 			cfg.IntrospectionClients = append(cfg.IntrospectionClients, id)
 		}
@@ -802,18 +805,12 @@ func loadConfig(path string) (settings, error) {
 
 	// Operator plane. Off unless a deployment names at least one account: an admin
 	// API is not something to expose by accident, and an empty allowlist that
-	// still mounted the routes would be a door with no lock.
-	if v := strings.TrimSpace(os.Getenv("RE0AUTH_ADMIN_SUBJECTS")); v != "" {
-		for _, part := range strings.Split(v, ",") {
-			if s := strings.TrimSpace(part); s != "" {
-				cfg.adminSubjects = append(cfg.adminSubjects, s)
-			}
-		}
-	} else {
-		for _, s := range f.Admin.Subjects {
-			if s = strings.TrimSpace(s); s != "" {
-				cfg.adminSubjects = append(cfg.adminSubjects, s)
-			}
+	// still mounted the routes would be a door with no lock. An explicitly empty
+	// RE0AUTH_ADMIN_SUBJECTS clears the file's list and unmounts the plane
+	// (config.List; Z12-4).
+	for _, s := range config.List("RE0AUTH_ADMIN_SUBJECTS", f.Admin.Subjects) {
+		if s = strings.TrimSpace(s); s != "" {
+			cfg.adminSubjects = append(cfg.adminSubjects, s)
 		}
 	}
 

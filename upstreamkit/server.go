@@ -82,8 +82,11 @@ type CascadeRevocationRequest struct {
 	ClientSecret string
 	// Token is the token Re0Auth holds for this binding — the refresh token when
 	// there is one, because that identifies the durable authorization rather than
-	// an hour of it. The source resolves the subject from it, and MAY consume it:
-	// the binding is removed either way.
+	// an hour of it. The source resolves the subject from it, and MAY consume the
+	// refresh value only AFTER the upstream session has actually ended: Re0Auth
+	// removes the binding only when the source confirmed, so a source that spent
+	// the token before a failed call would leave the retry unable to name the
+	// session. On failure the token must stay usable.
 	Token string
 	// TokenTypeHint is "refresh_token" or "access_token", as in RFC 7009. It is a
 	// hint, and a source that refuses because the caller guessed wrong is a source

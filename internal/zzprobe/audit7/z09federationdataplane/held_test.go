@@ -230,14 +230,22 @@ func TestZ09ASourceNameCannotInjectAResponseHeader(t *testing.T) {
 	}
 }
 
-// P1-3 (96d76cc) put 401 into the breaker's failure classification. This is the
-// regression guard: a source that always answers 401 must stop being dialed after
-// five attempts, not be dialed forever once per read.
+// RETARGETED by Z09V-1 (docs/issues/P2-medium.md). This was the P1-3 regression
+// guard: 401 used to be counted by the per-HOST breaker, and "a source that always
+// answers 401 stops being dialed after five attempts" was that rule's observable.
+// Counting a 401 per host is exactly what let one account's dead credential shed
+// every other account's reads of the source, so the breaker no longer sees 401 at
+// all. P1-3's goal is unchanged and is now met per BINDING: five consecutive 401s
+// on one (user, game, source) stop that binding being dialed, and nothing else.
+//
+// The probe drives the real HTTP surface, so what it measures is the shipped
+// composition: the per-host breaker (which must NOT open) plus the per-binding
+// cooldown (which must).
 func TestZ09ASourceThatAlwaysAnswers401TripsTheBreaker(t *testing.T) {
 	up := newProbeUpstream(t, http.StatusUnauthorized, "application/json", `{"error":"nope"}`, nil)
 	reg := zzRegistryFor(t, up.URL, false)
 	// No refresh token: callWithRefresh returns the 401 rather than rotating, so
-	// every read costs exactly one upstream call while the breaker is closed.
+	// every read costs exactly one upstream call until the binding cools.
 	srv, mint := zzHarness(t, reg, []zzBind{
 		{User: "usr_v", Game: zzGame, Source: "src", Access: "tok"},
 	}, nil)
@@ -253,11 +261,12 @@ func TestZ09ASourceThatAlwaysAnswers401TripsTheBreaker(t *testing.T) {
 	got := up.n.Load()
 	t.Logf("%d reads against an always-401 source produced %d upstream requests", reads, got)
 	if got == reads {
-		t.Errorf("every read was dialed (%d of %d): a 401 is not counted as a breaker failure, which is the "+
-			"state P1-3 fixed", got, reads)
+		t.Errorf("every read was dialed (%d of %d): neither the (now 401-free) breaker nor the per-binding "+
+			"cooldown stopped the binding, and a source whose token cannot be refreshed is charged on every read "+
+			"forever", got, reads)
 	}
 	if got != 5 {
-		t.Errorf("upstream requests = %d, want 5 (the breaker's failure threshold): the closing behaviour "+
+		t.Errorf("upstream requests = %d, want 5 (the per-binding cooldown threshold): the closing behaviour "+
 			"changed and this guard should be re-derived", got)
 	}
 }

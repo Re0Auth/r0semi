@@ -486,6 +486,126 @@ func TestConsentDecisionsAreAudited(t *testing.T) {
 	}
 }
 
+// TestAuthRequestByIDRefusesAnExpiredHandle is the reader-side half of Z07-1: the
+// by-ID read the consent screen performs adjudicates the stored deadline itself,
+// so a pending handle stops being describable before the janitor runs. The
+// positive control is the same read inside the TTL, and the stored-record control
+// proves the refusal was the read's, not the sweep's.
+func TestAuthRequestByIDRefusesAnExpiredHandle(t *testing.T) {
+	clock := newTestClock()
+	store := clockedStore(t, clock)
+	ctx := context.Background()
+
+	ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+		ClientID:     "cli",
+		RedirectURI:  "https://app.example/cb",
+		ResponseType: oidc.ResponseTypeCode,
+		Scopes:       oidc.SpaceDelimitedArray{"account.id"},
+	}, "usr_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: inside the TTL the handle is readable, so a read that refused
+	// everything would not satisfy the assertion below.
+	if _, err := store.AuthRequestByID(ctx, ar.GetID()); err != nil {
+		t.Fatalf("AuthRequestByID inside the TTL: %v", err)
+	}
+
+	// A minute past the default 30-minute request TTL, with no sweep run: the
+	// read itself must refuse (Z07-1, docs/issues/P2-medium.md).
+	clock.Advance(31 * time.Minute)
+	if _, err := store.AuthRequestByID(ctx, ar.GetID()); err == nil {
+		t.Fatal("AuthRequestByID returned a pending handle past its deadline; only the sweep ended it (Z07-1)")
+	}
+	if got := store.Counts().AuthRequests; got != 1 {
+		t.Fatalf("stored auth requests = %d, want 1: the sweep must not have been the refusal", got)
+	}
+}
+
+// TestDeleteAuthRequestAuditsOnlyARealRefusal is the Z20-1 store-level check. The
+// library deletes the auth request again after minting, when it is already done;
+// that cleanup must not write a refusal event. The controls are the genuinely
+// pending request, whose deletion IS the refusal, and a missing row, which
+// records nothing.
+func TestDeleteAuthRequestAuditsOnlyARealRefusal(t *testing.T) {
+	clock := newTestClock()
+	clients := oauth.NewMemoryClientRegistry()
+	c, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "",
+		[]string{"https://app.example/cb"}, []oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clients.Create(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	logger := audit.NewMemoryLogger()
+	store, err := NewOIDCStore(OIDCOptions{
+		Clients:  clients,
+		Registry: oauth.DefaultRegistry(),
+		Signer:   signerForTests(t),
+		Audit:    logger,
+		Now:      clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	newRequest := func() string {
+		t.Helper()
+		ar, err := store.CreateAuthRequest(ctx, &oidc.AuthRequest{
+			ClientID:     "cli",
+			RedirectURI:  "https://app.example/cb",
+			ResponseType: oidc.ResponseTypeCode,
+			Scopes:       oidc.SpaceDelimitedArray{"account.id"},
+		}, "usr_1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ar.GetID()
+	}
+	denies := func() int {
+		n := 0
+		for _, e := range logger.Events() {
+			if e.Action == "oidc.consent.deny" {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Control: deleting a still-pending request is the refusal and records it.
+	if err := store.DeleteAuthRequest(ctx, newRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if got := denies(); got != 1 {
+		t.Fatalf("deleting a pending request recorded %d deny events, want 1", got)
+	}
+
+	// Z20-1: the post-mint cleanup deletes an already-done request. That is not a
+	// refusal, so the deny count must not move.
+	done := newRequest()
+	if err := store.CompleteLogin(ctx, done, "usr_1", []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteAuthRequest(ctx, done); err != nil {
+		t.Fatal(err)
+	}
+	if got := denies(); got != 1 {
+		t.Errorf("the cleanup of a done request recorded a consent deny: %d deny events, want still 1 (Z20-1)", got)
+	}
+
+	// The same cleanup after AuthRequestByCode consumed the row finds nothing at
+	// all, which must also record nothing.
+	if err := store.DeleteAuthRequest(ctx, "no-such-request"); err != nil {
+		t.Fatal(err)
+	}
+	if got := denies(); got != 1 {
+		t.Errorf("deleting a missing row recorded a consent deny: %d deny events, want still 1 (Z20-1)", got)
+	}
+}
+
 // The lookup itself is the claim, so a code cannot be exchanged twice even if two
 // requests race for it. The library only deletes the request after minting, so a
 // read-then-delete would let both win.

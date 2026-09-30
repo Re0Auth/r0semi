@@ -205,13 +205,12 @@ func TestSweepExpiredKeepsMapsBounded(t *testing.T) {
 // class past its deadline on the fake clock and asserts the READ refuses it while
 // the record is still in the maps — before SweepExpired has run.
 //
-// One class is known not to hold yet, and one cannot be asserted here at all.
-// Both are skipped by name rather than quietly omitted, and the skip is the
-// signal: Z07-1's skip goes away when that fix lands, while the device class is
-// exempt for a reason that outlives G-7 — its expiry is adjudicated by the
-// library, which also has to tell expired_token from access_denied, so the read
-// is deliberately not where the refusal happens. G-7's own half (an approved
-// code past its deadline must stop reporting Done) is asserted by
+// One class cannot be asserted here at all. It is skipped by name rather than
+// quietly omitted, and the skip is the signal: the device class is exempt for a
+// reason that outlives G-7 — its expiry is adjudicated by the library, which also
+// has to tell expired_token from access_denied, so the read is deliberately not
+// where the refusal happens. G-7's own half (an approved code past its deadline
+// must stop reporting Done) is asserted by
 // TestApprovedDeviceCodePastExpiryIsNotDone.
 func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 	// Past every deadline in the table — including the 30-day refresh token and
@@ -234,10 +233,6 @@ func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 
 	cases := []struct {
 		name string
-		// gap names the open finding this class is red for. Non-empty means the
-		// read path does not judge the deadline yet, so the case is skipped with
-		// that finding named.
-		gap string
 		// exempt names why this class cannot be asserted at all — the refusal
 		// lives outside this read — so the skip outlives the finding that
 		// prompted it.
@@ -252,7 +247,6 @@ func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 	}{
 		{
 			name:  "auth request by id",
-			gap:   "Z07-1",
 			plant: plantAuthRequest,
 			read: func(_ *testing.T, s *OIDCStore, key string) error {
 				_, err := s.AuthRequestByID(context.Background(), key)
@@ -351,11 +345,6 @@ func TestEverySweptReadPathRefusesExpiredBeforeTheSweep(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.exempt != "" {
 				t.Skipf("N-01: %s", tc.exempt)
-			}
-			if tc.gap != "" {
-				t.Skipf("%s: the memory %s read does not judge its deadline yet, so the sweep is still the "+
-					"only thing that removes an expired one; delete this t.Skip when %s lands — the case then "+
-					"proves the read refuses it before the sweep (N-01)", tc.gap, tc.name, tc.gap)
 			}
 			clock := newTestClock()
 			store := clockedStore(t, clock)

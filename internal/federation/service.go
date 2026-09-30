@@ -201,6 +201,13 @@ type FetchResult struct {
 	Source   string
 	Degraded bool
 	Data     json.RawMessage
+	// Release returns this result's upstream-body reservation to the joint byte
+	// budget (Config.MaxBufferedBytes). The reservation admits the READ, but the
+	// bytes stay held until the body has been written out, so ownership transfers
+	// from fetchResource to the caller and Release must be called after the write,
+	// not when Fetch returns (Z11-2, docs/issues/P2-medium.md). It is nil for a
+	// result that holds no reservation, so a caller calls it only when non-nil.
+	Release func()
 }
 
 // Service is the federation capability.
@@ -285,7 +292,12 @@ type Config struct {
 	// buffering read reserves what it may hold — up to maxBody (4 MiB) for a raw
 	// passthrough, or the upstream's declared Content-Length plus one when that is
 	// smaller — and a read that does not fit is shed with ErrBufferBudget instead
-	// of allocated. On top of that, EVERY caller (keyed by subject) holds at most
+	// of allocated. The reservation covers the WHOLE life of the body, not just the
+	// read: it is acquired before the read and returned only after the handler has
+	// written the body out, because a slow client blocks that write while the slice
+	// is still live (Z11-2, docs/issues/P2-medium.md); RawResult/FetchResult carry
+	// the release for exactly that reason. On top of that, EVERY caller (keyed by
+	// subject) holds at most
 	// max(2*maxBody, MaxBufferedBytes/4) at once; a caller that exceeds its own
 	// share is shed with the SAME ErrBufferBudget rather than consuming another
 	// caller's headroom. Without that share one subject's stalled reads — a source
@@ -303,6 +315,17 @@ type Config struct {
 	// 64 MiB/4)); the same manifest sets GOMEMLIMIT so the heap has a soft limit
 	// below the container's hard one.
 	MaxBufferedBytes int
+	// BindingFailureThreshold is how many consecutive 401s from a source on ONE
+	// binding start that binding's cooldown (Z09V-1, docs/issues/P2-medium.md).
+	// Zero takes bindingCooldownThreshold (5), which is the per-host breaker's own
+	// FailureThreshold; the per-binding counter exists so the breaker no longer has
+	// to read a 401 as host failure to reach P1-3's goal.
+	BindingFailureThreshold int
+	// BindingCooldown is how long a binding whose credential the source keeps
+	// rejecting is not asked again. Zero takes bindingCooldownWindow (30s), the
+	// per-host breaker's own Cooldown. It bounds ONE binding only: another binding
+	// on the same host keeps being served.
+	BindingCooldown time.Duration
 	// TotalTimeout bounds ONE data-plane request end to end, across every outbound
 	// call it makes in series (candidate sources, token refreshes, the fetch again
 	// after a 401). Zero takes defaultTotalTimeout.
@@ -378,6 +401,7 @@ func NewService(cfg Config) (Service, error) {
 		now:           cfg.Now,
 		metrics:       cfg.Metrics,
 		buffers:       newBufferBudget(cfg.MaxBufferedBytes),
+		cooldown:      newBindingCooldown(maxCooledBindings, cfg.BindingFailureThreshold, cfg.BindingCooldown, cfg.Now),
 		totalDeadline: cfg.TotalTimeout,
 	}, nil
 }
@@ -402,6 +426,10 @@ type service struct {
 	// buffers is the joint budget for the response bodies held in memory by the
 	// two data-plane read paths. See Config.MaxBufferedBytes.
 	buffers *bufferBudget
+	// cooldown counts consecutive 401s per binding and sheds a binding that keeps
+	// earning them, without touching another binding on the same host. See
+	// binding_cooldown.go and Config.BindingFailureThreshold.
+	cooldown *bindingCooldown
 	// totalDeadline bounds one data-plane request end to end. See
 	// Config.TotalTimeout.
 	totalDeadline time.Duration
@@ -537,19 +565,45 @@ func (s *service) trySource(ctx context.Context, src Source, req FetchRequest) (
 		return FetchResult{}, err
 	}
 
-	var data json.RawMessage
+	// The per-binding 401 cooldown (Z09V-1, docs/issues/P2-medium.md): a binding
+	// whose credential the source keeps rejecting is shed here, before any upstream
+	// call, and another binding on the same host is untouched.
+	key := bindingKey(req.User, req.Game, src.Name)
+	if s.cooldown.cooling(key) {
+		return FetchResult{}, &BindingCooldownError{Game: req.Game, Source: src.Name}
+	}
+
+	var (
+		data    json.RawMessage
+		release func()
+	)
 	err = s.callWithRefresh(ctx, src, binding, func(token string) error {
-		d, e := s.fetchResource(ctx, src, req.Resource, token, string(req.User))
+		d, r, e := s.fetchResource(ctx, src, req.Resource, token, string(req.User))
 		if e != nil {
 			return e
 		}
 		data = d
+		release = r
 		return nil
 	})
+	s.noteBindingOutcome(key, err)
 	if err != nil {
 		return FetchResult{}, err
 	}
-	return FetchResult{Source: src.Name, Data: data}, nil
+	return FetchResult{Source: src.Name, Data: data, Release: release}, nil
+}
+
+// noteBindingOutcome updates one binding's consecutive-401 counter. A 401 from the
+// source counts toward the cooldown; every other outcome — a success, a refresh
+// that worked, a transport error, a shed — resets the run, so the counter means
+// "consecutive", exactly like the breaker's failure window
+// (Z09V-1, docs/issues/P2-medium.md).
+func (s *service) noteBindingOutcome(key string, err error) {
+	if isUnauthorized(err) {
+		s.cooldown.reject(key)
+		return
+	}
+	s.cooldown.reset(key)
 }
 
 // candidates returns the sources to try, in order. A pinned source is the only
@@ -602,6 +656,13 @@ type RawResult struct {
 	Status      int
 	ContentType string
 	Body        []byte
+	// Release returns this result's upstream-body reservation to the joint byte
+	// budget (Config.MaxBufferedBytes). The reservation admits the READ, but the
+	// bytes stay held until the body has been written out, so ownership transfers
+	// from rawFetch to the caller and Release must be called after the write, not
+	// when Raw returns (Z11-2, docs/issues/P2-medium.md). It is nil for a result
+	// that holds no reservation, so a caller calls it only when non-nil.
+	Release func()
 }
 
 // Raw proxies a source's native API without modifying the body, preserving the
@@ -631,6 +692,16 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 		return RawResult{}, err
 	}
 
+	// The per-binding 401 cooldown (Z09V-1, docs/issues/P2-medium.md), the same
+	// check the normalized path makes: this binding's credential is in cooldown, so
+	// the source is not asked on its behalf, while another binding on the same host
+	// still is.
+	key := bindingKey(req.User, req.Game, src.Name)
+	if s.cooldown.cooling(key) {
+		s.metrics.ObserveUpstreamFetch(req.Game, src.Name, observability.UpstreamUnavailable)
+		return RawResult{}, &BindingCooldownError{Game: req.Game, Source: src.Name}
+	}
+
 	var out RawResult
 	start := time.Now()
 	err = s.callWithRefresh(ctx, src, binding, func(token string) error {
@@ -639,11 +710,18 @@ func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 			return e
 		}
 		if result.Status == http.StatusUnauthorized {
+			// This body is discarded in favour of a refreshed attempt, so its
+			// reservation goes back now; only the result that is actually returned
+			// carries its Release to the handler.
+			if result.Release != nil {
+				result.Release()
+			}
 			return &SourceError{Source: src.Name, Status: http.StatusUnauthorized}
 		}
 		out = result
 		return nil
 	})
+	s.noteBindingOutcome(key, err)
 	elapsed := time.Since(start)
 	if err != nil {
 		outcome := observability.UpstreamUnavailable
@@ -775,11 +853,26 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	// the bytes exist from the moment ReadAll starts copying them: admitting after
 	// the fact would mean the budget can only report an overrun it has already
 	// suffered.
+	//
+	// It is RELEASED by the eventual writer of the body, not here (Z11-2,
+	// docs/issues/P2-medium.md). `defer s.buffers.release(...)` returned the bytes
+	// when rawFetch returned, which is before the handler's w.Write — so a body
+	// parked in a slow write was invisible to the budget, which is the invariant
+	// `held <= MaxBufferedBytes` failing open. The reservation is transferred to
+	// RawResult.Release and the guarded defer below returns it only on the paths
+	// that never produce a result.
 	reserve := reserveFor(resp, maxBody+1)
 	if !s.buffers.acquire(caller, reserve) {
 		return RawResult{}, ErrBufferBudget
 	}
-	defer s.buffers.release(caller, reserve)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { s.buffers.release(caller, reserve) }) }
+	transferred := false
+	defer func() {
+		if !transferred {
+			release()
+		}
+	}()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return RawResult{}, fmt.Errorf("federation: read raw %s: %w", src.Name, err)
@@ -787,43 +880,58 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	if len(body) > maxBody {
 		return RawResult{}, ErrResponseTooLarge
 	}
+	transferred = true
 	return RawResult{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
 		Body:        body,
+		Release:     release,
 	}, nil
 }
 
-func (s *service) fetchResource(ctx context.Context, src Source, resource, token, caller string) (json.RawMessage, error) {
+// fetchResource returns the parsed body together with the release for its byte
+// reservation. The caller owns that release: it must be called once the body has
+// been written out (Z11-2, docs/issues/P2-medium.md). The error paths release
+// here, before returning, because there is no body to hand on.
+func (s *service) fetchResource(ctx context.Context, src Source, resource, token, caller string) (json.RawMessage, func(), error) {
 	endpoint := strings.TrimRight(src.Issuer, "/") + "/resources/" + url.PathEscape(resource)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("federation: build request: %w", err)
+		return nil, nil, fmt.Errorf("federation: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := s.doer.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("federation: source %s: %w", src.Name, err)
+		return nil, nil, fmt.Errorf("federation: source %s: %w", src.Name, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Same joint budget as the raw path: a normalized fetch holds one body of up
-	// to maxBody while it parses. See Config.MaxBufferedBytes.
+	// to maxBody while it parses. See Config.MaxBufferedBytes. The reservation
+	// outlives fetchResource on the success path; see the raw path for why.
 	reserve := reserveFor(resp, maxBody)
 	if !s.buffers.acquire(caller, reserve) {
-		return nil, ErrBufferBudget
+		return nil, nil, ErrBufferBudget
 	}
-	defer s.buffers.release(caller, reserve)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { s.buffers.release(caller, reserve) }) }
+	transferred := false
+	defer func() {
+		if !transferred {
+			release()
+		}
+	}()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
-		return nil, fmt.Errorf("federation: read %s: %w", src.Name, err)
+		return nil, nil, fmt.Errorf("federation: read %s: %w", src.Name, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, &SourceError{Source: src.Name, Status: resp.StatusCode}
+		return nil, nil, &SourceError{Source: src.Name, Status: resp.StatusCode}
 	}
 	if !json.Valid(body) {
-		return nil, fmt.Errorf("federation: source %s returned invalid JSON", src.Name)
+		return nil, nil, fmt.Errorf("federation: source %s returned invalid JSON", src.Name)
 	}
-	return json.RawMessage(body), nil
+	transferred = true
+	return json.RawMessage(body), release, nil
 }

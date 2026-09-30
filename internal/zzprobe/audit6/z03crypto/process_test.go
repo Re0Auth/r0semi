@@ -100,21 +100,24 @@ func TestProbeStartupLogDoesNotEchoKeyMaterial(t *testing.T) {
 	}
 }
 
-// TestProbeRotateKeysReportsTheGateOnAnEmptyVault is the command-level
-// regression guard for the P1-1 fix: a clean run exits 0, prints its counts,
-// and unconditionally names the re-run gate ("rewrapped=0 skipped=0") the
-// operator must pass before removing the retired key.
-func TestProbeRotateKeysReportsTheGateOnAnEmptyVault(t *testing.T) {
+// TestProbeRotateKeysRefusesToCertifyAnEmptyVault is the command-level guard for
+// Z12-2. A clean run over an empty vault prints scanned=0, which is exactly what
+// the documented gate ("run until rewrapped=0 skipped=0") reads as success — but
+// it certified nothing. The run must exit non-zero, name the counts, and say the
+// storage may be the wrong one.
+func TestProbeRotateKeysRefusesToCertifyAnEmptyVault(t *testing.T) {
 	env := baseEnv()
 	env["RE0AUTH_KEK_ID"] = "kek-2"
 	env["RE0AUTH_KEK_OLD"] = base64.StdEncoding.EncodeToString([]byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 	code, out := runToExit(t, env, "-rotate-keys", "-config", retiredConfig(t, "kek-1", "RE0AUTH_KEK_OLD"))
-	if code != 0 {
-		t.Fatalf("-rotate-keys on an empty vault exited %d; output:\n%s", code, out)
+	if code == 0 {
+		t.Fatalf("-rotate-keys on an empty vault exited 0; the documented gate would read that as a "+
+			"completed rotation, so the retired key would be removed on a signal that certified "+
+			"nothing:\n%s", out)
 	}
 	for _, needle := range []string{
 		"scanned=0 rewrapped=0",
-		"rewrapped=0 skipped=0",
+		"nothing to rotate",
 		"retired KEKs are configured",
 	} {
 		if !strings.Contains(out, needle) {

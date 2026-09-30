@@ -194,6 +194,42 @@ func TestCircuitBreakerCounts5xxNot4xx(t *testing.T) {
 	}
 }
 
+// Z09V-1 (docs/issues/P2-medium.md): this breaker is keyed by HOST and shared by
+// every caller, so a 401 — one caller's credential being dead — must never open
+// it. Counting it here is what let five reads by one account shed every other
+// account's reads of the same source for the cooldown. The positive control keeps
+// this from being "the breaker stopped working": the very same breaker still opens
+// on a 5xx.
+func TestCircuitBreakerDoesNotCount401AsHostFailure(t *testing.T) {
+	ft := &fakeTransport{status: http.StatusUnauthorized}
+	cb := CircuitBreaker(ft, BreakerOptions{FailureThreshold: 2})
+	req := breakerReq(t)
+
+	const attempts = 20
+	for i := 0; i < attempts; i++ {
+		resp, err := cb.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("401 attempt %d = %v: a rejected credential was read as the host being down", i+1, err)
+		}
+		resp.Body.Close()
+	}
+	if got := ft.callCount(); got != attempts {
+		t.Fatalf("only %d of %d 401s reached the transport: the host breaker opened on a per-caller status", got, attempts)
+	}
+
+	ft.set(nil, http.StatusInternalServerError)
+	for i := 0; i < 2; i++ {
+		resp, err := cb.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("5xx = %v, want a response", err)
+		}
+		resp.Body.Close()
+	}
+	if _, err := cb.RoundTrip(req); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen after two 5xx", err)
+	}
+}
+
 // A caller who cancels is not the upstream failing, so the breaker must not open.
 func TestCircuitBreakerIgnoresCallerCancellation(t *testing.T) {
 	ft := &fakeTransport{err: context.Canceled}

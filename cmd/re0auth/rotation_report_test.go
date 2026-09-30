@@ -44,13 +44,19 @@ func TestRotationReport(t *testing.T) {
 		}
 	})
 
-	t.Run("nothing to rotate is called out", func(t *testing.T) {
+	t.Run("nothing to rotate is called out and is not a pass", func(t *testing.T) {
+		// Z12-2: "scanned=0" satisfies the documented gate ("run until
+		// rewrapped=0 skipped=0") without having certified anything, so it must
+		// exit non-zero like the skipped case does.
 		lines, incomplete := rotationReport(vault.Rotation{})
-		if incomplete {
-			t.Fatal("an empty vault is not an incomplete rotation")
+		if !incomplete {
+			t.Fatal("an empty scan must be an incomplete rotation: exiting 0 is the false green")
 		}
 		if !strings.Contains(strings.Join(lines, "\n"), "nothing to rotate") {
 			t.Errorf("an empty run does not warn that the storage may be the wrong one: %v", lines)
+		}
+		if !strings.Contains(strings.Join(lines, "\n"), "cannot certify") {
+			t.Errorf("an empty run does not say why it cannot be read as done: %v", lines)
 		}
 	})
 }

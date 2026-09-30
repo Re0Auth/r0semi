@@ -101,7 +101,7 @@ func (s *service) describe(ctx context.Context, req AuthorizationRequest) (Clien
 	if !client.AllowsRedirect(req.RedirectURI) {
 		return Client{}, nil, protocolError("invalid_request", "redirect_uri is not registered")
 	}
-	if req.CodeChallenge == "" || req.CodeChallengeMethod != "S256" {
+	if !validPKCEChallenge(req.CodeChallenge) || req.CodeChallengeMethod != "S256" {
 		return Client{}, nil, protocolError("invalid_request", "PKCE with S256 is required")
 	}
 	descriptors, err := s.scopes.Resolve(req.Scopes, client.ID)
@@ -458,8 +458,35 @@ func (s *service) record(ctx context.Context, action, subject, clientID, outcome
 	})
 }
 
+// validPKCEChallenge reports whether challenge has the only shape an S256 PKCE
+// challenge can have: the unpadded base64url encoding of a SHA-256 digest, which
+// is exactly 43 characters drawn from [A-Za-z0-9_-] (RFC 7636 §4.2). It is shared
+// by describe and verifyPKCE so the authorize-side admission and the
+// exchange-side verification cannot drift apart: a challenge rejected at
+// authorize must never have been acceptable at exchange, and vice versa.
+//
+// Known limit: §4.2 gives no way to refuse an upper-cased 43-character digest
+// without the verifier, because uppercase letters are in the base64url alphabet.
+// Such a challenge is shape-valid and is accepted here; it fails only at the
+// exchange, where the constant-time comparison over the computed digest exposes
+// it. That is a property of the format, not of this predicate.
+func validPKCEChallenge(challenge string) bool {
+	if len(challenge) != 43 {
+		return false
+	}
+	for i := 0; i < len(challenge); i++ {
+		c := challenge[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func verifyPKCE(verifier, challenge, method string) bool {
-	if verifier == "" || challenge == "" || method != "S256" {
+	if verifier == "" || !validPKCEChallenge(challenge) || method != "S256" {
 		return false
 	}
 	sum := sha256.Sum256([]byte(verifier))

@@ -628,3 +628,67 @@ func TestConcurrentExchangeMintsOnce(t *testing.T) {
 		t.Fatalf("concurrent exchanges minted %d times, want exactly 1", minted)
 	}
 }
+
+// DescribeAuthorization admits only a code_challenge with the shape RFC 7636 §4.2
+// requires — 43 unpadded base64url characters — so a malformed one is refused at
+// the authorize endpoint instead of minting a code that can never be redeemed
+// (KIT-5). The residual is asserted explicitly: an upper-cased digest is
+// shape-valid, so authorize accepts it and only the exchange can refuse it.
+func TestDescribeAuthorizationValidatesPKCEChallengeShape(t *testing.T) {
+	svc, clients, _, _, _ := newTestAS(t)
+	registerClient(t, clients, "app", ClientConfidential, "secret", []Scope{ScopeAccountID})
+	ctx := context.Background()
+	verifier := "shape-verifier-shape-verifier-shape"
+	sum := sha256.Sum256([]byte(verifier))
+	full := base64.RawURLEncoding.EncodeToString(sum[:])
+	const redirect = "https://app.example/cb"
+	base := AuthorizationRequest{
+		ClientID: "app", RedirectURI: redirect, Subject: "user-1",
+		Scopes: []Scope{ScopeAccountID}, CodeChallengeMethod: "S256",
+	}
+
+	base.CodeChallenge = full
+	if _, err := svc.DescribeAuthorization(ctx, base); err != nil {
+		t.Fatalf("vacuity: a real 43-character S256 challenge was refused: %v", err)
+	}
+
+	for _, tc := range []struct{ name, ch string }{
+		{"padded", base64.URLEncoding.EncodeToString(sum[:])},
+		{"42 chars", full[:len(full)-1]},
+		{"one char", "A"},
+		{"empty", ""},
+		{"illegal alphabet", strings.Repeat("+", 43)},
+	} {
+		req := base
+		req.CodeChallenge = tc.ch
+		_, err := svc.DescribeAuthorization(ctx, req)
+		if err == nil {
+			t.Errorf("%s challenge %q was accepted at authorize", tc.name, tc.ch)
+			continue
+		}
+		if got := protocolCode(t, err); got != "invalid_request" {
+			t.Errorf("%s: error code = %q, want invalid_request", tc.name, got)
+		}
+		t.Logf("%-17s rejected at authorize: %v", tc.name, err)
+	}
+
+	upper := strings.ToUpper(full)
+	if upper == full {
+		t.Fatalf("vacuity: the sample challenge has no letters to upper-case")
+	}
+	req := base
+	req.CodeChallenge = upper
+	resp, err := svc.Authorize(ctx, req)
+	if err != nil {
+		t.Fatalf("an upper-cased 43-character digest was refused at authorize (%v); §4.2 leaves no way to "+
+			"refuse it without the verifier, so this is the shape check over-reaching", err)
+	}
+	if _, err := svc.Exchange(ctx, CodeExchangeRequest{
+		ClientID: "app", ClientSecret: "secret", Code: resp.Code,
+		RedirectURI: redirect, CodeVerifier: verifier,
+	}); err == nil {
+		t.Error("the exchange accepted an upper-cased digest, so the residual claim is wrong too")
+	} else {
+		t.Logf("residual: authorize accepted the upper-cased digest; the exchange refused it: %v", err)
+	}
+}

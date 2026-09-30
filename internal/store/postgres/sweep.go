@@ -22,15 +22,13 @@ const sweepBatchSize = 1000
 // was already stale when the fix landed (Z15-1, docs/issues/P2-medium.md).
 //
 // The set mirrors what the in-memory OP store sweeps. Deleting by deadline is the
-// stricter direction, so a sweep can never revoke something still in use — but
-// "an expired row is one a lookup already refuses" is NOT yet true for every
-// table here: oidc_auth_requests read by id (Z07-1) is judged only by this sweep
-// until that fix lands (oidc_devices' consume predicate now carries the
-// store-clock deadline, so G-7 no longer belongs in this list). The oauth_* and
-// federation_* deadlines are adjudicated by the legacy engine's service
-// (oauth/as.go, oauth/device.go, internal/federation/bind.go), not by this
-// adapter. Nothing else removed these rows, so without a sweep the tables keep
-// every code, token and pending request the deployment ever issued.
+// stricter direction, so a sweep can never revoke something still in use — every
+// swept OIDC read path refuses an expired row before this sweep reaches it (N-01;
+// TestEverySweptReadPathAdjudicatesItsDeadline pins the predicate each one
+// carries). The oauth_* and federation_* deadlines are adjudicated by the legacy
+// engine's service (oauth/as.go, oauth/device.go, internal/federation/bind.go),
+// not by this adapter. Nothing else removed these rows, so without a sweep the
+// tables keep every code, token and pending request the deployment ever issued.
 //
 // Every deadline column here is written by this process (never by the database),
 // so every comparison is against this process's clock, passed in as a parameter.

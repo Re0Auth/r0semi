@@ -12,32 +12,42 @@ import (
 	"github.com/Re0Auth/r0semi/internal/ratelimit"
 )
 
-// Z12-6: a non-finite rate_limit is accepted by the loader and turns the limiter
-// into a limiter that admits everything.
+// Z12-6: a non-finite rate_limit is refused at load.
 //
-// config.Float (internal/config/config.go:98-108) is strconv.ParseFloat, which
-// accepts "NaN", "Inf" and "+Inf"; loadConfig's only guard is
-// `cfg.RateLimit < 0` (cmd/re0auth/config.go:512-522), and every comparison
-// against NaN is false, so NaN walks past the negative check, past the
-// `== 0` (disable) branch and past `burst < 1`. buildLimiter (main.go:224-229)
-// then sees `NaN <= 0` as false and installs a limiter instead of the documented
-// "0 disables it".
+// config.Float is strconv.ParseFloat, which accepts "nan"/"inf", and every
+// comparison against NaN is false, so the old guard (`rate_limit < 0`) let NaN
+// reach buildLimiter, which installed a limiter that admitted everything
+// (main.go:224-229). The loader now rejects a non-finite value before anything
+// is wired. The limiter arithmetic at the end of this test is kept as the reason
+// the refusal matters: it shows what the accepted value used to do.
 //
 // The probe first proves the spelling is accepted by a real process, then
 // measures what the resulting limiter does, using the same ratelimit package
 // buildLimiter builds.
-func TestZ12NonFiniteRateLimitIsAcceptedAndDisablesTheLimiter(t *testing.T) {
-	// First, that the loader really accepts the spelling a deployment would use:
-	// the same run with the same environment reaches the listener, so the value
-	// was consumed rather than refused.
+func TestZ12NonFiniteRateLimitIsRefusedAtLoad(t *testing.T) {
+	// The finding: the spelling a deployment would use is refused by the loader,
+	// before anything is wired, and the refusal names the field.
 	env := serveEnv()
 	env["RE0AUTH_RATE_LIMIT"] = "nan"
 	got := runBinary(t, env)
-	if !strings.Contains(got.out, "stage=listen") {
-		t.Fatalf("RE0AUTH_RATE_LIMIT=nan was not accepted by the loader, so the finding below "+
-			"does not apply to a real process:\n%s", got.out)
+	if strings.Contains(got.out, "stage=listen") {
+		t.Fatalf("RE0AUTH_RATE_LIMIT=nan still reached the listener:\n%s", got.out)
 	}
-	t.Logf("RE0AUTH_RATE_LIMIT=nan was accepted: the run reached %s", stageOf(got.out))
+	if !strings.Contains(got.out, "stage=config") {
+		t.Fatalf("RE0AUTH_RATE_LIMIT=nan was not refused at load (want stage=config):\n%s", got.out)
+	}
+	if !strings.Contains(got.out, "server.rate_limit") {
+		t.Fatalf("the refusal does not name the field:\n%s", got.out)
+	}
+	t.Logf("RE0AUTH_RATE_LIMIT=nan was refused at load: %s", oneLine(got.out))
+
+	// Control: a finite value still starts, so the refusal is about the
+	// non-finite spelling and not about this probe's environment.
+	finiteEnv := serveEnv()
+	finiteEnv["RE0AUTH_RATE_LIMIT"] = "50"
+	if finiteRun := runBinary(t, finiteEnv); !strings.Contains(finiteRun.out, "stage=listen") {
+		t.Fatalf("control: a finite rate_limit did not reach the listener:\n%s", finiteRun.out)
+	}
 
 	// Control: the same probe with a finite value, so the assertions below are
 	// about the non-finite value and not about the limiter being broken.
@@ -76,22 +86,15 @@ func TestZ12NonFiniteRateLimitIsAcceptedAndDisablesTheLimiter(t *testing.T) {
 	t.Logf("1000 sequential requests: finite(50/s,burst100)=%d NaN=%d +Inf=%d",
 		admitted, nanAdmitted, infAdmitted)
 
-	if nanAdmitted == 1000 {
-		t.Errorf("rate_limit = NaN is accepted by the configuration layer and builds a limiter that " +
-			"admits every request (1000 of 1000): per-address load shedding is silently OFF, while " +
-			"the same variable with 0 means \"off\" deliberately and a negative is refused. " +
-			"buildLimiter's `cfg.RateLimit <= 0` is false for NaN, so a limiter is installed; " +
-			"inside it the NaN never reaches rate's `limit == Inf` shortcut, so every reservation " +
-			"leaves tokens=NaN and x/time/rate's comparison is false — i.e. always allowed. " +
-			"The deployment's documented default (50/s) is gone and nothing says so")
-		return
+	// Kept as the demonstration of why the load-time refusal is the fix: the
+	// value the loader used to accept admitted every request, while the same
+	// variable with 0 means "off" deliberately and a negative is refused.
+	if nanAdmitted != 1000 {
+		t.Logf("note: the NaN limiter admitted %d of 1000 (it used to admit all); the load-time refusal "+
+			"is still the property under test", nanAdmitted)
 	}
-	if nanAdmitted == 0 {
-		t.Errorf("rate_limit = NaN builds a limiter that refuses every request (0 of 1000 admitted)")
-		return
-	}
-	t.Errorf("rate_limit = NaN builds a limiter with an unspecified verdict (%d of 1000 admitted)",
-		nanAdmitted)
+	t.Logf("had NaN been accepted it would have admitted every request: finite(50/s,burst100)=%d "+
+		"NaN=%d +Inf=%d of 1000", admitted, nanAdmitted, infAdmitted)
 }
 
 // Z12-8: positional arguments are never checked, so an argument that is not a

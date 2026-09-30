@@ -553,10 +553,12 @@ func TestC3_PKCEMethodEnforcement(t *testing.T) {
 	}
 }
 
-// Authorize accepts any non-empty code_challenge with method S256, including one
-// that cannot be a SHA-256 digest in the required encoding. The exchange then
-// fails, so an honest client's mistake costs it the login — though since KIT-4
-// the code itself is no longer burned by the refusal.
+// The authorize side must validate the SHAPE of code_challenge, not merely that
+// it is non-empty: an unpadded 43-character base64url value (RFC 7636 §4.2). A
+// malformed challenge is refused at authorize instead of minting a code that can
+// never be redeemed. One residual remains by construction: an upper-cased
+// 43-character digest is shape-valid, so authorize accepts it and only the
+// exchange — which holds the verifier — can refuse it.
 func TestC4_PKCEChallengeShapeIsNotValidated(t *testing.T) {
 	ctx := context.Background()
 	full := challengeFor(probeVerifier)
@@ -584,7 +586,7 @@ func TestC4_PKCEChallengeShapeIsNotValidated(t *testing.T) {
 			continue
 		}
 		accepted[tc.name] = true
-		t.Logf("%-16s ACCEPTED at authorize (describe only checks non-empty + S256)", tc.name)
+		t.Logf("%-16s ACCEPTED at authorize: shape-valid (only the exchange can refuse it)", tc.name)
 		resp, aerr := svc.Authorize(ctx, oauth.AuthorizationRequest{
 			ClientID: confClientID, RedirectURI: confRedirect, Subject: subject,
 			Scopes: []oauth.Scope{accountScope}, CodeChallenge: tc.ch, CodeChallengeMethod: "S256",

@@ -159,6 +159,42 @@ func TestExpiredAuthorizationCodeIsRefused(t *testing.T) {
 	}
 }
 
+// TestAuthRequestByIDRefusesAnExpiredHandle is the Postgres twin of the memory
+// check for Z07-1 (memory.TestAuthRequestByIDRefusesAnExpiredHandle): the by-ID
+// read carries the deadline predicate, so an expired pending handle is refused
+// before the sweep runs. It needs a database and skips without TEST_DATABASE_URL,
+// like the rest of the integration tests.
+func TestAuthRequestByIDRefusesAnExpiredHandle(t *testing.T) {
+	store, _, ctx := oidcFixture(t)
+	ar := newAuthRequest(t, ctx, store)
+
+	// Control: inside the TTL the handle is readable, so a read that refused
+	// everything would not satisfy the assertion below.
+	if _, err := store.AuthRequestByID(ctx, ar.GetID()); err != nil {
+		t.Fatalf("AuthRequestByID inside the TTL: %v", err)
+	}
+
+	// Age the row past its deadline directly: the store clock is real, so moving
+	// the stored deadline is the only way to reach it without sleeping.
+	if _, err := store.pool.Exec(ctx,
+		`UPDATE oidc_auth_requests SET expires_at = now() - interval '1 minute' WHERE id = $1`,
+		ar.GetID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthRequestByID(ctx, ar.GetID()); err == nil {
+		t.Fatal("AuthRequestByID returned a pending handle past its deadline; only the sweep ended it (Z07-1)")
+	}
+	// The refusal is the read's, not the sweep's: the row is still there.
+	var n int
+	if err := store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM oidc_auth_requests WHERE id = $1`, ar.GetID()).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("auth request rows = %d, want 1: the sweep must not have been the refusal", n)
+	}
+}
+
 // Mirrors memory.TestRevokeTokenCutsTheWholeGrant.
 func TestRevokeTokenCutsTheWholeGrant(t *testing.T) {
 	store, _, ctx := oidcFixture(t)

@@ -263,11 +263,13 @@ type authRequestRow struct {
 	MaxAgeSeconds       *int       `db:"max_age_seconds"`
 }
 
-// authRequestOwnerRow is the subject/client projection used when a refused
-// request is audited.
+// authRequestOwnerRow is the subject/client/done projection used when a refused
+// request is audited: `done` tells a real pending refusal from the library's
+// post-mint cleanup.
 type authRequestOwnerRow struct {
 	Subject  string `db:"subject"`
 	ClientID string `db:"client_id"`
+	Done     bool   `db:"done"`
 }
 
 // authRequestFreshnessRow is the locked projection CompleteLogin reads to decide
@@ -297,13 +299,16 @@ func (r authRequestRow) request() oidcstore.AuthRequest {
 	}
 }
 
-// AuthRequestByID implements op.Storage.
+// AuthRequestByID implements op.Storage. The deadline is adjudicated here, in the
+// read the consent screen performs, not only by the sweep: a pending handle is a
+// capability with an expiry, and before this predicate an expired one stayed
+// describable and approvable until the next tick (Z07-1, docs/issues/P2-medium.md).
 func (s *OIDCStore) AuthRequestByID(ctx context.Context, id string) (op.AuthRequest, error) {
 	return s.scanAuthRequest(ctx, `
 		SELECT id, client_id, redirect_uri, response_type, response_mode, scopes, state, nonce,
 		       code_challenge, code_challenge_method, subject, done, auth_time,
 		       prompt, max_age_seconds
-		  FROM oidc_auth_requests WHERE id = $1`, id)
+		  FROM oidc_auth_requests WHERE id = $1 AND expires_at > $2`, id, s.now())
 }
 
 // AuthRequestByCode implements op.Storage. It consumes the code in one
@@ -369,22 +374,33 @@ func (s *OIDCStore) SaveAuthCode(ctx context.Context, id, code string) error {
 	return nil
 }
 
-// DeleteAuthRequest implements op.Storage.
+// DeleteAuthRequest implements op.Storage. It records a refusal only for a
+// request still awaiting a decision. The library calls this after minting too
+// (pkg/op/token.go CreateTokenResponse), and by then AuthRequestByCode has
+// already deleted the row, so the previous unconditional record wrote a
+// field-empty `oidc.consent.deny` on every successful exchange (Z20-1,
+// docs/issues/P2-medium.md). A missing row records nothing.
 func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Read the subject and client before deleting: a refused request leaves as
-	// much trace as an approved one, and this row is the only place the two ids
-	// live. The subject is empty for a request nobody signed in for, which is
-	// itself the honest record. A lookup failure leaves both empty, as before.
-	var subject, clientID string
+	// Read the owner before deleting, under FOR UPDATE so a concurrent
+	// CompleteLogin cannot flip done between this read and the delete. The
+	// projection is the only place the two ids live; the subject is empty for a
+	// request nobody signed in for, which is itself the honest record. A lookup
+	// failure (including a row the code exchange already consumed) leaves denied
+	// false, so nothing is recorded.
+	var (
+		owner  authRequestOwnerRow
+		denied bool
+	)
 	if rows, err := tx.Query(ctx,
-		`SELECT subject, client_id FROM oidc_auth_requests WHERE id = $1`, id); err == nil {
-		if owner, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestOwnerRow]); err == nil {
-			subject, clientID = owner.Subject, owner.ClientID
+		`SELECT subject, client_id, done FROM oidc_auth_requests WHERE id = $1 FOR UPDATE`,
+		id); err == nil {
+		if o, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestOwnerRow]); err == nil {
+			owner, denied = o, !o.Done
 		}
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_codes WHERE request_id = $1`, id); err != nil {
@@ -396,7 +412,9 @@ func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.recordConsent(ctx, "oidc.consent.deny", subject, clientID, nil, audit.OutcomeDenied)
+	if denied {
+		s.recordConsent(ctx, "oidc.consent.deny", owner.Subject, owner.ClientID, nil, audit.OutcomeDenied)
+	}
 	return nil
 }
 

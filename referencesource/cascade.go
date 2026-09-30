@@ -49,7 +49,7 @@ func (s *Source) cascadeRevoke(ctx context.Context, req upstreamkit.CascadeRevoc
 		return err
 	}
 
-	subject, err := s.tokenSubject(ctx, req)
+	subject, refresh, err := s.tokenSubject(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -59,26 +59,46 @@ func (s *Source) cascadeRevoke(ctx context.Context, req upstreamkit.CascadeRevoc
 	if err := s.vault.Use(ctx, identity, func(credential []byte) error {
 		return revoker.RevokeUpstream(ctx, subject, credential)
 	}); err != nil {
+		// Nothing local happened, and nothing may: the binding, the vault
+		// credential and the presented token all stay usable so Re0Auth's retry can
+		// name the session again. Spending the token in tokenSubject — the shape
+		// this used to have — made the retry impossible.
 		return err
 	}
-	// The session is over, so the stored credential's reason to exist is too.
+	// The upstream session is over, so the presented refresh token is now spent.
+	// ConsumeRefresh is what rotates it and leaves the reuse tombstone, so a later
+	// replay of this value is the theft signal rather than "never issued"; the
+	// read that resolved the subject cost the token nothing. An access token is
+	// deliberately left alone: it is a short-lived handle, not the durable
+	// authorization, and the branch that resolved it must stay non-destructive.
+	if refresh {
+		if _, err := s.tokens.ConsumeRefresh(ctx, req.Token); err != nil {
+			return err
+		}
+	}
+	// The session is gone, so the stored credential's reason to exist is too.
 	return s.vault.Revoke(ctx, identity)
 }
 
-// tokenSubject resolves which account a token belongs to.
+// tokenSubject resolves which account a token belongs to, and whether that token
+// is a refresh token (so the caller knows what it may spend once the upstream
+// call has succeeded).
 //
 // The token was issued by this source, so this source is the only party that can
 // answer — which is why the request carries a token rather than a subject Re0Auth
-// would be asking to be trusted about.
-func (s *Source) tokenSubject(ctx context.Context, req upstreamkit.CascadeRevocationRequest) (string, error) {
+// would be asking to be trusted about. The resolution is READ-ONLY: GetRefresh and
+// GetAccess are the read peers of the destructive claims, so a request whose
+// upstream call then fails has taken nothing from the token's owner and can be
+// retried with the same value.
+func (s *Source) tokenSubject(ctx context.Context, req upstreamkit.CascadeRevocationRequest) (string, bool, error) {
 	if req.Token == "" {
-		return "", errors.New("referencesource: cascade revocation carried no token")
+		return "", false, errors.New("referencesource: cascade revocation carried no token")
 	}
 
 	// The hint is a hint. Try what it names first and the other second, because a
 	// source that refuses over a wrong guess is a source that gets blamed for it.
 	byRefresh := func() (string, bool) {
-		tok, err := s.tokens.ConsumeRefresh(ctx, req.Token)
+		tok, err := s.tokens.GetRefresh(ctx, req.Token)
 		if err != nil {
 			return "", false
 		}
@@ -93,14 +113,16 @@ func (s *Source) tokenSubject(ctx context.Context, req upstreamkit.CascadeRevoca
 	}
 
 	first, second := byRefresh, byAccess
+	refreshFirst := true
 	if req.TokenTypeHint == "access_token" {
 		first, second = byAccess, byRefresh
+		refreshFirst = false
 	}
 	if subject, ok := first(); ok {
-		return subject, nil
+		return subject, refreshFirst, nil
 	}
 	if subject, ok := second(); ok {
-		return subject, nil
+		return subject, !refreshFirst, nil
 	}
-	return "", oauth.ErrTokenNotFound
+	return "", false, oauth.ErrTokenNotFound
 }

@@ -181,6 +181,45 @@ func TestMemoryStoreGetCodeIsNonDestructive(t *testing.T) {
 	}
 }
 
+// GetRefresh is the non-destructive peer of ConsumeRefresh: it returns a live
+// refresh token's record and leaves it claimable. It is what lets a caller
+// resolve whose session a token names before a fallible upstream call without
+// spending the token, so a failure does not make the retry impossible (Z14-1).
+func TestMemoryStoreGetRefreshIsNonDestructive(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	want := RefreshToken{ClientID: "cli", Subject: "usr", FamilyID: "fam"}
+	if err := store.SaveRefresh(ctx, "rt", want); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetRefresh(ctx, "rt")
+	if err != nil {
+		t.Fatalf("GetRefresh: %v", err)
+	}
+	if got.ClientID != want.ClientID || got.Subject != want.Subject || got.FamilyID != want.FamilyID {
+		t.Fatalf("GetRefresh = %+v, want %+v", got, want)
+	}
+	// Reading again must not consume it, and the record must still be claimable
+	// exactly once.
+	if _, err := store.GetRefresh(ctx, "rt"); err != nil {
+		t.Fatalf("second GetRefresh consumed the record: %v", err)
+	}
+	if _, err := store.ConsumeRefresh(ctx, "rt"); err != nil {
+		t.Fatalf("the reads spent the refresh token: %v", err)
+	}
+	if _, err := store.GetRefresh(ctx, "rt"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("GetRefresh after consume = %v, want ErrTokenNotFound (a spent value is not a live record)", err)
+	}
+	if _, err := store.GetRefresh(ctx, "other"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("GetRefresh of an unknown value = %v, want ErrTokenNotFound", err)
+	}
+	// The claim, not the read, is where a spent value becomes the reuse signal.
+	if _, err := store.ConsumeRefresh(ctx, "rt"); !errors.Is(err, ErrRefreshTokenReused) {
+		t.Fatalf("ConsumeRefresh of a spent value after GetRefresh = %v, want ErrRefreshTokenReused", err)
+	}
+}
+
 // A code is a redeemable capability, so bulk revocation has to remove it with the
 // tokens. A Kill Switch that only deleted access/refresh rows would let the code
 // mint a fresh pair afterwards.

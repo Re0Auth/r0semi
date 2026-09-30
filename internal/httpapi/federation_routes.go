@@ -137,6 +137,13 @@ func (s *Server) handleGameResource(w http.ResponseWriter, r *http.Request, info
 		w.Header().Set("Re0Auth-Degraded", "true")
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// The body's byte reservation is held until this handler returns, not until
+	// Fetch returns (Z11-2, docs/issues/P2-medium.md): the bytes are live in this
+	// frame from here through w.Write, so releasing earlier would let the budget
+	// admit another full-cap read while this one is still holding its slice.
+	if result.Release != nil {
+		defer result.Release()
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(result.Data)
 }
@@ -179,6 +186,17 @@ func (s *Server) writeFederationError(w http.ResponseWriter, r *http.Request, er
 		w.Header().Set("Retry-After", "1")
 		s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable",
 			"too much upstream response data is being buffered right now")
+	case errors.Is(err, federation.ErrBindingCooldown):
+		// This binding's credential was rejected by the source on
+		// bindingCooldownThreshold consecutive reads, so the data plane stopped
+		// asking (Z09V-1, docs/issues/P2-medium.md). It is NOT the host breaker:
+		// the source is fine and another account's binding to it keeps being
+		// served, so this is deliberately not the 502 "upstream_unavailable" the
+		// breaker's circuit_open maps to. It is a temporary local shed with the
+		// same retry hint as the byte budget.
+		w.Header().Set("Retry-After", "1")
+		s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable",
+			"this account's credential for the source was rejected repeatedly; retry later or bind the source again")
 	case errors.Is(err, context.DeadlineExceeded):
 		// The data plane's own deadline for one request, which exists so that this
 		// answer is written at all: before it, the candidate loop times the outbound
@@ -293,6 +311,12 @@ func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oaut
 	// body instead of rendering it. An API client reads neither.
 	w.Header().Set("Content-Security-Policy", cspRawProxy)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+rawDownloadName(game, source, r.PathValue("path"))+`"`)
+	// Same as the normalized handler: the reservation travels with the body and is
+	// returned after this frame's w.Write, which is where a slow-reading client
+	// blocks while the slice is live (Z11-2, docs/issues/P2-medium.md).
+	if result.Release != nil {
+		defer result.Release()
+	}
 	w.WriteHeader(result.Status)
 	_, _ = w.Write(result.Body)
 }

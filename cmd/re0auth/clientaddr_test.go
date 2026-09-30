@@ -36,7 +36,7 @@ func TestClientAddrHeaderResolution(t *testing.T) {
 		t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", valid)
 		t.Setenv("DATABASE_URL", "")
 		t.Setenv("RE0AUTH_AUDIT_KEY", "")
-		t.Setenv("RE0AUTH_TRUSTED_PROXIES", "")
+		unsetEnv(t, "RE0AUTH_TRUSTED_PROXIES")
 		t.Setenv("RE0AUTH_CLIENT_ADDR_HEADER", "")
 	}
 

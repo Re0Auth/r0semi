@@ -437,6 +437,15 @@ func (s *OIDCStore) AuthRequestByID(_ context.Context, id string) (op.AuthReques
 	if !ok {
 		return nil, errors.New("memory: auth request not found")
 	}
+	// The pending handle is a capability with a deadline, and the by-ID read the
+	// consent screen performs is where that deadline is adjudicated — not only in
+	// SweepExpired, which left the handle describable and approvable until the
+	// next tick. Mirrors AuthRequestByCode's `!s.now().Before(...)`; a missing
+	// expiry entry reads as the zero time and therefore fails closed (Z07-1,
+	// docs/issues/P2-medium.md).
+	if !s.now().Before(s.authRequestExpiry[id]) {
+		return nil, errors.New("memory: auth request is unknown or expired")
+	}
 	return cloneAuthRequest(a), nil
 }
 
@@ -489,12 +498,19 @@ func (s *OIDCStore) SaveAuthCode(_ context.Context, id, code string) error {
 	return nil
 }
 
-// DeleteAuthRequest implements op.Storage.
+// DeleteAuthRequest implements op.Storage. It records a refusal only when the
+// request was still pending. The library calls this a second time after it mints
+// (pkg/op/token.go CreateTokenResponse), and AuthRequestByCode has already
+// consumed the request by then, so the previous unconditional record wrote a
+// field-empty `oidc.consent.deny` on every successful exchange — one bogus
+// refusal per login (Z20-1, docs/issues/P2-medium.md). A missing row (the
+// post-mint cleanup) records nothing.
 func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 	s.mu.Lock()
 	subject, clientID := "", ""
+	denied := false
 	if a, ok := s.authRequests[id]; ok {
-		subject, clientID = a.Subject, a.ClientID
+		subject, clientID, denied = a.Subject, a.ClientID, !a.IsDone
 	}
 	s.deleteRequestLocked(id)
 	for k, c := range s.codes {
@@ -506,7 +522,9 @@ func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 	// A refused request leaves as much trace as an approved one: who was asked,
 	// which client, and the answer no. The subject is empty for a request nobody
 	// signed in for, which is itself the honest record.
-	s.recordConsent(ctx, "oidc.consent.deny", subject, clientID, nil, audit.OutcomeDenied)
+	if denied {
+		s.recordConsent(ctx, "oidc.consent.deny", subject, clientID, nil, audit.OutcomeDenied)
+	}
 	return nil
 }
 
@@ -1127,11 +1145,11 @@ func (s *OIDCStore) purgeExpiredDevicesLocked(now time.Time) int {
 //
 // No goroutine starts here, so a test can call it directly; the composition root
 // runs it on a ticker. Deleting by deadline is the stricter direction, so a sweep
-// can never revoke something still in use — but the "a lookup already refuses it"
-// invariant is not yet true for every path: auth requests read by id (Z07-1)
-// are only removed here until that fix lands, and a pending device authorization
-// is returned with its past deadline for the library to refuse (G-7 adjudicates
-// the approved-consume path, which is the one that mints).
+// can never revoke something still in use — every swept lookup now refuses an
+// expired record before the sweep reaches it (N-01). The one deliberate exception
+// is a pending device authorization, which is returned with its past deadline for
+// the library to refuse (G-7 adjudicates the approved-consume path, which is the
+// one that mints).
 func (s *OIDCStore) SweepExpired() int {
 	now := s.now()
 	s.mu.Lock()

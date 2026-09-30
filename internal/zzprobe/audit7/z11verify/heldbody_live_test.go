@@ -101,7 +101,6 @@ func TestZ11VHeldBodiesAreLiveWhileTheHandlerWrites(t *testing.T) {
 	up := zzUpstream(t, release, &stalled)
 	t.Cleanup(stop)
 	srv, token := dataAPI(t, dataConfig{Upstream: up.URL, MaxBufferedBytes: budget})
-	addr := srv.Listener.Addr().String()
 	path := "/v1/games/" + zzGame + "/sources/src/raw/big"
 
 	// Control: one stalled read holds the whole budget, so a second concurrent
@@ -136,6 +135,15 @@ func TestZ11VHeldBodiesAreLiveWhileTheHandlerWrites(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// ---- phase 1: the measurement ----------------------------------------
+	// A budget that admits all n readers, so that on a host where the socket writes
+	// really block (Linux) every reader can park: the point of the phase is that
+	// once they are parked the budget reports itself SPENT, so a further full-cap
+	// read is shed. With the one-reservation budget of the control above, the
+	// second reader would be shed before it could park.
+	phaseBudget := n * (zzMaxBody + 1)
+	bigSrv, bigToken := dataAPI(t, dataConfig{Upstream: up.URL, MaxBufferedBytes: phaseBudget})
+	addr := bigSrv.Listener.Addr().String()
+
 	// The access log is written when (and only when) a handler returns, so
 	// counting the completed /raw/big lines at measurement time says exactly how
 	// many handlers are still parked and holding their body.
@@ -165,13 +173,14 @@ func TestZ11VHeldBodiesAreLiveWhileTheHandlerWrites(t *testing.T) {
 				t.Logf("SetReadBuffer: %v", err)
 			}
 		}
-		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: probe\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", path, token)
+		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: probe\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", path, bigToken)
 		if _, err := c.Write([]byte(req)); err != nil {
 			t.Fatalf("write request %d: %v", i, err)
 		}
 		head := readHeaders(t, c)
 		if !strings.HasPrefix(head, "HTTP/1.1 200") {
-			t.Fatalf("request %d answered %q, want 200", i, strings.SplitN(head, "\r\n", 2)[0])
+			t.Fatalf("request %d answered %q, want 200 (budget %d admits all %d readers before any body is written)",
+				i, strings.SplitN(head, "\r\n", 2)[0], phaseBudget, n)
 		}
 		conns = append(conns, c)
 	}
@@ -193,28 +202,38 @@ func TestZ11VHeldBodiesAreLiveWhileTheHandlerWrites(t *testing.T) {
 		n, float64(delta)/(1<<20), n, bodyBytes, float64(int64(n)*bodyBytes)/(1<<20))
 	t.Logf("live 4 MiB bodies attributable to the delta: ~%d of %d", delta/bodyBytes, n)
 
-	// The budget reports itself free: a further full-cap read completes.
-	extraCode, _, body := getAuth(t, srv.Client(), srv.URL+path, token)
-	t.Logf("with those %d slow readers outstanding and a %d-byte budget, one more full-cap read = %d (%d bytes)",
-		n, budget, extraCode, len(body))
-	if extraCode != http.StatusOK {
-		t.Errorf("the extra read was shed (%d): the budget did notice held bodies", extraCode)
-		return
-	}
-
 	liveBodies := delta / bodyBytes
 	parked := int64(n - done)
 	t.Logf("live 4 MiB bodies attributable to the delta: ~%d; handlers parked at measurement: %d", liveBodies, parked)
-	switch {
-	case parked == 0:
-		t.Fatalf("all %d handlers returned before the measurement: on this host the kernel absorbed every 4 MiB "+
-			"response without a blocking write, so the probe cannot exhibit a held body at all", n)
-	case liveBodies < parked*3/4:
+	if parked == 0 {
+		// Z11-2 verification note: this is a property of the HOST, not of the code.
+		// Whether a socket write blocks depends on the kernel buffers, and this host
+		// absorbs a 4 MiB response into them. The deterministic probe
+		// (heldbody_deterministic_test.go) parks the same write IN PROCESS and is the
+		// platform-independent confirmation; this probe stays as the Linux
+		// confirmation, where a socket write really does block.
+		t.Skipf("all %d handlers returned before the measurement: on this host the kernel absorbed every 4 MiB "+
+			"response without a blocking write, so a held-body WRITE window cannot be exhibited here. "+
+			"heldbody_deterministic_test.go covers the same window without a socket.", n)
+	}
+	if liveBodies < parked*3/4 {
 		t.Errorf("~%d bodies are live in the heap while %d handlers are parked (the access log shows only %d of %d "+
 			"returned), yet the instrument control above sees deliberately-held bodies: the held-body premise is "+
-			"not established. The budget still admits a further full-cap read, which is the real defect.",
-			liveBodies, parked, done, n)
-	default:
+			"not established on this host", liveBodies, parked, done, n)
+	}
+
+	// INVERTED for the fix (Z11-2, docs/issues/P2-medium.md): with the reservation
+	// transferred to the body, parked writers keep the budget spent, so a further
+	// full-cap read must be SHED. Before the fix this same read completed, because
+	// rawFetch released on return.
+	extraCode, _, body := getAuth(t, bigSrv.Client(), bigSrv.URL+path, bigToken)
+	t.Logf("with %d parked handlers holding %d-byte bodies and a %d-byte budget, one more full-cap read = %d (%d bytes)",
+		parked, bodyBytes, phaseBudget, extraCode, len(body))
+	if extraCode != http.StatusServiceUnavailable {
+		t.Errorf("the extra read was ADMITTED (%d) while %d handlers are parked holding %d-byte bodies: the "+
+			"reservation did not travel with the body (Z11-2)", extraCode, parked, bodyBytes)
+	}
+	if liveBodies >= parked*3/4 {
 		t.Logf("held-body premise CONFIRMED on this host: ~%d parked handlers account for ~%d live 4 MiB bodies",
 			parked, liveBodies)
 	}

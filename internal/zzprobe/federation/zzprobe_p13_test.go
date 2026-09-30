@@ -74,48 +74,51 @@ func TestZZProbeDataPlaneIsBoundedInTimeAndShedsA401Source(t *testing.T) {
 		}
 	})
 
-	t.Run("C a permanently-401 source trips the breaker", func(t *testing.T) {
-		// The breaker is the real decorator, not a stub: a per-host circuit breaker
-		// over a transport that always answers 401.
+	t.Run("C a permanently-401 source stops being dialed per binding", func(t *testing.T) {
+		// RETARGETED by Z09V-1 (docs/issues/P2-medium.md). This subtest used to
+		// drive the bare per-HOST breaker and require that ten 401s open it. That
+		// rule is what let one account's dead credential shed every other account's
+		// reads of the same source, so the breaker no longer counts 401. P1-3's
+		// goal — the permanently-401 source is not paid for forever — is met by the
+		// per-binding 401 cooldown in internal/federation, which is what this
+		// subtest now measures: the first five reads reach the source, the sixth
+		// does not.
 		var calls int64
-		base := &stubRoundTripper{fn: func(*http.Request) (*http.Response, error) {
-			atomic.AddInt64(&calls, 1)
-			return &http.Response{
-				StatusCode: http.StatusUnauthorized,
-				Header:     http.Header{"Content-Type": {"application/json"}},
-				Body:       http.NoBody,
-				Request:    nil,
-			}, nil
-		}}
-		breaker := httpclient.CircuitBreaker(base, httpclient.BreakerOptions{
-			FailureThreshold:  3,
-			Cooldown:          time.Minute,
-			HalfOpenSuccesses: 2,
-		})
-		client := &http.Client{Transport: breaker, Timeout: 5 * time.Second}
+		client := &http.Client{
+			Transport: &stubRoundTripper{fn: func(*http.Request) (*http.Response, error) {
+				atomic.AddInt64(&calls, 1)
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       http.NoBody,
+				}, nil
+			}},
+			Timeout: 5 * time.Second,
+		}
+		svc := cooldownService(t, client)
 
-		open := false
-		for i := 0; i < 10; i++ {
-			req, err := http.NewRequest(http.MethodGet, "https://upstream.example/v1/records", nil)
-			if err != nil {
-				t.Fatal(err)
+		for i := 0; i < 5; i++ {
+			if _, err := svc.Fetch(context.Background(), federation.FetchRequest{
+				User: "usr_1", Game: "phigros", Resource: "profile",
+			}); err == nil {
+				t.Fatalf("read %d: the 401 was accepted", i+1)
 			}
-			resp, err := client.Do(req)
-			if errors.Is(err, httpclient.ErrCircuitOpen) {
-				open = true
-				break
-			}
-			if err != nil {
-				t.Fatalf("request %d: %v", i, err)
-			}
-			_ = resp.Body.Close()
 		}
-		if !open {
-			t.Errorf("ten consecutive 401s did not open the breaker (transport calls: %d): "+
-				"a source whose tokens cannot be refreshed is charged on every request forever",
-				atomic.LoadInt64(&calls))
+		atThreshold := atomic.LoadInt64(&calls)
+		if atThreshold != 5 {
+			t.Fatalf("five 401 reads produced %d upstream calls, want 5", atThreshold)
 		}
-		t.Logf("the breaker opened after %d upstream calls", atomic.LoadInt64(&calls))
+		_, err := svc.Fetch(context.Background(), federation.FetchRequest{
+			User: "usr_1", Game: "phigros", Resource: "profile",
+		})
+		if !errors.Is(err, federation.ErrBindingCooldown) {
+			t.Errorf("the sixth read = %v, want federation.ErrBindingCooldown: a binding the source keeps "+
+				"rejecting is still charged an upstream call on every read", err)
+		}
+		if got := atomic.LoadInt64(&calls); got != atThreshold {
+			t.Errorf("a cooling binding was still dialed: upstream calls %d -> %d", atThreshold, got)
+		}
+		t.Logf("the per-binding cooldown stopped the source after %d upstream calls", atThreshold)
 	})
 
 	t.Run("D control: a 401 followed by a success never opens it", func(t *testing.T) {
@@ -218,3 +221,38 @@ type stubRoundTripper struct {
 }
 
 func (s *stubRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return s.fn(req) }
+
+// cooldownService wires the default source for one binding ("usr_1") over an
+// arbitrary doer, so a probe can observe the per-binding 401 cooldown
+// (Z09V-1, docs/issues/P2-medium.md) at the service boundary.
+func cooldownService(t *testing.T, doer httpclient.Doer) federation.Service {
+	t.Helper()
+	reg, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "src", DisplayName: "Src", Issuer: "https://upstream.example",
+		TokenClass: "revocable",
+		Resources: []federation.Resource{
+			{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := federation.NewMemoryBindingStore()
+	v := newTestVault(t)
+	b := federation.Binding{User: "usr_1", Game: "phigros", Source: "src", Version: 1}
+	if err := bindings.Put(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Enroll(context.Background(), federation.BindingIdentity(b),
+		mustPair(t, "upstream-token", ""), nil); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := federation.NewService(federation.Config{
+		Registry: reg, Bindings: bindings, Vault: v,
+		Doer: doer, HTTPClient: &http.Client{Timeout: 5 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return svc
+}

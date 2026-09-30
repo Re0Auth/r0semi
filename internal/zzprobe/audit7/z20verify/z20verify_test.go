@@ -76,9 +76,13 @@ func TestZ20VProfileOnlyTokenReachesAnyNativePath(t *testing.T) {
 	}
 }
 
-// TestZ20VDenyEventAppearsOnlyAtTokenExchange isolates Z20-1's call site: the
-// spurious deny must not exist after the consent decision or after the callback,
-// and must appear only when the code is exchanged at the token endpoint.
+// TestZ20VDenyEventAppearsOnlyAtTokenExchange pins Z20-1's fix (the name is the
+// finding it used to assert): no deny event is written by the consent decision,
+// the callback, or a successful token exchange. The library's post-mint
+// DeleteAuthRequest call reaches a store that now records a refusal only for a
+// request still awaiting a decision, so the field-empty event every success used
+// to write is gone. A real refusal arrives through the interaction API, before a
+// code exists.
 func TestZ20VDenyEventAppearsOnlyAtTokenExchange(t *testing.T) {
 	e := newVEnv(t, vOptions{})
 	id := e.vStartAuthorize(vSubject, "account.id")
@@ -101,17 +105,15 @@ func TestZ20VDenyEventAppearsOnlyAtTokenExchange(t *testing.T) {
 	if st != http.StatusOK {
 		t.Fatalf("token = %d: %s", st, body)
 	}
-	denies := e.vEvents("oidc.consent.deny")
-	if len(denies) != 1 {
-		t.Fatalf("the successful exchange recorded %d deny events, want 1", len(denies))
+	// The finding is gone: a successful exchange must record ZERO deny events.
+	// Before the Z20-1 fix this was exactly 1, a field-empty row.
+	if denies := e.vEvents("oidc.consent.deny"); len(denies) != 0 {
+		t.Fatalf("the successful exchange recorded %d deny events, want 0: %+v", len(denies), denies)
 	}
-	d := denies[0]
-	t.Logf("spurious deny: subject=%q detail=%v outcome=%s", d.Subject, d.Detail, d.Outcome)
-	if d.Subject != "" || d.Detail["client_id"] != "" {
-		t.Errorf("the spurious deny is attributable: subject=%q detail=%v", d.Subject, d.Detail)
-	}
-	if d.Outcome != "denied" {
-		t.Errorf("the spurious event is not shaped as a refusal: %+v", d)
+	// Non-vacuity: the same store does record events, so an empty deny stream is
+	// not the result of an unwired sink.
+	if len(approves) != 1 {
+		t.Fatalf("control: the approval event vanished while checking the deny stream")
 	}
 }
 

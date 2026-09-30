@@ -129,6 +129,25 @@ func Int(key string, fallback int) (int, error) {
 	return v, nil
 }
 
+// List reads a comma-separated environment list, falling back to the file value
+// only when the variable is genuinely unset.
+//
+// os.Getenv cannot express the difference between "unset" and "set to empty", so
+// the callers that used it treated an explicitly empty RE0AUTH_ADMIN_SUBJECTS /
+// RE0AUTH_TRUSTED_PROXIES / RE0AUTH_INTROSPECTION_CLIENTS as "unset": the file's
+// list survived and the operator's way of saying "nobody" was silently ignored —
+// for the admin allowlist that is the difference between an unmounted operator
+// plane and one that is still serving (Z12-4, docs/issues/P2-medium.md). A
+// present-but-empty value returns an empty list; the callers filter empty
+// entries, so ["", ""] never reaches them.
+func List(key string, fallback []string) []string {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	return strings.Split(raw, ",")
+}
+
 // Path picks the config file: the flag, then the environment variable, then the
 // default path if it exists. explicit reports whether a specific file was asked
 // for, so a missing explicit file can be a hard error rather than a silent

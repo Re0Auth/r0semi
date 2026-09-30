@@ -331,13 +331,14 @@ func TestSweepSurvivesATightStatementTimeout(t *testing.T) {
 // true for most tables but not for all of them, and a table added to
 // expiredTables must not be able to inherit the claim silently. Every swept table
 // needs an explicit entry: a read-path predicate this test can see in the shipped
-// source, or a citation for the service layer that owns the deadline — or, for
-// the remaining known gap (Z07-1), an explicit exemption that has to be deleted
-// when that fix lands.
+// source, or a citation for the service layer that owns the deadline.
 //
-// The marker check is a file-level `contains`, so a marker shared by several
-// tables (the `$2` forms) is weaker than a per-method extraction; the entry map is
-// what actually stops a new table from slipping in.
+// Where the predicate lives in an OIDCStore method, the entry names that method
+// (entry.method) and the guard reads only its body: `expires_at > $2` is shared by
+// several reads in oidc.go, so a file-level `contains` would let a table inherit a
+// predicate it never carries. The remaining exemptions are the citations for the
+// legacy engine's service layer (oauth/as.go, oauth/device.go,
+// internal/federation/bind.go); there is no open gap left in this store.
 func TestEverySweptReadPathAdjudicatesItsDeadline(t *testing.T) {
 	read := func(name string) string {
 		t.Helper()
@@ -356,17 +357,19 @@ func TestEverySweptReadPathAdjudicatesItsDeadline(t *testing.T) {
 		file   string
 		marker string
 		note   string
-		// open names the read method of a known gap. It must NOT yet carry a
-		// deadline predicate: the exemption then goes red the moment Z07-1
-		// lands instead of silently exempting a fixed path.
-		open string
+		// method names the one OIDCStore method that must carry marker. When
+		// set, the guard reads that method's body instead of the whole file, so a
+		// marker shared by several reads cannot satisfy this entry. Empty means
+		// the marker is checked at file level, for the legacy engine whose
+		// receivers are not OIDCStore.
+		method string
 	}{
-		"oidc_codes":                    {"oidc.go", "expires_at > $2", "", ""},
-		"oidc_access_tokens":            {"oidc.go", "ExpiresAt.After(s.now())", "", ""},
-		"oidc_refresh_tokens":           {"oidc.go", "expires_at > $2", "", ""},
-		"oidc_refresh_token_tombstones": {"oidc.go", "expires_at > $2", "", ""},
-		"oidc_auth_requests":            {"oidc.go", "", "Z07-1: the by-id read judges no deadline yet; delete this exemption when it lands", "AuthRequestByID"},
-		"oidc_devices":                  {"oidc.go", "expires_at > $3", "", ""},
+		"oidc_codes":                    {"oidc.go", "expires_at > $2", "", "AuthRequestByCode"},
+		"oidc_access_tokens":            {"oidc.go", "ExpiresAt.After(s.now())", "", "SetIntrospectionFromToken"},
+		"oidc_refresh_tokens":           {"oidc.go", "expires_at > $2", "", "TokenRequestByRefreshToken"},
+		"oidc_refresh_token_tombstones": {"oidc.go", "expires_at > $2", "", "TokenRequestByRefreshToken"},
+		"oidc_auth_requests":            {"oidc.go", "expires_at > $2", "", "AuthRequestByID"},
+		"oidc_devices":                  {"oidc.go", "expires_at > $3", "", "GetDeviceAuthorizatonState"},
 		"oauth_codes":                   {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
 		"oauth_access_tokens":           {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
 		"oauth_refresh_tokens":          {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
@@ -381,29 +384,22 @@ func TestEverySweptReadPathAdjudicatesItsDeadline(t *testing.T) {
 				"expired row, or cite the service layer that owns the deadline (N-01)", tc.table)
 			continue
 		}
-		if entry.open != "" {
-			// Red-gated exemption: while the gap is open the method must not
-			// judge the deadline. If it does, the fix landed and this entry must
-			// be replaced by a real marker (N-01).
-			body := oidcStoreMethod(t, files["oidc.go"], entry.open)
-			for _, marker := range []string{"expires_at >", "ExpiresAt.After("} {
-				if strings.Contains(body, marker) {
-					t.Errorf("swept table %q is exempted as %q, but %s now contains %q: the gap appears fixed — "+
-						"delete the exemption and give this table a deadline marker (N-01)",
-						tc.table, entry.note, entry.open, marker)
-				}
-			}
-			continue
-		}
 		if entry.marker == "" {
 			if entry.note == "" {
 				t.Errorf("swept table %q carries neither a predicate nor a citation (N-01)", tc.table)
 			}
 			continue
 		}
-		if !strings.Contains(files[entry.file], entry.marker) {
+		// The marker must live in the named method when there is one: several
+		// reads share `expires_at > $2`, so a file-level match would prove nothing
+		// about this table's own read path (N-01).
+		where, subject := entry.file, files[entry.file]
+		if entry.method != "" {
+			where, subject = entry.method, oidcStoreMethod(t, files["oidc.go"], entry.method)
+		}
+		if !strings.Contains(subject, entry.marker) {
 			t.Errorf("swept table %q claims %s adjudicates its deadline, but %s does not contain %q (N-01)",
-				tc.table, entry.file, entry.file, entry.marker)
+				tc.table, where, where, entry.marker)
 		}
 	}
 }
