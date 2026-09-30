@@ -48,7 +48,7 @@ func newFakeUpstream(t *testing.T) *httptest.Server {
 			if strings.Contains(redirect, "?") {
 				sep = "&"
 			}
-			http.Redirect(w, r, redirect+sep+"code="+url.QueryEscape(code)+"&state="+url.QueryEscape(q.Get("state")), http.StatusFound)
+			http.Redirect(w, r, redirect+sep+"code="+url.QueryEscape(code)+"&state="+url.QueryEscape(q.Get("state")), http.StatusFound) //nolint:gosec // G710: the fixture redirects to the redirect_uri under test
 
 		case "/oauth/token":
 			_ = r.ParseForm()

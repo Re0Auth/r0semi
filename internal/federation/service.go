@@ -227,9 +227,13 @@ type Service interface {
 	// The errors are the fetch's own vocabulary — ErrUnknownGame, ErrUnknownSource,
 	// ErrSourceRetired, ErrUnknownResource — so a caller maps them the same way.
 	ResourceRequirements(game, resource, pinned string) ([]ResourceRequirement, error)
-	// Fetch proxies a normalized resource from a bound source.
+	// Fetch proxies a normalized resource from a bound source. The caller owns
+	// the returned result's Release and must call it once the body has been
+	// written out; see FetchResult.
 	Fetch(ctx context.Context, req FetchRequest) (FetchResult, error)
-	// Raw proxies a source's native API verbatim.
+	// Raw proxies a source's native API verbatim. The caller owns the returned
+	// result's Release and must call it once the body has been written out; see
+	// RawResult.
 	Raw(ctx context.Context, req RawRequest) (RawResult, error)
 	// BeginBind starts binding a source for a user.
 	BeginBind(ctx context.Context, user account.UserID, game, source, returnTo string) (BindChallenge, error)
@@ -660,8 +664,10 @@ type RawResult struct {
 	// budget (Config.MaxBufferedBytes). The reservation admits the READ, but the
 	// bytes stay held until the body has been written out, so ownership transfers
 	// from rawFetch to the caller and Release must be called after the write, not
-	// when Raw returns (Z11-2, docs/issues/P2-medium.md). It is nil for a result
-	// that holds no reservation, so a caller calls it only when non-nil.
+	// when Raw returns (Z11-2, docs/issues/P2-medium.md). This is the data plane's
+	// version of the outbound bulkhead's permit, which is likewise held until the
+	// body is closed (httpclient/outbound.go). It is nil for a result that holds no
+	// reservation, so a caller calls it only when non-nil.
 	Release func()
 }
 

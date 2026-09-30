@@ -488,11 +488,16 @@ func TestServeUntilSignalDrainsInFlightRequest(t *testing.T) {
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		close(started)
-		<-release
-		_, _ = w.Write([]byte("done"))
-	})}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			close(started)
+			<-release
+			_, _ = w.Write([]byte("done"))
+		}),
+		// The test's own listener still gets a header deadline, so this fixture
+		// is not the Slowloris shape G112 exists to catch.
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -541,9 +546,13 @@ func TestServeUntilSignalDrainsOnlyAfterBecomingUnready(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	})}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("ok"))
+		}),
+		// See the note in TestServeUntilSignalDrainsInFlightRequest.
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	var mu sync.Mutex
 	unreadyAt := time.Time{}
@@ -614,10 +623,14 @@ func TestServeUntilSignalClosesHungConnectionsAfterTimeout(t *testing.T) {
 	release := make(chan struct{})
 	// Release the handler when the test ends so its goroutine does not leak.
 	defer close(release)
-	srv := &http.Server{Handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-		close(started)
-		<-release
-	})}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			close(started)
+			<-release
+		}),
+		// See the note in TestServeUntilSignalDrainsInFlightRequest.
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1052,9 +1065,13 @@ func TestServeUntilSignalDrainsEveryEndpoint(t *testing.T) {
 			t.Fatal(err)
 		}
 		endpoints = append(endpoints, endpoint{
-			server: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte("ok"))
-			})},
+			server: &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = w.Write([]byte("ok"))
+				}),
+				// See the note in TestServeUntilSignalDrainsInFlightRequest.
+				ReadHeaderTimeout: 5 * time.Second,
+			},
 			listener: ln,
 		})
 		addrs = append(addrs, ln.Addr().String())

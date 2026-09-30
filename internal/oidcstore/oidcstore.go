@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
@@ -232,6 +233,16 @@ func (a *AuthRequest) RequiresReauthentication(now time.Time) bool {
 	at := a.GetAuthTime()
 	if at.IsZero() {
 		return true
+	}
+	// max_age is an OIDC uint and time.Duration is a signed int64 of
+	// nanoseconds, so the naive time.Duration(*a.MaxAge)*time.Second can
+	// overflow for a value a client is free to send (G115). Bound it first:
+	// above this a freshness window already outlives any real authentication,
+	// so no recorded auth_time can be older than it. Below the bound the
+	// conversion is lossless. (Z16-2, docs/issues/P2-medium.md)
+	const maxDurationSeconds = uint64(math.MaxInt64) / uint64(time.Second)
+	if uint64(*a.MaxAge) > maxDurationSeconds {
+		return false
 	}
 	return now.Sub(at) > time.Duration(*a.MaxAge)*time.Second
 }

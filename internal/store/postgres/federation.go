@@ -41,7 +41,11 @@ func (r bindingRow) binding() federation.Binding {
 		Source:     r.Source,
 		TokenType:  r.TokenType,
 		HasRefresh: r.HasRefresh,
-		Version:    uint64(r.Version),
+		// The version is a random uint64 stored bit-exactly in the signed
+		// bigint column (see bindingRow.Version above), so the signed→unsigned
+		// conversion returns the same bits rather than truncating a magnitude
+		// (G115).
+		Version: uint64(r.Version), //nolint:gosec // G115: bit-exact round trip of the random version
 	}
 	if r.Expiry != nil {
 		b.Expiry = *r.Expiry
@@ -72,7 +76,7 @@ func (s *Bindings) Put(ctx context.Context, b federation.Binding) error {
 			expiry      = EXCLUDED.expiry,
 			has_refresh = EXCLUDED.has_refresh,
 			version     = EXCLUDED.version`,
-		string(b.User), b.Game, b.Source, b.TokenType, nullTime(b.Expiry), b.HasRefresh, int64(b.Version))
+		string(b.User), b.Game, b.Source, b.TokenType, nullTime(b.Expiry), b.HasRefresh, int64(b.Version)) //nolint:gosec // G115: bit-exact round trip of the random version
 	return err
 }
 
@@ -91,7 +95,7 @@ func (s *Bindings) PutIfVersion(ctx context.Context, b federation.Binding, expec
 		       version     = $7
 		 WHERE user_id = $1 AND game = $2 AND source = $3 AND version = $8`,
 		string(b.User), b.Game, b.Source, b.TokenType, nullTime(b.Expiry),
-		b.HasRefresh, int64(b.Version), int64(expectedVersion))
+		b.HasRefresh, int64(b.Version), int64(expectedVersion)) //nolint:gosec // G115: bit-exact round trip of the random version
 	if err != nil {
 		return false, err
 	}

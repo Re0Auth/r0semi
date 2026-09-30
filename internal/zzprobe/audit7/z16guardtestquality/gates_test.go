@@ -19,11 +19,14 @@ import (
 // This file holds the two gate-quality probes of zone 16 that are not about the
 // shape of a single test function:
 //
-//   - the security linter's rule set is narrowed by `.golangci.yml`'s
-//     `gosec.includes`, so a rule the project cares about can be installed,
-//     configured and still never run. The probe asserts the invariant that
-//     matters: no rule that gosec's own default set finds on this tree may be
-//     missing from the narrowed set;
+//   - the security linter's rule set must stay default-on. `.golangci.yml` once
+//     "curated" gosec through `gosec.includes`, which in golangci-lint v2 is a
+//     `rules.NewRuleFilter(false, includes...)` *allowlist*: naming five rules
+//     did not select them, it silently switched every other rule off, so G112,
+//     G114 and G115 were installed, configured and inert. The probe asserts that
+//     no allowlist has returned, and that any rule the config does decline is
+//     declined by name — with a reason written next to it — rather than by a
+//     filter that hides its own contents;
 //   - every test file behind a build tag is invisible to `go build`, `go vet`,
 //     `go test ./...` and `golangci-lint run ./...` alike, so the audit corpus
 //     can rot without a single gate noticing (supplement to N-04, which records
@@ -36,18 +39,33 @@ var gosecRule = regexp.MustCompile(`\((gosec)\)`)
 // diagnostic.
 var ruleID = regexp.MustCompile(`\b(G\d{3}):`)
 
+// bareRuleID matches a rule id wherever it appears, such as the `text:` value of
+// a linters.exclusions entry, which carries no trailing colon.
+var bareRuleID = regexp.MustCompile(`\bG\d{3}\b`)
+
 type linterConfig struct {
 	Linters struct {
 		Enable   []string `yaml:"enable"`
 		Settings struct {
 			Gosec struct {
 				Includes []string `yaml:"includes"`
+				Excludes []string `yaml:"excludes"`
 			} `yaml:"gosec"`
 		} `yaml:"settings"`
+		Exclusions struct {
+			Rules []struct {
+				Path    string   `yaml:"path"`
+				Linters []string `yaml:"linters"`
+				Text    string   `yaml:"text"`
+			} `yaml:"rules"`
+		} `yaml:"exclusions"`
 	} `yaml:"linters"`
 }
 
-func readLinterConfig(t *testing.T, root string) linterConfig {
+// readLinterConfig parses `.golangci.yml` and also returns its comment lines, so
+// "documented" can mean what it says: a rule id appearing in a `#` line next to
+// the exclusion it explains.
+func readLinterConfig(t *testing.T, root string) (linterConfig, []string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(root, ".golangci.yml"))
 	if err != nil {
@@ -57,20 +75,22 @@ func readLinterConfig(t *testing.T, root string) linterConfig {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		t.Fatalf("parse .golangci.yml: %v", err)
 	}
-	return cfg
+	var comments []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "#") {
+			comments = append(comments, trimmed)
+		}
+	}
+	return cfg, comments
 }
 
-// runLint invokes the pinned golangci-lint over the packages whose production
-// code carries the rules under discussion, and returns its combined output.
-// withRepoConfig selects the configuration CI runs.
-func runLint(t *testing.T, root, lint string, withRepoConfig bool) string {
+// runLint invokes the pinned golangci-lint with gosec's own default rule set over
+// the whole module. The repository config is deliberately not read, so the result
+// is what gosec reports before any project-level exclusion is applied — the
+// question this probe asks is what the exclusions are hiding.
+func runLint(t *testing.T, root, lint string) string {
 	t.Helper()
-	args := []string{"run", "--timeout=3m"}
-	if !withRepoConfig {
-		args = append(args, "--no-config", "--default", "none", "--enable", "gosec")
-	}
-	args = append(args, "./cmd/re0auth/", "./cmd/referencesource/", "./cmd/perfreport/")
-	cmd := exec.Command(lint, args...)
+	cmd := exec.Command(lint, "run", "--timeout=3m", "--no-config", "--default", "none", "--enable", "gosec", "./...")
 	cmd.Dir = root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -83,70 +103,117 @@ func runLint(t *testing.T, root, lint string, withRepoConfig bool) string {
 }
 
 // TestNarrowedGosecRuleSetHidesNoLiveFinding pins the invariant behind
-// `.golangci.yml`'s curated gosec subset.
+// `.golangci.yml`'s gosec settings: the rule set is default-on and the only
+// rules that do not run are the ones the config declines *by name*, with a
+// one-line reason.
 //
-// The config comment explains the subset by naming the patterns the project uses
-// on purpose (a MAC that really is HMAC-SHA1, a config path that really comes
-// from a flag) and G101. What it does not say is that `includes` is a *filter*:
-// the five ids listed there are the only gosec rules that run at all, so the
-// server-hardening and overflow rules the service's own threat model names —
-// G112 (no ReadHeaderTimeout), G114 (a serve function with no timeouts), G115
-// (integer-overflow conversion) — are installed, configured and inert. The
-// assertion is therefore not "the list must be long", it is: nothing gosec's own
-// default set finds on this tree may be missing from the narrowed set.
+// The name is kept from the probe's first version, when the config used
+// `gosec.includes`. That was the bug: in golangci-lint v2 `includes` is a
+// `rules.NewRuleFilter(false, includes...)` allowlist, so the five ids listed
+// there were the only gosec rules that ran at all — the server-hardening and
+// overflow rules the service's own threat model names (G112 no
+// ReadHeaderTimeout, G114 a serve function with no timeouts, G115 an
+// integer-overflow conversion) were installed, configured and inert. The probe
+// now fails if an allowlist returns, fails on a path-only gosec exclusion (a
+// blanket suppression in the same family), and checks the dynamic half: every
+// rule gosec's own default set reports on this tree must either run under the
+// repository config or be a declined rule whose id is written in the config's
+// comments.
+//
+// (Z16-2, docs/issues/P2-medium.md)
 func TestNarrowedGosecRuleSetHidesNoLiveFinding(t *testing.T) {
 	root := repoRoot(t)
-	cfg := readLinterConfig(t, root)
-	includes := cfg.Linters.Settings.Gosec.Includes
+	cfg, comments := readLinterConfig(t, root)
 	if !slices.Contains(cfg.Linters.Enable, "gosec") {
 		t.Fatal("gosec is no longer enabled; this probe no longer measures the CI lint gate")
 	}
-	if len(includes) == 0 {
-		t.Fatal("gosec has no `includes` list, so this probe's premise (a narrowed rule set) is gone")
+
+	// (a) The allowlist must not come back. A non-empty `includes` is not a
+	// selection of the rules named; it is the silent removal of every rule not
+	// named, which is exactly what this probe exists to catch.
+	if includes := cfg.Linters.Settings.Gosec.Includes; len(includes) > 0 {
+		t.Fatalf("gosec.includes = %v is non-empty: in golangci-lint v2 it is an allowlist, so every rule "+
+			"not named never runs. Decline a finding by naming it in gosec.excludes with a reason instead.", includes)
 	}
-	t.Logf("repository gosec.includes = %v", includes)
+
+	// The rules the config declines, and how. `gosec.excludes` is rule-level; a
+	// `linters.exclusions.rules` entry that names gosec and carries a `text` is
+	// rule-level on a path. An entry with no `text` hides every gosec rule on
+	// that path — the allowlist failure wearing a path-shaped coat.
+	declined := map[string]bool{}
+	for _, id := range cfg.Linters.Settings.Gosec.Excludes {
+		declined[id] = true
+	}
+	for _, rule := range cfg.Linters.Exclusions.Rules {
+		if !slices.Contains(rule.Linters, "gosec") {
+			continue
+		}
+		if strings.TrimSpace(rule.Text) == "" {
+			t.Errorf("the gosec exclusion for path %q has no `text`: it hides every gosec rule on those files "+
+				"rather than a named one. Name the rule in gosec.excludes, or give the entry a `text`.", rule.Path)
+			continue
+		}
+		for _, id := range ruleIDsIn(rule.Text) {
+			declined[id] = true
+		}
+	}
 
 	lint, err := exec.LookPath("golangci-lint")
 	if err != nil {
-		// The tool is what CI installs (v2.14.0, pinned in the lint job); without
-		// it the dynamic half cannot run, so the static half is asserted instead.
+		// Without the tool CI pins the dynamic half cannot run; the static half —
+		// no allowlist, no blanket exclusion — has already been asserted.
 		t.Logf("golangci-lint is not on PATH: %v; asserting the static shape only", err)
-		for _, want := range []string{"G114", "G115"} {
-			if !slices.Contains(includes, want) {
-				t.Errorf("gosec.includes does not run %s; the repository has a live hit for it "+
-					"(run `golangci-lint run --no-config --default none --enable gosec ./...` to see it)", want)
-			}
-		}
 		return
 	}
 
-	wide := runLint(t, root, lint, false)
-	narrow := runLint(t, root, lint, true)
-
+	wide := runLint(t, root, lint)
 	wideRules := reportedRules(wide)
 	if len(wideRules) == 0 {
 		t.Fatal("gosec's default rule set reported nothing at all: the positive control is empty, " +
 			"so a green result here would mean the probe is broken rather than the gate sound")
 	}
-	var hidden []string
+
+	var running, hidden []string
 	for _, id := range wideRules {
-		if !slices.Contains(includes, id) {
+		switch {
+		case !declined[id]:
+			// With no allowlist in force, a rule the config does not decline runs.
+			running = append(running, id)
+		case documentedRule(comments, id):
+			// Declined on purpose, with the reason written beside it.
+		default:
 			hidden = append(hidden, id)
 		}
 	}
 	sort.Strings(hidden)
-	t.Logf("gosec default set reported %v; the repository config runs only %v", wideRules, includes)
+	t.Logf("gosec's default set reported %v; running under the repository config: %v; declined by name: %v",
+		wideRules, running, sortedKeys(declined))
 	if len(hidden) > 0 {
-		t.Errorf("the CI lint gate cannot see %v: `gosec.includes` is a filter, so a rule that is not "+
-			"listed never runs. Live hits it hides (from the wide run):\n%s",
+		t.Errorf("the CI lint gate cannot see %v, and nothing in .golangci.yml says why. A rule may only be "+
+			"declined by name — `gosec.excludes`, or a `_test\\.go` entry carrying a `text` — and its reason "+
+			"must be written as a comment that names the rule. Live hits it hides (from the wide run):\n%s",
 			hidden, firstLines(wide, 12))
 	}
-	// The control: with the repository config the same packages must report a
-	// subset. If the two runs agree, `includes` did not narrow anything and this
-	// probe is measuring the wrong thing.
-	if strings.Contains(narrow, "G114:") || strings.Contains(narrow, "G115:") {
-		t.Logf("the repository config reported a rule this probe expected it to drop: %s", firstLines(narrow, 6))
+}
+
+// documentedRule reports whether the config's comment lines name id, which is how
+// every declined rule carries its one-line reason.
+func documentedRule(comments []string, id string) bool {
+	for _, c := range comments {
+		if strings.Contains(c, id) {
+			return true
+		}
 	}
+	return false
+}
+
+// ruleIDsIn returns the GNNN ids in a linters.exclusions `text` value.
+func ruleIDsIn(text string) []string {
+	var ids []string
+	for _, m := range bareRuleID.FindAllString(text, -1) {
+		ids = append(ids, m)
+	}
+	return ids
 }
 
 // reportedRules returns the sorted, unique gosec rule ids in a lint output.

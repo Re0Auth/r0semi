@@ -1068,10 +1068,18 @@ func resolvePool(section storageSection) (poolSettings, error) {
 		StatementTimeout: defaults.StatementTimeout,
 	}
 	if section.MaxConns != nil {
-		out.MaxConns = int32(*section.MaxConns)
+		n, err := poolSize("storage.max_conns", *section.MaxConns)
+		if err != nil {
+			return poolSettings{}, err
+		}
+		out.MaxConns = n
 	}
 	if section.MinConns != nil {
-		out.MinConns = int32(*section.MinConns)
+		n, err := poolSize("storage.min_conns", *section.MinConns)
+		if err != nil {
+			return poolSettings{}, err
+		}
+		out.MinConns = n
 	}
 	if section.ConnectTimeout != nil {
 		d, err := parseDuration(*section.ConnectTimeout, "storage.connect_timeout")
@@ -1117,6 +1125,21 @@ func resolvePool(section storageSection) (poolSettings, error) {
 			`storage.statement_timeout cannot be negative (use "0s" to leave the server's setting alone)`)
 	}
 	return out, nil
+}
+
+// poolSize converts a pool size read from the TOML file — the decoder stores it
+// in an int — to the int32 the driver takes. The bounds check is what makes the
+// conversion provably lossless (G115): a value outside int32 is refused by name
+// instead of being silently truncated, which is the same "say what is wrong, do
+// not start" rule resolvePool applies to every other setting.
+//
+// This is the validation Z12-9 asks for at the config boundary.
+// (Z16-2, docs/issues/P2-medium.md)
+func poolSize(what string, n int) (int32, error) {
+	if n > math.MaxInt32 || n < math.MinInt32 {
+		return 0, fmt.Errorf("%s %d is out of range (max %d)", what, n, math.MaxInt32)
+	}
+	return int32(n), nil
 }
 
 // envInt32 overrides a value from an environment variable, so a deployment that

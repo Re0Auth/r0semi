@@ -89,7 +89,11 @@ func TestNoticeCoversTheBuildGraph(t *testing.T) {
 // is not actionable.
 func goListOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("go", args...)
+	// The program is the fixed "go" toolchain and args are this helper's own
+	// literals from the call sites below; nothing here is caller- or
+	// network-supplied. G204 flags the variadic slice because it cannot tell
+	// that apart from a tainted command line.
+	cmd := exec.Command("go", args...) //nolint:gosec // G204: fixed go toolchain with this test's literal args
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {

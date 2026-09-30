@@ -625,7 +625,10 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		h.failLogin(w, r, provider, returnTo, codeProviderUnavailable)
 		return
 	}
-	http.Redirect(w, r, authURL, http.StatusFound)
+	// authURL is assembled by the OIDC client from the provider's registered
+	// discovery document plus the random state, verifier and nonce above: it is
+	// the provider's own authorize endpoint, never a caller-chosen destination.
+	http.Redirect(w, r, authURL, http.StatusFound) //nolint:gosec // G710: authURL is the registered provider's authorize endpoint
 }
 
 func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
@@ -746,7 +749,10 @@ func redirectError(w http.ResponseWriter, r *http.Request, returnTo, code string
 	q := u.Query()
 	q.Set("error", code)
 	u.RawQuery = q.Encode()
-	http.Redirect(w, r, u.String(), http.StatusSeeOther)
+	// returnTo reached this point through safeurl.RelativePath, which returns a
+	// same-origin absolute path or "/", so the redirect cannot name another
+	// host (G710 cannot follow that sanitiser through the helper boundary).
+	http.Redirect(w, r, u.String(), http.StatusSeeOther) //nolint:gosec // G710: returnTo is sanitised by safeurl.RelativePath
 }
 
 func randomToken(n int) string {

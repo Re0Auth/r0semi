@@ -141,9 +141,13 @@ func (w *LocalKeyWrapper) open(nonce, ct, aad []byte) ([]byte, error) {
 func bindingAAD(version byte, subject, provider string) []byte {
 	b := make([]byte, 0, 1+4+len(subject)+4+len(provider))
 	b = append(b, version)
-	b = binary.BigEndian.AppendUint32(b, uint32(len(subject)))
+	// The prefix is uint32 by the AAD's own layout. A credential subject or
+	// provider is a bounded identity string, so the truncation G115 warns about
+	// is not reachable, and this AAD builder has no error return to carry a
+	// length check (G115).
+	b = binary.BigEndian.AppendUint32(b, uint32(len(subject))) //nolint:gosec // G115: 4 GiB identity is not a stored shape
 	b = append(b, subject...)
-	b = binary.BigEndian.AppendUint32(b, uint32(len(provider)))
+	b = binary.BigEndian.AppendUint32(b, uint32(len(provider))) //nolint:gosec // G115: 4 GiB identity is not a stored shape
 	b = append(b, provider...)
 	return b
 }

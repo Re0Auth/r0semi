@@ -44,7 +44,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: covertable <coverage.out>")
 		os.Exit(2)
 	}
-	raw, err := os.ReadFile(os.Args[1])
+	// The operand is the coverage file named on the command line. Reading
+	// exactly that path is this tool's whole contract, and a CLI operand is not
+	// a request-time taint source; G703 flagged it because the analysis cannot
+	// tell the two apart.
+	raw, err := os.ReadFile(os.Args[1]) //nolint:gosec // G703: the path is the coverage file named on the command line
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "covertable: %v\n", err)
 		os.Exit(1)

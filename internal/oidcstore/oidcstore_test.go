@@ -66,7 +66,10 @@ func TestValidateSigner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	small, err := rsa.GenerateKey(rand.Reader, 1024)
+	// 1024 bits is the input under test: ValidateSigner must refuse it as too
+	// small. Generating it is the point, not an accident, so G403 is annotated
+	// rather than the key being made valid.
+	small, err := rsa.GenerateKey(rand.Reader, 1024) //nolint:gosec // G403: the weak key is the case under test
 	if err != nil {
 		t.Fatal(err)
 	}

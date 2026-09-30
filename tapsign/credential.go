@@ -29,8 +29,13 @@ func (c Credential) Valid() error {
 }
 
 // Encode serializes the credential for storage in the vault.
+//
+// The JSON names the secret field on purpose: it is the vault's opaque payload,
+// encrypted by Enroll before it is stored and scrubbed by the caller
+// (referencesource/taptap.go). G117 sees only the field name at the marshal
+// boundary.
 func (c Credential) Encode() ([]byte, error) {
-	b, err := json.Marshal(c)
+	b, err := json.Marshal(c) //nolint:gosec // G117: the marshaled credential is the vault-encrypted payload
 	if err != nil {
 		return nil, fmt.Errorf("tapsign: encode credential: %w", err)
 	}

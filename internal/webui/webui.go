@@ -126,7 +126,11 @@ func Handler(fsys fs.FS) http.Handler {
 			w.Header().Set("Content-Security-Policy", shellCSP)
 		}
 		setCacheHeaders(w, name)
-		http.ServeFileFS(w, r, fsys, "/"+name)
+		// name was cleaned above and only reaches "index.html" or a file that
+		// fs.Stat confirmed inside fsys; the server is an fs.FS, not the host
+		// filesystem, so there is no path to escape to. G703 cannot see the
+		// isFile/fs.FS guard through ServeFileFS's signature.
+		http.ServeFileFS(w, r, fsys, "/"+name) //nolint:gosec // G703: name is cleaned and confined to the embedded fs.FS
 	})
 }
 

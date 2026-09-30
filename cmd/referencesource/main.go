@@ -132,8 +132,28 @@ func main() {
 	}
 
 	slog.Info("listening", "source", src.Discovery().Source, "addr", cfg.Addr, "issuer", cfg.Issuer)
-	die("serve", http.ListenAndServe(cfg.Addr, src.Handler()))
+	// Serve through an explicit http.Server rather than http.ListenAndServe:
+	// that helper takes no timeouts, so a client that opens a connection and
+	// never finishes its header block can hold it until the process runs out of
+	// descriptors (G114). ReadHeaderTimeout is the whole Slowloris bound here;
+	// the handlers are short-lived, so the read/write deadlines stay unset.
+	// (Z16-2, docs/issues/P2-medium.md)
+	srv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           src.Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
+	}
+	die("serve", srv.ListenAndServe())
 }
+
+// Connection deadlines for the reference server. They mirror the public
+// server's shape (cmd/re0auth) at the scale a reference data source needs.
+const (
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+)
 
 func newTapTapLogin(tap tapTapSettings) (*referencesource.TapTapLogin, error) {
 	// Retry transient upstream failures. Only idempotent methods are retried, so

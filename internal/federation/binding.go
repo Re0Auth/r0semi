@@ -79,7 +79,11 @@ func BindingIdentity(b Binding) vault.Identity {
 
 // storeBindingSecret encrypts and stores the upstream token pair.
 func (s *service) storeBindingSecret(ctx context.Context, b Binding, secret bindingSecret) error {
-	encoded, err := json.Marshal(secret)
+	// encoded is the vault's plaintext payload: Enroll encrypts it before it
+	// reaches the store and it is scrubbed on the way out (defer below), which
+	// is the protection G117 is looking for at a marshal boundary. The JSON
+	// field names are the persisted format, not a wire leak.
+	encoded, err := json.Marshal(secret) //nolint:gosec // G117: the marshaled token pair is the vault-encrypted payload
 	if err != nil {
 		return fmt.Errorf("federation: encode binding secret: %w", err)
 	}

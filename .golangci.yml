@@ -40,25 +40,35 @@ linters:
     # unconvert catches conversions of a value to its own type, which are usually
     # a sign of a half-finished refactor.
     - unconvert
-    # gosec is the security rule set, enabled as a curated subset rather than in
-    # full. The blanket set flags patterns this service uses on purpose — TapTap's
-    # MAC really does require HMAC-SHA1, and the config loader really does open a
-    # path taken from a flag — and a gate that is wrong on every run is one people
-    # learn to route around. G101 (hardcoded credentials) is left out for that
-    # reason: it fires on public OAuth endpoint URLs and on test fixtures, while
-    # gitleaks already scans the tree and the history for real secrets. A
-    # production site that legitimately trips one of the rules below carries a
-    # //nolint naming gosec and saying why.
+    # gosec runs with its full default rule set. It used to be "curated" through
+    # `gosec.includes`, but in golangci-lint v2 that knob is an allowlist
+    # (`rules.NewRuleFilter(false, includes...)`): listing five rules does not
+    # select those five, it silently switches off every rule not named — G112,
+    # G114 and G115 among them, which is precisely the server-hardening and
+    # overflow surface this service's threat model names. The shape is now
+    # default-on plus a short, documented `gosec.excludes` below, so every rule
+    # keeps running and each accepted finding is named once, with its reason,
+    # rather than being invisible in a filter. A production site that trips a
+    # rule not excluded below carries a //nolint naming gosec and saying why.
+    # (Z16-2, docs/issues/P2-medium.md)
     - gosec
 
   settings:
     gosec:
-      includes:
-        - G304 # filesystem path from a variable
-        - G401 # weak crypto primitive (md5/sha1/des)
-        - G402 # TLS config that skips verification
-        - G404 # math/rand instead of crypto/rand
-        - G501 # import of a weak crypto package
+      # `excludes` is the visible half of what `includes` only appeared to do.
+      # An allowlist makes the gate look curated while silently disabling every
+      # rule it omits; an exclusion list runs everything and documents the few
+      # findings the project accepts. Each entry here is a deliberate choice,
+      # with the reason stated at the entry.
+      excludes:
+        # G101 (hardcoded credentials) fires on the public OAuth endpoint and
+        # JWKS URLs in provider metadata (idp/idp.go, oidchttp/oidchttp.go) and
+        # on test fixtures, not on secrets; gitleaks scans the tree and its
+        # history for the real thing.
+        - G101
+        # G505 (crypto/sha1) is the MAC TapTap's built-in-account protocol
+        # specifies: HMAC-SHA1 is not ours to change (taptapoauth/client.go).
+        - G505
 
   exclusions:
     generated: lax
@@ -77,3 +87,12 @@ linters:
         linters:
           - gosec
         text: G304
+      # gosec's G104 is errcheck's finding under a security-linter name, and
+      # tests are already exempt from errcheck and bodyclose above: a fixture
+      # that ignores a Close error to stay readable is the same judgement, made
+      # once. The entry is scoped to _test\.go, so production still answers to
+      # G104 (and to errcheck) for every unhandled error.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: G104

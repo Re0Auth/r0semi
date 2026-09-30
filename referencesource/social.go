@@ -115,7 +115,10 @@ func (l *SocialLogin) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not start the authorization", http.StatusBadGateway)
 		return
 	}
-	http.Redirect(w, r, authURL, http.StatusFound)
+	// authURL is the registered provider's authorize endpoint, assembled by the
+	// OIDC client from discovery plus the random state, verifier and nonce;
+	// return_to is carried in the session, not this URL.
+	http.Redirect(w, r, authURL, http.StatusFound) //nolint:gosec // G710: authURL is the registered provider's authorize endpoint
 }
 
 func (l *SocialLogin) handleCallback(w http.ResponseWriter, r *http.Request, establish Establish) {

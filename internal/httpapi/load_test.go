@@ -194,7 +194,9 @@ func TestLoadProfile(t *testing.T) {
 	// The numbers belong in the job summary too, so a run that is only read from
 	// the CI UI still shows what it measured.
 	if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+		// 0o600: the mode only applies if the summary file does not already
+		// exist (the runner creates it), and the same user reads it back.
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600) //nolint:gosec // G703: path is GITHUB_STEP_SUMMARY, set by the CI runner
 		if err == nil {
 			_, _ = fmt.Fprintf(f, "```\n%s\n```\n", report)
 			_ = f.Close()

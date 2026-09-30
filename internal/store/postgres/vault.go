@@ -34,10 +34,14 @@ type vaultRow struct {
 	UpdatedAt  time.Time         `db:"updated_at"`
 }
 
+// record converts the stored row. The only version this code writes is vault's
+// recordVersion (1), which is a byte; the int16 column is headroom, so narrowing
+// it back to the byte the format uses cannot truncate a value this code produces
+// (G115).
 func (r vaultRow) record() vault.Record {
 	return vault.Record{
 		Identity:   vault.Identity{Subject: r.Subject, Provider: r.Provider},
-		Version:    byte(r.Version),
+		Version:    byte(r.Version), //nolint:gosec // G115: the column holds vault's recordVersion byte
 		WrappedDEK: r.WrappedDEK,
 		KEKID:      r.KEKID,
 		Nonce:      r.Nonce,

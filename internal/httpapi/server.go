@@ -576,7 +576,10 @@ func (s *Server) Handler() http.Handler {
 			if r.URL.RawQuery != "" {
 				target += "?" + r.URL.RawQuery
 			}
-			http.Redirect(w, r, target, http.StatusFound)
+			// target is webui.BasePath plus the request's query string, so it
+			// always begins with "/" and stays a same-origin path whatever the
+			// query holds (G710 cannot see the leading constant).
+			http.Redirect(w, r, target, http.StatusFound) //nolint:gosec // G710: target is a same-origin path under BasePath
 		})
 	}
 	root.HandleFunc("/", s.handleNotFound)

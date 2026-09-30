@@ -652,7 +652,11 @@ func main() {
 		fmt.Print(report)
 		return
 	}
-	if err := os.WriteFile(*out, []byte(report), 0o644); err != nil {
+	// 0o600: the report names branch state and benchmark timings, but there is no
+	// reason for it to be group- or world-readable on a shared host, and the
+	// caller can always widen it. G306 is the reason this is not 0o644.
+	// (Z16-2, docs/issues/P2-medium.md)
+	if err := os.WriteFile(*out, []byte(report), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "perfreport: %v\n", err)
 		os.Exit(1)
 	}

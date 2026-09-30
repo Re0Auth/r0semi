@@ -102,7 +102,11 @@ type auditVerifyRow struct {
 // unambiguous: without the length, ("ab","c") and ("a","bc") would hash the same.
 func writeLenPrefixed(b *bytes.Buffer, s string) {
 	var n [4]byte
-	binary.BigEndian.PutUint32(n[:], uint32(len(s)))
+	// The prefix is uint32 by the chain's own wire format, and every field fed
+	// here is a bounded column value, so the truncation G115 warns about is not
+	// reachable. The function has no error return to carry a length check, so
+	// the conversion is annotated rather than made fallible.
+	binary.BigEndian.PutUint32(n[:], uint32(len(s))) //nolint:gosec // G115: 4 GiB audit field is not a stored shape
 	b.Write(n[:])
 	b.WriteString(s)
 }

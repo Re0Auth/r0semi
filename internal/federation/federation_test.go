@@ -117,7 +117,10 @@ func mustSecret(t *testing.T, token string) []byte {
 
 func mustSecretPair(t *testing.T, access, refresh string) []byte {
 	t.Helper()
-	payload, err := json.Marshal(bindingSecret{AccessToken: access, RefreshToken: refresh})
+	// The fixture reproduces the vault payload storeBindingSecret writes; the
+	// tokens are test values, so the marshal boundary G117 flags carries
+	// nothing real.
+	payload, err := json.Marshal(bindingSecret{AccessToken: access, RefreshToken: refresh}) //nolint:gosec // G117: vault-payload fixture with test tokens
 	if err != nil {
 		t.Fatal(err)
 	}
