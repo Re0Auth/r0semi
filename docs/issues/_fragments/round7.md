@@ -127,7 +127,7 @@
 | Z15-4 | P3 | `negotiate` 快速路径对每个已配置 coding 重新 `strings.Split` 一次头部，成本随服务端配置增长 | `internal/compress/compress.go:180-193` | OPEN | 快速路径先切一次成切片再 `EqualFold` 匹配（来源：`Z15-VERIFIED.md:67-77`） |
 | Z15V-1 | P2 | 会话清扫与 Z15-1 跑在同一 15 分钟循环、同样无 `LIMIT`；单句撞超时第二句永不执行（孤儿行持续累积） | `internal/store/postgres/sessions.go:144-151` | FIXED（4dff4a3） | 同 Z15-1 的有界批 + 每句独立提交，anti-join 也分批（来源：`Z15-VERIFIED.md:83-96`） |
 | Z16-1 | P2 | CI 的 `load` 门禁在「什么都没测」时仍然绿：job 内没有任何一步读 `make load` 的输出 | `.github/workflows/ci.yml:407-428` | OPEN | load job 加一行 `grep -q 'capacity profile:'`（照抄 perf.yml）（来源：`Z16-VERIFIED.md:29-36`） |
-| Z16-2 | P2 | gosec 的 `includes` 是白名单：CI lint 门禁对有真实生产命中的规则（G112/G114/G115/G104/G107）永远不会红 | `.golangci.yml:55-61` | OPEN | 把 `includes` 换成 `excludes`，或把 G112/G114/G115 与 G104/G107 显式加回（来源：`Z16-VERIFIED.md:38-47`、`00-MAIN-VERIFICATION.md:533-547`） |
+| Z16-2 | P2 | gosec 的 `includes` 是白名单：CI lint 门禁对有真实生产命中的规则（G112/G114/G115/G104/G107）永远不会红 | `.golangci.yml:55-61` | FIXED（55c64ab） | 把 `includes` 换成 `excludes`，或把 G112/G114/G115 与 G104/G107 显式加回（来源：`Z16-VERIFIED.md:38-47`、`00-MAIN-VERIFICATION.md:533-547`） |
 | Z16-3 | P2 | 101 个 `audit5` 标签探针在任何 CI 门禁之外，连编译/vet/lint 都看不到（对 N-04 的补充） | `.github/workflows/*.yml`（无 `-tags` 步骤） | OPEN | CI 加 `probe-compile` job：`go vet -tags audit5 ./...`（可再加 audit6/audit7）（来源：`Z16-VERIFIED.md:49-58`） |
 | Z16-4 | P3 | `internal/archtest` 的 Makefile 守卫是整文件 `strings.Contains`，把目标行整行注释掉仍 PASS | `internal/archtest/workflows_test.go:31-40` | OPEN | 复用同包结构解析，断言 `release` 的前置真含 `npm-attribution`/`checksums`（来源：`Z16-VERIFIED.md:60-65`） |
 | Z16-5 | P3 | `ci.yml` 的 fuzz 目标清单靠手维护，没有任何守卫保证它完整（删掉 5 条无人发现） | `.github/workflows/ci.yml:467-478` | OPEN | archtest 用 `go test -list '^Fuzz'` 枚举目标并断言全在清单（来源：`Z16-VERIFIED.md:67-72`） |
@@ -220,6 +220,7 @@
   - Z09V-1 — 401 不再算主机级熔断失败，改按 binding 的 401 冷却（阈值 5/30s，有界），跨账号不再互相 shed — `b17c76f`
   - Z11-2 — 先补平台无关的确定性复现（阻塞 writer），再把字节预算预留跟随响应体生命周期（`Release` + handler `defer`） — `b17c76f`
   - Z14-1 — `oauth.Store` 新增非破坏性 `GetRefresh`；级联失败不再消费 refresh，上游成功后才消费 — `b17c76f`
+  - Z16-2 — gosec 不再用 `includes` 当白名单：默认全开 + 显式 `excludes`（G101/G505），逐条处置新暴露的生产命中（含 G114 超时、G306 权限、G115 截断范围校验），并加防回归守卫 — `55c64ab`
 
 ## 有意不做 / 已裁定
 

@@ -149,6 +149,12 @@
 - **authorize 校验 `code_challenge` 形状（KIT-5）**：非 43 字符 base64url 的 S256 challenge
   以前会被接受、铸出注定换不了的码；现在 `describe` 与 `verifyPKCE` 共用同一判据
   （大写 43 字符形状合法，只能在兑换时拒绝，已在代码注释说明）。
+- **lint 门禁不再只看 5 条 gosec 规则（Z16-2）**：`.golangci.yml` 的 `gosec.includes`
+  是白名单，静默关掉了未列出的每条规则；现改为默认全开 + 显式 `excludes`
+  （G101 公共 OAuth/JWKS URL 与测试夹具、G505 TapTap 规定要用的 HMAC-SHA1）。新暴露的
+  生产命中逐条处置（`cmd/referencesource` 的 `ListenAndServe` 换成带 `ReadHeaderTimeout`
+  的 `http.Server`、`cmd/perfreport` 的写权限收紧到 0600、G115 的 int32 截断加范围校验等），
+  CI 同款命令仍为 `0 issues.`，并新增未打 tag 的守卫防止白名单回归。
 
 - **refresh 重放即撤销整条令牌族（RFC 9700 §4.14.2，P0 G-1）**：此前重放一个已轮换的 refresh token
   只被拒，小偷已换出的那一代继续有效到 TTL 结束。现在轮换在被消费的行上留墓碑（族标识 + 配对
