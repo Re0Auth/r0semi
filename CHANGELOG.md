@@ -127,6 +127,29 @@
   名单（48 个仍红的包不入名单，且不允许 `continue-on-error`）；`release.yml` 复用
   `ci.yml`，打 tag 时自动继承。**运维影响**：CI 增加约 4–6 分钟。
 
+### T3 · 首个补丁（9/10，`b17c76f`）
+- **过期的同意句柄不再只靠定时清扫（Z07-1）**：两个 store 的按 ID 读现在裁决 deadline，
+  30 分钟后打开旧标签页会得到「已过期」而不是继续展示/批准；N-01 的对应豁免随之删除。
+- **成功的令牌兑换不再写假 `oidc.consent.deny`（Z20-1）**：库在铸码后调用的清理此前被
+  记成一次「用户拒绝」，污染真拒绝的可检测性。**运维影响**：审计里不再出现字段全空的
+  deny 事件；真拒绝照记。
+- **非有限 `rate_limit` 加载期拒绝（Z12-6）**：`nan`/`inf` 此前会装一个放行一切的限流器。
+- **显式空列表变量真正生效（Z12-4）**：`RE0AUTH_ADMIN_SUBJECTS=""`（以及
+  `RE0AUTH_TRUSTED_PROXIES`、`RE0AUTH_INTROSPECTION_CLIENTS`）现在清空文件里的列表并
+  卸载对应面；新增启动日志 `access lists resolved` 与 `operator plane disabled`。
+- **`-rotate-keys` 扫到 0 条时非零退出（Z12-2）**：`scanned=0` 此前与完成的轮换同样退 0，
+  书面闸门会把「什么都没认证」读成成功（空 vault 部署会因此开始退出非零）。
+- **401 不再掐掉整台主机（Z09V-1）**：熔断器的 401 判据移出主机级失败，改为按 binding 的
+  401 冷却（阈值 5、30s，有界 map）；**行为变化**：一个账号凭据坏不再让其他账号读不到该源。
+- **字节预算跟随响应体生命周期（Z11-2）**：写响应期间的 body 此前已不在预算内；现在
+  预留转移到 `RawResult`/`FetchResult` 的 `Release`，由 handler 写到结束才归还。
+- **级联失败不再烧掉 refresh（Z14-1）**：`oauth.Store` 新增非破坏性 `GetRefresh`（**公共
+  接口新增方法，第三方 Store 实现者需补**）；referencesource 先只读解析 subject，上游
+  成功后才消费，`docs/upstream-protocol.md` §6.1 与 Kit 注释同步。
+- **authorize 校验 `code_challenge` 形状（KIT-5）**：非 43 字符 base64url 的 S256 challenge
+  以前会被接受、铸出注定换不了的码；现在 `describe` 与 `verifyPKCE` 共用同一判据
+  （大写 43 字符形状合法，只能在兑换时拒绝，已在代码注释说明）。
+
 - **refresh 重放即撤销整条令牌族（RFC 9700 §4.14.2，P0 G-1）**：此前重放一个已轮换的 refresh token
   只被拒，小偷已换出的那一代继续有效到 TTL 结束。现在轮换在被消费的行上留墓碑（族标识 + 配对
   access 的 id），读路径命中墓碑即在一个事务里撤销该族全部 refresh 与 access，然后仍按

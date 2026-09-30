@@ -20,7 +20,7 @@
 | FO-04 | P3 | `NewRegistry` 不校验 `game`/`name`/`Resources[].Scope`：带空格的 scope 让上游收到从未声明的额外 scope，`?`/`#`/`..` 让回调 URL 与注册到源的 `redirect_uri` 不一致（操作者 TOML 输入，无远程路径） | `internal/federation/federation.go:112-122`（`bindScopes`）、`:141-175`（`NewRegistry`） | OPEN | 按 `idp.validateProviderName` 同款规则校验 `game`/`name`，`Resource.Scope` 严格文法或拒绝含空白｜来源：`docs/audit-5/findings/federation.md:164` |
 | KIT-2 | P2 | 一次请求可声明两个客户端身份：`ClientCredentials` Basic 赢者通吃，表单里的第二个身份完全不比对（未观察到提权，风险是下游按表单判身份时与 kit 不一致） | `oauth/http.go:33-38` | OPEN | 把 `internal/oidchttp` 已裁定的「一请求一身份」搬进 `oauth.ClientCredentials`：两身份同时出现且不一致 → `invalid_client`｜来源：`docs/audit-5/findings/_fragment_kit.md:82` |
 | KIT-4 | P2 | `ConsumeCode` 在任何绑定校验之前执行 ⇒ 知道 code 就足以无凭据烧掉它（低成本定向 DoS），且失败不写审计、不可观测 | `oauth/as.go:165`（校验在 `:175`/`:178`/`:181`） | FIXED（7cfbdb5） | 已按建议的最小形状落地：非破坏性 `GetCode` → 全绑定校验 → `ConsumeCode` 原子门（单次使用/并发窗口不变），失败记 `oauth.exchange_failed`。守卫：`oauth/as_test.go`、`oauth/tokens_test.go`、kit `TestC1_`/`TestC2_`、postgres 无 DB 源码守卫。注：OP 面（`oidchttp`+`OIDCStore.AuthRequestByCode`）仍是 consume-on-read 的同形兄弟项，本条不含。｜来源：`docs/audit-5/findings/_fragment_kit.md:154` |
-| KIT-5 | P2 | `describe()` 只查非空 + S256，1 字符/padded/大写 `code_challenge` 也发码，该码永远换不出令牌；KIT-4 已修后该码不再被烧，但仍是死码，用户白授权且需重走全流程 | `oauth/as.go:104-106` | OPEN | 在 `describe()` 加与兑换侧同源的形状校验（S256 必为 43 字符 base64url），或抽公共函数防两处漂移｜来源：`docs/audit-5/findings/_fragment_kit.md:189` |
+| KIT-5 | P2 | `describe()` 只查非空 + S256，1 字符/padded/大写 `code_challenge` 也发码，该码永远换不出令牌；KIT-4 已修后该码不再被烧，但仍是死码，用户白授权且需重走全流程 | `oauth/as.go:104-106` | FIXED（b17c76f） | 在 `describe()` 加与兑换侧同源的形状校验（S256 必为 43 字符 base64url），或抽公共函数防两处漂移｜来源：`docs/audit-5/findings/_fragment_kit.md:189` |
 | KIT-6 | P2 | `RestoreClient` 故意不重校验重定向 URI，而 authorize 路径没有第二道检查 ⇒ registry 里的 `javascript:`/`data:` 历史行照单全收（现代浏览器 `Location` 不执行，风险在渲染成链接的源实现） | `oauth/client.go:180-192`、`:159-166`（`AllowsRedirect` 纯字符串） | OPEN | 在 `AllowsRedirect` 里补 `validRedirectURI`。**涉及裁定**：`docs/admin.md:69` 把 registry 写入方视为可信运维，not-doing §四.2 主张正式降为提示｜来源：`docs/audit-5/findings/_fragment_kit.md:226` |
 | KIT-7 | P2 | 一致性套件对客户端认证零断言：声明 `client_secret_basic` 却谁都不认证的源零 error 通过（含无认证 cascade 判 PASS）⇒ 假「合规」保证 | `upstreamkit/conformance/conformance.go:183-205` | FIXED（4dff4a3） | 加「未知 client 打已宣告端点必须 4xx」与「正确凭据 200 / 错误凭据 401」两组断言，并把 `token_endpoint_auth_methods_supported` 与实收方式比对｜来源：`docs/audit-5/findings/_fragment_kit.md:263` |
 | KIT-8 | P3 | 无 `Content-Length`（chunked/gzip）的超限体经 `MaxBytesError`→`ParseForm` 错误塌成 `400 malformed form body`，而非文档承诺的 413（**无绕过**，是误分类/不可观测） | `oauth/bodylimit.go:27-35`、`upstreamkit/server.go:240-243`（另 `:296-299`、`:319-322`） | OPEN | `ParseForm` 错误里 `errors.As(err, new(*http.MaxBytesError))` → 413；三个调用点共用一个 helper｜来源：`docs/audit-5/findings/_fragment_kit.md:310` |
@@ -53,7 +53,8 @@
 - P2-5 — `oidc_auth_requests.client_id` 补前导索引 — `b35f893`
 - P2-6 — `trusted_proxies` 的 `0.0.0.0/0`/`::/0` 需显式承认 — `e9dc23d`
 - P2-7 — `sources[].token_class` 校验枚举并给安全默认（=CS-4 转绿） — `e9dc23d`
-- KIT-7 — conformance 套件新增客户端认证断言：未知客户端+无凭据在 token/revoke 必须 401，可选 `ClientID/ClientSecret` 校验「正确密钥不被 invalid_client 拒、错密钥必须被拒」，并对照 `token_endpoint_auth_methods_supported` — `4dff4a3`
+- KIT-7 — conformance 套件新增客户端认证断言：未知客户端+无凭据在 token/revoke 必须 401，可选 `ClientID/ClientSecret` 校验「正确密钥不被 invalid_client 拒、错密钥必须被拒绝」，并对照 `token_endpoint_auth_methods_supported` — `4dff4a3`
+- KIT-5 — authorize 侧 `describe` 校验 `code_challenge` 形状（43 字符 base64url），与 `verifyPKCE` 共用同一判据防漂移 — `b17c76f`
 - P2-8 — `DATABASE_URL` 单独即选 postgres、新增 `RE0AUTH_STORAGE_DRIVER`、修正警告文案 — `e9dc23d`
 - P2-9 — `restore.sh` 校验绑定到实际入参 — `7f19637`
 - P2-10 — `.age` 加密备份路径同样执行校验 — `7f19637`

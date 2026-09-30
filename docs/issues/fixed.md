@@ -41,6 +41,15 @@
 - Z14-4 — discovery 持续失败时 provider 缓存新增 2×TTL 硬上界，超过即 fail-closed — `4dff4a3`
 - Z19-4 — `vault.KeyFingerprint` 可选接口 + `LocalKeyWrapper` 指纹，`WithRetiredKeys` 拒绝同材料换 id 的「轮换」 — `4dff4a3`
 - N-04 — ci.yml 新增 `probes` 作业（三套 tag 的 vet 编译 + 显式绿名单），打 tag 时经 release.yml 自动继承 — `4dff4a3`
+- 第七轮 T3 批次（「首个补丁（月内）」，本轮九项；Z16-2 另起，`b17c76f`）：
+- Z07-1 — 两个 store 的 `AuthRequestByID` 裁决 `expires_at`；N-01 的 Z07-1 豁免删除（postgres 守卫改为按方法体断言） — `b17c76f`
+- Z20-1 — 铸码后的 `DeleteAuthRequest` 清理不再写字段全空的 `oidc.consent.deny`；只在行还在且未完成时记真拒绝 — `b17c76f`
+- Z12-6 — 非有限 `rate_limit` 加载期拒绝，不再装「放行一切」的限流器 — `b17c76f`
+- Z12-4 — 显式空的三个列表变量真正清空文件列表（`config.List` 用 `os.LookupEnv`），并记 `access lists resolved` / `operator plane disabled` — `b17c76f`
+- Z12-2 — `-rotate-keys` 扫到 0 条时非零退出（`scanned=0` 不能认证轮换完成） — `b17c76f`
+- Z09V-1 — 401 不再算主机级熔断失败，改按 binding 的 401 冷却（阈值 5/30s，有界），跨账号不再互相 shed — `b17c76f`
+- Z11-2 — 先补平台无关的确定性复现（阻塞 writer），再把字节预算预留跟随响应体生命周期（`Release` + handler `defer`） — `b17c76f`
+- Z14-1 — `oauth.Store` 新增非破坏性 `GetRefresh`；级联失败不再消费 refresh，上游成功后才消费 — `b17c76f`
 
 ### 第 6 轮
 
@@ -79,7 +88,8 @@
 - P2-5 — `oidc_auth_requests.client_id` 补前导索引 — `b35f893`
 - P2-6 — `trusted_proxies` 的 `0.0.0.0/0`/`::/0` 需显式承认 — `e9dc23d`
 - P2-7 — `sources[].token_class` 校验枚举并给安全默认（=CS-4 转绿） — `e9dc23d`
-- KIT-7 — conformance 套件新增客户端认证断言：未知客户端+无凭据在 token/revoke 必须 401，可选 `ClientID/ClientSecret` 校验「正确密钥不被 invalid_client 拒、错密钥必须被拒」，并对照 `token_endpoint_auth_methods_supported` — `4dff4a3`
+- KIT-7 — conformance 套件新增客户端认证断言：未知客户端+无凭据在 token/revoke 必须 401，可选 `ClientID/ClientSecret` 校验「正确密钥不被 invalid_client 拒、错密钥必须被拒绝」，并对照 `token_endpoint_auth_methods_supported` — `4dff4a3`
+- KIT-5 — authorize 侧 `describe` 校验 `code_challenge` 形状（43 字符 base64url），与 `verifyPKCE` 共用同一判据防漂移 — `b17c76f`
 - P2-8 — `DATABASE_URL` 单独即选 postgres、新增 `RE0AUTH_STORAGE_DRIVER`、修正警告文案 — `e9dc23d`
 - P2-9 — `restore.sh` 校验绑定到实际入参 — `7f19637`
 - P2-10 — `.age` 加密备份路径同样执行校验 — `7f19637`

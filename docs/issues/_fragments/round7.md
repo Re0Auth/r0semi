@@ -62,7 +62,7 @@
 
 | ID | 严重度 | 问题 | 位置 | 状态 | 修法要点 |
 |---|---|---|---|---|---|
-| Z07-1 | P2 | pending 同意句柄的 TTL 在两个后端的 by-ID 读/决策路径上都不裁决，只靠 15 分钟一轮 sweep 执行（sweep 停摆则永不过期） | `internal/store/memory/oidc.go:402-410` | OPEN | `AuthRequestByID` 内存版补过期判据、PG 版加 `AND expires_at > $2`，并补「过期 auth request 的 by-ID 读被拒」测试；依据 `Z07-VERIFIED.md:45`、`00-MAIN-VERIFICATION.md` 无对应节 |
+| Z07-1 | P2 | pending 同意句柄的 TTL 在两个后端的 by-ID 读/决策路径上都不裁决，只靠 15 分钟一轮 sweep 执行（sweep 停摆则永不过期） | `internal/store/memory/oidc.go:402-410` | FIXED（b17c76f） | `AuthRequestByID` 内存版补过期判据、PG 版加 `AND expires_at > $2`，并补「过期 auth request 的 by-ID 读被拒」测试；依据 `Z07-VERIFIED.md:45`、`00-MAIN-VERIFICATION.md` 无对应节 |
 | Z07-3 | P2 | 设备验证页把调用方可控的 user_code 原样绑进浏览器会话：实测 32 次导航把单会话堆到 1 807 500 B（≈1.72 MiB；产品自设上限为 64 KiB，非原报告的 1 MiB） | `internal/httpapi/device_routes.go:69` | FIXED（4dff4a3） | 绑定/回显都用 `oauth.NormalizeUserCode(userCode)` 的规范值，并给 `Bind` 的 id 加字节上限；依据 `Z07-VERIFIED.md:47`、`Z07-VERIFIED.md:81-94` |
 | Z07-4 | P3 | CSRF 令牌创建是「后写者赢」竞态：并发首读者拿到服务端不认的令牌（4 个不同令牌中 3 个被拒） | `internal/auth/auth.go:238-245` | OPEN | 令牌由会话确定性导出（如 `HMAC(serverKey, sessionToken)`）或对「首次创建」做 compare-and-set；依据 `Z07-VERIFIED.md:48` |
 | Z07-5 | P3 | 设备决策要求调用方原样拼写 user_code，而查找走规范化 ⇒ 同一设备码两个答案（规范拼写反而 404） | `internal/httpapi/device_routes.go:108-112` | OPEN | 决策前先 `oauth.NormalizeUserCode(body.UserCode)`，并修正 `oauth/device.go:479` 与实现不符的注释；依据 `Z07-VERIFIED.md:49` |
@@ -79,7 +79,7 @@
 | Z08V-2 | P3 | Z08-3 的「构建产物无 `version.json` 引用」是错的：产物 `chunks/DqohD3-m.js` 确实带 `fetch(.../_app/version.json)` 与版本比对逻辑（方向是低估风险） | `docs/audit-7/findings/Z08-frontend-browser.md:133` | OPEN | 更正该事实，并据此给 `_app/version.json` 明确缓存指令；依据 `Z08-VERIFIED.md:26`、`Z08-VERIFIED.md:130-136` |
 | Z09-1 | P2 | `sources[].status` 无词汇表闸门：任何拼写变体（`Retired`/`retired `/`disabled`）被静默当作可服务源继续读取，并继续决定**另一个源**的 scope 闸门 | `internal/federation/federation.go:53-62` | OPEN | 照 `token_class` 同形在 `NewRegistry` 加显式 switch、词表外值拒绝启动（拒绝 vs 归一化是裁定）；同时更正 CS-4 的假文档断言 | 
 | Z09-4 | P2 | 缓冲预算全局先到先得、无 per-subject 分摊：15 个 raw 并发读（零字节或 ≥4 MiB body）即把其他用户的满额读 shed 成 503 | `internal/federation/service.go:108-113` | FIXED（6665193） | 三选一（裁定）：按调用方配额 / 按已读字节预留 / 首字节期限；并在 `MaxBufferedBytes` 注释写明"全局先到先得" | 
-| Z09V-1 | P2 | 共享 per-host 熔断器把"一个账号凭据坏了"当"源坏了"：5 次 401 让**其他账号** 30s 内读不到该源 | `httpclient/circuitbreaker.go:196-204` | OPEN | 401 按调用方/binding 计失败而非 host 熔断（裁定）；P1-3 目标用"同一 binding 连续 N 次 401 ⇒ 该 binding 冷却"达成 | 
+| Z09V-1 | P2 | 共享 per-host 熔断器把"一个账号凭据坏了"当"源坏了"：5 次 401 让**其他账号** 30s 内读不到该源 | `httpclient/circuitbreaker.go:196-204` | FIXED（b17c76f） | 401 按调用方/binding 计失败而非 host 熔断（裁定）；P1-3 目标用"同一 binding 连续 N 次 401 ⇒ 该 binding 冷却"达成 | 
 | Z09-2 | P3 | 归一化读没有"超过上限即拒绝"：4 MiB 上游体被静默截断后作为完整的 200 交出（`json.Valid` 接受尾随空白） | `internal/federation/service.go:760-775` | OPEN | 照抄 raw 两行：`LimitReader(..., maxBody+1)` + `len(body)>maxBody → ErrResponseTooLarge` | 
 | Z09-3 | P3 | 已退役的源仍可被绑定：`BeginBind`/`CompleteBind` 无 `Status` 判据，上游令牌被存进 vault 而数据面永不使用 | `internal/federation/bind.go:127-152` | OPEN | `registry.Get` 之后加 `Status == StatusRetired → ErrSourceRetired`（两处都要） | 
 | Z09V-2 | P3 | `refreshRejected` 把存储读失败当成"版本没动"：一次读故障即删绑定行并 crypto-shred vault 密钥（可能撕掉仍有效的绑定） | `internal/federation/refresh.go:143-159` | OPEN-PG | 重读的非 `ErrNotBound` 错误向上返回，不落入破坏性分支 | 
@@ -94,12 +94,12 @@
 | Z10-9 | P3 | `Verify` 不校验链头与最后一行一致：链头指向任何行都不拥有的哈希时仍答 `ok` | `internal/store/postgres/auditchain.go:318-328` | OPEN-PG | 遍历后 `bytes.Equal(prev, head)`，不一致即 `ok=false` + Reason | 
 | Z10V-1 | P3 | Kill Switch **失败路径**审计行漏记 `sessions_revoked`（会话已被切掉，持久记录里没有这个数） | `internal/admin/admin.go:389-391` | OPEN | 三条失败路径 Detail 加 `sessions_revoked`，或统一让失败路径走 `killDetail` | 
 | Z10V-2 | P3 | 内部监听器排空**没有自己的预算**：排在公网监听器之后共享同一个 30s `drainCtx`，第一个吃满时第二个得 0s | `cmd/re0auth/main.go:840-849` | OPEN | 每个 endpoint 各自 deadline / 内部监听器直接 `Close` / 改写 `shutdownTimeout` 语义并同步注释（裁定） | 
-| Z11-2 | P2 | 上游字节预算在写响应体之前就释放：预算约束的是读，不是被持有的 body（P0-3 修复不全）。**复核更正**：探针「body 被持有」前提在本机不成立（48/48 handler 已返回），证据等级由「探针测到」降为「源级 CONFIRMED + Linux 平台推论」 | `internal/federation/service.go:725-729`（写 body `internal/httpapi/federation_routes.go:296-297`） | OPEN | 预留生命周期挂到 body 持有者（`RawResult` 携带 `release`，`w.Write` 后释放），或按「已读+已写字节」计费 |
+| Z11-2 | P2 | 上游字节预算在写响应体之前就释放：预算约束的是读，不是被持有的 body（P0-3 修复不全）。**复核更正**：探针「body 被持有」前提在本机不成立（48/48 handler 已返回），证据等级由「探针测到」降为「源级 CONFIRMED + Linux 平台推论」 | `internal/federation/service.go:725-729`（写 body `internal/httpapi/federation_routes.go:296-297`） | FIXED（b17c76f） | 预留生命周期挂到 body 持有者（`RawResult` 携带 `release`，`w.Write` 后释放），或按「已读+已写字节」计费 |
 | Z11-3 | P2 | 调用方写的 `X-Request-Id` 无长度/字符集上限，被原样回显进响应头并写进访问日志（60 000 字节 ⇒ `echoed=60000 logged=60157`） | `internal/httpapi/middleware.go:138-142`（`:262` 入日志） | FIXED（6665193） | 仅 `len <= 128` 且字符集 `[A-Za-z0-9._-]` 时采信，否则生成新值；回显与日志都用清洗后的值 |
 | Z12-1 | P2 | 缺 `id:` 前缀的 `RE0AUTH_OIDC_RETIRED_TOKEN_KEYS` 把密钥原文打进启动日志（退役密钥仍解密轮换前签发的 access token） | `cmd/re0auth/main.go:1410`（`:1414` 同形） | FIXED（17914d4） | 消息只报位置/形状；CS-8 守卫补 plant 该变量 |
-| Z12-2 | P2 | `-rotate-keys` 扫到 0 条时退 0，恰好满足文档写下的放行闸门（「`rewrapped=0 skipped=0` 且退出 0」） | `cmd/re0auth/main.go:1209-1231`（文档闸门 `config/re0auth.example.toml:229-231`） | OPEN | `Scanned == 0` 时非零退出 |
-| Z12-4 | P2 | 文件里配的列表无法被环境清空（`RE0AUTH_ADMIN_SUBJECTS=""` ≠ 无人）：空串被当未设置，`/v1/admin` 仍挂着且无日志 | `cmd/re0auth/config.go:799`（`:564`、`:655`） | OPEN | 与 `rate_limit` 同形用指针区分缺省与显式空，或启动日志公布三个列表生效长度 |
-| Z12-6 | P2 | `rate_limit = NaN` 被接受并让限流器**放行一切**；复核补强：`+Inf` 语义同为永远允许，TOML 小写 `nan` 也成立（大写 `NaN` 被拒） | `cmd/re0auth/config.go:512-522`（`main.go:225-228`） | OPEN | 解析后加 `math.IsNaN/IsInf` 即拒，判据改成非 NaN 安全形式 |
+| Z12-2 | P2 | `-rotate-keys` 扫到 0 条时退 0，恰好满足文档写下的放行闸门（「`rewrapped=0 skipped=0` 且退出 0」） | `cmd/re0auth/main.go:1209-1231`（文档闸门 `config/re0auth.example.toml:229-231`） | FIXED（b17c76f） | `Scanned == 0` 时非零退出 |
+| Z12-4 | P2 | 文件里配的列表无法被环境清空（`RE0AUTH_ADMIN_SUBJECTS=""` ≠ 无人）：空串被当未设置，`/v1/admin` 仍挂着且无日志 | `cmd/re0auth/config.go:799`（`:564`、`:655`） | FIXED（b17c76f） | 与 `rate_limit` 同形用指针区分缺省与显式空，或启动日志公布三个列表生效长度 |
+| Z12-6 | P2 | `rate_limit = NaN` 被接受并让限流器**放行一切**；复核补强：`+Inf` 语义同为永远允许，TOML 小写 `nan` 也成立（大写 `NaN` 被拒） | `cmd/re0auth/config.go:512-522`（`main.go:225-228`） | FIXED（b17c76f） | 解析后加 `math.IsNaN/IsInf` 即拒，判据改成非 NaN 安全形式 |
 | Z12-9 | P2 | 文件里的池大小被截断到 int32（`4294967297` 读成 1、`4294967296` 读成 0），环境变量路径却拒绝越界值——两路径语义不一致 | `cmd/re0auth/config.go:1062-1067`（环境路径 `:1116-1126`） | OPEN-PG | 先做 `math.MinInt32/MaxInt32` 范围检查，或字段声明为 `*int32`；真 pgxpool 实际池大小只能在真 Postgres 上定论 |
 | Z13-1 | P2 | 两个备份脚本默认输出目录 `./backups` 既不在 `.gitignore` 也不在 `.dockerignore`；一次 `git add -A` 送上 KEK 与全部长期密钥 | `scripts/backup.sh:12`、`scripts/backup-keys.sh:23` | FIXED（17914d4） | `.gitignore` 与 `.dockerignore` 各加 `/backups/`、`*.dump`、`*.env`（或默认落点改 `$TMPDIR`/必填） |
 | Z13-3 | P2 | 运行镜像不带 npm 归属清单，而 Makefile 自己要求它随「每个二进制、归档和镜像」分发（SPA 经 `go:embed` 进同一二进制） | `Dockerfile:74`（`Makefile:205-221`） | FIXED（17914d4） | web 阶段落 `pnpm licenses list --json` 到 `/out/`，runtime `COPY`，并更新 `workflows_test.go:21-41` 与 `artifacts_test.go:606` 两处白名单 |
@@ -114,7 +114,7 @@
 | Z13-5 | P3 | `internal/archtest` 的写权限门只看 workflow 级 `permissions`，job 级越权不响（仓库已有真实 job 级 `security-events: write` 未被看见） | `internal/archtest/workflows_test.go:280-312` | OPEN | 下钻 `jobs.*.permissions`，断言写 scope 只出现在已知需要它的 job 名单里（名单写成测试常量） |
 | Z13-6 | P3 | npm 归属清单是否被 `SHA256SUMS` 覆盖，没有守卫；**与 Z16-4 同守卫同根因，复核建议合并为一** | `Makefile:219`（`internal/archtest/workflows_test.go:16-20`） | OPEN | 门禁加「走向真实产出路径」的断言（解出 `checksums` glob 逐个匹配文件名），或改显式列表而非通配 |
 | Z13-7 | P3 | README 对发布产物与镜像内容的描述与产物不符（未提 npm 清单；称镜像「只带二进制与 CA 证书」而 `Dockerfile:74` 已 COPY LICENSE/NOTICE） | `README.md:129-132`（`:160`） | OPEN | README 补 npm 清单文件名与用途；镜像那句改成含 LICENSE、NOTICE |
-| Z14-1 | P2 | 级联撤销失败后 refresh token 已被源消费，Re0Auth 的「重试」永远解不出 subject，该绑定「登出全部设备」永久不可用 | `referencesource/cascade.go:52-55,80-86` | OPEN | 先非破坏性解析 subject、上游成功后再消费，并把 `upstream-protocol.md:162` 与 `server.go:85-86` 改成「仅成功后 MAY consume」（来源：`Z14-VERIFIED.md:24-25`） |
+| Z14-1 | P2 | 级联撤销失败后 refresh token 已被源消费，Re0Auth 的「重试」永远解不出 subject，该绑定「登出全部设备」永久不可用 | `referencesource/cascade.go:52-55,80-86` | FIXED（b17c76f） | 先非破坏性解析 subject、上游成功后再消费，并把 `upstream-protocol.md:162` 与 `server.go:85-86` 改成「仅成功后 MAY consume」（来源：`Z14-VERIFIED.md:24-25`） |
 | Z14-2 | P2 | 一致性套件对 `/oauth/revoke` 认证零断言，谁都能吊销的数据源被判 compliant（对 KIT-7 只修了 cascade 一半的补充） | `upstreamkit/conformance/conformance.go:253-265` | FIXED（4dff4a3） | `checkRevocationEndpoint` 对无凭据 POST 断言非 2xx，并给 `token.rejects_bad_grant` 加未知 client 判据（来源：`Z14-VERIFIED.md:39-40`） |
 | Z14-3 | P2 | `jwks_uri` 不与 issuer 绑定，能左右 discovery 的一方用自控私钥伪造任意 sub（对 RP-3 修复的补充：钉了 2 个端点、漏第 3 个） | `idp/idp.go:486-509` | FIXED（17914d4） | `pinToIssuer` 纳入 `jwks_uri`（空值跳过）并接到 verifier 路径；该 scope-out 按裁定应本轮收回（来源：`Z14-VERIFIED.md:51-61`、`00-MAIN-VERIFICATION.md:411-424`） |
 | Z14-4 | P2 | discovery 持续失败时 provider 缓存回退使退役密钥无限期验签成功（RP-2 的 TTL 被旁路，窗口从 15 分钟变成「故障持续多久」） | `idp/idp.go:619-637` | FIXED（4dff4a3） | 保留旧 provider 的同时保留其年龄，超过硬上界（如 `2×TTL`）即 fail-closed（来源：`Z14-VERIFIED.md:63-70`、`00-MAIN-VERIFICATION.md:426-436`） |
@@ -144,7 +144,7 @@
 | Z17V-1 | P3 | README 的参考数据源快速开始同样照抄即拒绝启动：样例 `[client] secret_env` 生效而样例头部自称「every field has a default」 | `config/referencesource.example.toml:17-18`、`README.md:73-78` | OPEN | 样例注释掉 `[client] secret_env`，README 片段补 `REFERENCE_SOURCE_CLIENT_SECRET`，并修正「或 GOOGLE_CLIENT_SECRET」的表述（来源：`Z17-VERIFIED.md:95-125`） |
 | Z19-1 / Z19V-1 | P2 | `*_env`（含 `dsn_env`）「名字位塞值/DSN 原文」被启动错误原文回显进日志（同一洞，主代理 V-28 裁定合并） | `internal/config/config.go:57-66`；`internal/store/postgres/postgres.go:225-227`；`cmd/re0auth/config.go:1037` | FIXED（17914d4） | 不做形状正则判断（纯字母数字密钥可通过），直接**不回显文件里的字符串**，只报字段名＋「不是合法变量名」；同族站点 `kek_id` 一并对齐 |
 | Z19-4 | P2 | `-rotate-keys` 用「同料不同 id」的 KEK 报出成功轮换，退役键仍能开每条记录且 exit 0 | `vault/service.go:112-130` | FIXED（4dff4a3） | `WithRetiredKeys` 在 id 检查外加材料同一性检查（`Fingerprint()`，不暴露 KEK），启动时两两比对拒绝启动 |
-| Z20-1 | P2 | 每一次成功的授权码兑换都写一条字段全空的 `oidc.consent.deny`（两后端），真拒绝流被 1:1 污染 | `internal/store/memory/oidc.go:449-467`；`internal/store/postgres/oidc.go:287-311` | OPEN | `DeleteAuthRequest` 先读 `done`/`subject`：行已不存在按「已兑换清理」记 `oidc.consent.exchange`（或不记），仅当行存在且 `!done` 才记 deny |
+| Z20-1 | P2 | 每一次成功的授权码兑换都写一条字段全空的 `oidc.consent.deny`（两后端），真拒绝流被 1:1 污染 | `internal/store/memory/oidc.go:449-467`；`internal/store/postgres/oidc.go:287-311` | FIXED（b17c76f） | `DeleteAuthRequest` 先读 `done`/`subject`：行已不存在按「已兑换清理」记 `oidc.consent.exchange`（或不记），仅当行存在且 `!done` 才记 deny |
 | Z18-2 | P3 | `idp` 把 `providerMu` 跨 discovery 网络 I/O 持有，发现期间该 provider 登录被串行化（最坏 10s/次，失败不缓存会重复） | `idp/idp.go:619-637` | OPEN | 网络发现移到锁外（double-checked）或给发现单独短超时＋singleflight |
 | Z18-3 | P3 | `oauth.MemoryStore` 把存储的 `Scopes` 切片交出去（GetAccess/Introspect），改返回值即改活令牌授权 | `oauth/tokens.go:216-232`；`oauth/as.go:280` | OPEN | `Save*/Get*/Consume*` 出入口 `slices.Clone`（PG 后端已 clone，属同契约实现不对称） |
 | Z18v-1 | P3 | 同族第二道门：`ListBySubject` 的 `GrantRecord.Scopes` 也指向存储数组，Z18-3 修法漏了它 | `oauth/tokens.go:158-180` | OPEN | `ListBySubject` 返回时 clone（或统一到一个 `cloneToken` 出口） |
@@ -211,6 +211,15 @@
   - Z14-4 — discovery 持续失败时 provider 缓存新增 2×TTL 硬上界，超过即 fail-closed — `4dff4a3`
   - Z19-4 — `vault.KeyFingerprint` 可选接口 + `LocalKeyWrapper` 指纹，`WithRetiredKeys` 拒绝同材料换 id 的「轮换」 — `4dff4a3`
   - N-04 — ci.yml 新增 `probes` 作业（三套 tag 的 vet 编译 + 显式绿名单），打 tag 时经 release.yml 自动继承 — `4dff4a3`
+- 第七轮 T3 批次（「首个补丁（月内）」，本轮九项；Z16-2 另起，`b17c76f`）：
+  - Z07-1 — 两个 store 的 `AuthRequestByID` 裁决 `expires_at`；N-01 的 Z07-1 豁免删除（postgres 守卫改为按方法体断言） — `b17c76f`
+  - Z20-1 — 铸码后的 `DeleteAuthRequest` 清理不再写字段全空的 `oidc.consent.deny`；只在行还在且未完成时记真拒绝 — `b17c76f`
+  - Z12-6 — 非有限 `rate_limit` 加载期拒绝，不再装「放行一切」的限流器 — `b17c76f`
+  - Z12-4 — 显式空的三个列表变量真正清空文件列表（`config.List` 用 `os.LookupEnv`），并记 `access lists resolved` / `operator plane disabled` — `b17c76f`
+  - Z12-2 — `-rotate-keys` 扫到 0 条时非零退出（`scanned=0` 不能认证轮换完成） — `b17c76f`
+  - Z09V-1 — 401 不再算主机级熔断失败，改按 binding 的 401 冷却（阈值 5/30s，有界），跨账号不再互相 shed — `b17c76f`
+  - Z11-2 — 先补平台无关的确定性复现（阻塞 writer），再把字节预算预留跟随响应体生命周期（`Release` + handler `defer`） — `b17c76f`
+  - Z14-1 — `oauth.Store` 新增非破坏性 `GetRefresh`；级联失败不再消费 refresh，上游成功后才消费 — `b17c76f`
 
 ## 有意不做 / 已裁定
 
