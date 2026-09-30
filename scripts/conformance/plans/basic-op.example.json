@@ -10,7 +10,7 @@
     "client": {
       "client_id": "conformance",
       "client_secret": "spike-secret",
-      "redirect_uri": "https://localhost:9443/test/a/conformance/callback"
+      "redirect_uri": "http://localhost:9443/test/a/conformance/callback"
     }
   }
 }

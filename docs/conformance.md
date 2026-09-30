@@ -33,7 +33,11 @@ have caught them on every commit.
 5. builds a derived suite image that imports Caddy's CA into the JVM `cacerts`
    (the JVM ignores a mounted PEM), falling back to the upstream image if that
    build fails;
-6. starts `openid/conformance-suite` on `:9443` and prints
+6. starts the suite **and its MongoDB** — the published suite image is the server
+   half of the project's compose topology: it listens on `:8080` and needs a
+   `mongo` beside it (we run `mongo:6.0.13`, the version the project pins). It is
+   published on `:9443` and reached over **HTTP**; the compose's nginx/TLS front is
+   only there to give a tester's browser a TLS origin. Prints
    `/api/runner/available` (milestones 1–5, plus 4b).
 7. when a plan payload is supplied, posts it to `/api/runner`, polls the run to a
    terminal status, and records the verdict (milestones 6–7). The suite has used
@@ -76,9 +80,10 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 
 ## Known gaps (the reason this is still a spike)
 
-- **JVM trust store.** Addressed by milestone 4b: the script builds a
-  `FROM openid/conformance-suite` image that runs `keytool -importcert` against
-  `${JAVA_HOME}/lib/security/cacerts` with Caddy's local CA — root, plus the
+- **JVM trust store.** Addressed by milestone 4b: the script builds a derived image
+  `FROM registry.gitlab.com/openid/conformance-suite:latest` (the base is
+  `eclipse-temurin:21`, so the JDK is at `/opt/java/openjdk`) that runs
+  `keytool -importcert` against its `cacerts` with Caddy's local CA — root, plus the
   intermediate when the layout has one, because the chain is root → intermediate →
   leaf and some builds serve only the leaf. This has not been observed on a runner
   yet — if the base image's JDK path differs, the build fails and the script falls
@@ -100,9 +105,12 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
   plans run unattended therefore requires a **test-only auto-login/auto-consent
   path** (build-tagged, never in a shipped binary) or an attended run. That is a
   product decision, not a wiring fix, and it is not implemented here.
-- **Pinned images.** `caddy:2`, `curlimages/curl:latest` and
-  `openid/conformance-suite` are floating tags. Once the job is a gate they must be
-  pinned by digest, like the `Dockerfile` base images.
+- **Pinned images.** `caddy:2`, `curlimages/curl:latest`,
+  `registry.gitlab.com/openid/conformance-suite:latest` and `mongo:6.0.13` are
+  floating tags. Once the job is a gate they must be pinned by digest, like the
+  `Dockerfile` base images. (Docker Hub's `openid/conformance-suite` no longer
+  exists — the first CI run found that out; the project publishes to its own GitLab
+  registry.)
 
 ## Turning it into a gate
 

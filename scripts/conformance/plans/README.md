@@ -29,7 +29,7 @@ things must line up at once:
 | `config.server.issuer` | the OP's issuer, `https://re0auth.test:8443` |
 | `config.client.client_id` | `conformance` (the id the spike seeds via `[client]`) |
 | `config.client.client_secret` | `CONFORMANCE_CLIENT_SECRET`, default `spike-secret` |
-| `config.client.redirect_uri` | **both** the value the suite expects for this test **and** the one the spike seeds. The suite generates it per test; read it from the test page (`https://localhost:9443`) or ask the suite in the first run, then pass it back as the `redirect_uri` input so the OP's `[client]` matches. |
+| `config.client.redirect_uri` | **both** the value the suite expects for this test **and** the one the spike seeds. The suite generates it per test from its public origin (`BASE_URL`, which the spike sets to `http://localhost:9443`); read it from the test page or ask the suite in the first run, then pass it back as the `redirect_uri` input so the OP's `[client]` matches. |
 
 A mismatch surfaces as `redirect_uri is not registered` from the OP (or a suite
 complaint that the authorization response went to the wrong place), which is why

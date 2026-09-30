@@ -20,7 +20,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 CADDY_NAME=re0auth-spike-caddy
-SUITE_NAME=re0auth-spike-suite
 OP_PID=""
 
 log()  { printf 'spike: %s\n' "$*"; }
@@ -34,7 +33,8 @@ warn() { printf 'WARN %s\n' "$*" | tee -a "${MILESTONES}"; log "$*"; }
 
 cleanup() {
   [[ -n "${OP_PID}" ]] && kill "${OP_PID}" 2>/dev/null || true
-  docker rm -f "${CADDY_NAME}" "${SUITE_NAME}" >/dev/null 2>&1 || true
+  docker rm -f "${CADDY_NAME}" "${SUITE_NAME}" "${MONGO_NAME}" >/dev/null 2>&1 || true
+  docker network rm "${SPIKE_NET}" >/dev/null 2>&1 || true
   rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -58,6 +58,18 @@ PUBLIC_PORT=8443
 SUITE_PORT=9443
 OP_PORT=8080
 
+# The suite is NOT on Docker Hub: `openid/conformance-suite` no longer exists there
+# (the first CI run died on "pull access denied"). It is published to the project's
+# own GitLab registry, anonymously pullable, and it is the SERVER half of the
+# topology: the app listens on 8080 in-container and needs MongoDB (the official
+# compose runs mongodb + server + nginx). We run server + mongo and reach the API
+# over HTTP, which is all a spike needs; TLS for the OP is Caddy's job below.
+SUITE_IMAGE="registry.gitlab.com/openid/conformance-suite:latest"
+MONGO_IMAGE="mongo:6.0.13" # the version the project's docker-compose.yml pins
+SUITE_NAME=re0auth-spike-suite
+MONGO_NAME=re0auth-spike-mongo
+SPIKE_NET=re0auth-spike-net
+
 # ---- material ---------------------------------------------------------------
 log "generating keys"
 head -c 32 /dev/urandom | base64 -w0 > "${WORK}/kek"
@@ -78,8 +90,9 @@ export CONFORMANCE_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET:-spike-secret}"
 export RE0AUTH_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET}"
 
 # The suite's redirect URI is generated per deployment; override it with
-# CONFORMANCE_REDIRECT_URI once the suite shows you its client configuration.
-REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-https://localhost:${SUITE_PORT}/test/a/conformance/callback}"
+# CONFORMANCE_REDIRECT_URI once the suite shows you its client configuration. Its
+# scheme and port follow BASE_URL (the suite's public origin), which is HTTP here.
+REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-http://localhost:${SUITE_PORT}/test/a/conformance/callback}"
 # `[client]` keys come from cmd/re0auth/config.go's clientSection: id, name,
 # secret_env, redirect_uris, scopes. `client_id` belongs to [idp.*] and is an
 # unknown key here, which the config loader refuses by design.
@@ -162,7 +175,6 @@ pass "milestone 4: a container reaches the OP over TLS with the spike CA"
 # PEM into the container does nothing for it. Derive an image that imports both CA
 # certificates, so the suite will accept the self-signed issuer. A build failure
 # falls back to the upstream image so the connectivity milestones below still report.
-SUITE_IMAGE="openid/conformance-suite"
 log "building a suite image that trusts the spike CA"
 # A clean build context: the working directory also holds the generated keys, and
 # a build context is shipped to the daemon whole.
@@ -171,8 +183,11 @@ cp "${WORK}/caddy-root.crt" "${WORK}/suite-image/caddy-root.crt"
 # COPY requires the file to exist; an empty stand-in makes the RUN step skip it.
 cp "${WORK}/caddy-root.crt" "${WORK}/suite-image/caddy-intermediate.crt"
 [[ -s "${WORK}/caddy-intermediate.crt" ]] && cp "${WORK}/caddy-intermediate.crt" "${WORK}/suite-image/caddy-intermediate.crt"
+# The upstream Dockerfile is `FROM eclipse-temurin:21`, whose JDK lives at
+# /opt/java/openjdk; JAVA_HOME covers a layout that sets it.
 cat > "${WORK}/suite-image/Dockerfile" <<'DOCKEREOF'
-FROM openid/conformance-suite
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 USER root
 COPY caddy-root.crt caddy-intermediate.crt /tmp/
 RUN set -eux; \
@@ -184,7 +199,8 @@ RUN set -eux; \
         -file /tmp/caddy-intermediate.crt -keystore "${ks}" -storepass changeit; \
     fi
 DOCKEREOF
-if docker build -t re0auth-conformance-spike:local -f "${WORK}/suite-image/Dockerfile" "${WORK}/suite-image" > "${WORK}/suite-build.log" 2>&1; then
+if docker build --build-arg "BASE_IMAGE=${SUITE_IMAGE}" -t re0auth-conformance-spike:local \
+     -f "${WORK}/suite-image/Dockerfile" "${WORK}/suite-image" > "${WORK}/suite-build.log" 2>&1; then
   SUITE_IMAGE="re0auth-conformance-spike:local"
   pass "milestone 4b: a CA-trusting suite image was built"
 else
@@ -192,20 +208,31 @@ else
   tail -n 20 "${WORK}/suite-build.log" || true
 fi
 
-# ---- 5. the suite itself ----------------------------------------------------
-log "starting the conformance suite (${SUITE_IMAGE})"
+# ---- 5. the suite itself (server + MongoDB) ---------------------------------
+# The app listens on 8080 in-container. We publish it on SUITE_PORT and speak HTTP:
+# the nginx half of the official compose only exists to give the tester's browser a
+# TLS origin, which a headless spike does not need. BASE_URL is the public origin the
+# suite builds its redirect URIs from, so it names the published port.
+log "starting the conformance suite and its MongoDB"
+docker network create "${SPIKE_NET}" >/dev/null
+docker run -d --name "${MONGO_NAME}" --network "${SPIKE_NET}" --network-alias mongodb \
+  "${MONGO_IMAGE}" >/dev/null
 docker run -d --name "${SUITE_NAME}" \
+  --network "${SPIKE_NET}" \
   --add-host re0auth.test:host-gateway \
-  -p "${SUITE_PORT}:8443" \
+  -e MONGODB_HOST=mongodb \
+  -e BASE_URL="http://localhost:${SUITE_PORT}" \
+  -e JAVA_EXTRA_ARGS="--fintechlabs.devmode=true --fintechlabs.startredir=true" \
+  -p "${SUITE_PORT}:8080" \
   "${SUITE_IMAGE}" >/dev/null
 
-for _ in $(seq 1 60); do
-  if curl -fsSk "https://localhost:${SUITE_PORT}/api/runner/available" >/dev/null 2>&1; then break; fi
-  sleep 1
+API="http://localhost:${SUITE_PORT}"
+for _ in $(seq 1 90); do
+  if curl -fsS "${API}/api/runner/available" >/dev/null 2>&1; then break; fi
+  sleep 2
 done
 
-API="https://localhost:${SUITE_PORT}"
-if curl -fsSk "${API}/api/runner/available" > "${WORK}/available.json" 2>/dev/null; then
+if curl -fsS "${API}/api/runner/available" > "${WORK}/available.json" 2>/dev/null; then
   pass "milestone 5: the suite REST API answers on :${SUITE_PORT}"
   log "available plans written to ${WORK}/available.json (first 40 lines):"
   head -n 40 "${WORK}/available.json" || true
@@ -240,7 +267,7 @@ PLAN_STATUS="not-run"
 PLAN_RESULT=""
 if [[ -n "${CONFORMANCE_PLAN_JSON:-}" && -f "${CONFORMANCE_PLAN_JSON}" ]]; then
   log "posting CONFORMANCE_PLAN_JSON to /api/runner"
-  curl -fsSk -X POST "${API}/api/runner" \
+  curl -fsS -X POST "${API}/api/runner" \
     -H 'Content-Type: application/json' \
     --data-binary "@${CONFORMANCE_PLAN_JSON}" > "${WORK}/run.json"
   RUN_ID="$(json_field "${WORK}/run.json" id testId test_id)"
@@ -252,7 +279,7 @@ if [[ -n "${CONFORMANCE_PLAN_JSON:-}" && -f "${CONFORMANCE_PLAN_JSON}" ]]; then
     PLAN_STATUS="RUNNING"
     deadline=$(( SECONDS + ${CONFORMANCE_TIMEOUT_SECONDS:-600} ))
     while (( SECONDS < deadline )); do
-      curl -fsSk "${API}/api/runner/${RUN_ID}" > "${WORK}/run-status.json" 2>/dev/null || true
+      curl -fsS "${API}/api/runner/${RUN_ID}" > "${WORK}/run-status.json" 2>/dev/null || true
       PLAN_STATUS="$(json_field "${WORK}/run-status.json" status)"
       case "${PLAN_STATUS}" in
         FINISHED|INTERRUPTED|STOPPED) break ;;
