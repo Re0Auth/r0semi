@@ -54,12 +54,21 @@ SPIKE_ARTIFACTS=$PWD/conformance-artifacts \
 
 ## Running a plan
 
-`workflow_dispatch` takes two inputs:
+`workflow_dispatch` takes three inputs:
 
 | input | meaning |
 |---|---|
-| `plan_json` | repo-relative path to a JSON payload for `POST /api/runner`. The suite's catalogue (`available.json` in the artifact) is the authority on the plan name, variant and client configuration. |
+| `plan_json` | repo-relative path to a JSON payload for `POST /api/runner`. **Leave empty on the first run**: the spike then prints the suite's plan catalogue under "Available plans" in the run summary, and that catalogue is the authority on the plan name and variant. [`scripts/conformance/plans/README.md`](../scripts/conformance/plans/README.md) has the fill-in guide and a template. |
+| `redirect_uri` | the redirect URI seeded into the OP's `[client]`. It must equal the one the suite generates for the test; read it from the suite and pass it back here so both sides match. Blank keeps the script default. |
 | `require_plan` | when true, the script exits non-zero unless the plan reaches `FINISHED` with `SUCCESS`/`WARNING`/`REVIEW`/`SKIPPED`. Use this once the nightly is green — it is the same switch as dropping `continue-on-error`. |
+
+**First run, concretely:** dispatch with `plan_json` empty. Read the milestone table
+and the plan list in the run summary, and `available.json` in the
+`conformance-spike` artifact. Then copy
+[`scripts/conformance/plans/basic-op.example.json`](../scripts/conformance/plans/basic-op.example.json)
+to a real payload, fill it from that catalogue, and dispatch again with
+`plan_json` set (plus `redirect_uri` if the suite's value differs from the seeded
+one).
 
 Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 `CONFORMANCE_REQUIRE_PLAN=1`, `CONFORMANCE_TIMEOUT_SECONDS` (default 600),

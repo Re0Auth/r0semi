@@ -252,6 +252,26 @@ else
 fi
 
 # ---- artifacts and the report the nightly routine reads ---------------------
+# The catalogue is the authority for a plan payload (test name, variant, config),
+# so surface it where the dispatcher will actually look: the run summary.
+plan_names() {
+  "${PYTHON}" - "${WORK}/available.json" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit
+if isinstance(data, dict):
+    names = list(data.keys())
+elif isinstance(data, list):
+    names = [d.get("testName") or d.get("name") or "?" for d in data]
+else:
+    names = []
+for name in names[:40]:
+    print(name)
+PY
+}
+
 if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
   mkdir -p "${SPIKE_ARTIFACTS}"
   cp "${WORK}/available.json" "${WORK}/run.json" "${WORK}/run-status.json" "${SPIKE_ARTIFACTS}/" 2>/dev/null || true
@@ -268,7 +288,16 @@ if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
     echo
     printf 'Plan: %s%s\n' "${PLAN_STATUS}" "${PLAN_RESULT:+ (${PLAN_RESULT})}"
     echo
-    printf 'Suite: %s | issuer %s\n' "${SUITE_IMAGE}" "${ISSUER}"
+    printf 'Suite: %s | issuer %s | seeded redirect_uri `%s`\n' "${SUITE_IMAGE}" "${ISSUER}" "${REDIRECT_URI}"
+    if [[ "${PLAN_STATUS}" == "not-run" ]]; then
+      echo
+      echo "No plan payload was supplied. This run proved connectivity; pick a plan below,"
+      echo "then dispatch again with \`plan_json\` (see scripts/conformance/plans/README.md)."
+      echo
+      echo "### Available plans (first 40; full list in available.json)"
+      echo
+      plan_names | sed 's/^/- `/; s/$/`/'
+    fi
   } > "${SPIKE_ARTIFACTS}/summary.md"
   cat "${SPIKE_ARTIFACTS}/summary.md" || true
 fi

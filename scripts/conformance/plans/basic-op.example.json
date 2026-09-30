@@ -1,0 +1,16 @@
+{
+  "test": "<plan name, e.g. oidcc-basic-certification-test-plan — copy it from available.json>",
+  "variant": {
+    "<variant key>": "<variant value>"
+  },
+  "config": {
+    "server": {
+      "issuer": "https://re0auth.test:8443"
+    },
+    "client": {
+      "client_id": "conformance",
+      "client_secret": "spike-secret",
+      "redirect_uri": "https://localhost:9443/test/a/conformance/callback"
+    }
+  }
+}

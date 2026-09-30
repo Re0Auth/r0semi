@@ -39,6 +39,24 @@ else:
 PY
 }
 
+plan_names() {
+  "${PYTHON}" - "$1" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit
+if isinstance(data, dict):
+    names = list(data.keys())
+elif isinstance(data, list):
+    names = [d.get("testName") or d.get("name") or "?" for d in data]
+else:
+    names = []
+for name in names[:40]:
+    print(name)
+PY
+}
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
@@ -47,6 +65,16 @@ printf '{"testId":"abc"}' > "${WORK}/run.json"
 
 got="$(json_field "${WORK}/run.json" id testId test_id)"
 [ "${got}" = "abc" ] || { printf 'field fallback returned %q, want "abc"\n' "${got}" >&2; exit 1; }
+
+# The catalogue has been an object of plan-name -> metadata, and a list of objects.
+printf '{"oidcc-basic-certification-test-plan":{},"fapi2-security-profile":{}}' > "${WORK}/avail-dict.json"
+printf '[{"testName":"oidcc-basic-certification-test-plan"},{"name":"oidcc-server"}]' > "${WORK}/avail-list.json"
+dict_names="$(plan_names "${WORK}/avail-dict.json" | tr -d '\r' | tr '\n' ',')"
+[ "${dict_names}" = "oidcc-basic-certification-test-plan,fapi2-security-profile," ] || {
+  printf 'dict catalogue names = %q\n' "${dict_names}" >&2; exit 1; }
+list_names="$(plan_names "${WORK}/avail-list.json" | tr -d '\r' | tr '\n' ',')"
+[ "${list_names}" = "oidcc-basic-certification-test-plan,oidcc-server," ] || {
+  printf 'list catalogue names = %q\n' "${list_names}" >&2; exit 1; }
 
 table="$(
   while IFS= read -r line; do

@@ -16,7 +16,11 @@ on:
   workflow_dispatch:
     inputs:
       plan_json:
-        description: 'Repo-relative path to a JSON payload for POST /api/runner (optional)'
+        description: 'Repo-relative path to a POST /api/runner payload. Leave EMPTY on the first run: the plan catalogue is printed to the summary.'
+        required: false
+        default: ''
+      redirect_uri:
+        description: 'Redirect URI seeded into the OP client; must equal the one the suite generates (blank = the script default)'
         required: false
         default: ''
       require_plan:
@@ -50,6 +54,7 @@ jobs:
         env:
           SPIKE_ARTIFACTS: ${{ github.workspace }}/conformance-artifacts
           CONFORMANCE_PLAN_JSON: ${{ inputs.plan_json }}
+          CONFORMANCE_REDIRECT_URI: ${{ inputs.redirect_uri }}
           CONFORMANCE_REQUIRE_PLAN: ${{ inputs.require_plan && '1' || '0' }}
         run: |
           mkdir -p "${SPIKE_ARTIFACTS}"
