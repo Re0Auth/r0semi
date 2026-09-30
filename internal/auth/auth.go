@@ -557,6 +557,58 @@ func outcomeFor(code string) string {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/{provider}/start", h.handleStart)
 	mux.HandleFunc("GET /auth/{provider}/callback", h.handleCallback)
+	mux.HandleFunc("GET /auth/reauth", h.handleReauth)
+}
+
+// handleReauth sends a signed-in browser back through its identity provider so a
+// request that demanded a fresh authentication gets one.
+//
+// It exists because the OP's login boundary cannot name the provider: only the
+// account store knows which identities the signed-in user has. The caller passes
+// the page to return to after the new sign-in; this resolves the primary
+// identity's provider and starts an ordinary login flow pointed at it (S02-1). A
+// user who cannot be resolved is refused rather than sent to a consent screen
+// that would have to fabricate an authentication.
+func (h *Handler) handleReauth(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.manager.User(r.Context())
+	if !ok {
+		http.Error(w, "sign in required", http.StatusUnauthorized)
+		return
+	}
+	returnTo := safeurl.RelativePath(r.URL.Query().Get("return_to"))
+
+	u, err := h.accounts.GetUser(r.Context(), user)
+	if err != nil {
+		http.Error(w, "cannot resolve your account", http.StatusInternalServerError)
+		return
+	}
+	identities, err := h.accounts.Identities(r.Context(), user)
+	if err != nil || len(identities) == 0 {
+		http.Error(w, "no identity to re-authenticate with", http.StatusBadRequest)
+		return
+	}
+	provider := identityProvider(identities, u.PrimaryIdentity)
+	if _, ok := h.registry.Get(provider); !ok {
+		http.Error(w, "the identity provider is no longer configured", http.StatusBadRequest)
+		return
+	}
+	target := "/auth/" + url.PathEscape(string(provider)) + "/start?mode=login&return_to=" + url.QueryEscape(returnTo)
+	// The target is a same-origin path: the provider is a validated registry key and
+	// return_to went through safeurl.RelativePath. No request value becomes an origin.
+	// nosemgrep: go.lang.security.injection.open-redirect.open-redirect
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+// identityProvider picks the identity the account names as primary, or the first
+// one. Primary is display-only (I-1), so any identity re-authenticates the same
+// account.
+func identityProvider(identities []account.Identity, primary account.IdentityID) idp.Provider {
+	for _, in := range identities {
+		if in.ID == primary {
+			return in.Provider
+		}
+	}
+	return identities[0].Provider
 }
 
 // Providers lists the identity providers this deployment offers, so a frontend can

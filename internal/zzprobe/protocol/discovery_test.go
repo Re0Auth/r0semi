@@ -123,9 +123,11 @@ func TestProbePromptNoneReturnsLoginRequired(t *testing.T) {
 	}
 }
 
-// The other half: with a live session, `prompt=none` is satisfied and proceeds to
-// consent rather than returning an error.
-func TestProbePromptNoneWithASessionProceeds(t *testing.T) {
+// The other half: with a live session but no remembered consent, `prompt=none`
+// must answer `consent_required` through the client — never render the consent UI.
+// (S02-2: this OP has no pre-stored consent, so a silent request can only be
+// refused; "with a session it proceeds to consent" was the defect.)
+func TestProbePromptNoneWithASessionIsConsentRequired(t *testing.T) {
 	signedIn := "usr_probe"
 	e := newEnv(t, envOptions{issuer: "https://issuer.probe", sessionUser: &signedIn})
 
@@ -136,13 +138,13 @@ func TestProbePromptNoneWithASessionProceeds(t *testing.T) {
 	t.Logf("prompt=none with a session answered %d %q", resp.StatusCode, loc)
 
 	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("prompt=none with a session = %d, want a 302 to consent", resp.StatusCode)
+		t.Fatalf("prompt=none with a session = %d, want a 302 back to the client", resp.StatusCode)
 	}
-	if strings.Contains(loc, "error=login_required") {
-		t.Errorf("prompt=none returned login_required despite a live session: %q", loc)
+	if !strings.Contains(loc, "error=consent_required") {
+		t.Errorf("prompt=none with a session did not answer consent_required: %q", loc)
 	}
-	if !strings.Contains(loc, "authRequestID=") {
-		t.Errorf("prompt=none with a session did not start the consent flow: %q", loc)
+	if strings.Contains(loc, "authRequestID=") || strings.Contains(loc, "/consent") {
+		t.Errorf("prompt=none with a session reached the interactive consent plane: %q", loc)
 	}
 }
 

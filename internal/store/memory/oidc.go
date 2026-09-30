@@ -49,9 +49,18 @@ type OIDCStore struct {
 	// has to go with it. By the time the replay arrives the live row is gone, so
 	// the tombstone is the only thing that still carries the family id and the
 	// paired access token's id hash the revocation needs.
+	//
+	// The map is bounded by maxTombstones. A rotation writes one entry that would
+	// otherwise live for the spent token's whole 30-day refresh TTL, and rotation
+	// is an ordinary token-endpoint path, so without a bound one client could grow
+	// this map for a month (S13-5). Past the bound one arbitrary entry is dropped:
+	// replay detection stays exact for the most recent rotations and becomes
+	// best-effort for the oldest, which is the documented trade.
 	refreshTombstones map[string]refreshTombstone
-	devices           map[string]deviceRecord // by TokenHash(device code)
-	userCodes         map[string]string       // normalized user code -> TokenHash(device code)
+	// maxTombstones bounds refreshTombstones. See OIDCOptions.
+	maxTombstones int
+	devices       map[string]deviceRecord // by TokenHash(device code)
+	userCodes     map[string]string       // normalized user code -> TokenHash(device code)
 
 	// Subject indexes. The token maps are keyed by token hash, so every lookup by
 	// subject — and every revocation by subject, which is what a Kill Switch sweep
@@ -293,7 +302,16 @@ type OIDCOptions struct {
 	// RequestTTL is how long a pending consent handle stays valid. Defaults to
 	// 30 minutes.
 	RequestTTL time.Duration
+	// MaxRefreshTombstones bounds the replay-detection residues the store keeps.
+	// Defaults to defaultMaxRefreshTombstones. See the field's own comment.
+	MaxRefreshTombstones int
 }
+
+// defaultMaxRefreshTombstones is the resident tombstone bound: 65536 entries is a
+// few megabytes and covers every rotation a normal client makes well inside the
+// 30-day refresh TTL; past it the oldest residues are dropped rather than the
+// process growing without limit.
+const defaultMaxRefreshTombstones = 1 << 16
 
 // NewOIDCStore builds an empty in-memory store.
 func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
@@ -312,6 +330,10 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 	ttl := opts.RequestTTL
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
+	}
+	maxTombstones := opts.MaxRefreshTombstones
+	if maxTombstones <= 0 {
+		maxTombstones = defaultMaxRefreshTombstones
 	}
 	return &OIDCStore{
 		clients:           opts.Clients,
@@ -334,6 +356,7 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		refreshTTL:        30 * 24 * time.Hour,
 		requestTTL:        ttl,
 		now:               now,
+		maxTombstones:     maxTombstones,
 	}, nil
 }
 
@@ -635,6 +658,17 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 			// Unreachable through this store, which always mints a family id, but
 			// a record with no family would otherwise make the replay a no-op.
 			familyID = spent
+		}
+		// The resident set is bounded: a rotation writes one tombstone that would
+		// otherwise live for the spent token's whole refresh TTL, and rotation is
+		// ordinary traffic. Past the bound one arbitrary entry is dropped, so the
+		// map — and every sweep of it — stays bounded. See the field's comment for
+		// the trade.
+		if _, exists := s.refreshTombstones[spent]; !exists && len(s.refreshTombstones) >= s.maxTombstones {
+			for old := range s.refreshTombstones {
+				delete(s.refreshTombstones, old)
+				break
+			}
 		}
 		s.refreshTombstones[spent] = refreshTombstone{
 			familyID:  familyID,
@@ -1257,6 +1291,21 @@ func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scope
 		s.mu.Unlock()
 		return errors.New("memory: auth request not found")
 	}
+	// The recorded authentication time is the session's real sign-in time, set by
+	// the login hook before the consent screen. A request that asked for a fresh
+	// authentication (`prompt=login` or an elapsed `max_age`) must not accept a
+	// time that does not satisfy it — and completing the interactive decision is
+	// NOT an authentication, so the decision clock must not be substituted for one
+	// (S02-1). A real re-authentication stamps a satisfying time first; with none,
+	// the request is refused rather than answered with a fabricated auth_time.
+	//
+	// The check runs BEFORE the request is mutated: a refused completion must not
+	// leave a half-decided record (done=true, subject set) behind.
+	now := s.now()
+	if a.RequiresReauthentication(now) {
+		s.mu.Unlock()
+		return oidcstore.ErrReauthenticationRequired
+	}
 	previous := a.Subject
 	a.Subject = subject
 	a.Scopes = append([]string(nil), scopes...)
@@ -1265,13 +1314,7 @@ func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scope
 		s.requestBySubject.remove(previous, id)
 		s.requestBySubject.add(subject, id)
 	}
-	// Preserve the session's real authentication time when the login hook set it;
-	// only fall back to the decision time when it did not. A request that asked
-	// for a fresh authentication (`prompt=login` or an elapsed `max_age`) is the
-	// exception: the recorded time is exactly what it asked not to accept, so
-	// completing the interactive decision is the re-authentication and the
-	// id_token must carry that moment, not the stale session's.
-	if now := s.now(); a.RequiresReauthentication(now) || a.AuthTime == nil {
+	if a.AuthTime == nil {
 		a.AuthTime = &now
 	}
 	clientID := a.ClientID

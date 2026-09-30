@@ -420,13 +420,17 @@ func setRateLimitHeaders(w http.ResponseWriter, v ratelimit.Verdict) {
 // when many slow requests arrive together. Probes are exempt for the same reason
 // the limiter exempts them, and the refusal is rendered per plane.
 //
-// The cap is shared, not owned by whoever arrives first: one (plane, client) may
-// hold at most half of it, and the other half is headroom every other client
-// draws from. A process-wide semaphore let a single address hold every slot with
-// a handful of slow-body sockets, so a denial of service against everyone else
-// was indistinguishable from load — /healthz and /readyz stayed 200 and the
-// orchestrator kept routing to the instance. The map holds only clients with a
-// request in flight, so it is bounded by maxInFlight.
+// The cap is shared, not owned by whoever arrives first: one CLIENT may hold at
+// most half of it, and the other half is headroom every other client draws from.
+// The counter is keyed by the client alone, never by (plane, client): the
+// semaphore is process-wide, so a per-plane counter let one address hold
+// maxInFlight/2 on each of two planes and consume the whole cap — the same
+// single-address denial the per-client share exists to prevent, split across two
+// namespaces. The rate limiter keeps its (plane, client) key; its budget is
+// per-kind, and its arithmetic is unaffected.
+//
+// The map holds only clients with a request in flight, so it is bounded by
+// maxInFlight.
 func (s *Server) withInFlightLimit(next http.Handler) http.Handler {
 	if s.maxInFlight <= 0 {
 		return next
@@ -456,7 +460,7 @@ func (s *Server) withInFlightLimit(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		key := s.bucketKey(r)
+		key := aggregateClientKey(s.clientKeyOf(r))
 		mu.Lock()
 		if active[key] >= perClient {
 			mu.Unlock()
@@ -485,9 +489,9 @@ func (s *Server) withInFlightLimit(next http.Handler) http.Handler {
 	})
 }
 
-// bucketKey is the (plane, client) key the limiter and the in-flight cap share.
-// One helper so a request can never be counted under one identity by the rate
-// limiter and another by the concurrency cap.
+// bucketKey is the (plane, client) key the rate limiter uses. The in-flight cap
+// deliberately does NOT share it: its counter is keyed by the client alone, because
+// its semaphore is process-wide (see withInFlightLimit).
 func (s *Server) bucketKey(r *http.Request) string {
 	return planeOf(r.URL.Path).String() + "|" + aggregateClientKey(s.clientKeyOf(r))
 }

@@ -115,9 +115,22 @@ type SessionLookup interface {
 }
 
 // ConsentStore is what the consent screen needs beyond op.Storage: marking an
-// auth request complete with the approved scopes.
+// auth request complete with the approved scopes, and recording the browser
+// session's real authentication time on it.
 type ConsentStore interface {
 	CompleteLogin(ctx context.Context, id, subject string, scopes []string) error
+	// SetAuthTime records when the human actually authenticated, so the id_token's
+	// auth_time is the authentication and not the consent decision. The consent
+	// boundary re-stamps it from the session after a forced re-login; the store
+	// refuses to complete a freshness-bound request without a satisfying time.
+	SetAuthTime(ctx context.Context, id string, at time.Time) error
+}
+
+// sessionAuthTimes is the optional half of SessionLookup: when the session also
+// knows its own authentication time, the consent boundary can re-stamp a request
+// after a forced re-login. Implementations that cannot answer simply omit it.
+type sessionAuthTimes interface {
+	AuthenticatedAt(ctx context.Context) (time.Time, bool)
 }
 
 // RetiredTokenKey is an old 32-byte token-encryption key kept for decryption
@@ -988,10 +1001,9 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 			http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 			return true
 		}
-		// A live session satisfies the silent request, so it proceeds to consent.
-		// Nil Sessions (or no session) means it cannot be satisfied without a UI:
-		// fail closed to login_required rather than answering a silent request as
-		// if it were interactive.
+		// No session: the silent request cannot be satisfied without a UI, so it
+		// fails closed to `login_required` rather than rendering a login page in
+		// the RP's frame.
 		if !h.signedIn(r) {
 			params := map[string]string{
 				"error":             "login_required",
@@ -1002,6 +1014,19 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 			http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
 			return true
 		}
+		// A live session is NOT enough. This OP has no remembered consent: every
+		// authorization is answered by the consent screen, so a silent request can
+		// never be satisfied silently. OIDC Core §3.1.2.1 requires
+		// `consent_required` through the redirect in exactly that case, rather than
+		// an interactive UI rendered inside the RP's frame (S02-2).
+		params := map[string]string{
+			"error":             "consent_required",
+			"error_description": "this provider has no pre-existing consent to reuse",
+			"state":             q.Get("state"),
+			"iss":               h.issuerFor(r),
+		}
+		http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+		return true
 	}
 	// OIDC Core §3.1.2.1: `max_age=N` asks the OP to re-authenticate when the
 	// browser's last authentication is more than N seconds old. The judgement
@@ -1776,6 +1801,23 @@ func (h *Handler) ApproveAuthorization(ctx context.Context, id, subject string, 
 	// offline_access implicitly rather than itemising it, because it is a
 	// token-lifetime flag, not a data permission.
 	granted = withOfflineAccess(granted)
+	// Re-stamp the request with the session's real authentication time. The login
+	// hook recorded it before the consent screen, but when the request demanded a
+	// fresh authentication the browser was sent through the provider first; by the
+	// time the decision arrives the session carries the re-authentication, and
+	// this is where it reaches the request (S02-1). The store refuses a
+	// freshness-bound request whose time does not satisfy it, so an attacker who
+	// calls this endpoint directly with a stale session gets a refusal, not a
+	// fabricated auth_time.
+	if h.sessions != nil {
+		if look, ok := h.sessions.(sessionAuthTimes); ok {
+			if at, ok := look.AuthenticatedAt(ctx); ok {
+				if err := h.consent.SetAuthTime(ctx, id, at); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
 	if err := h.consent.CompleteLogin(ctx, id, subject, granted); err != nil {
 		return "", err
 	}

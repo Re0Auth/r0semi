@@ -7,6 +7,7 @@
 package idp
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -697,6 +698,61 @@ func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, n
 // jwks_uri fails the pin counts as a failed discovery for the same reason.
 //
 // Serving the cached provider through a failure is bounded by
+// maxDiscoveryBytes bounds what a provider's discovery document or key set may
+// make this process read.
+//
+// go-oidc reads both with an unbounded io.ReadAll (oidc/oidc.go:312 for discovery,
+// oidc/jwks.go:315 for the key set) and net/http transparently decompresses gzip,
+// so the client's Timeout bounds time, not bytes. The adapter's own 1 MiB cap on
+// profile reads (getText) does not cover this path; without a cap a configured —
+// or hijacked — issuer can allocate unbounded memory during an ordinary sign-in
+// (S06-1). A document over the cap is refused rather than truncated: a truncated
+// discovery document would parse as a provider missing fields.
+const maxDiscoveryBytes = 1 << 20
+
+// discoveryClient returns a client whose transport caps every response body. The
+// provider built with it reuses the same client for JWKS, so discovery and the
+// key set share one bound. The clone keeps the caller's timeout and any wrapped
+// transport (pooling, bulkhead, SSRF guard); only the body is capped.
+func discoveryClient(hc *http.Client) *http.Client {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	clone := *hc
+	base := hc.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	clone.Transport = &boundedBodyTransport{next: base, limit: maxDiscoveryBytes}
+	return &clone
+}
+
+type boundedBodyTransport struct {
+	next  http.RoundTripper
+	limit int64
+}
+
+func (t *boundedBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	orig := resp.Body
+	defer func() { _ = orig.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(orig, t.limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("idp: read response: %w", err)
+	}
+	if int64(len(body)) > t.limit {
+		return nil, fmt.Errorf("idp: %s: response body exceeds the %d-byte limit",
+			req.URL.Redacted(), t.limit)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	return resp, nil
+}
+
 // providerStaleCeiling*providerTTL (retainOnDiscoveryFailure): a re-discovery
 // that keeps failing cannot advance discoveredAt, so without that ceiling the
 // never-expiring key set would keep every key the issuer ever published alive for
@@ -708,7 +764,7 @@ func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 	if c.discovered != nil && time.Since(c.discoveredAt) < c.providerTTL {
 		return c.discovered, nil
 	}
-	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, c.http), c.issuer)
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, discoveryClient(c.http)), c.issuer)
 	if err != nil {
 		return c.retainOnDiscoveryFailure(fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err))
 	}

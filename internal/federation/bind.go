@@ -168,6 +168,16 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 		return Binding{}, flow, errors.New("federation: authorization was refused")
 	}
 
+	// The per-binding keyed lock, held for the whole exchange-and-store sequence,
+	// exactly like every other writer of one binding's credential (Unbind,
+	// refreshBinding, CascadeRevoke, shredBinding). Without it a bind callback that
+	// landed inside an Unbind / Kill Switch / account-erasure window stored the
+	// vault secret and wrote the row back after the removal had reported success,
+	// so a source the user (or an operator) was told was disconnected existed again
+	// (S14-2). The two operations are now ordered: each sees the other's result.
+	unlock := s.locks.lock(bindingKey(user, flow.Game, flow.Source))
+	defer unlock()
+
 	src, ok := s.registry.Get(flow.Game, flow.Source)
 	if !ok {
 		return Binding{}, flow, ErrUnknownSource

@@ -191,6 +191,12 @@ func (c ProviderClient) IsScopeAllowed(scope string) bool {
 	return c.Client.AllowsScope(s)
 }
 
+// ErrReauthenticationRequired reports an authorization request that asked for a
+// fresh authentication and reached completion without one. Completing the consent
+// decision is not an authentication, so the store refuses rather than publishing a
+// fabricated auth_time (S02-1). The protocol layer maps it to `login_required`.
+var ErrReauthenticationRequired = errors.New("oidc: this authorization request requires a fresh authentication")
+
 // AuthRequest implements op.AuthRequest. It is the consent record, so scopes can
 // be narrowed here before the code is issued.
 type AuthRequest struct {
@@ -223,28 +229,70 @@ type AuthRequest struct {
 // authentication; `max_age=N` requires one once the recorded auth_time is more
 // than N seconds old (OIDC Core §3.1.2.1). An unknown auth_time cannot prove
 // freshness, so it fails closed to requiring reauthentication.
+// reauthRoundTripTolerance is how much slack FreshnessSatisfied allows beyond the
+// request's own bound. It exists for one case: a freshness requirement is met by a
+// real re-authentication, and the time between that sign-in and the consent
+// decision is the redirect round trip, not staleness. Without the slack the store
+// would refuse the very re-authentication the login boundary just forced.
+const reauthRoundTripTolerance = 2 * time.Minute
+
+// RequiresReauthentication reports whether the recorded authentication is too old
+// for what this request asked for. It is the STORE's judgement: a request with no
+// freshness bound never requires one, and one with a bound requires it unless the
+// recorded time satisfies FreshnessSatisfied.
 func (a *AuthRequest) RequiresReauthentication(now time.Time) bool {
+	return a.MaxAge != nil && !a.FreshnessSatisfied(a.GetAuthTime(), now)
+}
+
+// FreshnessNeeded reports whether an authentication at `at` fails to satisfy what
+// this request asked for, judged at the LOGIN BOUNDARY — where the request has
+// just been created and the browser's session is what it is.
+//
+// `prompt=login` always needs a fresh authentication (the library normalizes it to
+// max_age=0, which no already-recorded time can satisfy). `max_age=N` needs one
+// once `at` is more than N seconds old. There is deliberately no tolerance here:
+// the session must satisfy the request on its own, and the tolerance in
+// FreshnessSatisfied exists only for the re-authentication that follows.
+func (a *AuthRequest) FreshnessNeeded(at, now time.Time) bool {
 	if slices.Contains(a.Prompt, oidc.PromptLogin) {
 		return true
 	}
 	if a.MaxAge == nil {
 		return false
 	}
-	at := a.GetAuthTime()
 	if at.IsZero() {
 		return true
 	}
 	// max_age is an OIDC uint and time.Duration is a signed int64 of
-	// nanoseconds, so the naive time.Duration(*a.MaxAge)*time.Second can
-	// overflow for a value a client is free to send (G115). Bound it first:
-	// above this a freshness window already outlives any real authentication,
-	// so no recorded auth_time can be older than it. Below the bound the
-	// conversion is lossless. (Z16-2, docs/issues/P2-medium.md)
+	// nanoseconds, so the naive conversion can overflow for a value a client is
+	// free to send (G115). Bound it first. (Z16-2, docs/issues/P2-medium.md)
 	const maxDurationSeconds = uint64(math.MaxInt64) / uint64(time.Second)
 	if uint64(*a.MaxAge) > maxDurationSeconds {
 		return false
 	}
 	return now.Sub(at) > time.Duration(*a.MaxAge)*time.Second
+}
+
+// FreshnessSatisfied reports whether an authentication at `at` meets the request's
+// freshness bound, judged for COMPLETION: the recorded time is a real
+// authentication, and the round trip that followed it is not staleness.
+//
+// A request with no bound is satisfied by anything. A bounded one is satisfied by
+// a time within `max_age + reauthRoundTripTolerance`; an unrecorded time never
+// satisfies it. This is what lets CompleteLogin refuse a fabricated auth_time
+// instead of substituting its own clock (S02-1).
+func (a *AuthRequest) FreshnessSatisfied(at, now time.Time) bool {
+	if a.MaxAge == nil {
+		return true
+	}
+	if at.IsZero() {
+		return false
+	}
+	const maxDurationSeconds = uint64(math.MaxInt64) / uint64(time.Second)
+	if uint64(*a.MaxAge) > maxDurationSeconds {
+		return true
+	}
+	return now.Sub(at) <= time.Duration(*a.MaxAge)*time.Second+reauthRoundTripTolerance
 }
 
 func (a *AuthRequest) GetID() string                         { return a.ID }

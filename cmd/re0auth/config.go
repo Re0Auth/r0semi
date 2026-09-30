@@ -469,7 +469,6 @@ func loadConfig(path string) (settings, error) {
 		Issuer:         strings.TrimRight(config.FirstNonEmpty(os.Getenv("RE0AUTH_ISSUER"), f.Server.Issuer), "/"),
 		CookieSecure:   cookieSecure,
 		KEKID:          config.FirstNonEmpty(os.Getenv("RE0AUTH_KEK_ID"), f.Vault.KEKID, "kek-1"),
-		DatabaseURL:    os.Getenv("DATABASE_URL"),
 		InternalAddr:   config.FirstNonEmpty(os.Getenv("RE0AUTH_INTERNAL_ADDR"), f.Server.InternalAddr),
 		ExposeInternal: exposeInternal,
 	}
@@ -677,10 +676,20 @@ func loadConfig(path string) (settings, error) {
 	// The reason is recorded on the settings so reportDurability can say WHY, rather
 	// than the fixed because="no DATABASE_URL" it used to print even when the
 	// variable was set.
+	// The DSN's environment variable. A file that names one (`dsn_env`) is
+	// authoritative: the literal DATABASE_URL is only the default NAME, so a stale
+	// DATABASE_URL in the environment must not shadow the variable the operator
+	// declared. The name is resolved once for both branches below, and its value is
+	// read through config.Secret, so "declared but unset" is an error rather than a
+	// silent downgrade to memory (S08-2).
+	dsnEnv := f.Storage.DSNEnv
+	if dsnEnv == "" {
+		dsnEnv = "DATABASE_URL"
+	}
 	driver := config.FirstNonEmpty(strings.TrimSpace(os.Getenv("RE0AUTH_STORAGE_DRIVER")), f.Storage.Driver)
 	switch driver {
 	case "":
-		if f.Storage.DSNEnv != "" || cfg.DatabaseURL != "" {
+		if f.Storage.DSNEnv != "" || os.Getenv("DATABASE_URL") != "" {
 			driver = "postgres"
 		} else {
 			driver = "memory"
@@ -690,21 +699,17 @@ func loadConfig(path string) (settings, error) {
 		driver = "memory"
 		cfg.StorageReason = "storage.driver is memory"
 	case "postgres":
-		if cfg.DatabaseURL == "" {
-			dsnEnv := f.Storage.DSNEnv
-			if dsnEnv == "" {
-				dsnEnv = "DATABASE_URL"
-			}
-			dsn, err := config.Secret(dsnEnv, "storage.dsn_env")
-			if err != nil {
-				return settings{}, err
-			}
-			cfg.DatabaseURL = dsn
-		}
+		// Resolved below, exactly like the inferred case.
 	default:
 		return settings{}, fmt.Errorf("storage.driver %q must be \"memory\" or \"postgres\"", driver)
 	}
-	if driver == "memory" {
+	if driver == "postgres" {
+		dsn, err := config.Secret(dsnEnv, "storage.dsn_env")
+		if err != nil {
+			return settings{}, err
+		}
+		cfg.DatabaseURL = dsn
+	} else {
 		cfg.DatabaseURL = ""
 	}
 	cfg.StorageDriver = driver

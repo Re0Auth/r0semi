@@ -234,6 +234,9 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// resp.RedirectURI was validated against the client's registered URIs by
+	// DescribeAuthorization (oauth/as.go) before the code was minted.
+	// nosemgrep: go.lang.security.injection.open-redirect.open-redirect
 	http.Redirect(w, r, oauth.BuildRedirect(resp.RedirectURI, map[string]string{
 		"code": resp.Code, "state": resp.State,
 	}), http.StatusFound)

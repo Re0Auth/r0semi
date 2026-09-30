@@ -1333,12 +1333,40 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 		// be approved elsewhere. GetClientByClientID hands us the request context,
 		// which is where the session lives.
 		sessions.Bind(ctx, "authz", id)
-		if at, ok := sessions.AuthenticatedAt(ctx); ok {
+		consent := webui.BasePath + "/consent?id=" + url.QueryEscape(id)
+
+		// The request's freshness requirement. `prompt=login` always needs a fresh
+		// authentication; `max_age=N` needs one once the browser's session is
+		// older than N seconds. FreshnessNeeded is the boundary's judgement — it
+		// deliberately has no round-trip tolerance, unlike the store's, so a stale
+		// session is sent through the provider instead of being relabelled (S02-1).
+		ar, err := oidcStore.AuthRequestByID(ctx, id)
+		if err != nil {
+			slog.Warn("could not read the pending authorization request", "err", err)
+			return consent
+		}
+		fresh, ok := ar.(interface {
+			FreshnessNeeded(at, now time.Time) bool
+		})
+		if !ok {
+			return consent
+		}
+		if at, signedIn := sessions.AuthenticatedAt(ctx); signedIn {
+			if fresh.FreshnessNeeded(at, time.Now()) {
+				// Send the browser through the identity provider again and back to
+				// the consent screen. The consent boundary re-stamps the fresh
+				// auth_time, and the store refuses a request that still lacks one.
+				return "/auth/reauth?return_to=" + url.QueryEscape(consent)
+			}
 			if err := oidcStore.SetAuthTime(ctx, id, at); err != nil {
 				slog.Warn("could not record auth_time on the authorization request", "err", err)
 			}
+			return consent
 		}
-		return webui.BasePath + "/consent?id=" + url.QueryEscape(id)
+		// No session: the consent screen's sign-in flow drives the IdP, so there
+		// is nothing to force here. The store still refuses a freshness-bound
+		// request that completes without a recent authentication.
+		return consent
 	}
 
 	if store.db != nil {

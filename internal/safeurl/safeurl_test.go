@@ -1,6 +1,9 @@
 package safeurl
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRelativePath(t *testing.T) {
 	for _, tc := range []struct {
@@ -46,5 +49,25 @@ func TestRelativePath(t *testing.T) {
 				t.Errorf("RelativePath(%q) = %q, want %q — %s", tc.in, got, tc.want, tc.why)
 			}
 		})
+	}
+}
+
+// A navigation target is not a data channel: a value too large to be one is
+// replaced, so a caller that persists the result (the auth flow writes it into
+// the session) cannot be made to carry caller-priced bytes.
+func TestRelativePathBoundsLength(t *testing.T) {
+	atCap := "/" + strings.Repeat("a", MaxRelativePathBytes-1)
+	if got := RelativePath(atCap); got != atCap {
+		t.Errorf("RelativePath(at the %d-byte cap) was replaced; the cap is too tight", MaxRelativePathBytes)
+	}
+	over := "/" + strings.Repeat("a", MaxRelativePathBytes)
+	if got := RelativePath(over); got != "/" {
+		t.Errorf("RelativePath(%d bytes) = %.32q…, want %q", len(over), got, "/")
+	}
+	// The check is on the whole value, so a short path followed by a huge query
+	// is bounded too.
+	longQuery := "/app/sources?x=" + strings.Repeat("a", 4<<10)
+	if got := RelativePath(longQuery); got != "/" {
+		t.Errorf("RelativePath(%d bytes with a long query) was kept", len(longQuery))
 	}
 }

@@ -235,7 +235,8 @@ func codeFlow(t testing.TB, f fixture, scopes []string) map[string]any {
 // OIDC Core 1.0 §3.1.2.1: prompt=none is a silent request. Without a session it
 // must answer login_required through the registered redirect — never render the
 // login page (a hidden-iframe RP would get the UI inside the frame and no error).
-// With a session it proceeds to consent.
+// With a session but no remembered consent it must answer consent_required: this
+// OP answers every authorization with the consent screen, so it cannot be silent.
 func TestPromptNoneRequiresASession(t *testing.T) {
 	f := newFixture(t)
 	base := url.Values{
@@ -280,15 +281,20 @@ func TestPromptNoneRequiresASession(t *testing.T) {
 		t.Errorf("prompt=none+login error = %q, want invalid_request", got)
 	}
 
-	// With a session it proceeds to consent rather than erroring.
+	// With a session but no standing consent, the silent request is refused with
+	// consent_required through the client — not handed the interactive UI.
 	f.sessions.set("usr_1")
 	resp = get(t, noRedirect, f.server.URL+"/oauth/authorize?"+base.Encode())
 	next := resp.Header.Get("Location")
-	if strings.Contains(next, "error=") {
-		t.Fatalf("prompt=none with a session returned an error: %q", next)
+	loc, _ = url.Parse(next)
+	if loc.Host != "client.example" {
+		t.Fatalf("prompt=none with a session redirected to %q, want the client", loc.Host)
 	}
-	if !strings.Contains(next, "authRequestID=") {
-		t.Fatalf("prompt=none with a session did not start consent: %q", next)
+	if got := loc.Query().Get("error"); got != "consent_required" {
+		t.Fatalf("prompt=none with a session error = %q, want consent_required (%q)", got, next)
+	}
+	if strings.Contains(next, "authRequestID=") || strings.Contains(next, "/consent") {
+		t.Fatalf("prompt=none with a session reached the interactive plane: %q", next)
 	}
 
 	// Control: without prompt, an unauthenticated request still reaches the login

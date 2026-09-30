@@ -385,6 +385,9 @@ func (s *Server) handleBindStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sessions.Bind(r.Context(), "bind", challenge.ID)
+	// challenge.AuthorizeURL is built by the registered source's client from its
+	// configured issuer (internal/federation); no request value reaches it.
+	// nosemgrep: go.lang.security.injection.open-redirect.open-redirect
 	http.Redirect(w, r, challenge.AuthorizeURL, http.StatusFound)
 }
 
@@ -426,6 +429,8 @@ func (s *Server) handleBindCallback(w http.ResponseWriter, r *http.Request) {
 		redirectWithError(w, r, returnTo, "bind_failed")
 		return
 	}
+	// returnTo went through safeurl.RelativePath, so it is a same-origin path.
+	// nosemgrep: go.lang.security.injection.open-redirect.open-redirect
 	http.Redirect(w, r, returnTo, http.StatusSeeOther)
 }
 

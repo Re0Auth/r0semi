@@ -579,6 +579,9 @@ func (s *Server) Handler() http.Handler {
 			// target is webui.BasePath plus the request's query string, so it
 			// always begins with "/" and stays a same-origin path whatever the
 			// query holds (G710 cannot see the leading constant).
+			// target begins with the webui.BasePath constant, so the query string
+			// can never turn it into another origin (G710 cannot see the constant).
+			// nosemgrep: go.lang.security.injection.open-redirect.open-redirect
 			http.Redirect(w, r, target, http.StatusFound) //nolint:gosec // G710: target is a same-origin path under BasePath
 		})
 	}
@@ -596,10 +599,11 @@ func (s *Server) Handler() http.Handler {
 	//	2. panic recovery   -- so a crash answers in its plane's format.
 	//	3. security headers -- including on those rejections, so a failure is
 	//	                       still not frameable and still leaks no URL.
-	//	4. compression      -- so every eligible response can be negotiated.
-	//	5. in-flight cap    -- concurrency is the harder bound; answer before a
+	//	4. in-flight cap    -- concurrency is the harder bound; answer before a
 	//	                       rate-limited request spends a token.
-	//	6. the limiter      -- shed load before sessions or handlers do any work.
+	//	5. the limiter      -- shed load before sessions or handlers do any work.
+	//	6. compression      -- inside both, so a negotiation refusal spends a
+	//	                       token and holds a slot like any other response.
 	//	7. the body limit   -- cap what a handler can be made to read, which is a
 	//	                       different question from how often it may ask.
 	//	8. session loading  -- wraps the whole tree; /auth and /v1 both need it.
@@ -636,13 +640,19 @@ func (s *Server) Handler() http.Handler {
 		})
 	}
 	h = s.withBodyLimit(h)
+	// The compressor sits INSIDE the two anti-abuse bounds. It can answer on its
+	// own — a negotiation failure writes a 406 and never calls next — so a
+	// compressor outside them let any caller drive that path without spending a
+	// rate-limit token or holding an in-flight slot (S13-1). The security headers
+	// stay outside it: a refusal is exactly the response whose input the caller
+	// fully controls, and it must not be the one that goes out bare.
+	if s.compressor != nil {
+		h = s.compressor.Handler(h)
+	}
 	h = s.withRateLimit(h)
 	// In-flight wraps the limiter: concurrency is the harder bound, so it answers
 	// before a rate-limited request spends a token.
 	h = s.withInFlightLimit(h)
-	if s.compressor != nil {
-		h = s.compressor.Handler(h)
-	}
 	h = s.withSecurityHeaders(h)
 	out := s.withRequestContext(s.withAccessLog(recoverBrowser(h)))
 	if s.metrics != nil {
@@ -745,6 +755,9 @@ func withNoStore(next http.Handler) http.Handler {
 // the app shell is not turned into a 404.
 func (s *Server) withCanonicalPath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Clean is used to COMPARE which plane a spelling belongs to, never to
+		// sanitise a path that is then read — the refusal is the whole effect.
+		// nosemgrep: go.lang.security.filepath-clean-misuse.filepath-clean-misuse
 		if cleaned := path.Clean(r.URL.Path); cleaned != r.URL.Path && planeOf(cleaned) != planeOf(r.URL.Path) {
 			switch planeOf(r.URL.Path) {
 			case planeProtocol:

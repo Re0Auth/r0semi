@@ -11,13 +11,25 @@ import (
 	"strings"
 )
 
+// MaxRelativePathBytes bounds a value RelativePath will carry.
+//
+// Form alone is not enough: every caller stores the result somewhere that is
+// then re-read on later requests — the auth flow writes return_to into the
+// server-side session, and a session is re-encoded and committed whole on every
+// request. Without a bound, an anonymous GET could persist up to the server's
+// whole header budget per request and pay for it again on every later request.
+// The bound is far above any real navigation target (a deep app route plus a
+// query is a few hundred bytes) and far below a header limit.
+const MaxRelativePathBytes = 2048
+
 // RelativePath returns v if it is a same-origin absolute path, and "/" otherwise.
 //
 // "Same-origin absolute path" means: one leading slash and not two, no backslash,
-// and no control byte. Everything else — an absolute URL, a scheme-relative
-// "//host", an empty value, a Windows path — is replaced rather than rejected,
-// because every caller is a redirect and the alternative to a safe value is an
-// error page in the middle of a login.
+// no control byte, and at most MaxRelativePathBytes bytes. Everything else — an
+// absolute URL, a scheme-relative "//host", an empty value, an over-long value, a
+// Windows path — is replaced rather than rejected, because every caller is a
+// redirect and the alternative to a safe value is an error page in the middle of
+// a login.
 //
 // # Why it borrows url.Parse for one of the three rules
 //
@@ -35,6 +47,11 @@ func RelativePath(v string) string {
 	if v == "" {
 		// Two slashes are a scheme-relative reference: "//evil.example" names a
 		// host. One slash is a path on this host.
+		return "/"
+	}
+	if len(v) > MaxRelativePathBytes {
+		// A value too large to be a navigation target is not one; keeping it
+		// would turn a redirect parameter into a caller-priced session payload.
 		return "/"
 	}
 	if !strings.HasPrefix(v, "/") || strings.HasPrefix(v, "//") {

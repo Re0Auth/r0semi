@@ -1241,9 +1241,12 @@ func (s *OIDCStore) SetAuthTime(ctx context.Context, id string, at time.Time) er
 //
 // A request that asked for a fresh authentication (`prompt=login` or an
 // elapsed `max_age`) must not carry the session's old auth_time into the
-// id_token: the recorded time is exactly what it asked not to accept, so the
-// interactive decision completes the re-authentication and stamps its moment.
-// The judgement runs on the store clock, not the database's now().
+// id_token — and the interactive decision is not an authentication, so its clock
+// must not be substituted for one either (S02-1). A real re-authentication stamps
+// a satisfying auth_time first (the login hook, or the consent boundary after the
+// browser returns); with none recorded the request is refused rather than answered
+// with a fabricated time. The judgement runs on the store clock, not the
+// database's now().
 func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scopes []string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1266,7 +1269,12 @@ func (s *OIDCStore) CompleteLogin(ctx context.Context, id, subject string, scope
 	now := s.now()
 	authTime := locked.AuthTime
 	req := oidcstore.AuthRequest{Prompt: locked.Prompt, MaxAge: maxAgeFromSeconds(locked.MaxAgeSeconds), AuthTime: authTime}
-	if req.RequiresReauthentication(now) || authTime == nil {
+	if req.RequiresReauthentication(now) {
+		// The request asked for a fresh authentication and the recorded time does
+		// not satisfy it: refuse rather than publish a decision clock as auth_time.
+		return oidcstore.ErrReauthenticationRequired
+	}
+	if authTime == nil {
 		authTime = &now
 	}
 	if _, err := tx.Exec(ctx, `
