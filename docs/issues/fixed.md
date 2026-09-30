@@ -19,6 +19,15 @@
 - 区06 守住（HTTP 面）— body limit、压缩、探针端点、不计 header 上限、Slowloris 真进程均 PASS。
 - 区01 守住（第五轮回归）— 六个 `TestRegression*`（id_token sub、畸形参数、redirect_uri 变体、PKCE、码单次使用、request 参数）全 PASS。
 - 守卫（正面结论）— `internal/webui/webui.go:8-12` 包注释声明「never injects data, never templates, never rewrites the shell」，与本轮前端面绿探针一致，应保留为守卫。
+- KIT-4 — `ConsumeCode` 绑定校验后才原子消费，失败不再烧码并记 `oauth.exchange_failed` — `7cfbdb5`
+- 第七轮 T1 批次（P2 分级里「不修上不了线」的一组，见 `docs/issues/P2-triage.md`）：
+- Z13-3 — 运行镜像带 npm 归属清单；`internal/archtest` 的发布门禁开始读 Dockerfile，audit5 运行阶段白名单同步 — `17914d4`
+- Z12-1 — 两个退役密钥解析器只报条目下标、不回显值；CS-8 补 plant 该变量 — `17914d4`
+- Z19-1 / Z19V-1 — `*_env` 名字位塞值与 DSN 原文不再回显（`config.Secret`、`trusted_proxies`、`kek_id`、Postgres 解析错误剥连接串） — `17914d4`
+- Z13-1 — 备份脚本默认落点与备份产物进 `.gitignore`/`.dockerignore` — `17914d4`
+- Z13V-1 — `.dockerignore` 补 `scratchpad` 与其余被 gitignore 的本地状态 — `17914d4`
+- Z21-2 / Z21V-1 — 0013/0014 的 Down 改空段、Up 幂等，`MigrateDown` 在链上有行时拒退；ADR-0008 §5 — `17914d4`
+- Z14-3 — `jwks_uri` 默认同源、显式配置精确匹配；`Credentials.JWKSURL` 与 `idp.*.jwks_uri` 提供跨源出口 — `17914d4`
 
 ### 第 6 轮
 
@@ -30,6 +39,7 @@
 - PROTO-5/6/7/9/10 — discovery 不撒谎、`prompt=none` 落地、`form_post` 拒绝带 `iss`、POST+query 拆分拒绝、userinfo 判据；均已修（`_audit/protocol.md:210-214`）。
 - P1-1/P1-2 — vault 轮换窄写/CAS（lost-update）；第 6 轮新探针验证「修对、修全」（`03-crypto-vault.md:173-193`）。
 - P2-32 — 设备路径单时钟（bf81b2a）；三处 SQL 参数化，未引入新洞（`03-crypto-vault.md:195-201`）。
+- G-9 — 刷新签发的 id_token 保留原 nonce（OIDC Core §12.2）：`RefreshRequest`/`NonceOf`、两个 store 在 refresh 行上持久化并随轮换继承、`SetUserinfoFromRequest`、迁移 `0026`；audit6 里原本断言「刷新后没有 nonce」的探针翻转为断言保留 — `17914d4`
 
 ### 第 5 轮
 
@@ -75,6 +85,7 @@
 - P2-30 — 业务面 429/413 补 `no-store` — `b35f893`
 - P2-31 — auditbatch 排空加 30s 总预算 — `5cd1690`
 - P2-32 — 设备路径期限改由 store 时钟裁决 — `bf81b2a`
+- k1 — 抹除后的会话清理告警不再带原始 `usr_`，改带 `request_id`；新增默认套件守卫（旧代码上为红） — `17914d4`
 
 ### 第 2 轮
 

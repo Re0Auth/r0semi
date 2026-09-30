@@ -8,9 +8,10 @@
 
 ## v0.0.0-rc.4
 
-**本轮把 P0/P1 全部收掉**（逐条与守卫见 [docs/issues/P0-blockers.md](docs/issues/P0-blockers.md)
-与 [docs/issues/P1-high.md](docs/issues/P1-high.md)）。下面先列部署者/下游必须知道的变化，
-其后是自 rc.3 以来累积的条目。
+**本轮把 P0/P1 全部收掉，并把 P2 分级里 T1（「不修上不了线」）的 9 条一并收掉**
+（逐条与守卫见 [docs/issues/P0-blockers.md](docs/issues/P0-blockers.md)、
+[docs/issues/P1-high.md](docs/issues/P1-high.md)、[docs/issues/P2-triage.md](docs/issues/P2-triage.md)）。
+下面先列部署者/下游必须知道的变化，其后是自 rc.3 以来累积的条目。
 
 > 与 rc.3 一样，rc.4 验证的仍是 **tag → CI → 产物** 这条链路，**不是可以部署的版本**：
 > rc.1 一节列出的适用条件全部成立。另需记录在 release notes 里的一条：rc.3 已公开的归档中
@@ -23,6 +24,39 @@
 > [docs/operations.md](docs/operations.md) 的「最近一个真正发布过的 tag」换到 rc.4。pin 有守卫：
 > `internal/archtest` 要求它指向仓库里**真实存在**的 `v*` tag，所以第二步必须等 tag 推上去之后
 > ——rc.3 就是这么换的（提交 `632e00b`），rc.1 一节的教训也在这里。
+
+### T1 · P2 分级里「不修上不了线」的 9 条（`17914d4`）
+
+- **刷新签发的 id_token 现在保留原 `nonce`（OIDC Core §12.2，G-9）**：此前刷新请求不是
+  `op.AuthRequest`，库读不到 nonce，任何校验 nonce 的 RP 每次刷新都失败。现在 refresh 行
+  持久化原 nonce 并随轮换继承，`SetUserinfoFromRequest` 把它写回 id_token。**升级影响**：
+  新迁移 `0026` 给 `oidc_refresh_tokens` 加 `nonce`（存量行与设备流为空串，行为不变），
+  启动时自动执行。**行为变化**：刷新返回的 id_token 带上认证时的 nonce——这是 RP 期待的
+  形状；不检查 nonce 的 RP 无感。
+- **`jwks_uri` 绑定 issuer（Z14-3）**：验证 id_token 用的密钥集此前完全取自 discovery 文档，
+  能左右 discovery 的一方可用自控私钥伪造任意 `sub`。现在 discovery 里的 `jwks_uri`
+  默认必须与 issuer 同源；确实把密钥集放在别的源的提供方要么用内置（Google 已内置
+  `www.googleapis.com` 的真值），要么显式配置新增的 `[idp.*] jwks_uri`，此时要求与文档
+  完全一致。**行为变化**：跨源密钥集而**未**配置 `jwks_uri` 的自定义 IdP 会 fail-closed
+  拒绝登录并给出可操作的错误，而不是静默沿用文档里的值。
+- **审计链的 0013/0014 不可再被回退（Z21-2 / Z21V-1）**：这两步的 `Down` 现在不执行任何
+  DDL——旧 Down 会让历史行哈希变 NULL、链头回创世，而 `Verify` 仍报 `OK=true`（0014 则是
+  丢掉唯一的每账号假名密钥）。`postgres.MigrateDown` 在链上已有 `row_hash IS NOT NULL` 的
+  行时直接拒退并提示恢复备份；为兼容 goose 对空 Down 也会删版本行的行为，两者的 `Up`
+  已幂等化（`IF NOT EXISTS` + 链头 `ON CONFLICT DO NOTHING`，保留真实链头）。ADR-0008 增 §5。
+  **升级影响**：无新迁移；`-migrate-down` 在正常库上会在这两步之前被拦住，这是预期。
+- **运行镜像随附 npm 归属清单（Z13-3）**：`/npm-attribution.json` 进镜像，和归档里的
+  `re0auth_<ver>_npm-attribution.json` 是同一次 `pnpm licenses list --json` 的产物；
+  发布门禁开始读 `Dockerfile`。
+- **仓库与构建上下文不再包含备份产物与审计工作区（Z13-1 / Z13V-1）**：`.gitignore` 与
+  `.dockerignore` 补 `/backups/`、`*.dump`、`*.env`、`scratchpad`、`go.work*`、`*.local.toml`
+  等。**行为变化**：默认落点 `./backups` 下的文件不再被 `git add -A` 暂存；审计工作区
+  不再进 `docker build` 的上下文。
+- **密钥/凭据不再进日志（Z12-1 / Z19-1 / Z19V-1 / k1）**：退役 token/signing key 解析失败、
+  `*_env` 名字位被塞入值、`dsn_env` 的 DSN 解析失败、`trusted_proxies` 的自由文本、`kek_id`
+  冲突、以及抹除后会话清理失败——这些错误现在只报**字段与位置**（条目下标 / `request_id`），
+  不再回显配置或密钥原文。**行为变化**：启动日志里这些错误的文案不再带变量名或值，
+  排障时以字段名 + 手上的配置文件定位。
 
 - **refresh 重放即撤销整条令牌族（RFC 9700 §4.14.2，P0 G-1）**：此前重放一个已轮换的 refresh token
   只被拒，小偷已换出的那一代继续有效到 TTL 结束。现在轮换在被消费的行上留墓碑（族标识 + 配对

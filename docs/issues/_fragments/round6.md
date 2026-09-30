@@ -80,7 +80,7 @@
 |---|---|---|---|---|---|
 | G-7 | P2 | 已批准的 device_code 过了 `expires_at` 仍能铸出整套令牌（库 `Done` 短路先于 `Expires`；两后端消费谓词都无期限判断） | `internal/store/postgres/oidc.go:749` | OPEN-PG | 两后端消费谓词补 `expires_at`（PG 的 DELETE 加 `AND expires_at > $n` ← `s.now()`） |
 | G-8 | P2 | `/oauth/revoke` 是存活性预言机：匿名者对别人的活跃令牌得 401、对未知字符串得 200 | `oauth/as.go:223` | OPEN | 让响应形状不区分「别人的活令牌」与「未知字符串」（`oauth/as.go:234-239` 与 `:223-231` 自相矛盾） |
-| G-9 | P2 | 刷新后的 id_token 丢掉 `nonce`（OIDC Core §12.2 要求保留），检查 nonce 的 RP 每次刷新都失败 | `internal/oidcstore/oidcstore.go`（`RefreshRequest` 无 nonce 字段；探针 `internal/zzprobe/audit6/z01protocolauth/regress_test.go:394`） | OPEN | refresh 路径签发的 id_token 带上原始 nonce（两 store 需持久化） |
+| G-9 | P2 | 刷新后的 id_token 丢掉 `nonce`（OIDC Core §12.2 要求保留），检查 nonce 的 RP 每次刷新都失败 | `internal/oidcstore/oidcstore.go`（`RefreshRequest` 无 nonce 字段；探针 `internal/zzprobe/audit6/z01protocolauth/regress_test.go:394`） | FIXED（17914d4） | refresh 路径签发的 id_token 带上原始 nonce（两 store 需持久化） |
 | G-10 | P2 | 设备流 token 轮询拒绝 discovery 广告的 `client_secret_post`，且被拒的 401 把 device_code 烧掉 | `pkg/op/device.go:217`（机制）/ `:235`；修法在 `internal/oidchttp` 边界 | OPEN | 设备授予接受 `client_secret_post`，且 401 **不得**先跑消费谓词烧掉 device_code |
 | G-11 | P3 | `/readyz` 在「已有一次检查在跑」且**从未产生结论**时答 200（`running` 分支返回零值 `nil`） | `internal/httpapi/health.go:111` | OPEN | `c.running && !c.checked` 时 fail-closed 回 503；已下调 P3（出厂清单下 kubelet 撞不到） |
 | G-13 | P2 | `GetRefreshTokenInfo` 把数据库错误折叠成 `op.ErrInvalidRefreshToken`，废掉库的 500 分支 | `internal/store/postgres/oidc.go:561` | OPEN-PG | `noRows(err) → 哨兵；其余原样返回（wrap）`；与 G-3 同批收口 |
@@ -109,6 +109,7 @@
 - PROTO-5/6/7/9/10 — discovery 不撒谎、`prompt=none` 落地、`form_post` 拒绝带 `iss`、POST+query 拆分拒绝、userinfo 判据；均已修（`_audit/protocol.md:210-214`）。
 - P1-1/P1-2 — vault 轮换窄写/CAS（lost-update）；第 6 轮新探针验证「修对、修全」（`03-crypto-vault.md:173-193`）。
 - P2-32 — 设备路径单时钟（bf81b2a）；三处 SQL 参数化，未引入新洞（`03-crypto-vault.md:195-201`）。
+- G-9 — 刷新签发的 id_token 保留原 nonce（OIDC Core §12.2）：`RefreshRequest`/`NonceOf`、两个 store 在 refresh 行上持久化并随轮换继承、`SetUserinfoFromRequest`、迁移 `0026`；audit6 里原本断言「刷新后没有 nonce」的探针翻转为断言保留 — `17914d4`
 
 ## 有意不做 / 已裁定
 

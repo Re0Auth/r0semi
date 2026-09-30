@@ -14,7 +14,7 @@
 
 | ID | 严重度 | 问题 | 位置 | 状态 | 修法要点 |
 |---|---|---|---|---|---|
-| k1 | P2 | 账号抹除后原始 `usr_…` 仍随 `slog.Warn("...erasure", "user", string(user))` 进**进程日志**，假名密钥销毁够不到 | `internal/httpapi/account_routes.go:54-74`（日志在 `:73`） | OPEN | 删掉该行的 `"user"` 属性（`request_id` 已够定位）或改记形状｜来源：`docs/audit-5/findings/crypto-keys.md:51` |
+| k1 | P2 | 账号抹除后原始 `usr_…` 仍随 `slog.Warn("...erasure", "user", string(user))` 进**进程日志**，假名密钥销毁够不到 | `internal/httpapi/account_routes.go:54-74`（日志在 `:73`） | FIXED（17914d4） | 删掉该行的 `"user"` 属性（`request_id` 已够定位）或改记形状｜来源：`docs/audit-5/findings/crypto-keys.md:51` |
 | k6 | P3 | 同类身份进日志共 7 处（除 k1 都在错误路径），不受假名销毁影响；`admin.go:442` 由合法运维请求触发、面最大 | `internal/admin/admin.go:442`、`internal/auth/auth.go:218`、`internal/federation/bind.go:208`、`internal/federation/refresh.go:155`、`:160`、`internal/httpapi/account_routes.go:73`、`internal/httpapi/binding_routes.go:57` | OPEN | 统一改记 `action`/`self` 等形状而非 id；把该静态守卫并入常规套件｜来源：`docs/audit-5/findings/crypto-keys.md:175` |
 | FO-03 | P3 | `nonPublicPrefixes` 漏 `0.0.0.0/8`（含 `::ffff:0.x`），`DenyPrivateAddresses=true` 时仍被拨号层放行；Linux 上若内核把 `0/8` 路由到回环即等价 SSRF（本机 Windows 未能证实可利用性） | `httpclient/outbound.go:117-128`（`IsPublicAddress` 在 `:130-153`） | OPEN | 把 `netip.MustParsePrefix("0.0.0.0/8")` 加进 `nonPublicPrefixes`｜来源：`docs/audit-5/findings/federation.md:123` |
 | FO-04 | P3 | `NewRegistry` 不校验 `game`/`name`/`Resources[].Scope`：带空格的 scope 让上游收到从未声明的额外 scope，`?`/`#`/`..` 让回调 URL 与注册到源的 `redirect_uri` 不一致（操作者 TOML 输入，无远程路径） | `internal/federation/federation.go:112-122`（`bindScopes`）、`:141-175`（`NewRegistry`） | OPEN | 按 `idp.validateProviderName` 同款规则校验 `game`/`name`，`Resource.Scope` 严格文法或拒绝含空白｜来源：`docs/audit-5/findings/federation.md:164` |
@@ -77,6 +77,7 @@
 - P2-30 — 业务面 429/413 补 `no-store` — `b35f893`
 - P2-31 — auditbatch 排空加 30s 总预算 — `5cd1690`
 - P2-32 — 设备路径期限改由 store 时钟裁决 — `bf81b2a`
+- k1 — 抹除后的会话清理告警不再带原始 `usr_`，改带 `request_id`；新增默认套件守卫（旧代码上为红） — `17914d4`
 
 ## 有意不做 / 已裁定
 
