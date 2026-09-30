@@ -208,6 +208,11 @@ type idpSection struct {
 	AuthURL     string `toml:"auth_url"`
 	TokenURL    string `toml:"token_url"`
 	UserInfoURL string `toml:"userinfo_url"`
+	// JWKSURL names the key set that verifies id_tokens, for a provider whose
+	// discovery document advertises a jwks_uri on another origin than its issuer.
+	// Optional: when empty, the discovered jwks_uri must share the issuer's
+	// origin. Setting it requires the discovered value to match exactly.
+	JWKSURL string `toml:"jwks_uri"`
 	// Issuer names an OIDC provider. On a built-in provider it overrides the
 	// built-in issuer; on any other name it is required and makes that name a
 	// custom OIDC provider.
@@ -759,9 +764,11 @@ func loadConfig(path string) (settings, error) {
 		case "":
 			return settings{}, fmt.Errorf("%s.kek_id is required", field)
 		case cfg.KEKID:
+			// The id is free text from the file (or RE0AUTH_KEK_ID) and is not
+			// repeated: a value pasted into the kek_id slot would be echoed the same
+			// way an *_env name used to be (Z19-1). The field names the position.
 			return settings{}, fmt.Errorf(
-				"%s.kek_id %q is the current key's id; a retired key must be a different key",
-				field, retired.KEKID)
+				"%s.kek_id is the current key's id; a retired key must be a different key", field)
 		}
 		value, err := config.Secret(retired.KEKEnv, field+".kek_env")
 		if err != nil {
@@ -871,6 +878,7 @@ func loadIdP(cfg *settings, sections map[string]idpSection) error {
 			AuthURL:     section.AuthURL,
 			TokenURL:    section.TokenURL,
 			UserInfoURL: section.UserInfoURL,
+			JWKSURL:     section.JWKSURL,
 			Issuer:      section.Issuer,
 			DisplayName: section.DisplayName,
 		}
@@ -1023,7 +1031,7 @@ func hasUniversalPrefix(prefixes []netip.Prefix) bool {
 // exactly the kind of setting that looks applied and is not.
 func parseTrustedProxies(values []string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
-	for _, raw := range values {
+	for i, raw := range values {
 		v := strings.TrimSpace(raw)
 		if v == "" {
 			continue
@@ -1034,7 +1042,10 @@ func parseTrustedProxies(values []string) ([]netip.Prefix, error) {
 		}
 		addr, err := netip.ParseAddr(v)
 		if err != nil {
-			return nil, fmt.Errorf("server.trusted_proxies entry %q is not an IP address or CIDR", v)
+			// The entry is free text from the file and is not repeated: a pasted
+			// secret is echoed the same way an *_env name used to be (Z19-1). The
+			// index is the position an operator needs to find it.
+			return nil, fmt.Errorf("server.trusted_proxies entry %d is not an IP address or CIDR", i)
 		}
 		addr = addr.Unmap()
 		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,36 @@ func TestReadRejectsUnknownKeys(t *testing.T) {
 	// An empty path still means "environment only", not an error.
 	if err := Read("", &out); err != nil {
 		t.Fatalf("the empty path was rejected: %v", err)
+	}
+}
+
+// TestSecretDoesNotEchoTheNameItCouldNotResolve is the guard for Z19-1: the
+// configured string is never repeated, because the *_env convention invites
+// pasting a secret value into the name slot and the message reaches the startup
+// log. The field is what locates the mistake.
+func TestSecretDoesNotEchoTheNameItCouldNotResolve(t *testing.T) {
+	const pasted = "Z19-SECRET-VALUE-PASTED-INTO-THE-NAME"
+	t.Setenv("TEST_UNSET_SECRET_VAR", "")
+
+	_, err := Secret(pasted, "vault.kek_env")
+	if err == nil {
+		t.Fatal("an unset variable was accepted")
+	}
+	if strings.Contains(err.Error(), pasted) {
+		t.Errorf("the refusal echoed the configured string: %v", err)
+	}
+	if !strings.Contains(err.Error(), "vault.kek_env") {
+		t.Errorf("the refusal does not name the field: %v", err)
+	}
+
+	// Control: a name that resolves returns the value and no error.
+	t.Setenv("TEST_SET_SECRET_VAR", "value")
+	if got, err := Secret("TEST_SET_SECRET_VAR", "vault.kek_env"); err != nil || got != "value" {
+		t.Fatalf("Secret(resolvable) = %q, %v; want the value", got, err)
+	}
+
+	// Control: the empty-name branch is unchanged.
+	if _, err := Secret("", "vault.kek_env"); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("Secret(\"\") = %v; want a required-field error", err)
 	}
 }

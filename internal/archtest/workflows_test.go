@@ -38,6 +38,25 @@ func TestReleaseShipsNpmAttribution(t *testing.T) {
 			t.Errorf("the Makefile no longer has %q: the SPA's npm licence listing would not reach a release", need)
 		}
 	}
+	// The image is the third shipping form of the same embedded SPA. This gate used
+	// to read only the Makefile, so it stayed green while the runtime stage copied
+	// LICENSE and NOTICE and nothing else — the archive had the listing and the
+	// image did not (Z13-3). Reading the Dockerfile here is what makes the gap fail
+	// at pull-request time; the audit5 canary for the same edit is
+	// internal/zzprobe/deploy/artifacts_test.go's runtime-stage whitelist.
+	df, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := string(df)
+	if i := strings.LastIndex(runtime, "FROM scratch"); i >= 0 {
+		runtime = runtime[i:]
+	}
+	if !strings.Contains(runtime, "npm-attribution") {
+		t.Errorf("the runtime stage of the Dockerfile does not copy the npm attribution " +
+			"listing the Makefile builds: the SPA is embedded in the same binary, so the " +
+			"image has the same MIT/ISC notice obligation as the archives")
+	}
 }
 
 // TestWorkflowActionsArePinnedToFullSHAs makes the SHA-pinning rule a check rather

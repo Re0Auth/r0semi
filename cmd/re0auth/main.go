@@ -1405,14 +1405,22 @@ func oidcRetiredTokenKeys() ([]oidchttp.RetiredTokenKey, error) {
 		return nil, nil
 	}
 	var out []oidchttp.RetiredTokenKey
-	for _, part := range strings.Split(v, ",") {
+	for i, part := range strings.Split(v, ",") {
 		id, encoded, ok := strings.Cut(strings.TrimSpace(part), ":")
 		if !ok || id == "" {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS entry %q must be id:base64", part)
+			// The entry itself is never repeated. A missing "id:" prefix is exactly
+			// the shape produced by pasting key material alone, and this message used
+			// to carry that material into the startup log (Z12-1). A retired token
+			// key is live secret material: it still decrypts every opaque access
+			// token issued before the rotation. The index identifies the entry.
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS entry %d must be id:base64", i)
 		}
 		b, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil || len(b) != 32 {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS entry %q must be 32 bytes base64", id)
+			// The id is not repeated either: it is free text from the environment,
+			// and an entry of the form "<pasted value>:<junk>" would otherwise echo
+			// the pasted half. The index locates it.
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS entry %d must be 32 bytes base64", i)
 		}
 		var key [32]byte
 		copy(key[:], b)
@@ -1452,22 +1460,26 @@ func oidcRetiredSigningKeys() ([]oidcstore.RetiredSigningKey, error) {
 		return nil, nil
 	}
 	var out []oidcstore.RetiredSigningKey
-	for _, part := range strings.Split(v, ",") {
+	for i, part := range strings.Split(v, ",") {
 		id, encoded, ok := strings.Cut(strings.TrimSpace(part), ":")
 		if !ok || id == "" {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q must be kid:base64", part)
+			// Same shape as the retired token keys above, and the same reason to fix
+			// it: the variable is documented as holding public keys, but an operator
+			// can paste a PKCS#8 *private* key, and the error used to repeat it. The
+			// index identifies the entry; the value never appears.
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %d must be kid:base64", i)
 		}
 		der, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q: %w", id, err)
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %d: %w", i, err)
 		}
 		pub, err := x509.ParsePKIXPublicKey(der)
 		if err != nil {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q: %w", id, err)
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %d: %w", i, err)
 		}
 		rsaPub, ok := pub.(*rsa.PublicKey)
 		if !ok {
-			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %q must be an RSA public key", id)
+			return nil, fmt.Errorf("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS entry %d must be an RSA public key", i)
 		}
 		out = append(out, oidcstore.RetiredSigningKey{ID: id, Public: rsaPub})
 	}

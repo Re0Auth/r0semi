@@ -333,14 +333,18 @@ client_secret_env = "GOOGLE_CLIENT_SECRET"
 # identity namespace, so it must not collide with a built-in name.
 #
 # A discovered endpoint must be on the issuer's origin (scheme + host): the
-# discovery document is attacker-influenced in a mix-up, and the client secret
-# must not be sent to another origin. A provider that really hosts its endpoints
-# on a different host sets `auth_url`/`token_url` explicitly, which skips
-# discovery.
+# discovery document is attacker-influenced in a mix-up, so neither the client
+# secret nor the key set that verifies id_tokens may be delegated to another
+# origin. A provider that really hosts its endpoints elsewhere sets
+# `auth_url`/`token_url` explicitly, which skips discovery. One that advertises
+# its key set on another origin sets `jwks_uri`, which must then match the
+# discovered value exactly. (The built-in google is the one case that carries
+# such a value itself, for www.googleapis.com.)
 # [idp.authentik]
 # client_id         = "..."
 # client_secret_env = "AUTHENTIK_CLIENT_SECRET"
 # issuer            = "https://auth.example/application/o/re0auth/"
+# jwks_uri          = "https://keys.example/jwks"   # only if it is on another origin
 # display_name      = "Authentik"
 
 # A self-hosted or proxied endpoint, and the required Microsoft tenant form:

@@ -25,12 +25,16 @@ func oneLine(s string) string {
 // The whole config schema is built on one convention (internal/config/config.go:
 // "a config file never contains a secret. It names the environment variable that
 // holds it"). Nothing checks the name's shape. `config.Secret`
-// (internal/config/config.go:57-66) looks the name up and, on a miss, returns
+// (internal/config/config.go:57-66) looks the name up and, on a miss, used to
+// return
 //
 //	%s names %q, which is not set
 //
 // with the name interpolated verbatim — and cmd/re0auth/main.go:304 turns that
 // into `slog.Error("cannot start", "stage", …, "err", failure.err)`.
+//
+// The FIX (Z19-1) removes the interpolation entirely: the refusal names the field
+// only. The control below asserts the new contract.
 //
 // Swapping a value for its own variable name is the mistake the convention
 // invites: `client_secret_env = "<the secret>"`, `kek_env = "<the base64 KEK>"`.
@@ -69,12 +73,14 @@ func TestZ19SecretEnvNameHoldingTheSecretValueIsEchoed(t *testing.T) {
 		return runBinary(t, env, "-config", writeConfig(t, "re0auth.toml", body))
 	}
 
-	// Control: the same shape with a NAME that is merely unset does not print a
-	// value — the error names the field and the variable, which is the useful
-	// half. (This is what the message is for.)
+	// Control: the same shape with a NAME that is merely unset. The message names
+	// the FIELD; it deliberately no longer repeats the configured string, because
+	// the fixed message cannot tell a mistyped name from a pasted secret (and a
+	// shape test would let an alphanumeric secret through). The field plus the
+	// config file in hand are what locate it.
 	ctrl := run(t, base, "[vault]\nkek_env = \"NO_SUCH_VARIABLE\"\n")
-	if !strings.Contains(ctrl.out, "stage=config") || !strings.Contains(ctrl.out, "NO_SUCH_VARIABLE") {
-		t.Fatalf("control did not reach the config stage with a named variable:\n%s", ctrl.out)
+	if !strings.Contains(ctrl.out, "stage=config") || !strings.Contains(ctrl.out, "vault.kek_env") {
+		t.Fatalf("control did not reach the config stage naming the field:\n%s", ctrl.out)
 	}
 	if strings.Contains(ctrl.out, kekSecret) {
 		t.Fatalf("control is wrong: an unset NAME revealed a value:\n%s", ctrl.out)

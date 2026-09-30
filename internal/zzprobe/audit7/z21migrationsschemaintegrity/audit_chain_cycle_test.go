@@ -99,7 +99,18 @@ func TestAuditVerifyModelIsNotVacuous(t *testing.T) {
 	}
 }
 
-// TestAuditChainSurvivesADownUpCycle is the red probe for Z21-2.
+// TestAuditChainSurvivesADownUpCycle is the Z21-2 probe, and it reads the
+// migration's Down section from disk instead of hardcoding what it does. It has
+// two branches:
+//
+//   - the Down executes DDL (the pre-fix state): the chain columns and the head
+//     are dropped and re-seeded by the Up, every historical hash column comes
+//     back NULL, Verify calls all of them Legacy, and OK is still true. RED.
+//   - the Down executes nothing (the fixed state): the chain is untouched by the
+//     cycle, which is only actually true if the Up is idempotent and does not
+//     rewind a surviving head to genesis. The Up is asserted directly, because
+//     modelVerify cannot see a head that was rewound: a chain whose rows are
+//     still hashed verifies OK against any head as long as one row is chained.
 func TestAuditChainSurvivesADownUpCycle(t *testing.T) {
 	rows := []chainedRow{
 		{ /* two pre-0013 rows, unchained legacy */ },
@@ -113,38 +124,88 @@ func TestAuditChainSurvivesADownUpCycle(t *testing.T) {
 		t.Fatalf("precondition: the healthy chain was rejected before the cycle: %s", reason)
 	}
 
-	// 0013 Down (:51) drops audit_chain wholesale — the head row it held is gone;
-	// (:53-55) drops prev_hash, row_hash and signature from audit_events. No DROP
-	// or DELETE of audit_events appears in any Down section, so the rows survive
-	// with their chain metadata cleared. 0013 Up then re-creates the table and
-	// re-inserts the genesis head ('\x'::bytea at :48).
-	//
-	// Note the head is NOT re-derived from the surviving rows: it is seeded empty.
-	droppedColumns := true // 0013_down_altered_audit_events
-	if !droppedColumns {
-		t.Fatal("model precondition")
+	raw := readAll(t, migrationFiles(t))
+	body, ok := raw["0013_audit_chain.sql"]
+	if !ok {
+		t.Fatalf("0013_audit_chain.sql is not among the migration files; the locator is broken")
 	}
-	after := make([]chainedRow, len(rows))
-	for i := range after {
-		after[i] = chainedRow{} // row_hash/prev_hash columns were dropped and re-added, so NULL
-	}
-	headAfter := []byte{} // 0013's Up INSERT ... VALUES (true, '\x'::bytea)
-
-	if ok, reason := modelVerify(after, headAfter); !ok {
-		t.Errorf("REGRESSION NOT FLAGGED: model says the post-cycle log is bad (%s)", reason)
-	} else {
-		t.Errorf("AUDIT CHAIN LOST BY A DOWN/UP CYCLE (silently): after the cycle all %d chained rows "+
-			"read back as legacy (their hash columns were dropped and re-added) and the re-created "+
-			"head is the genesis, so Verify reports OK with every linkage and signature the chain "+
-			"held gone. The next new row chains from genesis, forking from the historical rows.",
-			len(rows)-2)
+	up, down := splitDirection(body)
+	if strings.TrimSpace(down) == "" {
+		t.Fatalf("0013 has no Down section; the probe is reading the wrong text")
 	}
 
-	// Control: if the chain metadata HAD survived (the mutation this probe is
-	// looking for is a real presence check, not a model that always passes), the
-	// head would not be the genesis and the walk would notice something is wrong.
-	if ok, _ := modelVerify(after, headBefore); ok {
-		t.Errorf("control failed: the model called the lost metadata 'chained' as well")
+	// What the Down actually executes, read from the file. Comments are stripped
+	// first: the fixed Down documents at length why it does nothing, and prose is
+	// not SQL.
+	executed := strings.TrimSpace(stripSQLComments(down))
+
+	if executed != "" {
+		// Pre-fix state. 0013's Down dropped audit_chain and the three
+		// audit_events columns; no DROP or DELETE of audit_events appears
+		// anywhere, so the rows survive with their chain metadata cleared. The Up
+		// then re-seeds the head to the genesis hash rather than re-deriving it
+		// from the surviving rows.
+		after := make([]chainedRow, len(rows))
+		for i := range after {
+			after[i] = chainedRow{} // row_hash/prev_hash were dropped and re-added, so NULL
+		}
+		headAfter := []byte{} // 0013's Up seeds the genesis
+
+		if ok, reason := modelVerify(after, headAfter); !ok {
+			t.Errorf("REGRESSION NOT FLAGGED: model says the post-cycle log is bad (%s)", reason)
+		} else {
+			t.Errorf("AUDIT CHAIN LOST BY A DOWN/UP CYCLE (silently): 0013's Down still executes "+
+				"%q, so after the cycle all %d chained rows read back as legacy (their hash "+
+				"columns were dropped and re-added) and the re-created head is the genesis, so "+
+				"Verify reports OK with every linkage and signature the chain held gone. The "+
+				"next new row chains from genesis, forking from the historical rows.",
+				strings.TrimSpace(executed), len(rows)-2)
+		}
+
+		// Control: if the chain metadata HAD survived, the head would not be the
+		// genesis and the walk would notice something is wrong.
+		if ok, _ := modelVerify(after, headBefore); ok {
+			t.Errorf("control failed: the model called the lost metadata 'chained' as well")
+		}
+		return
+	}
+
+	// Fixed state: the Down executes nothing, so the modelled chain is unchanged
+	// and Verify still passes. This half is a definition rather than a discovery —
+	// the content of the green branch is the Up assertions below, because a no-op
+	// Down is only safe if the re-run Up neither collides with nor rewinds the
+	// objects that survived it.
+	if ok, reason := modelVerify(rows, headBefore); !ok {
+		t.Errorf("the chain was rejected after a no-op Down: %s", reason)
+	}
+
+	// goose deletes the version row for a Down that runs no statements, so the
+	// next Open() re-runs this Up against the surviving objects. The Up must
+	// therefore be idempotent and must not rewind a surviving head to genesis.
+	upNoComments := strings.ToUpper(stripSQLComments(up))
+	for _, want := range []string{
+		"ALTER TABLE AUDIT_EVENTS ADD COLUMN IF NOT EXISTS PREV_HASH",
+		"ALTER TABLE AUDIT_EVENTS ADD COLUMN IF NOT EXISTS ROW_HASH",
+		"ALTER TABLE AUDIT_EVENTS ADD COLUMN IF NOT EXISTS SIGNATURE",
+		"CREATE UNIQUE INDEX IF NOT EXISTS AUDIT_EVENTS_ROW_HASH_IDX",
+		"CREATE TABLE IF NOT EXISTS AUDIT_CHAIN",
+		"ON CONFLICT (ONLY_ROW) DO NOTHING",
+	} {
+		if !strings.Contains(upNoComments, want) {
+			t.Errorf("the Down is a no-op but the Up is not idempotent: it no longer contains %q. "+
+				"The next Open() re-runs this Up against the surviving schema, so a bare "+
+				"statement fails with `already exists`, and an unconditional INSERT rewinds a "+
+				"real surviving chain head to genesis.", want)
+		}
+	}
+	for _, pair := range []struct{ bare, idempotent string }{
+		{"ADD COLUMN", "ADD COLUMN IF NOT EXISTS"},
+		{"CREATE TABLE", "CREATE TABLE IF NOT EXISTS"},
+		{"CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS"},
+	} {
+		if got, want := strings.Count(upNoComments, pair.bare), strings.Count(upNoComments, pair.idempotent); got != want {
+			t.Errorf("the Up has %d %q statement(s) but only %d idempotent ones", got, pair.bare, want)
+		}
 	}
 }
 
@@ -155,31 +216,48 @@ func TestDownDoesNotDropAuditRows(t *testing.T) {
 	raw := readAll(t, migrationFiles(t))
 	for name, body := range raw {
 		_, down := splitDirection(body)
-		for _, stmt := range strings.Split(down, ";") {
+		for _, stmt := range strings.Split(stripSQLComments(down), ";") {
 			u := strings.ToUpper(stmt)
 			if strings.Contains(u, "DELETE") || strings.Contains(u, "TRUNCATE") {
 				t.Errorf("%s: a Down section deletes rows (%q)", name, strings.TrimSpace(stmt))
 			}
-			if strings.Contains(u, "DROP TABLE") && !strings.Contains(u, "AUDIT_CHAIN") &&
-				!strings.Contains(u, "AUDIT_SUBJECT_KEYS") && !strings.Contains(u, "AUTHZ_REQUESTS") {
+			if strings.Contains(u, "DROP TABLE") && !strings.Contains(u, "AUTHZ_REQUESTS") {
 				t.Logf("%s: Down drops a table: %q", name, strings.TrimSpace(stmt))
 			}
 		}
 	}
-	// Positive control for the extractor: 0013's Down must contain the DROP TABLE
-	// this probe is about, or the scan above is looking at the wrong text.
-	_, down := splitDirection(raw["0013_audit_chain.sql"])
-	if !strings.Contains(strings.ToUpper(down), "DROP TABLE IF EXISTS AUDIT_CHAIN") {
-		t.Fatalf("control failed: 0013's Down does not drop audit_chain (%q)", strings.TrimSpace(down))
+
+	// Positive control for the extractor: 0013's Up must create the objects its
+	// Down used to drop (audit_chain, audit_events_row_hash_idx), or the scan
+	// above is looking at the wrong text.
+	up13, down13 := splitDirection(raw["0013_audit_chain.sql"])
+	if strings.TrimSpace(up13) == "" {
+		t.Fatalf("control failed: 0013 has no Up section")
 	}
-	_, d14 := splitDirection(raw["0014_audit_pseudonyms.sql"])
-	if !strings.Contains(strings.ToUpper(d14), "DROP TABLE IF EXISTS AUDIT_SUBJECT_KEYS") {
-		t.Fatalf("control failed: 0014's Down does not drop audit_subject_keys (%q)", strings.TrimSpace(d14))
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS audit_chain",
+		"CREATE UNIQUE INDEX IF NOT EXISTS audit_events_row_hash_idx",
+	} {
+		if !strings.Contains(strings.ToUpper(up13), strings.ToUpper(want)) {
+			t.Fatalf("control failed: 0013's Up does not contain %q", want)
+		}
 	}
-	// And 0014's Down destroys the per-subject keys, which are the only thing that
+	// And its Down must execute nothing at all: that is the Z21-2 fix. A Down
+	// that drops the chain columns silently destroys tamper-evidence (ADR-0008 §5).
+	if got := strings.TrimSpace(stripSQLComments(down13)); got != "" {
+		t.Fatalf("0013's Down executes SQL (%q); it must be a comment-only no-op", got)
+	}
+
+	// 0014's Down destroyed the per-subject keys, which are the only thing that
 	// makes an erased account's audit history unlinkable (auditpseudo.go:167-186).
-	if strings.Contains(strings.ToUpper(d14), "BACKUP") {
-		t.Fatal("control failed")
+	// It must execute nothing too, and its Up must be idempotent so the next
+	// Open()'s re-run does not collide.
+	up14, down14 := splitDirection(raw["0014_audit_pseudonyms.sql"])
+	if !strings.Contains(strings.ToUpper(up14), "CREATE TABLE IF NOT EXISTS AUDIT_SUBJECT_KEYS") {
+		t.Fatalf("control failed: 0014's Up no longer creates audit_subject_keys idempotently")
+	}
+	if got := strings.TrimSpace(stripSQLComments(down14)); got != "" {
+		t.Fatalf("0014's Down executes SQL (%q); it must be a comment-only no-op", got)
 	}
 	_ = hex.EncodeToString
 	_ = hmac.New

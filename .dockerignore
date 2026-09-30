@@ -30,6 +30,25 @@ config/*.local.*
 config/*.secret.*
 .env
 
+# The backup scripts' default output (scripts/backup.sh:12, backup-keys.sh:23):
+# a plaintext SQL dump and a KEK/OIDC/audit-key .env. Same reason as .env above.
+backups
+*.dump
+*.env
+
+# The audit workspace and the other local state .gitignore excludes. The build
+# needs none of it, and scratchpad/ is where audits leave probes and generated
+# material — including key-shaped files — so it must not reach the build context
+# or the backend stage's `COPY . .` layer (Dockerfile:42).
+scratchpad
+go.work
+go.work.sum
+*.local.toml
+*.out
+bench.txt
+load.txt
+report.md
+
 # Editor and VCS noise.
 .gitignore
 .vscode

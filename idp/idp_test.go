@@ -277,27 +277,172 @@ func TestMicrosoftBuiltInIssuerIsRefusedAtConstruction(t *testing.T) {
 	}
 }
 
-// A discovered OAuth endpoint that is not on the configured issuer's origin is
-// refused, so the client secret cannot be sent to another origin. Paths may
+// A discovered OAuth endpoint or key set that is not on the configured issuer's
+// origin is refused, so the client secret cannot be sent to another origin and
+// no other origin can choose the key that signs an accepted id_token. Paths may
 // differ; scheme and host may not.
 func TestDiscoveredEndpointMustMatchIssuerOrigin(t *testing.T) {
 	c := &Client{provider: "authentik", issuer: "https://auth.example/application/o/re0auth/"}
 	// Same origin, different path: allowed.
 	if err := c.pinToIssuer("https://auth.example/application/o/re0auth/authorize",
-		"https://auth.example/application/o/re0auth/token"); err != nil {
+		"https://auth.example/application/o/re0auth/token",
+		"https://auth.example/application/o/re0auth/jwks"); err != nil {
 		t.Fatalf("a same-origin endpoint was refused: %v", err)
 	}
 	// Another host, and another scheme: refused.
-	if err := c.pinToIssuer("https://evil.example/authorize", ""); err == nil {
+	if err := c.pinToIssuer("https://evil.example/authorize", "", ""); err == nil {
 		t.Error("accepted an authorization endpoint on another host")
 	}
-	if err := c.pinToIssuer("", "http://auth.example/token"); err == nil {
+	if err := c.pinToIssuer("", "http://auth.example/token", ""); err == nil {
 		t.Error("accepted a token endpoint on a downgraded scheme")
 	}
-	// A missing endpoint is not this check's business.
-	if err := c.pinToIssuer("", ""); err != nil {
+	// A key set on another origin would let that origin's key sign any sub.
+	if err := c.pinToIssuer("", "", "https://evil.example/jwks"); err == nil {
+		t.Error("accepted a jwks_uri on another host")
+	}
+	// A missing endpoint is not this check's business, jwks_uri included (an
+	// empty value is skipped rather than parsed).
+	if err := c.pinToIssuer("", "", ""); err != nil {
 		t.Errorf("pinToIssuer rejected empty endpoints: %v", err)
 	}
+}
+
+// An explicitly configured jwks_uri is the escape hatch for a provider whose key
+// set really lives on another origin (Google is the built-in case): the document
+// must name exactly that key set, and any other value is refused.
+func TestConfiguredJWKSURIAllowsAForeignOrigin(t *testing.T) {
+	const foreign = "https://www.googleapis.com/oauth2/v3/certs"
+	c := &Client{
+		provider: "google",
+		issuer:   "https://accounts.google.com",
+		def:      definition{jwksURL: foreign},
+	}
+	if err := c.pinJWKSURI(foreign); err != nil {
+		t.Fatalf("the configured cross-origin key set was refused: %v", err)
+	}
+	if err := c.pinJWKSURI("https://evil.example/jwks"); err == nil {
+		t.Error("accepted a jwks_uri other than the configured one")
+	}
+	// Without a configured key set the same-origin rule is back in force.
+	c.def.jwksURL = ""
+	if err := c.pinJWKSURI(foreign); err == nil {
+		t.Error("accepted a cross-origin jwks_uri with nothing configured")
+	}
+}
+
+// The Google built-in carries the cross-origin key set its document names, and
+// the value is dropped when an operator points the provider at another issuer
+// (the tests do exactly that), so a correct document is not refused for naming
+// its own key set.
+func TestGoogleBuiltInJWKSURIIsScopedToTheBuiltInIssuer(t *testing.T) {
+	reg, err := NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		Credentials:  []Credentials{{Provider: Google, ClientID: "cid", ClientSecret: "sec"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := reg.Get(Google)
+	const want = "https://www.googleapis.com/oauth2/v3/certs"
+	if c.def.jwksURL != want {
+		t.Errorf("google's built-in jwks_uri = %q, want %q", c.def.jwksURL, want)
+	}
+
+	reg, err = NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		Credentials: []Credentials{{
+			Provider: Google, ClientID: "cid", ClientSecret: "sec",
+			Issuer: "https://idp.example",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ = reg.Get(Google)
+	if c.def.jwksURL != "" {
+		t.Errorf("google's built-in jwks_uri survived an issuer override: %q", c.def.jwksURL)
+	}
+
+	// The override can name the real key set itself.
+	reg, err = NewRegistry(RegistryConfig{
+		RedirectBase: "https://re0auth.test",
+		Credentials: []Credentials{{
+			Provider: Google, ClientID: "cid", ClientSecret: "sec",
+			Issuer: "https://idp.example", JWKSURL: "https://keys.example/jwks",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ = reg.Get(Google)
+	if c.def.jwksURL != "https://keys.example/jwks" {
+		t.Errorf("configured jwks_uri = %q", c.def.jwksURL)
+	}
+}
+
+// The pin has to be applied where the document is actually read, not only in
+// pinToIssuer's unit test: discovery says the key set lives on another origin,
+// and the client must refuse before it ever trusts a token.
+func TestDiscoveryJWKSURIMustShareTheIssuerOrigin(t *testing.T) {
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{}})
+	}))
+	defer foreign.Close()
+
+	serve := func(jwksURI string) *Client {
+		t.Helper()
+		var base string
+		mux := http.NewServeMux()
+		mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+			if jwksURI == "" {
+				jwksURI = base + "/jwks"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer":                                base,
+				"authorization_endpoint":                base + "/authorize",
+				"token_endpoint":                        base + "/token",
+				"jwks_uri":                              jwksURI,
+				"response_types_supported":              []string{"code"},
+				"subject_types_supported":               []string{"public"},
+				"id_token_signing_alg_values_supported": []string{"RS256"},
+			})
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		base = srv.URL
+
+		reg, err := NewRegistry(RegistryConfig{
+			RedirectBase: "https://re0auth.test",
+			HTTPClient:   srv.Client(),
+			Credentials: []Credentials{{
+				Provider: "authentik", ClientID: "cid", ClientSecret: "sec", Issuer: srv.URL,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, ok := reg.Get("authentik")
+		if !ok {
+			t.Fatal("authentik was not registered")
+		}
+		return c
+	}
+
+	// Anti-vacuity: a same-origin key set still discovers.
+	ok := serve("")
+	if _, err := ok.AuthCodeURL(context.Background(), "st", ok.NewVerifier(), "n"); err != nil {
+		t.Fatalf("a same-origin jwks_uri was refused: %v", err)
+	}
+
+	// The attack: the document names the attacker's key set.
+	hostile := serve(foreign.URL + "/jwks")
+	url, err := hostile.AuthCodeURL(context.Background(), "st", hostile.NewVerifier(), "n")
+	if err == nil {
+		t.Fatalf("accepted a discovery document whose jwks_uri is on another origin; login URL %q", url)
+	}
+	t.Logf("foreign jwks_uri refused: %v", err)
 }
 
 // The fallback client, used when a caller does not inject one, must carry the

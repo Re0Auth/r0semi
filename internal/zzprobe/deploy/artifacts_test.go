@@ -602,8 +602,10 @@ func TestRuntimeStageShipsTheBinaryAndTheCABundleOnly(t *testing.T) {
 	// The licence and the attribution are the third thing the runtime stage is
 	// allowed to carry (added with the P2-21 fix): NOTICE is what tells a
 	// redistributor which third-party code is in the binary, so shipping the image
-	// without it is the same gap as shipping an archive without it.
-	allowed := []string{"/etc/ssl/certs/ca-certificates.crt", "/out/re0auth", "LICENSE", "NOTICE"}
+	// without it is the same gap as shipping an archive without it. The npm
+	// listing joined them with the Z13-3 fix: the SPA is compiled into that same
+	// binary, and NOTICE covers only the Go module graph.
+	allowed := []string{"/etc/ssl/certs/ca-certificates.crt", "/out/re0auth", "LICENSE", "NOTICE", "npm-attribution.json"}
 	for _, line := range strings.Split(runtime, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "COPY ") && !strings.HasPrefix(trimmed, "ADD ") {

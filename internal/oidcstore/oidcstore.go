@@ -266,11 +266,20 @@ type RefreshRequest struct {
 	AMR      []string
 	Audience []string
 	AuthTime *time.Time
+	// Nonce carries the nonce of the authorization that created the family. OIDC
+	// Core §12.2 says the id_token returned by a refresh MUST NOT have a nonce
+	// claim unless the nonce is the same as in the original authorization
+	// request, so the value is not re-derived here: it is the code grant's nonce,
+	// persisted with the refresh row and replayed on every rotation. It is stored
+	// on the refresh request rather than recovered from an op.AuthRequest because
+	// a refresh grant has no live auth request to read it from.
+	Nonce string
 }
 
 func (r *RefreshRequest) GetAMR() []string            { return r.AMR }
 func (r *RefreshRequest) GetAudience() []string       { return r.Audience }
 func (r *RefreshRequest) GetClientID() string         { return r.ClientID }
+func (r *RefreshRequest) GetNonce() string            { return r.Nonce }
 func (r *RefreshRequest) GetScopes() []string         { return r.Scopes }
 func (r *RefreshRequest) GetSubject() string          { return r.Subject }
 func (r *RefreshRequest) SetCurrentScopes(s []string) { r.Scopes = s }
@@ -279,6 +288,17 @@ func (r *RefreshRequest) GetAuthTime() time.Time {
 		return time.Time{}
 	}
 	return *r.AuthTime
+}
+
+// NonceOf returns the nonce of a token request, or "" when it carries none.
+// It exists because the nonce is not part of op.IDTokenRequest: the library only
+// reads it from an op.AuthRequest, so both stores have to recognise whichever of
+// their own request types is in hand and copy the nonce into the refresh row.
+func NonceOf(request any) string {
+	if r, ok := request.(interface{ GetNonce() string }); ok {
+		return r.GetNonce()
+	}
+	return ""
 }
 
 // SplitProtocolScopes partitions a scope set into the ones the catalogue

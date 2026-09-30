@@ -240,6 +240,9 @@ type refreshToken struct {
 	amr       []string
 	audience  []string
 	authTime  *time.Time
+	// nonce is the authorization request's nonce, carried so a rotated id_token can
+	// repeat it (OIDC Core §12.2). Rotation inherits it from the token it spends.
+	nonce string
 	// familyID is shared by every generation descended from one authorization.
 	// Rotation inherits it, so a replay that reaches a tombstone can name the
 	// chain to revoke rather than only the value that was presented.
@@ -584,6 +587,7 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 		amr:       amr,
 		audience:  audience,
 		authTime:  authTime,
+		nonce:     oidcstore.NonceOf(request),
 		issuedAt:  now,
 		expiresAt: now.Add(s.refreshTTL),
 	}
@@ -666,6 +670,7 @@ func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) 
 		IDHash: r.idHash, ClientID: r.clientID, Subject: r.subject,
 		Scopes: append([]string(nil), r.scopes...),
 		AMR:    append([]string(nil), r.amr...),
+		Nonce:  r.nonce,
 	}
 	out.Audience = append([]string(nil), r.audience...)
 	if r.authTime != nil {
@@ -892,6 +897,31 @@ func (s *OIDCStore) AuthorizeClientIDSecret(ctx context.Context, clientID, clien
 // REQUIRED, and the identity an RP keys its session on. Both stores have to set it.
 func (s *OIDCStore) SetUserinfoFromScopes(_ context.Context, userinfo *oidc.UserInfo, userID, _ string, _ []string) error {
 	userinfo.Subject = userID
+	return nil
+}
+
+// SetUserinfoFromRequest implements op.CanSetUserinfoFromRequest. It is the seam
+// the library offers for claims that depend on the request rather than the scopes
+// (op.CreateIDToken calls it right after SetUserinfoFromScopes and merges the
+// claims into the id_token), and the nonce is exactly such a claim.
+//
+// OIDC Core §12.2: the id_token returned by a refresh MUST NOT carry a nonce
+// unless it is the same nonce as in the original authorization request. The
+// library reads the nonce only from an op.AuthRequest, and this store must not
+// make RefreshRequest satisfy op.AuthRequest — `needsRefreshToken` switches on
+// `case AuthRequest` before `case RefreshTokenRequest`, so doing that would break
+// rotation and make CreateTokenResponse delete the auth request and emit a bogus
+// consent denial. Setting the claim here is the sanctioned alternative. An empty
+// nonce is left out: the claim has `omitempty`, and §12.2 forbids inventing one.
+func (s *OIDCStore) SetUserinfoFromRequest(_ context.Context, userinfo *oidc.UserInfo, request op.IDTokenRequest, _ []string) error {
+	nonce := oidcstore.NonceOf(request)
+	if nonce == "" {
+		return nil
+	}
+	if userinfo.Claims == nil {
+		userinfo.Claims = make(map[string]any, 1)
+	}
+	userinfo.Claims["nonce"] = nonce
 	return nil
 }
 

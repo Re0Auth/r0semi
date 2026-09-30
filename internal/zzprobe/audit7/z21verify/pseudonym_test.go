@@ -36,9 +36,11 @@ func TestMigration0014DownDestroysEveryPseudonymKey(t *testing.T) {
 	downNoComments := stripSQLComments(down)
 
 	// Control: the table really is the key store this probe is about, and the Up
-	// creates it empty (so nothing restores the keys after a Down/Up cycle).
-	if !strings.Contains(upNoComments, "CREATE TABLE audit_subject_keys") {
-		t.Fatalf("premise changed: 0014's Up no longer creates audit_subject_keys")
+	// creates it empty (so nothing restores the keys after a Down/Up cycle). The
+	// Up is `IF NOT EXISTS` because its Down is a no-op and the next Open() re-runs
+	// it; see ADR-0008 §5 and TestAuditIntegrityMigrationsCannotBeRolledBack.
+	if !strings.Contains(upNoComments, "CREATE TABLE IF NOT EXISTS audit_subject_keys") {
+		t.Fatalf("premise changed: 0014's Up no longer creates audit_subject_keys idempotently")
 	}
 	if strings.Contains(strings.ToUpper(upNoComments), "INSERT INTO AUDIT_SUBJECT_KEYS") {
 		t.Logf("note: 0014's Up now repopulates audit_subject_keys; re-read Z21V-1")

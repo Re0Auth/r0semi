@@ -20,6 +20,17 @@ RUN corepack enable
 # changes; the source that follows does not invalidate the dependency install.
 COPY web/package.json web/pnpm-lock.yaml ./web/
 RUN cd web && pnpm install --frozen-lockfile
+# The npm half of the licence attribution, for the image. It reads the INSTALLED
+# tree — the install above — so it needs no registry access, and running it here
+# rather than after the build keeps it cached across source edits. `test -s`
+# mirrors the Makefile's refusal to ship an empty listing. The image cannot use
+# the Makefile's version-bearing name: the runtime stage has no ARG VERSION (ARG
+# is stage-scoped and Dockerfile:49 is in the build stage), and inside one image
+# the version is redundant with the binary's own stamp.
+RUN mkdir -p /out \
+ && cd web \
+ && pnpm licenses list --json > /out/npm-attribution.json \
+ && test -s /out/npm-attribution.json
 COPY web/ ./web/
 # adapter-static writes to ../internal/webui/dist, which is where //go:embed
 # reads. Make the parent first so the build never depends on it existing.
@@ -72,6 +83,11 @@ COPY --from=build /out/re0auth /re0auth
 # archive: NOTICE is what tells a redistributor which third-party code is in the
 # binary, so an image without it has the same gap as an archive without it.
 COPY LICENSE NOTICE /
+# The SPA is compiled into the very binary this image ships, so the image has the
+# same npm notice obligation the archives carry; NOTICE covers the Go module graph
+# only, and leaving this out was Z13-3. COPY --from=web is valid from any earlier
+# stage, and the file is version-less for the reason given in the web stage.
+COPY --from=web /out/npm-attribution.json /npm-attribution.json
 # Numeric uid 65532 is the conventional nonroot id; scratch has no passwd file,
 # so it stays unnamed. The process cannot write over its own image.
 USER 65532:65532

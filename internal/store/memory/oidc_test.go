@@ -600,6 +600,52 @@ func TestRefreshTokenRotationStillWorksWhenPresentedOnce(t *testing.T) {
 	}
 }
 
+// OIDC Core §12.2: the id_token a refresh returns may repeat the original
+// authorization request's nonce. The nonce therefore has to survive the storage
+// round trip and every rotation, or the refreshed id_token loses it. This reads
+// the minted row back, rotates the token twice and asserts the nonce is still
+// there after each rotation.
+func TestRefreshRequestCarriesTheNonceAcrossRotations(t *testing.T) {
+	store, client := testStore(t)
+	ctx := context.Background()
+	const nonce = "nonce-1234567890"
+	req := &oidcstore.AuthRequest{
+		ClientID: client.ID, Subject: "usr_1",
+		Scopes: []string{"account.id"}, Nonce: nonce,
+	}
+
+	_, refresh, _, err := store.CreateAccessAndRefreshTokens(ctx, req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The stored row carries the nonce before any rotation.
+	held, err := store.TokenRequestByRefreshToken(ctx, refresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := oidcstore.NonceOf(held); got != nonce {
+		t.Fatalf("the minted refresh request's nonce = %q, want %q", got, nonce)
+	}
+
+	// Two rotations, each time reading the replacement back through the same path
+	// the library uses. The nonce must be inherited rather than dropped.
+	for i := 0; i < 2; i++ {
+		_, rotated, _, err := store.CreateAccessAndRefreshTokens(ctx, held, refresh)
+		if err != nil {
+			t.Fatalf("rotation %d was refused: %v", i+1, err)
+		}
+		held, err = store.TokenRequestByRefreshToken(ctx, rotated)
+		if err != nil {
+			t.Fatalf("rotation %d's replacement was rejected: %v", i+1, err)
+		}
+		if got := oidcstore.NonceOf(held); got != nonce {
+			t.Fatalf("after rotation %d the nonce = %q, want %q", i+1, got, nonce)
+		}
+		refresh = rotated
+	}
+}
+
 // Revocation must work through the path a client actually takes.
 //
 // The library feeds GetRefreshTokenInfo's identifier straight back into

@@ -54,13 +54,22 @@ func Read(path string, out any) error {
 
 // Secret resolves an environment variable by name. field names the config key,
 // so a misconfiguration points at the file rather than only at the variable.
+//
+// The configured string itself is never repeated. The schema's contract is that
+// the file names the variable holding a secret rather than the secret, so the
+// mistake it invites is putting the value in the name slot — and
+// "field names %q, which is not set" then printed a live KEK, client secret or
+// DSN into the startup log (Z19-1). The refusal is deliberately *not* gated on
+// the name's shape: a purely alphanumeric secret matches any environment-variable
+// pattern, so an echo conditioned on shape would still leak. `field` names the
+// position, and -print-secret-env is where a legal name is read back.
 func Secret(envName, field string) (string, error) {
 	if envName == "" {
 		return "", fmt.Errorf("%s is required", field)
 	}
 	value := os.Getenv(envName)
 	if value == "" {
-		return "", fmt.Errorf("%s names %q, which is not set", field, envName)
+		return "", fmt.Errorf("%s names an environment variable that is not set", field)
 	}
 	return value, nil
 }

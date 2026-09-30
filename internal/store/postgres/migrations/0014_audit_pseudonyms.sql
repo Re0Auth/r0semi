@@ -33,10 +33,34 @@
 -- over the old value (breaking 0013's chain) or require an in-Go data migration at
 -- startup. See docs/architecture.md §4.17.
 
-CREATE TABLE audit_subject_keys (
+-- IF NOT EXISTS for the same reason as 0013: 0014's Down is a no-op, goose
+-- still deletes the version row for it, and the next Open() re-runs this Up.
+CREATE TABLE IF NOT EXISTS audit_subject_keys (
     idx text  PRIMARY KEY,
     key bytea NOT NULL
 );
 
 -- +goose Down
-DROP TABLE IF EXISTS audit_subject_keys;
+--
+-- This step is NOT reversible, and deliberately executes nothing.
+--
+-- It used to drop the whole audit_subject_keys table, the ONLY copy of every
+-- per-subject pseudonym key. Dropping it splits every live subject's pseudonym
+-- history: the next audit append for that subject finds no key, mints a fresh
+-- random one (auditpseudo.go, subjectKey), and every row written afterwards
+-- carries a different pseudonym than the same account's older rows. The admin
+-- read path (?subject=usr_…) then answers with only the post-wipe rows — a
+-- silently truncated history, with nothing in Verify to notice because every
+-- remaining row is still chain-valid. And the re-Up re-creates the table empty
+-- and would collide on the table name if this section were a partial no-op
+-- instead of an empty one.
+--
+-- A key table cannot be "rolled back" without destroying the erasure property
+-- it exists for, so rollback is restore-from-backup (ADR-0008 §5). The same
+-- MigrateDown refusal helps here only indirectly: the pseudonym keys are a
+-- 0014 object, and 0014 is refused on the same terms as 0013 because it is
+-- stacked on the chain it pseudonymises. Keeping the section empty is the
+-- control for the operator driving the goose CLI directly.
+--
+-- Do not add DDL to this section: `TestAuditIntegrityMigrationsCannotBeRolledBack`
+-- fails on any executed statement here.

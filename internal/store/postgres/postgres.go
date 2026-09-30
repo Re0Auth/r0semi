@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io/fs"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -236,7 +237,7 @@ func Open(ctx context.Context, dsn string, opts PoolOptions, options ...Option) 
 func poolConfig(dsn string, opts PoolOptions) (*pgxpool.Config, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+		return nil, fmt.Errorf("postgres: parse dsn: %w", redactDSNParseError(err))
 	}
 	cfg.MaxConns = opts.MaxConns
 	cfg.MinConns = opts.MinConns
@@ -257,6 +258,23 @@ func poolConfig(dsn string, opts PoolOptions) (*pgxpool.Config, error) {
 			strconv.FormatInt(opts.StatementTimeout.Milliseconds(), 10)
 	}
 	return cfg, nil
+}
+
+// redactDSNParseError removes the connection string from the driver's parse error.
+//
+// pgconn quotes the input it could not parse and redacts it only in the positions
+// its own heuristics recognise ("necessarily best effort", pgconn/errors.go). A
+// userinfo with no '@', or a keyword/value pair missing its '=', comes back
+// verbatim — password included — and postgres.Open hands that to the caller, which
+// logs it at stage=storage (Z19V-1). Replacing the exact string the driver
+// reported keeps the reason ("invalid port") and drops the input: the replacement
+// is scoped to the error text, so a DSN that parses is untouched.
+func redactDSNParseError(err error) error {
+	var pe *pgconn.ParseConfigError
+	if !errors.As(err, &pe) || pe.ConnString == "" {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), pe.ConnString, "<redacted>"))
 }
 
 // Close releases the pool. Append writers handed out by Audit are stopped first,
@@ -433,12 +451,60 @@ func (db *DB) Migrate(ctx context.Context) error {
 // went wrong is usually better served by the last-known-good dump.
 func MigrateDown(ctx context.Context, dsn string, opts PoolOptions) error {
 	return withMigrationLock(ctx, dsn, opts.normalized().ConnectTimeout,
-		func(ctx context.Context, _ *sql.DB, provider *goose.Provider) error {
+		func(ctx context.Context, sqlDB *sql.DB, provider *goose.Provider) error {
+			if err := refuseAuditChainRollback(ctx, sqlDB, provider); err != nil {
+				return err
+			}
 			if _, err := provider.Down(ctx); err != nil {
 				return fmt.Errorf("postgres: migrate: down: %w", err)
 			}
 			return nil
 		})
+}
+
+// These are the versions whose Down sections are no-ops because rolling them
+// back destroys tamper-evidence rather than undoing a schema change. They are
+// named constants so refuseAuditChainRollback and its guard test cannot drift
+// from one another on the numbers.
+const (
+	migrationAuditChain      = 13
+	migrationAuditPseudonyms = 14
+)
+
+// refuseAuditChainRollback stops `-migrate-down` from running 0013's or 0014's
+// step while the audit chain holds chained rows.
+//
+// Both Down sections are empty, so this guard is not what prevents the damage;
+// it is what turns a silent, unrecoverable loss into a refusal an operator can
+// act on. 0013 used to drop prev_hash/row_hash/signature and re-seed the chain
+// head to genesis in Up, which made every historical row read back as Legacy
+// while Verify still returned OK=true — a destroyed audit chain that reports
+// healthy. 0014 used to drop audit_subject_keys, the only copy of every
+// per-subject pseudonym key. Neither is reversible by re-applying Up, so the
+// rollback story is restore-from-backup (ADR-0008 §5).
+//
+// The refusal only fires for versions 13 and 14 and only when a row with a
+// non-NULL row_hash exists: on a fresh or never-chained database there is
+// nothing to protect, so the rollback proceeds and `-migrate-down` keeps
+// working there. The provider drives the version, not the migration file
+// contents, so a future migration stacked on 13 gets its own decision.
+func refuseAuditChainRollback(ctx context.Context, sqlDB *sql.DB, provider *goose.Provider) error {
+	version, err := provider.GetDBVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: migrate: down: read version: %w", err)
+	}
+	if version != migrationAuditChain && version != migrationAuditPseudonyms {
+		return nil
+	}
+	var chained bool
+	if err := sqlDB.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM audit_events WHERE row_hash IS NOT NULL)`).Scan(&chained); err != nil {
+		return fmt.Errorf("postgres: migrate: down: audit chain probe: %w", err)
+	}
+	if chained {
+		return fmt.Errorf("postgres: migrate: down: refusing to roll back migration %d: the audit chain holds chained rows and its rollback is not reversible (ADR-0008); restore the last-known-good backup instead", version)
+	}
+	return nil
 }
 
 // adoptLegacyMigrations copies a pre-goose `schema_migrations` table into

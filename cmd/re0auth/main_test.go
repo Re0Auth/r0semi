@@ -292,6 +292,65 @@ func TestOIDCRetiredKeysParsing(t *testing.T) {
 	}
 }
 
+// TestOIDCRetiredKeysDoNotEchoKeyMaterial is the guard for Z12-1. Both retired-key
+// parsers refuse an entry by position, never by value: a retired token key still
+// decrypts every opaque access token issued before the rotation, and the variable
+// documented as holding public signing keys is a place an operator can paste a
+// PKCS#8 private key.
+func TestOIDCRetiredKeysDoNotEchoKeyMaterial(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x41}, 32))
+
+	t.Setenv("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS", key)
+	_, err := oidcRetiredTokenKeys()
+	if err == nil {
+		t.Fatal("a retired token key with no id: prefix was accepted")
+	}
+	if strings.Contains(err.Error(), key) {
+		t.Errorf("the refusal echoed the key material: %v", err)
+	}
+	if !strings.Contains(err.Error(), "entry 0") {
+		t.Errorf("the refusal does not identify the entry position: %v", err)
+	}
+
+	// "<pasted>:<junk>" reaches the second branch.
+	t.Setenv("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS", key+":short")
+	if _, err := oidcRetiredTokenKeys(); err == nil {
+		t.Fatal("a retired token key with a short payload was accepted")
+	} else if strings.Contains(err.Error(), key) {
+		t.Errorf("the refusal echoed the pasted half: %v", err)
+	}
+
+	t.Setenv("RE0AUTH_OIDC_RETIRED_SIGNING_KEYS", key)
+	if _, err := oidcRetiredSigningKeys(); err == nil {
+		t.Fatal("a retired signing key with no kid: prefix was accepted")
+	} else if strings.Contains(err.Error(), key) {
+		t.Errorf("the signing-key refusal echoed the pasted value: %v", err)
+	}
+}
+
+// TestParseTrustedProxiesDoesNotEchoTheEntry is the other half of Z19-1: a
+// free-form config value is refused by position. The value could be anything the
+// operator pasted there, so the message names the field and the index only.
+func TestParseTrustedProxiesDoesNotEchoTheEntry(t *testing.T) {
+	const pasted = "Z19-SECRET-VALUE-PASTED-INTO-TRUSTED-PROXIES"
+	if _, err := parseTrustedProxies([]string{pasted}); err == nil {
+		t.Fatal("a non-address entry was accepted")
+	} else {
+		if strings.Contains(err.Error(), pasted) {
+			t.Errorf("the refusal echoed the configured value: %v", err)
+		}
+		if !strings.Contains(err.Error(), "entry 0") {
+			t.Errorf("the refusal does not identify the entry position: %v", err)
+		}
+	}
+
+	// Control: a valid list still parses.
+	got, err := parseTrustedProxies([]string{"10.0.0.0/8", "127.0.0.1"})
+	if err != nil || len(got) != 2 {
+		t.Fatalf("valid proxies = %v, %v", got, err)
+	}
+}
+
 // A provider name that is not built in is a custom OIDC provider, and must name
 // its issuer. This is how a self-hosted Passkey/Keycloak/Authentik login is
 // configured without a code change.

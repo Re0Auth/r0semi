@@ -560,10 +560,10 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO oidc_refresh_tokens
-			(token_hash, id_hash, client_id, subject, scopes, amr, audience, auth_time, family_id, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			(token_hash, id_hash, client_id, subject, scopes, amr, audience, auth_time, nonce, family_id, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		hashValue(value), hashValue(accessID), clientIDOf(request), request.GetSubject(),
-		scopes, amr, audience, authTime, familyID, now.Add(s.refreshTTL),
+		scopes, amr, audience, authTime, oidcstore.NonceOf(request), familyID, now.Add(s.refreshTTL),
 	); err != nil {
 		return "", "", time.Time{}, fmt.Errorf("postgres: create refresh token: %w", err)
 	}
@@ -620,6 +620,7 @@ type refreshRequestRow struct {
 	AMR      []string   `db:"amr"`
 	Audience []string   `db:"audience"`
 	AuthTime *time.Time `db:"auth_time"`
+	Nonce    string     `db:"nonce"`
 }
 
 // TokenRequestByRefreshToken implements op.Storage.
@@ -636,7 +637,7 @@ type refreshRequestRow struct {
 // CreateAccessAndRefreshTokens, so this is the only place the replay is visible.
 func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string) (op.RefreshTokenRequest, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id_hash, client_id, subject, scopes, amr, audience, auth_time
+		SELECT id_hash, client_id, subject, scopes, amr, audience, auth_time, nonce
 		  FROM oidc_refresh_tokens WHERE token_hash = $1 AND expires_at > $2`, hashValue(value), s.now())
 	if err != nil {
 		return nil, errors.New("postgres: invalid refresh token")
@@ -686,6 +687,7 @@ func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string
 		AMR:      row.AMR,
 		Audience: row.Audience,
 		AuthTime: row.AuthTime,
+		Nonce:    row.Nonce,
 	}
 	return &r, nil
 }
@@ -916,6 +918,31 @@ func (s *OIDCStore) AuthorizeClientIDSecret(ctx context.Context, clientID, clien
 // REQUIRED, and the identity an RP keys its session on. Both stores have to set it.
 func (s *OIDCStore) SetUserinfoFromScopes(_ context.Context, userinfo *oidc.UserInfo, userID, _ string, _ []string) error {
 	userinfo.Subject = userID
+	return nil
+}
+
+// SetUserinfoFromRequest implements op.CanSetUserinfoFromRequest. It is the seam
+// the library offers for claims that depend on the request rather than the scopes
+// (op.CreateIDToken calls it right after SetUserinfoFromScopes and merges the
+// claims into the id_token), and the nonce is exactly such a claim.
+//
+// OIDC Core §12.2: the id_token returned by a refresh MUST NOT carry a nonce
+// unless it is the same nonce as in the original authorization request. The
+// library reads the nonce only from an op.AuthRequest, and RefreshRequest must
+// not be made to satisfy op.AuthRequest — `needsRefreshToken` switches on
+// `case AuthRequest` before `case RefreshTokenRequest`, so that would break
+// rotation and make CreateTokenResponse delete the auth request and emit a bogus
+// consent denial. Setting the claim here is the sanctioned alternative. An empty
+// nonce is left out: the claim has `omitempty`, and §12.2 forbids inventing one.
+func (s *OIDCStore) SetUserinfoFromRequest(_ context.Context, userinfo *oidc.UserInfo, request op.IDTokenRequest, _ []string) error {
+	nonce := oidcstore.NonceOf(request)
+	if nonce == "" {
+		return nil
+	}
+	if userinfo.Claims == nil {
+		userinfo.Claims = make(map[string]any, 1)
+	}
+	userinfo.Claims["nonce"] = nonce
 	return nil
 }
 

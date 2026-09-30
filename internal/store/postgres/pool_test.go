@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,5 +135,32 @@ func TestPoolStatsReflectsPoolConfig(t *testing.T) {
 
 	if got := (&DB{pool: pool}).PoolStats().MaxConns(); got != 16 {
 		t.Errorf("PoolStats().MaxConns() = %d, want 16", got)
+	}
+}
+
+// TestPoolConfigDoesNotEchoTheDsnOnAParseFailure is the no-database guard for
+// Z19V-1. pgx's own redaction is explicitly best effort, and the shapes below are
+// the ones its heuristics miss: it quotes the input back verbatim, password
+// included. postgres.Open hands that message to the composition root, which logs
+// it at stage=storage, so the boundary has to remove the connection string itself
+// and keep only the reason.
+func TestPoolConfigDoesNotEchoTheDsnOnAParseFailure(t *testing.T) {
+	const pw = "Z19V-POOL-DSN-PASSWORD-9c1e"
+	for _, dsn := range []string{
+		"postgres://pooluser:" + pw, // userinfo with no '@'
+		"pooluser:" + pw,            // bare userinfo
+		"host=h password " + pw,     // keyword/value without '='
+	} {
+		_, err := poolConfig(dsn, DefaultPoolOptions())
+		if err == nil {
+			t.Errorf("poolConfig(%q) accepted an unparseable DSN", dsn)
+			continue
+		}
+		if strings.Contains(err.Error(), pw) {
+			t.Errorf("the refusal echoed the DSN password for %q: %v", dsn, err)
+		}
+		if !strings.Contains(err.Error(), "parse dsn") {
+			t.Errorf("the failure for %q is not the parse refusal, so the assertion above is vacuous: %v", dsn, err)
+		}
 	}
 }

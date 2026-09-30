@@ -74,6 +74,12 @@ type definition struct {
 	// issuer, when set, makes the provider OIDC: the id_token is verified
 	// against the issuer's JWKS instead of trusting the userinfo endpoint.
 	issuer string
+	// jwksURL, when set, is the key set the discovery document MUST name. It is
+	// the one escape hatch for a provider whose real key set lives on another
+	// origin (Google's www.googleapis.com is the built-in case); empty means the
+	// discovered jwks_uri must share the issuer's origin, like the OAuth
+	// endpoints.
+	jwksURL string
 	// qqMeURL and qqUserInfoURL are used only by the QQ flow, parameterized so
 	// tests can point them at a fake server.
 	qqMeURL       string
@@ -106,7 +112,11 @@ var definitions = map[Provider]definition{
 			AuthURL:  "https://accounts.google.com/o/oauth2/v2/auth",
 			TokenURL: "https://oauth2.googleapis.com/token",
 		},
-		issuer:      "https://accounts.google.com",
+		issuer: "https://accounts.google.com",
+		// Google's discovery document names its key set on another origin
+		// (https://www.googleapis.com/oauth2/v3/certs), so the same-origin rule
+		// cannot apply to it. This is the value that document advertises.
+		jwksURL:     "https://www.googleapis.com/oauth2/v3/certs",
 		scopes:      []string{"openid", "email", "profile"},
 		userInfoURL: "https://openidconnect.googleapis.com/v1/userinfo",
 		mapIdentity: func(raw map[string]any) (Identity, error) {
@@ -198,6 +208,11 @@ type Credentials struct {
 	// that issuer and discovers its endpoints, which is how a self-hosted
 	// Keycloak/Authentik/Passkey provider is configured.
 	Issuer string
+	// JWKSURL names the key set that verifies id_tokens, for a provider whose
+	// real jwks_uri is on another origin than its issuer (Google is the built-in
+	// example). When set, the discovered jwks_uri must match it exactly; when
+	// empty, the discovered jwks_uri must share the issuer's origin.
+	JWKSURL string
 	// DisplayName is the label a sign-in button shows. Empty falls back to the
 	// built-in name, then to the provider id.
 	DisplayName string
@@ -329,6 +344,17 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 		}
 		if cred.Issuer != "" {
 			def.issuer = cred.Issuer
+			// A built-in jwksURL belongs to the built-in issuer. When an operator
+			// points the provider at a different issuer, the built-in key set is no
+			// longer the one being used, so drop it unless they name the new one:
+			// otherwise a correct document (the fake OP in the tests, or a proxy of
+			// the provider) would be refused for not naming the built-in origin.
+			if cred.JWKSURL == "" {
+				def.jwksURL = ""
+			}
+		}
+		if cred.JWKSURL != "" {
+			def.jwksURL = cred.JWKSURL
 		}
 
 		label := cred.DisplayName
@@ -462,7 +488,7 @@ func (c *Client) Exchange(ctx context.Context, code, verifier string) (*oauth2.T
 // the answer — so a document that names another origin must not receive it. Path
 // prefixes may differ (https://auth.example/application/o/re0auth/ is legal); a
 // provider whose endpoints really live on another host sets auth_url/token_url
-// explicitly, which skips discovery entirely.
+// (and, for its key set, jwks_uri) explicitly, which skips discovery entirely.
 func (c *Client) oauthConfig(ctx context.Context) (oauth2.Config, error) {
 	cfg := c.oauth
 	if cfg.Endpoint.AuthURL != "" && cfg.Endpoint.TokenURL != "" {
@@ -473,7 +499,9 @@ func (c *Client) oauthConfig(ctx context.Context) (oauth2.Config, error) {
 		return oauth2.Config{}, err
 	}
 	endpoint := provider.Endpoint()
-	if err := c.pinToIssuer(endpoint.AuthURL, endpoint.TokenURL); err != nil {
+	// The key set is pinned in oidcProvider, where the document is read; here the
+	// only endpoints in hand are the OAuth ones.
+	if err := c.pinToIssuer(endpoint.AuthURL, endpoint.TokenURL, ""); err != nil {
 		return oauth2.Config{}, err
 	}
 	cfg.Endpoint = endpoint
@@ -481,9 +509,12 @@ func (c *Client) oauthConfig(ctx context.Context) (oauth2.Config, error) {
 }
 
 // pinToIssuer refuses a discovered endpoint that is not on the configured
-// issuer's origin. An empty endpoint is left to the caller's own validation (a
-// document missing authorization_endpoint is a separate omission).
-func (c *Client) pinToIssuer(authURL, tokenURL string) error {
+// issuer's origin. It covers authorization_endpoint, token_endpoint and
+// jwks_uri: the client secret must not be posted to another origin, and an
+// id_token must not be checked against a key set another origin chose. An empty
+// endpoint is left to the caller's own validation (a document missing
+// authorization_endpoint is a separate omission).
+func (c *Client) pinToIssuer(authURL, tokenURL, jwksURL string) error {
 	issuer, err := url.Parse(c.issuer)
 	if err != nil {
 		return fmt.Errorf("idp: %s: issuer is not a URL: %w", c.provider, err)
@@ -491,6 +522,7 @@ func (c *Client) pinToIssuer(authURL, tokenURL string) error {
 	for _, endpoint := range []struct{ name, value string }{
 		{"authorization_endpoint", authURL},
 		{"token_endpoint", tokenURL},
+		{"jwks_uri", jwksURL},
 	} {
 		if endpoint.value == "" {
 			continue
@@ -501,11 +533,44 @@ func (c *Client) pinToIssuer(authURL, tokenURL string) error {
 		}
 		if u.Scheme != issuer.Scheme || u.Host != issuer.Host {
 			return fmt.Errorf("idp: %s: discovered %s %q is not on the issuer's origin %q; "+
-				"set auth_url/token_url explicitly for a provider that hosts its endpoints elsewhere",
+				"set auth_url/token_url/jwks_uri explicitly for a provider that hosts its endpoints elsewhere",
 				c.provider, endpoint.name, endpoint.value, c.issuer)
 		}
 	}
 	return nil
+}
+
+// pinDiscoveredJWKS enforces whose signature the id_token is checked against.
+//
+// go-oidc copies jwks_uri out of the discovery document and builds its key set
+// from it, so whoever answers discovery decides which key signs a valid token --
+// and with that can mint any sub. A configured key set must be named exactly;
+// otherwise it must share the issuer's origin, the rule the OAuth endpoints
+// already get. Google is the built-in provider whose document legitimately names
+// another origin, and its definition carries that key set.
+func (c *Client) pinDiscoveredJWKS(provider *oidc.Provider) error {
+	var meta struct {
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := provider.Claims(&meta); err != nil {
+		return fmt.Errorf("idp: %s: decode discovery document: %w", c.provider, err)
+	}
+	return c.pinJWKSURI(meta.JWKSURI)
+}
+
+// pinJWKSURI applies the key-set rule to a discovered jwks_uri: an explicitly
+// configured key set must be named exactly, and otherwise the issuer's origin is
+// required.
+func (c *Client) pinJWKSURI(jwksURI string) error {
+	if c.def.jwksURL != "" {
+		if jwksURI != c.def.jwksURL {
+			return fmt.Errorf("idp: %s: discovered jwks_uri %q does not match the configured jwks_uri %q; "+
+				"the key set that verifies id_tokens must be the one the operator named",
+				c.provider, jwksURI, c.def.jwksURL)
+		}
+		return nil
+	}
+	return c.pinToIssuer("", "", jwksURI)
 }
 
 // Identity verifies and canonicalizes the authenticated user.
@@ -615,7 +680,8 @@ func (c *Client) identityFromIDToken(ctx context.Context, token *oauth2.Token, n
 // The new provider replaces the old ONLY on success: a failed re-discovery must
 // not clear the working cache (that would be a downgrade, and it would stop a
 // token whose key is already cached from verifying). A failed discovery is
-// likewise not cached, so it can be retried on the next call.
+// likewise not cached, so it can be retried on the next call. A document whose
+// jwks_uri fails the pin counts as a failed discovery for the same reason.
 func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 	c.providerMu.Lock()
 	defer c.providerMu.Unlock()
@@ -630,6 +696,15 @@ func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 			return c.discovered, nil
 		}
 		return nil, fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err)
+	}
+	if err := c.pinDiscoveredJWKS(provider); err != nil {
+		if c.discovered != nil {
+			// The same retain-the-working-provider rule as a failed fetch: a
+			// re-discovery that names a key set we will not trust must not
+			// downgrade a provider that was already pinned.
+			return c.discovered, nil
+		}
+		return nil, err
 	}
 	c.discovered = provider
 	c.discoveredAt = time.Now()

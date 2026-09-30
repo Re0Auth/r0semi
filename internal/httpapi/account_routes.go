@@ -77,7 +77,13 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		// row is already deleted by the erasure itself, so the practical effect is
 		// nil, and turning the whole request into a 500 would tell the caller the
 		// deletion failed when it did not.
-		slog.Warn("could not clear the session after account erasure", "user", string(user), "err", err)
+		//
+		// The subject is deliberately absent, for the reason given above the call:
+		// the pseudonym key is already gone, and logging the raw usr_… here would
+		// restore the link the erasure just removed (k1). request_id is the
+		// correlation handle; the account itself is named by the erasure's own
+		// account.delete record.
+		slog.Warn("could not clear the session after account erasure", "request_id", requestID(r), "err", err)
 	}
 	writeJSON(w, http.StatusOK, deleteAccountView{
 		Result: result,

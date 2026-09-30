@@ -712,6 +712,47 @@ func TestRefreshGrantRotatesAndSpendsTheOldToken(t *testing.T) {
 	}
 }
 
+// OIDC Core §12.2: an id_token issued by the refresh grant MUST NOT carry a
+// nonce unless it is the same nonce as in the original authorization request.
+// The code flow sent `nonce-1234567890`, so the refreshed id_token has to repeat
+// it. Re-deriving a fresh nonce would be a §12.2 violation too, hence equality
+// with the code grant's nonce and not merely "some nonce".
+func TestRefreshedIDTokenKeepsTheNonce(t *testing.T) {
+	f := newFixture(t)
+	tokens := codeFlow(t, f, []string{"openid", "account.id", "offline_access"})
+	refresh, _ := tokens["refresh_token"].(string)
+	if refresh == "" {
+		t.Fatalf("the code flow issued no refresh token: %v", tokens)
+	}
+
+	refreshed, status := postToken(t, f.server.URL, f.webID, "s3cret", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refresh},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("refresh status = %d: %v", status, refreshed)
+	}
+	raw, _ := refreshed["id_token"].(string)
+	if raw == "" {
+		t.Fatalf("the refresh grant issued no id_token: %v", refreshed)
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		t.Fatalf("the refreshed id_token is not a compact JWS: %q", raw)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims["nonce"] != "nonce-1234567890" {
+		t.Fatalf("the refreshed id_token's nonce = %v, want the code grant's nonce (OIDC Core §12.2)", claims["nonce"])
+	}
+}
+
 // The ID token was never decoded by a test: every claim except `sub` was
 // asserted only in prose. This pins the actual JWT payload, so a library upgrade
 // or a signing change cannot silently drop iss/aud/azp/nonce/hashes.

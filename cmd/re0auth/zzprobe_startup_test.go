@@ -466,6 +466,13 @@ client_secret_env = "PROBE_SOURCE_SECRET"
 		t.Setenv("RE0AUTH_OIDC_TOKEN_KEY", tokKey)
 		t.Setenv("RE0AUTH_OIDC_SIGNING_KEY", signKey)
 		t.Setenv("RE0AUTH_AUDIT_KEY", auditK)
+		// A retired token key is secret material the process reads (it decrypts
+		// access tokens issued before a rotation), and CS-8 did not plant it, so
+		// the guard could not see Z12-1's path (cmd/re0auth/main.go's
+		// oidcRetiredTokenKeys). Well-formed here: this probe must reach the
+		// stages below, so it cannot plant the malformed shape that triggers the
+		// refusal; TestOIDCRetiredKeysDoNotEchoKeyMaterial covers that branch.
+		t.Setenv("RE0AUTH_OIDC_RETIRED_TOKEN_KEYS", "probe-old:"+tokKey)
 		t.Setenv("PROBE_CLIENT_SECRET", clSec)
 		t.Setenv("PROBE_IDP_SECRET", idpSec)
 		t.Setenv("PROBE_SOURCE_SECRET", srcSec)
@@ -606,7 +613,7 @@ func TestProbeInventedAndEmptySectionsAreRefused(t *testing.T) {
 		{"an [oidc] section", base + "[oidc]\n", "unknown keys"},
 		{"an empty [vault] section with no RE0AUTH_KEK", base + "[vault]\n", "vault"},
 		{"postgres without a reachable DSN", base + "[storage]\ndriver = \"postgres\"\ndsn_env = \"PROBE_DSN\"\n",
-			"PROBE_DSN"},
+			"storage.dsn_env"},
 		{"a malformed statement timeout", base + "[storage]\nstatement_timeout = \"30\"\n", "duration"},
 	}
 	for _, tc := range cases {

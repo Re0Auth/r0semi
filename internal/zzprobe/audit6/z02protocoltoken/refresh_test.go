@@ -212,8 +212,8 @@ func TestZ02RefreshReplayAndExpiry(t *testing.T) {
 	if claims["sub"] != "usr_z02" {
 		t.Errorf("the refreshed id_token's sub = %v, want usr_z02 (P0-1 regression on the refresh path)", claims["sub"])
 	}
-	if _, hasNonce := claims["nonce"]; hasNonce {
-		t.Errorf("the refreshed id_token carries a nonce: %v", claims["nonce"])
+	if claims["nonce"] != "nonce-z02" {
+		t.Errorf("the refreshed id_token's nonce = %v, want nonce-z02, the code grant's nonce (OIDC Core §12.2)", claims["nonce"])
 	}
 
 	// Expiry: past the 30-day refresh TTL the replacement is refused.

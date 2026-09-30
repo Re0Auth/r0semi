@@ -286,10 +286,13 @@ func TestZZAuditRPForeignTokenEndpointIsRefused(t *testing.T) {
 	}
 }
 
-// TestZZAuditRPForeignJWKSURIComesFromTheDocument is the half that is not pinned:
-// the trust anchor for id_token signatures is whatever jwks_uri the discovery
-// document names, and a token signed by the foreign key verifies.
-func TestZZAuditRPForeignJWKSURIComesFromTheDocument(t *testing.T) {
+// TestZZAuditRPForeignJWKSURIIsRefused is the third endpoint, now pinned: the
+// trust anchor for id_token signatures is not chosen by another origin. A
+// document that names a foreign jwks_uri is refused as a failed discovery, so a
+// token signed by that foreign key is never even looked at. (The half that used
+// to be open accepted it; the probe in
+// internal/zzprobe/audit7/z14kitrptaptap is the end-to-end form.)
+func TestZZAuditRPForeignJWKSURIIsRefused(t *testing.T) {
 	op := newAuditOP(t)
 	foreign := newAuditOP(t)
 	foreignKey := newAuditKey(t, "k-foreign")
@@ -302,9 +305,12 @@ func TestZZAuditRPForeignJWKSURIComesFromTheDocument(t *testing.T) {
 
 	c := auditClient(t, op, "auditjwks", 0)
 	tok := idTokenWith(t, foreignKey, op.URL, "n", "cid", nil)
-	if _, err := c.Identity(auditCtx(op), tok, "n"); err != nil {
-		t.Fatalf("a token signed by the key named by jwks_uri was refused: %v", err)
+	if _, err := c.Identity(auditCtx(op), tok, "n"); err == nil {
+		t.Fatal("accepted a token signed by the key a foreign jwks_uri named")
+	} else {
+		t.Logf("foreign jwks_uri refused: %v", err)
 	}
-	_, j := foreign.counts()
-	t.Logf("verified a token against the key set at jwks_uri on ANOTHER origin (foreign jwks fetches=%d)", j)
+	if _, j := foreign.counts(); j != 0 {
+		t.Errorf("the foreign key set was fetched %d times although jwks_uri was refused", j)
+	}
 }

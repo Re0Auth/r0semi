@@ -204,3 +204,53 @@ func TestMigrationDefinesTheRefreshTokenFamily(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrationDefinesTheRefreshNonce pins the schema half of OIDC Core §12.2:
+// the refresh row carries the nonce, so migration 0026 must add the column (and
+// drop it on rollback), and the production SQL must actually name it in both the
+// INSERT that mints the row and the SELECT that reads it back for a rotation. A
+// column the code never names is dead weight; a code name with no column is a
+// runtime error, and neither is visible without a database.
+func TestMigrationDefinesTheRefreshNonce(t *testing.T) {
+	const name = "migrations/0026_oidc_refresh_nonce.sql"
+	body, err := fs.ReadFile(migrationsFS, name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	text := string(body)
+
+	up := text
+	down := ""
+	if i := strings.Index(text, "-- +goose Down"); i >= 0 {
+		up, down = text[:i], text[i:]
+	} else {
+		t.Fatalf("%s has no Down section", name)
+	}
+
+	if !strings.Contains(up, "ALTER TABLE oidc_refresh_tokens ADD COLUMN nonce") {
+		t.Errorf("%s Up no longer adds the nonce column the refresh INSERT writes", name)
+	}
+	if !strings.Contains(down, "ALTER TABLE oidc_refresh_tokens DROP COLUMN IF EXISTS nonce") {
+		t.Errorf("%s Down no longer drops the nonce column; the rollback leaves schema the next Up collides with", name)
+	}
+
+	srcBody, err := os.ReadFile("oidc.go")
+	if err != nil {
+		t.Fatalf("cannot read the adapter source: %v", err)
+	}
+	src := string(srcBody)
+
+	// The INSERT: the minted row must persist the nonce the request carried.
+	rotate := oidcStoreMethod(t, src, "CreateAccessAndRefreshTokens")
+	if !strings.Contains(rotate, "nonce") {
+		t.Error("CreateAccessAndRefreshTokens no longer names the nonce column: the minted refresh row cannot " +
+			"carry it to the refresh grant (OIDC Core §12.2)")
+	}
+	// The SELECT: a rotation rebuilds the request from this projection, so a
+	// missing column silently drops the nonce on the next generation.
+	read := oidcStoreMethod(t, src, "TokenRequestByRefreshToken")
+	if !strings.Contains(read, "nonce") {
+		t.Error("TokenRequestByRefreshToken no longer selects the nonce column: a rotation rebuilds the request " +
+			"without it and the refreshed id_token drops the nonce")
+	}
+}

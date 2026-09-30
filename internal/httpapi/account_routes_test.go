@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/alexedwards/scs/v2"
+	"github.com/alexedwards/scs/v2/memstore"
 
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
@@ -37,7 +43,16 @@ type deleteEnv struct {
 	logger   *audit.MemoryLogger
 }
 
+// newDeleteEnv is the ordinary stack: an in-memory session store.
 func newDeleteEnv(t *testing.T) deleteEnv {
+	t.Helper()
+	return newDeleteEnvWithSessions(t, nil)
+}
+
+// newDeleteEnvWithSessions is newDeleteEnv with the session store swapped, so a
+// test can make the post-erasure cookie cleanup the only failing step. sessions
+// may be nil, which is the in-memory default.
+func newDeleteEnvWithSessions(t *testing.T, sessions scs.Store) deleteEnv {
 	t.Helper()
 	ctx := context.Background()
 
@@ -78,7 +93,7 @@ func newDeleteEnv(t *testing.T) deleteEnv {
 	}
 
 	accounts := account.NewMemoryStore()
-	manager := auth.NewManager(auth.Options{Secure: false})
+	manager := auth.NewManager(auth.Options{Secure: false, Store: sessions})
 	authHandler, err := auth.NewHandler(manager, registry, accounts)
 	if err != nil {
 		t.Fatal(err)
@@ -266,5 +281,58 @@ func TestDeleteAccountIsAbsentWhenNotConfigured(t *testing.T) {
 		if rt.Pattern == "/v1/account" {
 			t.Fatal("/v1/account is in specRoutes without a deleter")
 		}
+	}
+}
+
+// failingDeleteStore is an scs.Store whose Delete fails. It is the only way the
+// post-erasure session-cookie cleanup can fail once the erasure itself has
+// succeeded, which is the branch the handler logs on.
+type failingDeleteStore struct {
+	scs.Store
+	err error
+}
+
+func (s failingDeleteStore) Delete(string) error { return s.err }
+
+// TestDeleteAccountDoesNotLogTheRawSubjectWhenSessionCleanupFails is the guard
+// for k1. The erasure destroys the account's pseudonym key as its last step, so a
+// log line naming the raw usr_… afterwards puts back the link the erasure just
+// removed — the file's own comment above the EndSession call says exactly that.
+// The warning branch is reachable only from a session-store fault, so the store is
+// made to fail here; the test then asserts the warning fired (so the assertion is
+// not vacuous) and that the raw subject is absent from the captured log.
+func TestDeleteAccountDoesNotLogTheRawSubjectWhenSessionCleanupFails(t *testing.T) {
+	env := newDeleteEnvWithSessions(t, failingDeleteStore{
+		Store: memstore.New(),
+		err:   errors.New("session store unreachable"),
+	})
+	browser := newBrowser(t)
+	csrf := csrfFor(t, browser, env.base)
+
+	uid, err := env.accounts.FindByIdentity(context.Background(), idp.GitHub, "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid == "" || !strings.HasPrefix(string(uid), "usr_") {
+		t.Fatalf("the signed-in subject is not a usr_… id: %q", uid)
+	}
+
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	resp, body := deleteReq(t, browser, env.base, csrf, deleteAccountAcknowledgement)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete = %d, want 200 (only the cookie cleanup failed): %v", resp.StatusCode, body)
+	}
+
+	got := buf.String()
+	if !strings.Contains(got, "could not clear the session after account erasure") {
+		t.Fatalf("the warning branch was not reached, so this probe observed nothing:\n%s", got)
+	}
+	if strings.Contains(got, string(uid)) {
+		t.Errorf("the raw subject %q was logged after the erasure destroyed its pseudonym key; "+
+			"the log line must carry request_id instead:\n%s", uid, got)
 	}
 }

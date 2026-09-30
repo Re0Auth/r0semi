@@ -49,6 +49,18 @@ config/*.secret.*
 # example file already tells operators it is ignored; this makes that true.)
 config/re0auth.toml
 
+# The backup scripts' default output (scripts/backup.sh:12, backup-keys.sh:23):
+# plaintext SQL dumps and a KEK/OIDC/audit-key .env. A `git add -A` in the
+# documented backup workflow must not stage them, so the rule covers the default
+# directory and both file shapes wherever an operator points the scripts.
+/backups/
+*.dump
+*.env
+# The .dump files under _audit/scriptprobe/ are checked in deliberately (the
+# backup-script probes read them as fixtures), so re-include them; the rules
+# above are about backup output, not about test data.
+!_audit/scriptprobe/**
+
 # Editor/IDE
 # .idea/
 # .vscode/
