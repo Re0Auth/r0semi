@@ -79,6 +79,16 @@ SPIKE_NET=re0auth-spike-net
 SUITE_HOST=oidf-suite
 SUITE_PUBLIC="https://${SUITE_HOST}:8443"
 
+# Host-side name resolution. The runner has no DNS for either name, and the plan
+# runner is Python (urllib), which cannot use curl's --resolve. Map both to loopback
+# once, with sudo when the job is not root. If that fails, the host-side curl checks
+# still work through --resolve; run-plan.py would need an override instead.
+if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=""; fi
+if ! getent hosts re0auth.test >/dev/null 2>&1 || ! getent hosts "${SUITE_HOST}" >/dev/null 2>&1; then
+  ${SUDO} sh -c "printf '127.0.0.1 re0auth.test\n127.0.0.1 ${SUITE_HOST}\n' >> /etc/hosts" 2>/dev/null \
+    || log "could not add /etc/hosts entries; host curl still uses --resolve"
+fi
+
 # ---- material ---------------------------------------------------------------
 log "generating keys"
 head -c 32 /dev/urandom | base64 -w0 > "${WORK}/kek"

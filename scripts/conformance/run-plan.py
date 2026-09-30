@@ -62,6 +62,8 @@ def request(api, method, path, body=None, query=None, insecure=False):
     except urllib.error.HTTPError as err:
         raw = err.read().decode("utf-8", "replace")
         raise RuntimeError("%s %s -> HTTP %s: %s" % (method, url, err.code, raw[:600])) from None
+    except urllib.error.URLError as err:
+        raise RuntimeError("cannot reach %s: %s" % (url, err.reason)) from None
     if not raw.strip():
         return {}
     try:
