@@ -236,12 +236,20 @@ docker run -d --name "${MONGO_NAME}" --network "${SPIKE_NET}" --network-alias mo
 # dev compose uses would be parsed as a JVM option and kill the JVM
 # ("Unrecognized option"). Both names exist in the app's application.properties
 # (startredir) / application-dev.properties (devmode).
+#
+# The four OIDC_* vars are the entrypoint's own inputs, and it passes them as
+# `-Doidc.google.clientid=…` unconditionally. Left unset they override the app's
+# non-empty defaults ("google-client"/"gitlab-client") with EMPTY strings, and Spring
+# refuses to start ("Client id of registration 'gitlab' must not be empty"). devmode
+# never uses them, so dummies are enough.
 docker run -d --name "${SUITE_NAME}" \
   --network "${SPIKE_NET}" \
   --add-host re0auth.test:host-gateway \
   -e MONGODB_HOST=mongodb \
   -e BASE_URL="http://localhost:${SUITE_PORT}" \
   -e JAVA_EXTRA_ARGS="-Dfintechlabs.devmode=true -Dfintechlabs.startredir=true" \
+  -e OIDC_GOOGLE_CLIENTID=unused -e OIDC_GOOGLE_SECRET=unused \
+  -e OIDC_GITLAB_CLIENTID=unused -e OIDC_GITLAB_SECRET=unused \
   -p "${SUITE_PORT}:8080" \
   "${SUITE_IMAGE}" >/dev/null
 
