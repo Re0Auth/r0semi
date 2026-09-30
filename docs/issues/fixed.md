@@ -34,6 +34,13 @@
 - Z09-4 — 上游字节预算加 per-caller 分摊（镜像 `max_in_flight` 的既有裁定），注释与容量/决策文档同步 — `6665193`
 - N-01 — sweep 注释不再宣称假不变量；postgres 逐表守卫（显式豁免）+ memory 逐表守卫（G-7/Z07-1 带编号 `t.Skip`） — `6665193`
 - N-02 — 刷新热路径库故障与「未知令牌」分离（哨兵 + `%w`），`internal/oidchttp` 装饰器计入 `re0auth_store_unavailable_total`，库硬编码 `invalid_grant` 记入 `docs/dependencies.md` — `6665193`
+- 第七轮 T2 收尾批次（其余 11 条，`4dff4a3`）：
+- Z07-3 — `user_code` 句柄只绑定规范化后的码（两 store 返回、页面回显、决策路径规范化），`auth.Manager.Bind` 加 128 字节上限 — `4dff4a3`
+- Z15-1 / Z15V-1 — 过期清扫改单事务内有界批次（`ctid IN (… LIMIT 1000)`，12 张表）；会话侧第二个 DELETE 不再被跳过；新增 sweep 计数指标 — `4dff4a3`
+- Z14-2 — conformance 断言匿名调用者不得从 `/oauth/revoke` 拿到 2xx — `4dff4a3`
+- Z14-4 — discovery 持续失败时 provider 缓存新增 2×TTL 硬上界，超过即 fail-closed — `4dff4a3`
+- Z19-4 — `vault.KeyFingerprint` 可选接口 + `LocalKeyWrapper` 指纹，`WithRetiredKeys` 拒绝同材料换 id 的「轮换」 — `4dff4a3`
+- N-04 — ci.yml 新增 `probes` 作业（三套 tag 的 vet 编译 + 显式绿名单），打 tag 时经 release.yml 自动继承 — `4dff4a3`
 
 ### 第 6 轮
 
@@ -48,6 +55,9 @@
 - G-9 — 刷新签发的 id_token 保留原 nonce（OIDC Core §12.2）：`RefreshRequest`/`NonceOf`、两个 store 在 refresh 行上持久化并随轮换继承、`SetUserinfoFromRequest`、迁移 `0026`；audit6 里原本断言「刷新后没有 nonce」的探针翻转为断言保留 — `17914d4`
 - G-23 — 6 处原始 `usr_…` 不再进 slog（admin/auth/federation bind+refresh/httpapi binding_routes；第 7 处 account_routes 由 k1 收掉）；audit5 静态守卫由红翻绿 — `6665193`
 - G-13 — `GetRefreshTokenInfo` 现在把 `noRows` 报成哨兵、其余报 `oidc.ErrServerError`（库的 500 分支恢复可达）；经查在 `79d7333` 随 G-3 一并修掉，注册表此前陈旧 — `79d7333`
+- G-7 — 已批准但过期的 `device_code` 不再换到令牌：库先判 `Done` 再判 `Expires`，两个 store 同时收紧消费谓词并修掉「`Done=true` 的 fall-through」（memory 删除后 `Done=false`，postgres 过期时补删再清 `Done`） — `4dff4a3`
+- G-8 — `/oauth/revoke` 不再当存活性预言机：他人的活令牌与未知字符串同样 200、都不删；公共引擎与两个 store 的 `RevokeToken` 同步 — `4dff4a3`
+- G-10 — 设备码轮询接受自己广告的 `client_secret_post`，且认证失败不再烧码：`internal/oidchttp` 在库的消费谓词之前先认证机密客户端 — `4dff4a3`
 
 ### 第 5 轮
 
@@ -69,6 +79,7 @@
 - P2-5 — `oidc_auth_requests.client_id` 补前导索引 — `b35f893`
 - P2-6 — `trusted_proxies` 的 `0.0.0.0/0`/`::/0` 需显式承认 — `e9dc23d`
 - P2-7 — `sources[].token_class` 校验枚举并给安全默认（=CS-4 转绿） — `e9dc23d`
+- KIT-7 — conformance 套件新增客户端认证断言：未知客户端+无凭据在 token/revoke 必须 401，可选 `ClientID/ClientSecret` 校验「正确密钥不被 invalid_client 拒、错密钥必须被拒」，并对照 `token_endpoint_auth_methods_supported` — `4dff4a3`
 - P2-8 — `DATABASE_URL` 单独即选 postgres、新增 `RE0AUTH_STORAGE_DRIVER`、修正警告文案 — `e9dc23d`
 - P2-9 — `restore.sh` 校验绑定到实际入参 — `7f19637`
 - P2-10 — `.age` 加密备份路径同样执行校验 — `7f19637`

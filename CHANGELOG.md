@@ -58,7 +58,7 @@
   不再回显配置或密钥原文。**行为变化**：启动日志里这些错误的文案不再带变量名或值，
   排障时以字段名 + 手上的配置文件定位。
 
-### T2 · 首发窗口必修（本轮先收 6 条，`6665193`）
+### T2 · 首发窗口必修（18 条已全部收掉：`6665193` + `4dff4a3`）
 
 - **`X-Request-Id` 只采信短且合法的形状（Z11-3）**：此前调用方写的任意长度/字符集被
   原样回显进响应头、problem body 与访问日志，一个 60 000 字节的头就产生同量级日志行。
@@ -83,6 +83,49 @@
   去掉原始 `usr_…`，保留 action / game / source / request_id。**行为变化**：日志文案变化。
 - **台账更正（G-13）**：`GetRefreshTokenInfo` 的错误分类早在 `79d7333` 随 G-3 修好，
   本条此前是陈旧登记；探针已是回归守卫。
+
+#### T2 收尾一批（`4dff4a3`）
+
+- **已批准但过期的设备码不再换到令牌（G-7）**：库的设备码状态检查先判 `Done` 再判
+  `Expires`，此前一个已批准、已过 `expires_in` 的 `device_code` 仍能换到整套令牌（窗口
+  只到下一次清扫为止）。两个 store 现在同时收紧消费谓词并修掉「`Done=true` 的
+  fall-through」。**行为变化**：轮询一个已过期但曾获批的码会得到 `expired_token`。
+- **`/oauth/revoke` 不再是存活性预言机（G-8）**：此前匿名者用别人的活跃令牌拿到 401
+  `invalid_client`、用未知字符串拿到 200 —— 等于一个「这个令牌是不是活的」的询问接口。
+  现在两种输入都是 200、都不删（RFC 7009 §2.1 只要求校验归属）。**行为变化（公共
+  `oauth` 库契约）**：`Revoke` 对外来令牌不再返回 `invalid_client`；调用方若据错误码
+  区分「不是你的」需改。两个 store 的 `RevokeToken`、以及公共引擎同步。
+- **设备码轮询接受 `client_secret_post`，且认证失败不再烧码（G-10）**：库只认 Basic /
+  JWT 断言，`client_secret_post`（本服务 discovery 一直在广告）此前会被 401 拒，而
+  401 已经跑完消费谓词——重试变成 `access_denied`。`internal/oidchttp` 现在在库消费之前
+  先认证机密客户端：缺/错密钥 401 且不触碰 store，正确密钥折算成等价 Basic。
+- **设备验证句柄只绑定规范化后的 `user_code`（Z07-3）**：此前页面把调用方写的拼写原样
+  绑进会话，一次导航即可把 cookie 撑到请求行上限。现在两个 store 返回规范化拼写，页面
+  回显并绑定它，决策路径同样规范化，`auth.Manager.Bind` 另有 128 字节上限。
+  **行为变化**：非规范拼写仍可用于查找，但回显与句柄统一为规范化形式。
+- **过期清扫改为有界批次（Z15-1 / Z15V-1）**：此前 12 张表各一条无 `LIMIT` 的 DELETE
+  在一个事务里跑，撞 30 s 语句超时后每个 tick 重试同一份越积越大的工作；会话侧第二个
+  DELETE 还会因第一个失败被跳过，孤儿行只增不减。现在每句 `ctid IN (… LIMIT 1000)`，
+  会话侧两条都执行并合并错误；新增 `re0auth_sweep_removed_total` /
+  `re0auth_sweep_failed_total`。**运维影响**：新增指标，清扫单轮最多删 12×1000 行。
+- **同料换 id 的「轮换」不再被接受（Z19-4）**：`vault` 新增可选 `KeyFingerprint` 接口
+  与 `LocalKeyWrapper` 指纹，`WithRetiredKeys` 逐对比对材料。**行为变化（公共
+  `vault` 库）**：把同一份 KEK 材料换个 `kek_id` 再启动此前会静默「轮换」成功，现在
+  直接拒绝启动（有意 fail-closed）；KMS 包装器不实现该接口即跳过比对。
+- **provider 缓存新增 2×TTL 硬上界（Z14-4）**：discovery 持续失败时此前会无限期沿用
+  缓存的 provider 与其永不失效的 JWKS 缓存（TTL 被旁路）。现在超过 `2×TTL` 即
+  fail-closed。**行为变化**：discovery 故障超过 2×TTL 会开始拒绝登录（此前是继续用旧
+  密钥）。见 [docs/dependencies.md](docs/dependencies.md)。
+- **一致性套件新增客户端认证断言（Z14-2 / KIT-7）**：未知客户端 + 无凭据在
+  `/oauth/token`、`/oauth/revoke` 必须 401；新增可选 `Options.ClientID/ClientSecret`
+  校验「正确密钥不被 `invalid_client` 拒、错密钥必须被拒」，并对照
+  `token_endpoint_auth_methods_supported`。**行为变化（已发布的「可执行规范」）**：
+  此前零 error 的认证缺失数据源现在会失败；check 名是新增的，但按「无 error」判定的
+  使用者需要重测。
+- **CI 开始跑打 tag 的探针（N-04）**：`.github/workflows/ci.yml` 新增 `probes` 作业：
+  `go vet -tags audit5,audit6,audit7 ./...` 编译全部 294 个 tag 文件，另加三份显式绿
+  名单（48 个仍红的包不入名单，且不允许 `continue-on-error`）；`release.yml` 复用
+  `ci.yml`，打 tag 时自动继承。**运维影响**：CI 增加约 4–6 分钟。
 
 - **refresh 重放即撤销整条令牌族（RFC 9700 §4.14.2，P0 G-1）**：此前重放一个已轮换的 refresh token
   只被拒，小偷已换出的那一代继续有效到 TTL 结束。现在轮换在被消费的行上留墓碑（族标识 + 配对

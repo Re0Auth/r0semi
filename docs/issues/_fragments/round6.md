@@ -78,10 +78,10 @@
 
 | ID | 严重度 | 问题 | 位置 | 状态 | 修法要点 |
 |---|---|---|---|---|---|
-| G-7 | P2 | 已批准的 device_code 过了 `expires_at` 仍能铸出整套令牌（库 `Done` 短路先于 `Expires`；两后端消费谓词都无期限判断） | `internal/store/postgres/oidc.go:749` | OPEN-PG | 两后端消费谓词补 `expires_at`（PG 的 DELETE 加 `AND expires_at > $n` ← `s.now()`） |
-| G-8 | P2 | `/oauth/revoke` 是存活性预言机：匿名者对别人的活跃令牌得 401、对未知字符串得 200 | `oauth/as.go:223` | OPEN | 让响应形状不区分「别人的活令牌」与「未知字符串」（`oauth/as.go:234-239` 与 `:223-231` 自相矛盾） |
+| G-7 | P2 | 已批准的 device_code 过了 `expires_at` 仍能铸出整套令牌（库 `Done` 短路先于 `Expires`；两后端消费谓词都无期限判断） | `internal/store/postgres/oidc.go:749` | FIXED（4dff4a3） | 两后端消费谓词补 `expires_at`（PG 的 DELETE 加 `AND expires_at > $n` ← `s.now()`） |
+| G-8 | P2 | `/oauth/revoke` 是存活性预言机：匿名者对别人的活跃令牌得 401、对未知字符串得 200 | `oauth/as.go:223` | FIXED（4dff4a3） | 让响应形状不区分「别人的活令牌」与「未知字符串」（`oauth/as.go:234-239` 与 `:223-231` 自相矛盾） |
 | G-9 | P2 | 刷新后的 id_token 丢掉 `nonce`（OIDC Core §12.2 要求保留），检查 nonce 的 RP 每次刷新都失败 | `internal/oidcstore/oidcstore.go`（`RefreshRequest` 无 nonce 字段；探针 `internal/zzprobe/audit6/z01protocolauth/regress_test.go:394`） | FIXED（17914d4） | refresh 路径签发的 id_token 带上原始 nonce（两 store 需持久化） |
-| G-10 | P2 | 设备流 token 轮询拒绝 discovery 广告的 `client_secret_post`，且被拒的 401 把 device_code 烧掉 | `pkg/op/device.go:217`（机制）/ `:235`；修法在 `internal/oidchttp` 边界 | OPEN | 设备授予接受 `client_secret_post`，且 401 **不得**先跑消费谓词烧掉 device_code |
+| G-10 | P2 | 设备流 token 轮询拒绝 discovery 广告的 `client_secret_post`，且被拒的 401 把 device_code 烧掉 | `pkg/op/device.go:217`（机制）/ `:235`；修法在 `internal/oidchttp` 边界 | FIXED（4dff4a3） | 设备授予接受 `client_secret_post`，且 401 **不得**先跑消费谓词烧掉 device_code |
 | G-11 | P3 | `/readyz` 在「已有一次检查在跑」且**从未产生结论**时答 200（`running` 分支返回零值 `nil`） | `internal/httpapi/health.go:111` | OPEN | `c.running && !c.checked` 时 fail-closed 回 503；已下调 P3（出厂清单下 kubelet 撞不到） |
 | G-13 | P2 | `GetRefreshTokenInfo` 把数据库错误折叠成 `op.ErrInvalidRefreshToken`，废掉库的 500 分支 | `internal/store/postgres/oidc.go:561` | FIXED（79d7333） | `noRows(err) → 哨兵；其余原样返回（wrap）`；与 G-3 同批收口 |
 | G-14 | P3 | `oidc_devices` 是第七张没有 `client_id` 前导索引的 client-only 批量撤销表，守卫手写清单也漏了它 | `internal/store/postgres/oidc.go:1075`、`internal/store/postgres/migrations/0022_bulk_revoke_client_indexes.sql` | OPEN | 迁移 0023 补 `oidc_devices(client_id)`；守卫改为从 `revokeMatching` 调用点反推表集合 |
@@ -112,6 +112,9 @@
 - G-9 — 刷新签发的 id_token 保留原 nonce（OIDC Core §12.2）：`RefreshRequest`/`NonceOf`、两个 store 在 refresh 行上持久化并随轮换继承、`SetUserinfoFromRequest`、迁移 `0026`；audit6 里原本断言「刷新后没有 nonce」的探针翻转为断言保留 — `17914d4`
 - G-23 — 6 处原始 `usr_…` 不再进 slog（admin/auth/federation bind+refresh/httpapi binding_routes；第 7 处 account_routes 由 k1 收掉）；audit5 静态守卫由红翻绿 — `6665193`
 - G-13 — `GetRefreshTokenInfo` 现在把 `noRows` 报成哨兵、其余报 `oidc.ErrServerError`（库的 500 分支恢复可达）；经查在 `79d7333` 随 G-3 一并修掉，注册表此前陈旧 — `79d7333`
+- G-7 — 已批准但过期的 `device_code` 不再换到令牌：库先判 `Done` 再判 `Expires`，两个 store 同时收紧消费谓词并修掉「`Done=true` 的 fall-through」（memory 删除后 `Done=false`，postgres 过期时补删再清 `Done`） — `4dff4a3`
+- G-8 — `/oauth/revoke` 不再当存活性预言机：他人的活令牌与未知字符串同样 200、都不删；公共引擎与两个 store 的 `RevokeToken` 同步 — `4dff4a3`
+- G-10 — 设备码轮询接受自己广告的 `client_secret_post`，且认证失败不再烧码：`internal/oidchttp` 在库的消费谓词之前先认证机密客户端 — `4dff4a3`
 
 ## 有意不做 / 已裁定
 
