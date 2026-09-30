@@ -62,7 +62,11 @@ OP_PORT=8080
 log "generating keys"
 head -c 32 /dev/urandom | base64 -w0 > "${WORK}/kek"
 head -c 32 /dev/urandom | base64 -w0 > "${WORK}/token-key"
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER 2>/dev/null \
+# The OP reads a PKCS#8 DER key. `genpkey -outform DER` emits PKCS#1 for RSA on
+# some OpenSSL builds, which the OP refuses with "use ParsePKCS1PrivateKey"; going
+# through `pkcs8 -topk8 -nocrypt` produces PKCS#8 on every version.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 2>/dev/null \
+  | openssl pkcs8 -topk8 -nocrypt -outform DER 2>/dev/null \
   | base64 -w0 > "${WORK}/signing-key"
 
 export RE0AUTH_KEK="$(cat "${WORK}/kek")"
@@ -76,6 +80,9 @@ export RE0AUTH_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET}"
 # The suite's redirect URI is generated per deployment; override it with
 # CONFORMANCE_REDIRECT_URI once the suite shows you its client configuration.
 REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-https://localhost:${SUITE_PORT}/test/a/conformance/callback}"
+# `[client]` keys come from cmd/re0auth/config.go's clientSection: id, name,
+# secret_env, redirect_uris, scopes. `client_id` belongs to [idp.*] and is an
+# unknown key here, which the config loader refuses by design.
 cat > "${WORK}/re0auth.toml" <<TOMLEOF
 [server]
 issuer = "${ISSUER}"
@@ -83,7 +90,7 @@ addr   = "0.0.0.0:${OP_PORT}"
 cookie_secure = true
 
 [client]
-client_id    = "conformance"
+id = "conformance"
 secret_env   = "RE0AUTH_CLIENT_SECRET"
 redirect_uris = ["${REDIRECT_URI}"]
 TOMLEOF

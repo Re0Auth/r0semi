@@ -89,6 +89,15 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
   authorization code + PKCE + refresh + device, and not dynamic registration or
   PAR. The plan allowlist must name what is supported and record the rest as
   intentionally out of scope, never silently skipped.
+- **Headless limit (the important one).** The spike starts an OP with **no identity
+  provider configured**, so it warns "nobody can sign in". Discovery-level plans
+  (issuer metadata, JWKS, endpoint shape) can run headless; a plan that drives an
+  authorization-code flow — the Basic OP certification plan is one — needs a
+  signed-in subject and an approved consent, and this OP answers every
+  authorization with an interactive consent screen by design (S02-2). Making those
+  plans run unattended therefore requires a **test-only auto-login/auto-consent
+  path** (build-tagged, never in a shipped binary) or an attended run. That is a
+  product decision, not a wiring fix, and it is not implemented here.
 - **Pinned images.** `caddy:2`, `curlimages/curl:latest` and
   `openid/conformance-suite` are floating tags. Once the job is a gate they must be
   pinned by digest, like the `Dockerfile` base images.

@@ -36,3 +36,13 @@ complaint that the authorization response went to the wrong place), which is why
 the redirect URI is the one field worth checking twice.
 
 Then dispatch with `plan_json` set and, once it is green, `require_plan: true`.
+
+## Before you pick a plan
+
+The spike's OP has **no identity provider and no automated consent**: it starts with
+the warning "nobody can sign in". A plan that drives an authorization-code flow will
+reach the login plane and stop there. Discovery-level plans run headless; an
+interactive plan needs a test-only auto-login/auto-consent path (build-tagged, never
+in a shipped binary) or an attended run. See the "Headless limit" gap in
+[docs/conformance.md](../../../docs/conformance.md).
+
