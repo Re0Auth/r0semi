@@ -1,41 +1,56 @@
 # Plan payloads for the conformance spike
 
 `plan_json` (the `conformance` workflow input and `CONFORMANCE_PLAN_JSON`) is a
-**repo-relative path to a JSON body for `POST /api/runner`**. It is the suite's own
-"test configuration" object, not something this repository defines.
+**repo-relative path to this wrapper**, which the spike's
+[`run-plan.py`](../run-plan.py) turns into the suite's own API calls:
+
+| our field | suite call |
+|---|---|
+| `planName` | `POST /api/plan?planName=…` |
+| `variant` | `&variant=<json>` (variant parameter names, e.g. `response_type`) |
+| `config` | the request body — the suite's test configuration JSON |
+
+The suite's API is documented in its own
+[`frontend/src/api/openapi.json`](https://gitlab.com/openid/conformance-suite/-/blob/master/frontend/src/api/openapi.json)
+and implemented by `scripts/run-test-plan.py` upstream. The flow is: create the plan,
+create one test per module (`POST /api/runner?test=<module>&plan=<planId>`), poll
+`GET /api/info/<id>`.
 
 ## First run: leave it empty
 
-Dispatch the workflow with `plan_json` blank. The spike then:
+Dispatch with `plan_json` blank. The spike proves the connectivity milestones and
+writes the suite's **plan catalogue** to the run summary under *Available plans*
+(first 60 names) and `plan-catalogue.json` to the `conformance-spike` artifact. That
+catalogue is the authority for plan names and variant keys — do not guess them.
 
-1. proves the connectivity milestones (self-signed TLS via Caddy, a container
-   fetching discovery with the CA, the suite API answering);
-2. writes the suite's plan catalogue to the run summary under **Available plans**
-   (first 40 names) and the full `available.json` to the `conformance-spike`
-   artifact.
+## Second run: supply a payload
 
-That catalogue is the authority for the plan name, the variant keys and the
-configuration template. Do not guess them.
-
-## Second run: fill the payload
-
-Copy [`basic-op.example.json`](./basic-op.example.json) to a real file (for example
-`scripts/conformance/plans/basic-op.json`) and replace the placeholders. Three
-things must line up at once:
+[`oidcc-basic.json`](./oidcc-basic.json) is ready to use as-is for the spike's seeded
+environment; [`basic-op.example.json`](./basic-op.example.json) is the same shape with
+placeholders for another plan. What must line up:
 
 | field | must equal |
 |---|---|
-| `test`, `variant` | the plan name and variant keys from `available.json` |
-| `config.server.issuer` | the OP's issuer, `https://re0auth.test:8443` |
-| `config.client.client_id` | `conformance` (the id the spike seeds via `[client]`) |
-| `config.client.client_secret` | `CONFORMANCE_CLIENT_SECRET`, default `spike-secret` |
-| `config.client.redirect_uri` | **both** the value the suite expects for this test **and** the one the spike seeds. The suite generates it per test from its public origin (`BASE_URL`, which the spike sets to `http://localhost:9443`); read it from the test page or ask the suite in the first run, then pass it back as the `redirect_uri` input so the OP's `[client]` matches. |
+| `planName`, `variant` keys | the plan and its variant parameters from `plan-catalogue.json` |
+| `config.server.discoveryUrl` | the OP's discovery URL, `https://re0auth.test:8443/.well-known/openid-configuration` |
+| `config.client.client_id` / `client_secret` | `conformance` / `CONFORMANCE_CLIENT_SECRET` (default `spike-secret`) — what the spike seeds in `[client]` |
+| `config.alias` | the path segment the suite puts in its redirect URI |
 
-A mismatch surfaces as `redirect_uri is not registered` from the OP (or a suite
-complaint that the authorization response went to the wrong place), which is why
-the redirect URI is the one field worth checking twice.
+The suite derives its redirect URI as
+**`https://oidf-suite:8443/test/a/<alias>/callback`** (its `fintechlabs.base_url`, on
+the TLS front the spike runs). The spike seeds exactly that into the OP's `[client]`
+unless `redirect_uri` is overridden, so `alias: "conformance"` matches by default.
 
-Then dispatch with `plan_json` set and, once it is green, `require_plan: true`.
+If the plan has modules that need a **second client** (the Basic OP plan has a
+`client_secret_post` group), add those fields too — see the
+`client_secret_post` block in `oidcc-basic.json`.
+
+A mismatch surfaces as `redirect_uri is not registered` from the OP, or a suite
+complaint that the authorization response went to the wrong place.
+
+Dispatch with `plan_json: scripts/conformance/plans/oidcc-basic.json`. It is
+report-only until `require_plan: true` is set, which is the switch to flip once the
+nightly is green.
 
 ## Before you pick a plan
 
@@ -47,4 +62,3 @@ changes this — the spike then builds the OP with `-tags conformance` and sets
 request so the suite can finish the flow. That build-tagged path never reaches a
 shipped binary; see the "Headless authorization" gap in
 [docs/conformance.md](../../../docs/conformance.md) for the guards.
-

@@ -55,7 +55,6 @@ done
 
 ISSUER="https://re0auth.test:8443"
 PUBLIC_PORT=8443
-SUITE_PORT=9443
 OP_PORT=8080
 
 # The suite is NOT on Docker Hub: `openid/conformance-suite` no longer exists there
@@ -69,6 +68,16 @@ MONGO_IMAGE="mongo:6.0.13" # the version the project's docker-compose.yml pins
 SUITE_NAME=re0auth-spike-suite
 MONGO_NAME=re0auth-spike-mongo
 SPIKE_NET=re0auth-spike-net
+# The suite refuses plain HTTP outright (RejectPlainHttpTrafficFilter requires
+# request.getScheme()=="https"; application.properties sets
+# server.forward-headers-strategy=NATIVE, so X-Forwarded-Proto is honored). It
+# therefore needs a real TLS front. We reuse the Caddy instance already running for
+# the OP, published on the same 8443 and routed by name: the suite's public origin is
+# https://oidf-suite:8443, which Caddy serves with `tls internal` for the site. The
+# same local CA is already imported into the suite image's cacerts (milestone 4b), so
+# the suite also trusts the front when it fetches its own callback internally.
+SUITE_HOST=oidf-suite
+SUITE_PUBLIC="https://${SUITE_HOST}:8443"
 
 # ---- material ---------------------------------------------------------------
 log "generating keys"
@@ -90,9 +99,10 @@ export CONFORMANCE_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET:-spike-secret}"
 export RE0AUTH_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET}"
 
 # The suite's redirect URI is generated per deployment; override it with
-# CONFORMANCE_REDIRECT_URI once the suite shows you its client configuration. Its
-# scheme and port follow BASE_URL (the suite's public origin), which is HTTP here.
-REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-http://localhost:${SUITE_PORT}/test/a/conformance/callback}"
+# CONFORMANCE_REDIRECT_URI once the suite shows you its client configuration. It
+# follows the suite's public origin (SUITE_PUBLIC), which is where its own callback
+# lives; set the plan's `alias` to match the trailing path segment.
+REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-${SUITE_PUBLIC}/test/a/conformance/callback}"
 # `[client]` keys come from cmd/re0auth/config.go's clientSection: id, name,
 # secret_env, redirect_uris, scopes. `client_id` belongs to [idp.*] and is an
 # unknown key here, which the config loader refuses by design.
@@ -137,10 +147,18 @@ curl -fsS "http://127.0.0.1:${OP_PORT}/healthz" >/dev/null \
 pass "milestone 1: the OP answers /healthz on :${OP_PORT}"
 # ---- 2. Caddy terminates TLS ------------------------------------------------
 log "starting Caddy (self-signed 'tls internal')"
+# Two sites on one listener (8443), routed by name: the OP's issuer, and the
+# conformance suite's public origin. The suite site's upstream only exists later, and
+# Caddy resolves upstreams per request, so declaring it now is safe.
 cat > "${WORK}/Caddyfile" <<CADDYEOF
 ${ISSUER#https://} {
 	tls internal
 	reverse_proxy host.docker.internal:${OP_PORT}
+}
+
+${SUITE_HOST}:8443 {
+	tls internal
+	reverse_proxy ${SUITE_NAME}:8080
 }
 CADDYEOF
 docker run -d --name "${CADDY_NAME}" \
@@ -223,19 +241,21 @@ else
 fi
 
 # ---- 5. the suite itself (server + MongoDB) ---------------------------------
-# The app listens on 8080 in-container. We publish it on SUITE_PORT and speak HTTP:
-# the nginx half of the official compose only exists to give the tester's browser a
-# TLS origin, which a headless spike does not need. BASE_URL is the public origin the
-# suite builds its redirect URIs from, so it names the published port.
+# The app listens on 8080 in-container and is NOT published: the TLS front is the
+# Caddy instance started above, now attached to this network under the suite's public
+# hostname. The suite refuses plain HTTP, so BASE_URL is the https origin Caddy
+# serves, and server.forward-headers-strategy=NATIVE makes the proxied request look
+# secure to the filter.
 log "starting the conformance suite and its MongoDB"
 docker network create "${SPIKE_NET}" >/dev/null
+docker network connect --alias "${SUITE_HOST}" "${SPIKE_NET}" "${CADDY_NAME}"
 docker run -d --name "${MONGO_NAME}" --network "${SPIKE_NET}" --network-alias mongodb \
   "${MONGO_IMAGE}" >/dev/null
 # JAVA_EXTRA_ARGS is placed BEFORE `-jar` by the image's ENTRYPOINT, so these must be
 # JVM system properties (`-D…`): the `--fintechlabs.…` program-argument spelling the
 # dev compose uses would be parsed as a JVM option and kill the JVM
-# ("Unrecognized option"). Both names exist in the app's application.properties
-# (startredir) / application-dev.properties (devmode).
+# ("Unrecognized option"). startredir stays off: it exists to forward localhost:8443
+# to an in-network `nginx`, and our Caddy is that front directly.
 #
 # The four OIDC_* vars are the entrypoint's own inputs, and it passes them as
 # `-Doidc.google.clientid=…` unconditionally. Left unset they override the app's
@@ -246,14 +266,19 @@ docker run -d --name "${SUITE_NAME}" \
   --network "${SPIKE_NET}" \
   --add-host re0auth.test:host-gateway \
   -e MONGODB_HOST=mongodb \
-  -e BASE_URL="http://localhost:${SUITE_PORT}" \
-  -e JAVA_EXTRA_ARGS="-Dfintechlabs.devmode=true -Dfintechlabs.startredir=true" \
+  -e BASE_URL="${SUITE_PUBLIC}" \
+  -e JAVA_EXTRA_ARGS="-Dfintechlabs.devmode=true -Dfintechlabs.startredir=false" \
   -e OIDC_GOOGLE_CLIENTID=unused -e OIDC_GOOGLE_SECRET=unused \
   -e OIDC_GITLAB_CLIENTID=unused -e OIDC_GITLAB_SECRET=unused \
-  -p "${SUITE_PORT}:8080" \
   "${SUITE_IMAGE}" >/dev/null
 
-API="http://localhost:${SUITE_PORT}"
+API="${SUITE_PUBLIC}"
+# Host-side access to the suite goes through Caddy, which needs the name resolved.
+# Caddy's internal CA signs the site, hence -k on the host side (the suite itself
+# trusts that CA, which is what its own internal fetches need).
+suite_curl() {
+  curl -fsSk --resolve "${SUITE_HOST}:8443:127.0.0.1" "$@"
+}
 # The plan catalogue is the endpoint a plan run actually starts from
 # (GET /api/plan/available -> POST /api/plan?planName=…&variant=… ->
 # POST /api/runner?test=<module>&plan=<id>). `/api/runner/available` lists test
@@ -262,13 +287,13 @@ API="http://localhost:${SUITE_PORT}"
 PLAN_API="${API}/api/plan/available"
 MODULE_API="${API}/api/runner/available"
 for _ in $(seq 1 90); do
-  if curl -fsS "${PLAN_API}" >/dev/null 2>&1; then break; fi
+  if suite_curl "${PLAN_API}" >/dev/null 2>&1; then break; fi
   sleep 2
 done
 
-if curl -fsS "${PLAN_API}" > "${WORK}/plan-catalogue.json" 2>/dev/null; then
-  pass "milestone 5: the suite plan catalogue answers on :${SUITE_PORT}"
-  if curl -fsS "${MODULE_API}" > "${WORK}/available.json" 2>/dev/null; then
+if suite_curl "${PLAN_API}" > "${WORK}/plan-catalogue.json" 2>/dev/null; then
+  pass "milestone 5: the suite plan catalogue answers on ${API}"
+  if suite_curl "${MODULE_API}" > "${WORK}/available.json" 2>/dev/null; then
     log "module catalogue fetched too ($(wc -c < "${WORK}/available.json") bytes)"
   else
     log "module catalogue endpoint did not answer; a plan run does not need it"
@@ -278,7 +303,7 @@ if curl -fsS "${PLAN_API}" > "${WORK}/plan-catalogue.json" 2>/dev/null; then
 else
   # The status separates "it wants a login" from "it crashed", and the tail of a
   # Spring stack trace says nothing — the exception header does.
-  code="$(curl -sS -o "${WORK}/plan-catalogue.body" -w '%{http_code}' "${PLAN_API}" 2>/dev/null || true)"
+  code="$(curl -sSk --resolve "${SUITE_HOST}:8443:127.0.0.1" -o "${WORK}/plan-catalogue.body" -w '%{http_code}' "${PLAN_API}" 2>/dev/null || true)"
   log "probe HTTP status: ${code}"
   head -c 400 "${WORK}/plan-catalogue.body" 2>/dev/null || true
   echo
@@ -289,9 +314,10 @@ else
 fi
 
 # ---- optional: run a plan, and wait for its verdict -------------------------
-# The suite has used `id`/`testId`/`test_id` and `status`/`result` across versions.
-# Reading whichever appears keeps this spike working across releases instead of
-# pinning knowledge it cannot verify here.
+# The flow is the suite's own (see scripts/conformance/run-plan.py): create the plan
+# with POST /api/plan?planName=…&variant=… and the configuration as the body, then
+# create one test per module with POST /api/runner?test=…&plan=…, then poll
+# GET /api/info/<id>. run-plan.py prints one JSON object with status/result/modules.
 json_field() { # <file> <key>...
   "${PYTHON}" - "$@" <<'PY'
 import json, sys
@@ -313,43 +339,25 @@ PY
 PLAN_STATUS="not-run"
 PLAN_RESULT=""
 if (( PLAN_REQUESTED )); then
-  log "posting CONFORMANCE_PLAN_JSON to /api/runner"
-  curl -fsS -X POST "${API}/api/runner" \
-    -H 'Content-Type: application/json' \
-    --data-binary "@${CONFORMANCE_PLAN_JSON}" > "${WORK}/run.json"
-  RUN_ID="$(json_field "${WORK}/run.json" id testId test_id)"
-  if [[ -z "${RUN_ID}" ]]; then
-    warn "the suite returned no run id: $(cat "${WORK}/run.json")"
-    PLAN_STATUS="not-started"
+  log "running ${CONFORMANCE_PLAN_JSON} through the suite"
+  run_rc=0
+  set +e
+  "${PYTHON}" "${ROOT}/scripts/conformance/run-plan.py" \
+    --api "${API}" --insecure --payload "${CONFORMANCE_PLAN_JSON}" \
+    --timeout "${CONFORMANCE_PLAN_TIMEOUT_SECONDS:-900}" \
+    > "${WORK}/plan-run.json" 2> "${WORK}/plan-run.err"
+  run_rc=$?
+  set -e
+  [[ -s "${WORK}/plan-run.err" ]] && cat "${WORK}/plan-run.err" >&2 || true
+  PLAN_STATUS="$(json_field "${WORK}/plan-run.json" status)"
+  PLAN_RESULT="$(json_field "${WORK}/plan-run.json" result)"
+  if (( run_rc == 0 )); then
+    pass "milestone 6/7: the plan finished (result=${PLAN_RESULT:-unknown})"
   else
-    pass "milestone 6: plan run ${RUN_ID} created"
-    PLAN_STATUS="RUNNING"
-    deadline=$(( SECONDS + ${CONFORMANCE_TIMEOUT_SECONDS:-600} ))
-    while (( SECONDS < deadline )); do
-      curl -fsS "${API}/api/runner/${RUN_ID}" > "${WORK}/run-status.json" 2>/dev/null || true
-      PLAN_STATUS="$(json_field "${WORK}/run-status.json" status)"
-      case "${PLAN_STATUS}" in
-        FINISHED|INTERRUPTED|STOPPED) break ;;
-      esac
-      sleep 2
-    done
-    PLAN_RESULT="$(json_field "${WORK}/run-status.json" result summary)"
-    if [[ "${PLAN_STATUS}" == "FINISHED" ]]; then
-      case "${PLAN_RESULT}" in
-        SUCCESS|WARNING|REVIEW|SKIPPED|"")
-          pass "milestone 7: plan finished (result=${PLAN_RESULT:-unknown})" ;;
-        *)
-          if [[ "${CONFORMANCE_REQUIRE_PLAN:-0}" == "1" ]]; then
-            fail "plan finished with result=${PLAN_RESULT}"
-          fi
-          warn "plan finished with result=${PLAN_RESULT}" ;;
-      esac
-    else
-      if [[ "${CONFORMANCE_REQUIRE_PLAN:-0}" == "1" ]]; then
-        fail "plan did not finish within ${CONFORMANCE_TIMEOUT_SECONDS:-600}s (status=${PLAN_STATUS})"
-      fi
-      warn "plan did not finish within ${CONFORMANCE_TIMEOUT_SECONDS:-600}s (status=${PLAN_STATUS})"
+    if [[ "${CONFORMANCE_REQUIRE_PLAN:-0}" == "1" ]]; then
+      fail "the plan did not pass: status=${PLAN_STATUS:-unknown} result=${PLAN_RESULT:-unknown}"
     fi
+    warn "the plan did not pass: status=${PLAN_STATUS:-unknown} result=${PLAN_RESULT:-unknown}"
   fi
 else
   warn "no CONFORMANCE_PLAN_JSON supplied; connectivity only (no plan was run)"
@@ -380,7 +388,7 @@ PY
 
 if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
   mkdir -p "${SPIKE_ARTIFACTS}"
-  cp "${WORK}/plan-catalogue.json" "${WORK}/available.json" "${WORK}/run.json" "${WORK}/run-status.json" "${SPIKE_ARTIFACTS}/" 2>/dev/null || true
+  cp "${WORK}/plan-catalogue.json" "${WORK}/available.json" "${WORK}/plan-run.json" "${SPIKE_ARTIFACTS}/" 2>/dev/null || true
   docker logs "${SUITE_NAME}" > "${SPIKE_ARTIFACTS}/suite.log" 2>&1 || true
   docker logs "${CADDY_NAME}" > "${SPIKE_ARTIFACTS}/caddy.log" 2>&1 || true
   {

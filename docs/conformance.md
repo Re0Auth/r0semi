@@ -35,16 +35,20 @@ have caught them on every commit.
    build fails;
 6. starts the suite **and its MongoDB** — the published suite image is the server
    half of the project's compose topology: it listens on `:8080` and needs a
-   `mongo` beside it (we run `mongo:6.0.13`, the version the project pins). It is
-   published on `:9443` and reached over **HTTP**; the compose's nginx/TLS front is
-   only there to give a tester's browser a TLS origin. Prints
-   `/api/runner/available` (milestones 1–5, plus 4b).
+   `mongo` beside it (`mongo:6.0.13`, the version the project pins). The suite
+   **refuses plain HTTP** (`RejectPlainHttpTrafficFilter` demands scheme `https`,
+   and `server.forward-headers-strategy=NATIVE` honors `X-Forwarded-Proto`), so the
+   Caddy instance doubles as its TLS front: a second site serves
+   `https://oidf-suite:8443`, Caddy joins the spike network under that name, and the
+   suite's `cacerts` already carries the issuing CA from milestone 4b. Prints the
+   **plan** catalogue from `GET /api/plan/available` (milestones 1–5, plus 4b).
 7. when a plan payload is supplied, builds the OP with the `conformance` build tag
-   and its auto-login opt-in (see the headless gap below), posts the payload to
-   `/api/runner`, polls the run to a terminal status, and records the verdict
-   (milestones 6–7). The suite has used `id`/`testId`/`test_id` and
-   `status`/`result` across versions; the script reads whichever appears rather than
-   pinning knowledge it cannot verify locally.
+   and its auto-login opt-in (see the headless gap below), then runs the suite's own
+   flow through `scripts/conformance/run-plan.py`:
+   `POST /api/plan?planName=…&variant=…` → one
+   `POST /api/runner?test=<module>&plan=<id>` per module → poll `GET /api/info/<id>`
+   (milestones 6–7). The payload shape and the ready-made Basic OP file are in
+   `scripts/conformance/plans/`.
 
 Every milestone is written to `conformance-artifacts/summary.md`, which the
 workflow appends to the run's **step summary** — that table is what the nightly
@@ -64,7 +68,7 @@ SPIKE_ARTIFACTS=$PWD/conformance-artifacts \
 
 | input | meaning |
 |---|---|
-| `plan_json` | repo-relative path to a JSON payload for `POST /api/runner`. **Leave empty on the first run**: the spike then prints the suite's plan catalogue under "Available plans" in the run summary, and that catalogue is the authority on the plan name and variant. [`scripts/conformance/plans/README.md`](../scripts/conformance/plans/README.md) has the fill-in guide and a template. |
+| `plan_json` | repo-relative path to a plan payload (our wrapper around the suite's `POST /api/plan`; see [`scripts/conformance/plans/README.md`](../scripts/conformance/plans/README.md)). **Leave empty on the first run**: the spike then prints the suite's plan catalogue under "Available plans" in the run summary. |
 | `redirect_uri` | the redirect URI seeded into the OP's `[client]`. It must equal the one the suite generates for the test; read it from the suite and pass it back here so both sides match. Blank keeps the script default. |
 | `require_plan` | when true, the script exits non-zero unless the plan reaches `FINISHED` with `SUCCESS`/`WARNING`/`REVIEW`/`SKIPPED`. Use this once the nightly is green — it is the same switch as dropping `continue-on-error`. |
 

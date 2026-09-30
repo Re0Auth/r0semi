@@ -1,16 +1,16 @@
 {
-  "test": "<plan name, e.g. oidcc-basic-certification-test-plan — copy it from available.json>",
+  "planName": "<plan name from plan-catalogue.json, e.g. oidcc-basic-certification-test-plan>",
   "variant": {
-    "<variant key>": "<variant value>"
+    "<variant parameter>": "<variant value>"
   },
   "config": {
+    "alias": "<alias; this becomes the redirect URI path segment>",
     "server": {
-      "issuer": "https://re0auth.test:8443"
+      "discoveryUrl": "https://re0auth.test:8443/.well-known/openid-configuration"
     },
     "client": {
       "client_id": "conformance",
-      "client_secret": "spike-secret",
-      "redirect_uri": "http://localhost:9443/test/a/conformance/callback"
+      "client_secret": "<CONFORMANCE_CLIENT_SECRET, default spike-secret>"
     }
   }
 }

@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       plan_json:
-        description: 'Repo-relative path to a POST /api/runner payload. Leave EMPTY on the first run: the plan catalogue is printed to the summary.'
+        description: 'Repo-relative path to a plan payload (see scripts/conformance/plans/README.md). Leave EMPTY on the first run: the plan catalogue is printed to the summary.'
         required: false
         default: ''
       redirect_uri:
