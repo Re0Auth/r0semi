@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -141,7 +142,7 @@ func TestDeviceDeadlinesAreJudgedByTheClockThatWroteThem(t *testing.T) {
 	// judgement too must come from the store clock: the last_poll the first
 	// poll wrote is a store-clock value, so the database's now() would call it
 	// long past due and answer a second poll instead of throttling it.
-	if _, err := oidc.GetDeviceAuthorizatonState(ctx, "oidc-device", "clock-device-code"); err != context.DeadlineExceeded {
+	if _, err := oidc.GetDeviceAuthorizatonState(ctx, "oidc-device", "clock-device-code"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("second poll inside the interval = %v, want slow_down (context.DeadlineExceeded)", err)
 	}
 

@@ -31,3 +31,19 @@ paths = [
   '''docs/audit-5/findings/protocol\.md''',
   '''docs/audit-5/probes/verify-web/bundle-verify\.mjs''',
 ]
+
+# The seventh-round audit's raw probe log, same rationale: it quotes the failing
+# tests' token responses verbatim. Named by file, not by directory.
+[[allowlists]]
+description = "Proof-of-concept token output quoted in the seventh-round audit log"
+paths = ['''docs/audit-7/audit5-red\.log''']
+
+# One probe registers throwaway clients whose secrets are literal fixtures, never
+# credentials in any deployment. The exemption needs BOTH the exact file and the
+# fixture-secret shape (condition = "AND"): a genuine key in that file, or these
+# strings anywhere else, still reports.
+[[allowlists]]
+description = "Throwaway client-secret fixtures in the audit-6 protocol-token probe"
+condition = "AND"
+paths = ['''internal/zzprobe/audit6/z02protocoltoken/fixture_test\.go''']
+regexes = ['''z02-(web|narrow)-secret''']

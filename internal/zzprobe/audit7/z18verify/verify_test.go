@@ -385,9 +385,9 @@ func TestZ18vDiscoveryFailureKeepsServingTheStaleProvider(t *testing.T) {
 	newClient := func(ttl time.Duration) *idp.Client {
 		t.Helper()
 		reg, err := idp.NewRegistry(idp.RegistryConfig{
-			RedirectBase:      "https://re0auth.test",
-			HTTPClient:        issuer.Client(),
-			ProviderCacheTTL:  ttl,
+			RedirectBase:     "https://re0auth.test",
+			HTTPClient:       issuer.Client(),
+			ProviderCacheTTL: ttl,
 			Credentials: []idp.Credentials{{
 				Provider: idp.Provider("zzstale"), ClientID: "cid", ClientSecret: "sec",
 				Issuer: issuer.URL,
@@ -423,9 +423,9 @@ func TestZ18vDiscoveryFailureKeepsServingTheStaleProvider(t *testing.T) {
 	if err != nil {
 		return // re-discovery failed and the call failed: the TTL bound held
 	}
-	t.Errorf("NEW: with a 1ns provider TTL and the issuer's discovery answering 500, a call that must "+
-		"re-discover still succeeded. idp.go:626-633 returns the cached provider and does not update "+
-		"discoveredAt on failure, so the documented `at most providerTTL` bound (idp.go:606-613) does "+
-		"not hold once discovery starts failing: the cached keys — and the endpoints pinned from them — "+
+	t.Errorf("NEW: with a 1ns provider TTL and the issuer's discovery answering 500, a call that must " +
+		"re-discover still succeeded. idp.go:626-633 returns the cached provider and does not update " +
+		"discoveredAt on failure, so the documented `at most providerTTL` bound (idp.go:606-613) does " +
+		"not hold once discovery starts failing: the cached keys — and the endpoints pinned from them — " +
 		"are trusted for the life of the process.")
 }
