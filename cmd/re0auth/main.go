@@ -1299,6 +1299,9 @@ type oidcJanitor interface{ SweepExpired() int }
 // composition root owns every goroutine this process runs: started next to the
 // other loops, joined by the same group.
 func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.Logger, metrics *observability.Metrics) (*oidchttp.Handler, oidcBackend, oidcJanitor, error) {
+	if err := conformanceLoginStartupCheck(); err != nil {
+		return nil, nil, nil, err
+	}
 	tokenKey, err := oidcTokenKey()
 	if err != nil {
 		return nil, nil, nil, err
@@ -1334,6 +1337,16 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 		// which is where the session lives.
 		sessions.Bind(ctx, "authz", id)
 		consent := webui.BasePath + "/consent?id=" + url.QueryEscape(id)
+
+		// The conformance build can short-circuit the whole interactive flow, because
+		// the conformance suite has no human to log in or approve. Compiled out of
+		// production (conformance_stub.go) and inert unless its opt-in is set.
+		if target, handled, err := conformanceAutoLogin(ctx, oidcStore, id); err != nil {
+			slog.Error("conformance auto-login failed", "err", err)
+			return consent
+		} else if handled {
+			return target
+		}
 
 		// The request's freshness requirement. `prompt=login` always needs a fresh
 		// authentication; `max_age=N` needs one once the browser's session is

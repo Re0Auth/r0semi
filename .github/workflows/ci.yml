@@ -330,7 +330,7 @@ jobs:
       # so a probe that no longer builds fails here even when its package is not
       # (yet) on an allowlist below.
       - name: go vet (tagged probes)
-        run: go vet -tags audit5,audit6,audit7 ./...
+        run: go vet -tags audit5,audit6,audit7,conformance ./...
 
       - name: go test -tags audit5
         run: |
@@ -373,6 +373,14 @@ jobs:
             ./internal/zzprobe/audit7/z08verify \
             ./internal/zzprobe/audit7/z16verify \
             ./internal/zzprobe/audit7/z22reconcile
+
+      - name: go test -tags conformance
+        # The conformance auto-login path is build-tagged, so the default suite never
+        # compiles it. This keeps the tag building and its guards running; the
+        # non-tagged half — a production binary refuses the opt-in at startup — is in
+        # the default suite (zz_conformance_stub_test.go).
+        run: |
+          go test -tags conformance -count=1 -timeout 300s ./cmd/re0auth
 
   windows-smoke:
     # The release ships windows/amd64 binaries, but until this job no test ever

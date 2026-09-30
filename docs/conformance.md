@@ -39,10 +39,12 @@ have caught them on every commit.
    published on `:9443` and reached over **HTTP**; the compose's nginx/TLS front is
    only there to give a tester's browser a TLS origin. Prints
    `/api/runner/available` (milestones 1–5, plus 4b).
-7. when a plan payload is supplied, posts it to `/api/runner`, polls the run to a
-   terminal status, and records the verdict (milestones 6–7). The suite has used
-   `id`/`testId`/`test_id` and `status`/`result` across versions; the script reads
-   whichever appears rather than pinning knowledge it cannot verify locally.
+7. when a plan payload is supplied, builds the OP with the `conformance` build tag
+   and its auto-login opt-in (see the headless gap below), posts the payload to
+   `/api/runner`, polls the run to a terminal status, and records the verdict
+   (milestones 6–7). The suite has used `id`/`testId`/`test_id` and
+   `status`/`result` across versions; the script reads whichever appears rather than
+   pinning knowledge it cannot verify locally.
 
 Every milestone is written to `conformance-artifacts/summary.md`, which the
 workflow appends to the run's **step summary** — that table is what the nightly
@@ -96,15 +98,26 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
   authorization code + PKCE + refresh + device, and not dynamic registration or
   PAR. The plan allowlist must name what is supported and record the rest as
   intentionally out of scope, never silently skipped.
-- **Headless limit (the important one).** The spike starts an OP with **no identity
-  provider configured**, so it warns "nobody can sign in". Discovery-level plans
-  (issuer metadata, JWKS, endpoint shape) can run headless; a plan that drives an
-  authorization-code flow — the Basic OP certification plan is one — needs a
-  signed-in subject and an approved consent, and this OP answers every
-  authorization with an interactive consent screen by design (S02-2). Making those
-  plans run unattended therefore requires a **test-only auto-login/auto-consent
-  path** (build-tagged, never in a shipped binary) or an attended run. That is a
-  product decision, not a wiring fix, and it is not implemented here.
+- **Headless authorization (addressed by the `conformance` build tag).** The spike's
+  OP has no identity provider ("nobody can sign in") and answers every authorization
+  with an interactive consent screen by design, so a plan that drives an
+  authorization-code flow — the Basic OP plan is one — cannot be completed by a
+  humanless suite on the ordinary binary. Requesting a plan therefore makes the spike
+  build the OP with `-tags conformance` and set `RE0AUTH_CONFORMANCE_AUTOLOGIN=1`.
+  That path stamps a real `auth_time`, completes the login as a fixed subject
+  (`usr_conformance`) and returns the OP's own callback URL, so the code is issued
+  with no browser.
+  Guards, in layers: the code exists **only** under the build tag, and no release
+  target passes tags (`Makefile:169` builds with `go build -trimpath`); the runtime
+  opt-in is required; a warning is logged at startup and on every auto-approved
+  request; and a binary built **without** the tag **refuses to start** when the
+  variable is set (`cmd/re0auth/conformance_stub.go`), so nobody is left believing a
+  bypass is active. The tagged half is tested by
+  `go test -tags conformance ./cmd/re0auth` in CI, and the production half by the
+  default suite (`zz_conformance_stub_test.go`).
+  This is only for the suite's own run: it proves protocol behaviour, and it is not a
+  certification result — the OIDF certification plans still expect a real client and
+  user at the OP.
 - **Pinned images.** `caddy:2`, `curlimages/curl:latest`,
   `registry.gitlab.com/openid/conformance-suite:latest` and `mongo:6.0.13` are
   floating tags. Once the job is a gate they must be pinned by digest, like the

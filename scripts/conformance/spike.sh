@@ -109,8 +109,22 @@ redirect_uris = ["${REDIRECT_URI}"]
 TOMLEOF
 
 # ---- 1. the OP --------------------------------------------------------------
-log "building and starting the OP"
-( cd "${ROOT}" && go build -o "${WORK}/re0auth" ./cmd/re0auth )
+# A plan needs a user, and the conformance suite has none: no IdP, and this OP
+# always answers an authorization with an interactive consent screen by design. So
+# requesting a plan is what switches the OP to the `conformance`-tagged binary,
+# whose auto-login path is compiled out of every production build
+# (cmd/re0auth/conformance_stub.go) and inert until this opt-in is set. Without a
+# plan, the OP is the ordinary binary and nothing is bypassed.
+if [[ -n "${CONFORMANCE_PLAN_JSON:-}" && -f "${CONFORMANCE_PLAN_JSON}" ]]; then
+  PLAN_REQUESTED=1
+  export RE0AUTH_CONFORMANCE_AUTOLOGIN=1
+  log "a plan was requested; building the OP with -tags conformance (auto-login ON)"
+  ( cd "${ROOT}" && go build -tags conformance -o "${WORK}/re0auth" ./cmd/re0auth )
+else
+  PLAN_REQUESTED=0
+  log "no plan requested; building the ordinary OP"
+  ( cd "${ROOT}" && go build -o "${WORK}/re0auth" ./cmd/re0auth )
+fi
 "${WORK}/re0auth" -config "${WORK}/re0auth.toml" > "${WORK}/op.log" 2>&1 &
 OP_PID=$!
 
@@ -265,7 +279,7 @@ PY
 
 PLAN_STATUS="not-run"
 PLAN_RESULT=""
-if [[ -n "${CONFORMANCE_PLAN_JSON:-}" && -f "${CONFORMANCE_PLAN_JSON}" ]]; then
+if (( PLAN_REQUESTED )); then
   log "posting CONFORMANCE_PLAN_JSON to /api/runner"
   curl -fsS -X POST "${API}/api/runner" \
     -H 'Content-Type: application/json' \

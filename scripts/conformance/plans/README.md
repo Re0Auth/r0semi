@@ -39,10 +39,12 @@ Then dispatch with `plan_json` set and, once it is green, `require_plan: true`.
 
 ## Before you pick a plan
 
-The spike's OP has **no identity provider and no automated consent**: it starts with
-the warning "nobody can sign in". A plan that drives an authorization-code flow will
-reach the login plane and stop there. Discovery-level plans run headless; an
-interactive plan needs a test-only auto-login/auto-consent path (build-tagged, never
-in a shipped binary) or an attended run. See the "Headless limit" gap in
-[docs/conformance.md](../../../docs/conformance.md).
+The spike's OP has no identity provider and no automated consent on the ordinary
+binary: it starts with the warning "nobody can sign in", so an authorization-code
+plan would reach the login plane and stop. Supplying `plan_json` is the switch that
+changes this — the spike then builds the OP with `-tags conformance` and sets
+`RE0AUTH_CONFORMANCE_AUTOLOGIN=1`, which auto-authenticates and auto-approves the
+request so the suite can finish the flow. That build-tagged path never reaches a
+shipped binary; see the "Headless authorization" gap in
+[docs/conformance.md](../../../docs/conformance.md) for the guards.
 
