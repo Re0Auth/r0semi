@@ -254,18 +254,38 @@ docker run -d --name "${SUITE_NAME}" \
   "${SUITE_IMAGE}" >/dev/null
 
 API="http://localhost:${SUITE_PORT}"
+# The plan catalogue is the endpoint a plan run actually starts from
+# (GET /api/plan/available -> POST /api/plan?planName=…&variant=… ->
+# POST /api/runner?test=<module>&plan=<id>). `/api/runner/available` lists test
+# MODULES and is not needed for a plan, so it is fetched best-effort only: the first
+# CI runs died on it while the plan endpoint was never tried.
+PLAN_API="${API}/api/plan/available"
+MODULE_API="${API}/api/runner/available"
 for _ in $(seq 1 90); do
-  if curl -fsS "${API}/api/runner/available" >/dev/null 2>&1; then break; fi
+  if curl -fsS "${PLAN_API}" >/dev/null 2>&1; then break; fi
   sleep 2
 done
 
-if curl -fsS "${API}/api/runner/available" > "${WORK}/available.json" 2>/dev/null; then
-  pass "milestone 5: the suite REST API answers on :${SUITE_PORT}"
-  log "available plans written to ${WORK}/available.json (first 40 lines):"
-  head -n 40 "${WORK}/available.json" || true
+if curl -fsS "${PLAN_API}" > "${WORK}/plan-catalogue.json" 2>/dev/null; then
+  pass "milestone 5: the suite plan catalogue answers on :${SUITE_PORT}"
+  if curl -fsS "${MODULE_API}" > "${WORK}/available.json" 2>/dev/null; then
+    log "module catalogue fetched too ($(wc -c < "${WORK}/available.json") bytes)"
+  else
+    log "module catalogue endpoint did not answer; a plan run does not need it"
+  fi
+  log "plan catalogue written to ${WORK}/plan-catalogue.json (first 40 lines):"
+  head -n 40 "${WORK}/plan-catalogue.json" || true
 else
-  docker logs "${SUITE_NAME}" | tail -n 40 || true
-  fail "the suite API never answered; inspect its log above"
+  # The status separates "it wants a login" from "it crashed", and the tail of a
+  # Spring stack trace says nothing — the exception header does.
+  code="$(curl -sS -o "${WORK}/plan-catalogue.body" -w '%{http_code}' "${PLAN_API}" 2>/dev/null || true)"
+  log "probe HTTP status: ${code}"
+  head -c 400 "${WORK}/plan-catalogue.body" 2>/dev/null || true
+  echo
+  docker logs "${SUITE_NAME}" 2>&1 | grep -E "Exception|Caused by|APPLICATION FAILED|ERROR" | tail -n 15 || true
+  docker logs "${SUITE_NAME}" 2>&1 | tail -n 60 || true
+  docker logs "${MONGO_NAME}" 2>&1 | tail -n 15 || true
+  fail "the suite plan catalogue never answered; inspect the exception above"
 fi
 
 # ---- optional: run a plan, and wait for its verdict -------------------------
@@ -336,10 +356,10 @@ else
 fi
 
 # ---- artifacts and the report the nightly routine reads ---------------------
-# The catalogue is the authority for a plan payload (test name, variant, config),
-# so surface it where the dispatcher will actually look: the run summary.
+# The plan catalogue is the authority for a plan payload, so surface it where the
+# dispatcher will actually look: the run summary.
 plan_names() {
-  "${PYTHON}" - "${WORK}/available.json" <<'PY'
+  "${PYTHON}" - "${WORK}/plan-catalogue.json" <<'PY'
 import json, sys
 try:
     data = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -348,17 +368,19 @@ except Exception:
 if isinstance(data, dict):
     names = list(data.keys())
 elif isinstance(data, list):
-    names = [d.get("testName") or d.get("name") or "?" for d in data]
+    # The catalogue has been a list of plans (planName) and a list of test modules
+    # (testName) across versions; keep both readable.
+    names = [d.get("planName") or d.get("name") or d.get("testName") or "?" for d in data]
 else:
     names = []
-for name in names[:40]:
+for name in names[:60]:
     print(name)
 PY
 }
 
 if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
   mkdir -p "${SPIKE_ARTIFACTS}"
-  cp "${WORK}/available.json" "${WORK}/run.json" "${WORK}/run-status.json" "${SPIKE_ARTIFACTS}/" 2>/dev/null || true
+  cp "${WORK}/plan-catalogue.json" "${WORK}/available.json" "${WORK}/run.json" "${WORK}/run-status.json" "${SPIKE_ARTIFACTS}/" 2>/dev/null || true
   docker logs "${SUITE_NAME}" > "${SPIKE_ARTIFACTS}/suite.log" 2>&1 || true
   docker logs "${CADDY_NAME}" > "${SPIKE_ARTIFACTS}/caddy.log" 2>&1 || true
   {
@@ -378,7 +400,7 @@ if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
       echo "No plan payload was supplied. This run proved connectivity; pick a plan below,"
       echo "then dispatch again with \`plan_json\` (see scripts/conformance/plans/README.md)."
       echo
-      echo "### Available plans (first 40; full list in available.json)"
+      echo "### Available plans (first 60; full list in plan-catalogue.json)"
       echo
       plan_names | sed 's/^/- `/; s/$/`/'
     fi
