@@ -239,8 +239,20 @@ func TestVerifyUserinfoRefusesGarbageBearer(t *testing.T) {
 	if got := bearer(at); got != http.StatusOK {
 		t.Fatalf("control failed: a live access token was refused with %d", got)
 	}
-	// A one-character edit to the ciphertext must not survive AEAD.
-	edited := at[:len(at)-2] + "AA"
+	// A one-character edit to the ciphertext must not survive AEAD. Flip the byte at
+	// len-3, not the tail: the final base64url character can carry only ignored
+	// padding bits, so editing it decodes to the SAME ciphertext and the endpoint is
+	// right to accept it (that is not a tamper). Replacing the tail with a fixed
+	// "AA" also collides with a token that already ends in "AA". The third-from-last
+	// character always encodes significant bits; the protocol-plane probe
+	// (zzprobe/protocol/tokens_test.go) flips the same one.
+	tampered := []byte(at)
+	if tampered[len(tampered)-3] == 'A' {
+		tampered[len(tampered)-3] = 'B'
+	} else {
+		tampered[len(tampered)-3] = 'A'
+	}
+	edited := string(tampered)
 	if edited == at {
 		t.Fatal("probe bug: the edit did not change the token")
 	}
