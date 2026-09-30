@@ -6,22 +6,22 @@
 > `docs/*-decision.md` 的 ADR 里。升级步骤见 [docs/operations.md](docs/operations.md)
 > 的「升级」一节，它的第一步就是先读这里与受影响的 ADR。
 
-## v0.0.0-rc.4
+## v0.0.0-rc.5
 
 **本轮把 P0/P1 全部收掉，并把 P2 分级里 T1（「不修上不了线」）的 9 条一并收掉**
 （逐条与守卫见 [docs/issues/P0-blockers.md](docs/issues/P0-blockers.md)、
 [docs/issues/P1-high.md](docs/issues/P1-high.md)、[docs/issues/P2-triage.md](docs/issues/P2-triage.md)）。
 下面先列部署者/下游必须知道的变化，其后是自 rc.3 以来累积的条目。
 
-> 与 rc.3 一样，rc.4 验证的仍是 **tag → CI → 产物** 这条链路，**不是可以部署的版本**：
+> 与 rc.3 一样，rc.5 验证的仍是 **tag → CI → 产物** 这条链路，**不是可以部署的版本**：
 > rc.1 一节列出的适用条件全部成立。另需记录在 release notes 里的一条：rc.3 已公开的归档中
-> Svelte/SvelteKit 代码缺少版权/许可声明（第五轮 SUP-1），**已发出的产物无法回溯**；自 rc.4 起
+> Svelte/SvelteKit 代码缺少版权/许可声明（第五轮 SUP-1），**已发出的产物无法回溯**；自 rc.5 起
 > 归档随附 `re0auth_<ver>_npm-attribution.json` 许可清单（`make npm-attribution`，
 > 与 `SHA256SUMS` 一同发布，见本节 P2-21 条）。
 >
-> **发布动作（两步，顺序不能反）**：① 在 `main` 上打 `v0.0.0-rc.4` 并推送——`release.yml` 以
+> **发布动作（两步，顺序不能反）**：① 在 `main` 上打 `v0.0.0-rc.5` 并推送——`release.yml` 以
 > `ci.yml` 为门禁，门禁过了才发布产物；② 随后用**单独一次提交**把 `deploy/k8s/base` 的 pin 与
-> [docs/operations.md](docs/operations.md) 的「最近一个真正发布过的 tag」换到 rc.4。pin 有守卫：
+> [docs/operations.md](docs/operations.md) 的「最近一个真正发布过的 tag」换到 rc.5。pin 有守卫：
 > `internal/archtest` 要求它指向仓库里**真实存在**的 `v*` tag，所以第二步必须等 tag 推上去之后
 > ——rc.3 就是这么换的（提交 `632e00b`），rc.1 一节的教训也在这里。
 
@@ -397,9 +397,19 @@
   交给网络只需要写错一个地址。**k8s 基线需要改**：`deploy/k8s/base/configmap.yaml` 已补上
   `expose_internal = true`，它的安全性来自同目录的 NetworkPolicy（只放行 monitoring 命名空间到 9090）。
 
+## v0.0.0-rc.4
+
+预发布 tag，用途与 rc.5 相同，但**它没有产物**：`v0.0.0-rc.4` 打在「准备 v0.0.0-rc.4」那个提交
+（`8f72ed2`），那次 release 运行
+（[run 36675853689](https://github.com/Re0Auth/r0semi/actions/runs/36675853689)）死在 `ci.yml`
+的 `go test` 一步（Postgres store 的时间戳比较与过期行清理），`image` 与 `release` 两个作业被
+`needs: ci` 跳过，`gh release create` 从未执行，GHCR 上也没有该 tag 的镜像。修正落在 rc.5 之前的
+那些提交里（含 `internal/store/postgres/oidc.go` 的设备轮询节流 SQL，`f0fb7de`），内容随 rc.5
+一起发出——见上一节。
+
 ## v0.0.0-rc.3
 
-**首个带产物的预发布**（rc.4 之前唯一一个）：release 里有六个平台的归档、`SHA256SUMS` 及其 cosign 签名、以及 SBOM。
+**首个带产物的预发布**（rc.5 之前唯一一个）：release 里有六个平台的归档、`SHA256SUMS` 及其 cosign 签名、以及 SBOM。
 它验证的仍是 **tag → CI → 产物** 这条链路，所以它和下面各条一样**不是可以部署的版本**——
 rc.1 那节列出的适用条件全部成立。
 
