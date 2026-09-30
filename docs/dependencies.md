@@ -13,12 +13,13 @@
 | `github.com/alexedwards/scs/v2` | `internal/auth`（re0auth 会话）、`referencesource`（源侧会话） | 服务端会话、Cookie 属性、登录时轮换 |
 | `golang.org/x/time/rate` | `internal/ratelimit`（按 key 令牌桶），`httpapi` 限流中间件 | 标准令牌桶。**注意它内部用真实时钟，不要和注入的假时钟混用**（会静默算错补充速率） |
 | `github.com/failsafe-go/failsafe-go` | `httpclient`：重试（`retrypolicy`）、按上游的熔断器（`circuitbreaker`）、出站 bulkhead（`bulkhead`） | 韧性三件套一个库，替换掉此前手写的重试循环与熔断状态机。**策略留在本仓库，机制交给库**：幂等方法白名单、429/502/503/504 可重试而 500 不可、`Retry-After`（含 HTTP-date）与上限都是本项目规则，仍写在 `httpclient` 里；循环、退避与调度、熔断状态机与半开探测、许可计数都来自库。bulkhead 用的是它的**手动许可** API（`AcquirePermit`/`ReleasePermit`），因为许可必须活过 `RoundTrip`、覆盖整段响应体传输，而策略的作用域只是被执行的函数。**版本是 v0.x**：go.mod 精确锁定，升级按次要版本逐次评估。选型、被否的方案与三处语义变化见 [resilience-decision.md](./resilience-decision.md)（ADR-0009） |
-| `github.com/jackc/pgx/v5` (+`pgxpool`) | `internal/store/postgres` | Postgres 驱动。选它而不是 `database/sql` 是因为 v5 的泛型行扫描（`CollectRows`/`RowToStructByName`）能直接消除大量手写 `Scan` 错误 |
-| `github.com/pressly/goose/v3` | `internal/store/postgres` 的迁移执行 | 成熟的 SQL 迁移库：标准 `-- +goose Up/Down` 注解、按版本排序与乱序检测、advisory-lock session locker，并自带 `goose_db_version` 版本表。**不校验已应用迁移文件的内容**（goose 无 checksum），所以它换掉的是手写 runner，不是"内容完整性"保证 |
+| `github.com/jackc/pgx/v5` (+`pgxpool`) | `internal/store/postgres` | Postgres 驱动。选它而不是 `database/sql` 是因为 v5 的泛型行扫描（`CollectRows`/`CollectOneRow` + `RowToStructByName`）能直接消除手写 `Scan` 错误。**已落地**：`internal/store/postgres` 的全部多列读路径都改用它（列名映射，列序漂移成为响亮的错误）；单列标量读仍用 `QueryRow().Scan`，goose 的 `database/sql` 句柄（`adoptLegacyMigrations`）不在内——`CollectRows` 只接受 `pgx.Rows` |
+| `github.com/pressly/goose/v3` | `internal/store/postgres` 的迁移执行 | 成熟的 SQL 迁移库：标准 `-- +goose Up/Down` 注解、按版本排序与乱序检测、advisory-lock session locker（**已直接使用**：`lock.NewPostgresSessionLocker`，`pg_try_advisory_lock` 重试、等待有 5 分钟上界），并自带 `goose_db_version` 版本表。**不校验已应用迁移文件的内容**（goose 无 checksum），所以它换掉的是手写 runner，不是"内容完整性"保证 |
 | `github.com/zitadel/oidc/v3` | `internal/store/postgres` 的 `op.Storage`（ADR-0001：OpenID Provider） | OIDC 原生：设备码流（RFC 8628）内置、不透明引用令牌模型、`AuthRequest` 由实现者拥有（scope 收窄/同意可挂载）。**稳定 API 是 legacy `Storage`，新版 `Server` API 到 v4 前 experimental**。仍只用 `go-jose/v4`，不引第二套 JOSE（对照 fosite 见 [oidc-decision.md](./oidc-decision.md)） |
 | `github.com/BurntSushi/toml` | `internal/config` 与 `cmd/*` 加载 `config/*.toml` | TOML 的事实标准。配置来源只有文件和环境变量两类，不需要 koanf 那样的多来源合并层 |
 | `github.com/klauspost/compress` | `internal/compress`（HTTP `zstd` 内容编码） | zstd 不在 Go 标准库；这是纯 Go、无 cgo 的事实标准实现。**只为 zstd 引入**：gzip 用标准库（`compress/gzip`），br 暂缓（见 §3） |
 | `github.com/prometheus/client_golang` | `internal/observability`（黄金指标 + Go 运行时 / 进程采集器），经 `server.internal_addr` 的内部监听器暴露 | Prometheus 官方 Go 客户端，事实标准。选它而不是手写 exposition 格式，是因为格式与并发语义（counter / histogram 的原子性、注册表）错一次就是**指标本身在撒谎**——那比没有指标更糟。它只用**私有** `Registry`，于是"导出哪些指标"由本仓库决定，而不是被某个依赖注册进全局注册表的东西决定 |
+| `go.opentelemetry.io/otel`（`propagation` + `trace`） | `internal/httpapi` 解析入站 W3C `traceparent` | 该模块的 `TraceContext` 传播器是 W3C Trace Context 的参考实现：小写十六进制、trace/span id 非零、版本与 flags 的边界按规范判定，而不是本仓库的读法。**只取 trace id 做关联**——不导出 span、不引入 SDK/exporter（`propagation` 与 `trace` 都是纯 API 包，没有新模块进图）。此前手写的解析接受大写 hexadecimal，且不校验全零 span-id |
 | `gopkg.in/yaml.v3` | **仅测试**：`internal/httpapi` 解析 `docs/openapi.yaml`，断言 spec 与实际路由双向一致 | YAML 的事实标准。**只在 `_test.go` 里被引用，不进任何二进制** |
 
 关于 `yaml.v3` 的两点交代：
@@ -30,6 +31,22 @@
 
 - **它的测试依赖会进 `go.sum`。** `goose` 的测试用到 `modernc.org/sqlite` 等，`go mod tidy` 会在 `go.sum` 留下若干行；它们不在任何产物的构建图里（`go build ./cmd/...` 不含），代价与 `yaml.v3` 同类。
 - **它不做 checksum。** goose 只记录“哪个版本应用过”，不记录“应用时文件长什么样”。检测已应用迁移被篡改需要 Atlas 或自加校验列；当前接受这一边界，因为它本来就不是完整性机制。
+
+关于 `internal/compress` 为什么不用同一模块里的 `gzhttp`：
+
+- 第七轮审计把「库已在依赖树里却仍手写」列为待收敛项，`gzhttp` 是候选之一。本仓库实测过：
+  `internal/compress/spike_gzhttp_test.go`（`//go:build gzhttpspike`）把压缩框架钉住的 20 个行为
+  逐条跑在三个实现上——本项目、`gzhttp`、以及「本项目协商 + gzhttp 编码」的薄混合体。
+- 结果：`gzhttp` **10/20 不成立**、混合体 **4/20 不成立**。`gzhttp` 无法表达本仓库需要的语义：
+  `identity;q=0` / `*;q=0` 的 406、协议平面的路径豁免、`Cache-Control: no-transform` 绕过、
+  ETag 弱化、`Vary` 合并（它在 handler 之前无条件 `Add`，会被 handler 的 `Set` 覆盖）、
+  以及通配符与 `identity` 的 q 值协商；且它只认 gzip/zstd，而 `compress.New` 接受任意编码列表
+  （`z15` 探针用 4 个自定义编码）。
+- 混合体即便保留本项目的协商与 406，仍要自写 `ResponseWriter` 去处理 `Vary`/ETag/阈值，
+  等于把框架写回来，不是薄封装。**结论：不替换**，保留 `internal/compress` 的框架；编码本身仍来自
+  标准库 `compress/gzip` 与 `klauspost/compress` 的 `zstd`。
+- 证据可重跑：`RE0AUTH_GZHTTP_SPIKE=1 go test -tags gzhttpspike -count=1 -v ./internal/compress/`。
+  不带该环境变量时这组实验整体 skip，因此默认套件与默认门禁都不含它——它是一份随取随用的判定记录，不是一道门禁。
 
 ## 2. 刻意手写（用标准库就是"成熟库"）
 
