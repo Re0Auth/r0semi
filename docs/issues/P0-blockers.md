@@ -17,8 +17,8 @@
 - **位置**：`internal/store/memory/oidc.go:211`（`ErrRefreshTokenSpent` 哨兵；返回处 `:556`，Postgres 对应 `internal/store/postgres/oidc.go:340` / `:399`）
 - **影响**：refresh 是单次使用 + 轮换。小偷把偷到的第 2 代自己轮换成第 3 代后，合法客户端重放第 2 代（盗窃信号）只被拒，**第 3 代无人撤销**——攻击者保有静默访问直到 30 天 TTL 自然结束。「即时可撤销」卖点反面。
 - **修法**：检测到已消费 refresh 重放时撤销该 (client, subject) 全部 refresh/access（RFC 9700 token family 撤销）。注意第 7 轮更正：检测点上被重放那行已被 delete，store 拿不到 subject/client，**必须先在轮换时留族/代号标识或墓碑**，否则修不出覆盖顺序重放的版本。
-- **状态**：OPEN
-- **证据**：`internal/zzprobe/audit6/z02protocoltoken/refresh_test.go::TestZ02RefreshReplayDoesNotRevokeTheThiefsGeneration`（红）；`00-MAIN-VERIFICATION.md:249-267`（V-10 读码三点齐备）
+- **状态**：FIXED（79d7333）；探针已重推为回归守卫
+- **证据**：`internal/zzprobe/audit6/z02protocoltoken/refresh_test.go::TestZ02RefreshReplayRevokesTheThiefsGeneration`（红）；`00-MAIN-VERIFICATION.md:249-267`（V-10 读码三点齐备）
 - **来源**：`00-LAUNCH-READINESS-CONSOLIDATED.md:58`
 - **首次记录**：第 6 轮
 
@@ -31,7 +31,7 @@
 - **位置**：`internal/store/postgres/oidc.go:430`（SELECT 无 `expires_at` 谓词；轮换声明 `:392-401` 同）；对照内存 `internal/store/memory/oidc.go:573`
 - **影响**：过期 refresh token 仍能换出**全新 30 天 TTL** 的 access+refresh（TTL 被重置而非拒绝）；sweep 连续失败时窗口继续延长（`cmd/re0auth/main.go:1111` 只打日志）。默认套件全跑内存后端，所以测试永远绿而生产行为不同。
 - **修法**：`TokenRequestByRefreshToken` 的 SELECT 与轮换声明加 `expires_at > $n`（`$n` ← `s.now()`，保持单时钟政策）；两后端同形；`clock_test.go` 补「过期 refresh 被拒」。
-- **状态**：OPEN-PG（PG 侧端到端形状需真库；本机只有读码级 + 内存对照）
+- **状态**：FIXED（79d7333）；PG 侧端到端形状由 CI 的 postgres:16 定论
 - **证据**：`00-MAIN-VERIFICATION.md:70-74`（V-01）；`05-memory-store.md:27-56`（HYPOTHESIS，差 `TEST_DATABASE_URL`）；`internal/zzprobe/audit6/z05memstore/drift_guards_test.go::TestMemoryRefusesAnExpiredRefreshToken`（绿，钉内存拒绝半边）
 - **来源**：`00-LAUNCH-READINESS-CONSOLIDATED.md:75`
 - **首次记录**：第 6 轮
@@ -45,7 +45,7 @@
 - **位置**：`internal/store/postgres/oidc.go:474`
 - **影响**：三个 owner 查找全部以 `err == nil` 为进入条件，任何错误（连接断开、故障切换、`statement_timeout`、ctx 取消）都落穿到 `:530` 的 `return nil` ⇒ 协议层按「未知令牌即成功」答 200 且**不写审计**。客户端按 RFC 7009 不再重试，令牌在库恢复后继续有效到自然过期（refresh 最长 30 天）。安全事件响应路径上的静默失效。
 - **修法**：三个查找各接 `noRows(err)` 分类——只有 `pgx.ErrNoRows` 允许落穿；其余返回 `oidc.ErrServerError()`（映射 500，可重试）。照抄同文件 `TokenOwner`（`oauth.go:207`）的形状。
-- **状态**：OPEN（store 层失败注入红探针已在本机跑出；PG 端到端形状需 CI）
+- **状态**：FIXED（79d7333）
 - **证据**：`internal/zzprobe/audit6/z04pgstore/revocation_error_probe_test.go::TestRevokeTokenDoesNotReportSuccessWhenTheDatabaseCannotAnswer`（红）、`::TestRevokeTokenClassifiesOnlyNoRowsAsUnknownToken`（红）；`00-MAIN-VERIFICATION.md:76-80`（V-02）
 - **来源**：`00-LAUNCH-READINESS-CONSOLIDATED.md:90`
 - **首次记录**：第 6 轮
