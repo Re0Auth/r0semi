@@ -154,31 +154,36 @@ func TestV09UnreachableDatabaseErrorIsNotNoRows(t *testing.T) {
 	t.Logf("dead-pool error: %v (not pgx.ErrNoRows)", err)
 }
 
-// TestV09SourceShapeIsAsClaimed reads the shipped adapter and asserts the three
-// lookups really are `err == nil`-gated (claim 9's mechanism), so the executable
-// result above is not an artifact of the probe's own plumbing.
-func TestV09SourceShapeIsAsClaimed(t *testing.T) {
+// TestV09RevokeTokenClassifiesEveryLookup pins claim 9's fix against the shipped
+// adapter: all three of RevokeToken's lookups classify their error, so only
+// pgx.ErrNoRows may fall through to RFC 7009's "unknown token is success", and
+// every other error surfaces as server_error.
+//
+// It was originally the opposite probe — confirming the three lookups were
+// `err == nil` gated. The fix makes that confirmation impossible, so it is
+// re-derived here as the regression guard: a revert to swallowing `err != nil`
+// must fail it.
+func TestV09RevokeTokenClassifiesEveryLookup(t *testing.T) {
 	src := readShippedGo(t, "internal/store/postgres/oidc.go")
 	body := funcBody(t, src, "func (s *OIDCStore) RevokeToken(")
 	if got := strings.Count(body, "QueryRow"); got != 3 {
 		t.Fatalf("found %d QueryRow calls in RevokeToken; the extraction is broken (there are three)", got)
 	}
-	if strings.Contains(body, "errors.Is(err, pgx.ErrNoRows)") || strings.Contains(body, "noRows(err)") {
-		t.Errorf("RevokeToken now classifies its lookup errors, so claim 9's mechanism no longer holds " +
-			"of this revision — re-derive the finding")
+	if got := strings.Count(body, "noRows(err)"); got < 3 {
+		t.Errorf("only %d of RevokeToken's three lookups classify pgx.ErrNoRows; a connection error, "+
+			"failover, statement timeout or cancelled context would fall through to the final "+
+			"`return nil`, which the endpoint answers as RFC 7009 success", got)
 	}
-	t.Logf("RevokeToken gates all three lookups on err == nil and never classifies pgx.ErrNoRows: " +
-		"the final `return nil` is reachable for a connection error")
+	if got := strings.Count(body, "ErrServerError().WithParent(err)"); got < 3 {
+		t.Errorf("only %d of the three lookups surface a non-noRows error as server_error; the rest "+
+			"are swallowed", got)
+	}
 
-	// The contrast the original probe cites must be real, or the "classification
-	// gap" framing is wrong.
+	// The shared shape this fix copied must stay real, or "classification gap"
+	// stops describing the right thing.
 	oauthSrc := readShippedGo(t, "internal/store/postgres/oauth.go")
 	if !strings.Contains(oauthSrc, "noRows(err)") {
-		t.Errorf("TokenOwner no longer classifies noRows either; the \"this is a gap, not a policy\" " +
-			"framing is stale")
-	} else {
-		t.Logf("TokenOwner in oauth.go does classify noRows: the same package answers the same " +
-			"question both ways")
+		t.Fatalf("TokenOwner no longer classifies noRows; the shape RevokeToken was aligned to is gone")
 	}
 }
 

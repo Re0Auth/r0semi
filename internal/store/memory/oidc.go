@@ -43,6 +43,13 @@ type OIDCStore struct {
 	codes             map[string]codeRecord // by TokenHash(code)
 	accessTokens      map[string]accessToken
 	refreshTokens     map[string]refreshToken
+	// refreshTombstones is what is left of a spent refresh token, keyed by the
+	// same value hash. It exists for one reason: RFC 9700 §4.14.2 says a replay
+	// of a rotated refresh token is itself the theft signal, and the whole family
+	// has to go with it. By the time the replay arrives the live row is gone, so
+	// the tombstone is the only thing that still carries the family id and the
+	// paired access token's id hash the revocation needs.
+	refreshTombstones map[string]refreshTombstone
 	devices           map[string]deviceRecord // by TokenHash(device code)
 	userCodes         map[string]string       // normalized user code -> TokenHash(device code)
 
@@ -233,7 +240,22 @@ type refreshToken struct {
 	amr       []string
 	audience  []string
 	authTime  *time.Time
+	// familyID is shared by every generation descended from one authorization.
+	// Rotation inherits it, so a replay that reaches a tombstone can name the
+	// chain to revoke rather than only the value that was presented.
+	familyID  string
 	issuedAt  time.Time
+	expiresAt time.Time
+}
+
+// refreshTombstone is the residue rotation leaves behind for the token it spent.
+// It is not a credential: the value it stands for is already unusable, and the
+// hash it is keyed by cannot be turned back into that value.
+type refreshTombstone struct {
+	familyID  string
+	idHash    string
+	clientID  string
+	subject   string
 	expiresAt time.Time
 }
 
@@ -299,6 +321,7 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		codes:             make(map[string]codeRecord),
 		accessTokens:      make(map[string]accessToken),
 		refreshTokens:     make(map[string]refreshToken),
+		refreshTombstones: make(map[string]refreshTombstone),
 		devices:           make(map[string]deviceRecord),
 		userCodes:         make(map[string]string),
 		accessBySubject:   newSubjectIndex(),
@@ -566,14 +589,48 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	}
 
 	s.mu.Lock()
+	familyID := ""
 	if currentRefreshToken != "" {
 		spent := oauth.TokenHash(currentRefreshToken)
-		if _, held := s.refreshTokens[spent]; !held {
+		held, ok := s.refreshTokens[spent]
+		if !ok {
+			// The read path (TokenRequestByRefreshToken) is what normally turns a
+			// replay into a family revocation. Reaching rotation with a token this
+			// store no longer holds means that path was bypassed; if a tombstone
+			// still names the family, revoke it here too rather than answering the
+			// replay with a bare refusal and leaving the thief's generation alive.
+			if ts, known := s.refreshTombstones[spent]; known {
+				s.revokeFamilyLocked(ts.familyID)
+			}
 			s.mu.Unlock()
 			return "", "", time.Time{}, ErrRefreshTokenSpent
 		}
+		// Read the spent record BEFORE deleting it: this is the only moment its
+		// family id and paired access-token hash are still reachable. The
+		// tombstone carries both forward for the replay.
+		familyID = held.familyID
+		if familyID == "" {
+			// Unreachable through this store, which always mints a family id, but
+			// a record with no family would otherwise make the replay a no-op.
+			familyID = spent
+		}
+		s.refreshTombstones[spent] = refreshTombstone{
+			familyID:  familyID,
+			idHash:    held.idHash,
+			clientID:  held.clientID,
+			subject:   held.subject,
+			expiresAt: held.expiresAt,
+		}
 		s.deleteRefreshLocked(spent)
+	} else {
+		id, err := oidcstore.RandomValue()
+		if err != nil {
+			s.mu.Unlock()
+			return "", "", time.Time{}, err
+		}
+		familyID = id
 	}
+	refresh.familyID = familyID
 	s.putAccessLocked(oauth.TokenHash(accessID), access)
 	s.putRefreshLocked(oauth.TokenHash(value), refresh)
 	s.mu.Unlock()
@@ -583,11 +640,22 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 }
 
 // TokenRequestByRefreshToken implements op.Storage.
+//
+// A live, unexpired row is resolved as before. Anything else is the interesting
+// case: if an unexpired tombstone names the presented hash, this is a replay of a
+// token that was already rotated — the theft signal RFC 9700 §4.14.2 keys on — so
+// the whole family is revoked before the refusal is returned. The library maps
+// the error to invalid_grant, so the client still sees a 400.
 func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) (op.RefreshTokenRequest, error) {
+	spent := oauth.TokenHash(value)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.refreshTokens[oauth.TokenHash(value)]
+	r, ok := s.refreshTokens[spent]
 	if !ok || !s.now().Before(r.expiresAt) {
+		if ts, known := s.refreshTombstones[spent]; known && s.now().Before(ts.expiresAt) {
+			s.revokeFamilyLocked(ts.familyID)
+			return nil, ErrRefreshTokenSpent
+		}
 		return nil, errors.New("memory: invalid refresh token")
 	}
 	// Copy every slice and the *time.Time: Scopes was already copied, but AMR,
@@ -607,6 +675,37 @@ func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) 
 	return out, nil
 }
 
+// revokeFamilyLocked deletes every live generation of a family, every tombstone
+// of that family, and the access token each of them was paired with. The caller
+// holds the lock.
+//
+// It deletes by the family id rather than by subject or client on purpose: the
+// family is exactly the set of tokens descended from one authorization, which is
+// the unit RFC 9700 §4.14.2 revokes. The access token's key is the refresh row's
+// idHash, which is why the tombstone carries that field at all — the live row
+// that named it has already been consumed by the time a replay arrives.
+//
+// A family id is never empty for a record this store minted; the guard is here so
+// a malformed record cannot turn the revocation into "delete everything with an
+// empty family", which is every unset record.
+func (s *OIDCStore) revokeFamilyLocked(familyID string) {
+	if familyID == "" {
+		return
+	}
+	for key, t := range s.refreshTokens {
+		if t.familyID == familyID {
+			s.deleteRefreshLocked(key)
+			s.deleteAccessLocked(t.idHash)
+		}
+	}
+	for key, ts := range s.refreshTombstones {
+		if ts.familyID == familyID {
+			s.deleteAccessLocked(ts.idHash)
+			delete(s.refreshTombstones, key)
+		}
+	}
+}
+
 // TerminateSession implements op.Storage.
 func (s *OIDCStore) TerminateSession(_ context.Context, userID, clientID string) error {
 	s.mu.Lock()
@@ -621,6 +720,16 @@ func (s *OIDCStore) TerminateSession(_ context.Context, userID, clientID string)
 	for key := range s.refreshBySubject.keys(userID) {
 		if t, ok := s.refreshTokens[key]; ok && t.clientID == clientID {
 			s.deleteRefreshLocked(key)
+		}
+	}
+	// The spent generations of this subject's refresh tokens go with them: a
+	// tombstone left behind is not a credential, but it is state about a session
+	// that was just terminated, and its paired access row would be swept only by
+	// the replay path.
+	for key, ts := range s.refreshTombstones {
+		if ts.subject == userID && ts.clientID == clientID {
+			delete(s.refreshTombstones, key)
+			s.deleteAccessLocked(ts.idHash)
 		}
 	}
 	return nil
@@ -650,6 +759,11 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 				s.deleteRefreshLocked(k)
 			}
 		}
+		for k, ts := range s.refreshTombstones {
+			if ts.idHash == h {
+				delete(s.refreshTombstones, k)
+			}
+		}
 		s.mu.Unlock()
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
@@ -669,6 +783,11 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 		}
 		s.deleteRefreshLocked(k)
 		s.deleteAccessLocked(h)
+		for tk, ts := range s.refreshTombstones {
+			if ts.idHash == h {
+				delete(s.refreshTombstones, tk)
+			}
+		}
 		s.mu.Unlock()
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
@@ -679,8 +798,10 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
 		s.deleteRefreshLocked(h)
-		// The paired access token is keyed by the same id hash.
+		// The paired access token is keyed by the same id hash, and the spent
+		// generations of this value share its hash.
 		s.deleteAccessLocked(t.idHash)
+		delete(s.refreshTombstones, h)
 		s.mu.Unlock()
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
@@ -992,6 +1113,15 @@ func (s *OIDCStore) SweepExpired() int {
 			removed++
 		}
 	}
+	// A tombstone is swept on its own deadline, which is the spent token's: past
+	// that point the value it stands for could not have been spent anyway, so the
+	// family rule has nothing left to detect and the residue is pure memory.
+	for k, ts := range s.refreshTombstones {
+		if !now.Before(ts.expiresAt) {
+			delete(s.refreshTombstones, k)
+			removed++
+		}
+	}
 	removed += s.purgeExpiredDevicesLocked(now)
 	return removed
 }
@@ -1002,12 +1132,13 @@ type Counts struct {
 	Codes         int
 	AccessTokens  int
 	RefreshTokens int
+	Tombstones    int
 	Devices       int
 }
 
 // Records is the total number of records the store holds.
 func (c Counts) Records() int {
-	return c.AuthRequests + c.Codes + c.AccessTokens + c.RefreshTokens + c.Devices
+	return c.AuthRequests + c.Codes + c.AccessTokens + c.RefreshTokens + c.Tombstones + c.Devices
 }
 
 // Counts reports the current size of each map. It exists so the sweep's effect
@@ -1021,6 +1152,7 @@ func (s *OIDCStore) Counts() Counts {
 		Codes:         len(s.codes),
 		AccessTokens:  len(s.accessTokens),
 		RefreshTokens: len(s.refreshTokens),
+		Tombstones:    len(s.refreshTombstones),
 		Devices:       len(s.devices),
 	}
 }
@@ -1235,6 +1367,15 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 			s.deleteRefreshLocked(key)
 		}
 	}
+	// Spent generations are removed with the live ones: the family is what the
+	// grant names, and leaving a tombstone would leave the paired access row it
+	// names reachable by the replay path after the grant was revoked.
+	for key, ts := range s.refreshTombstones {
+		if ts.subject == subject && ts.clientID == clientID {
+			delete(s.refreshTombstones, key)
+			s.deleteAccessLocked(ts.idHash)
+		}
+	}
 	purged := make(map[string]bool)
 	for id := range s.requestBySubject.keys(subject) {
 		req, ok := s.authRequests[id]
@@ -1293,6 +1434,17 @@ func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, e
 			s.deleteRefreshLocked(k)
 			removed++
 		}
+	}
+	// Tombstones are not tokens, so they are not counted — but a revocation that
+	// named the family has to clear its spent generations too, and the paired
+	// access row each one names. They are removed on the same client/subject
+	// filter, because that is what a tombstone carries.
+	for k, ts := range s.refreshTombstones {
+		if !f.Matches(ts.clientID, ts.subject) {
+			continue
+		}
+		delete(s.refreshTombstones, k)
+		s.deleteAccessLocked(ts.idHash)
 	}
 	purged := make(map[string]bool)
 	for _, id := range s.requestKeysLocked(f.Subject) {

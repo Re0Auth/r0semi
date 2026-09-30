@@ -555,7 +555,10 @@ func TestRefreshTokenRotationIsSingleUse(t *testing.T) {
 }
 
 // The refusal must not be a blanket one: a rotation that presents a token the
-// store still holds has to succeed, or refresh stops working entirely.
+// store still holds has to succeed, or refresh stops working entirely. And once a
+// replay is detected, the whole family goes with it (RFC 9700 §4.14.2): refusing
+// only the presented value would leave the generation the thief already rotated
+// alive, which is exactly the silent access the family rule exists to cut.
 func TestRefreshTokenRotationStillWorksWhenPresentedOnce(t *testing.T) {
 	store, _ := testStore(t)
 	ctx := context.Background()
@@ -569,19 +572,31 @@ func TestRefreshTokenRotationStillWorksWhenPresentedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, second, _, err := store.CreateAccessAndRefreshTokens(ctx, held, first)
+	secondAccess, second, _, err := store.CreateAccessAndRefreshTokens(ctx, held, first)
 	if err != nil {
 		t.Fatalf("rotation was refused: %v", err)
 	}
 	if second == "" || second == first {
 		t.Fatalf("refresh token was not rotated: first=%q second=%q", first, second)
 	}
-	// The spent one is gone, and the replacement is live.
-	if _, err := store.TokenRequestByRefreshToken(ctx, first); err == nil {
-		t.Fatal("the spent refresh token is still accepted")
-	}
+	// The replacement is live BEFORE the replay, so the family revocation below
+	// cannot be confused with a rotation that never worked.
 	if _, err := store.TokenRequestByRefreshToken(ctx, second); err != nil {
 		t.Fatalf("the replacement refresh token was rejected: %v", err)
+	}
+
+	// The replay: the spent value, presented again. It is refused (a live first
+	// would have succeeded), and the family is revoked — so the replacement dies
+	// too, along with its paired access row.
+	if _, err := store.TokenRequestByRefreshToken(ctx, first); !errors.Is(err, ErrRefreshTokenSpent) {
+		t.Fatalf("replay error = %v, want ErrRefreshTokenSpent — the presented token was not a spent one", err)
+	}
+	if _, err := store.TokenRequestByRefreshToken(ctx, second); err == nil {
+		t.Fatal("the replacement survived a detected replay: the token family was not revoked")
+	}
+	var introspect oidc.IntrospectionResponse
+	if err := store.SetIntrospectionFromToken(ctx, &introspect, secondAccess, "usr_1", "cli"); err == nil {
+		t.Fatal("the replacement's paired access token survived the family revocation")
 	}
 }
 

@@ -145,7 +145,8 @@ func TestZ02RefreshCrossClientAndWrongShapeRefused(t *testing.T) {
 }
 
 // Z02-7 guards — replay of a rotated refresh token is invalid_grant (ADR-0005
-// §9), the replacement stays live, and expiry is enforced by the store's clock.
+// §9), the family dies with the replay (RFC 9700 §4.14.2), and expiry is enforced
+// by the store's clock.
 func TestZ02RefreshReplayAndExpiry(t *testing.T) {
 	clock := newTestClock()
 	e := newZoneEnv(t, zoneOptions{issuer: "https://issuer.z02", now: clock.Now})
@@ -158,6 +159,13 @@ func TestZ02RefreshReplayAndExpiry(t *testing.T) {
 		t.Fatalf("the first refresh was refused: %d %v", status, rotated)
 	}
 	second := asTokens(t, rotated)
+	if second.AccessToken == "" || second.RefreshToken == "" {
+		t.Fatalf("the rotation issued no usable pair: %v", rotated)
+	}
+	// Control before any replay: the rotated generation is live.
+	if s, _ := e.userinfo(t, second.AccessToken); s != http.StatusOK {
+		t.Fatalf("the rotated access token is not live before any replay: userinfo = %d", s)
+	}
 
 	replay, status := e.refresh(t, e.webID, e.webSec, first)
 	if status != http.StatusBadRequest {
@@ -166,18 +174,33 @@ func TestZ02RefreshReplayAndExpiry(t *testing.T) {
 	if got := replay["error"]; got != "invalid_grant" {
 		t.Fatalf("replay error = %v, want invalid_grant: %v", got, replay)
 	}
-	// The replacement is live, and rotating it yields the third generation —
-	// the one the id_token and expiry checks below run against.
-	thirdResp, status := e.refresh(t, e.webID, e.webSec, second.RefreshToken)
-	if status != http.StatusOK {
-		t.Fatalf("the replacement refresh token was rejected: %d %v", status, thirdResp)
+
+	// The family is revoked with the detected replay: the honest client's
+	// replacement is refused too, and the access token minted with it is dead.
+	after, status := e.refresh(t, e.webID, e.webSec, second.RefreshToken)
+	if status == http.StatusOK {
+		t.Fatalf("the replacement survived the replay: no family was revoked: %v", after)
+	}
+	if status != http.StatusBadRequest || after["error"] != "invalid_grant" {
+		t.Fatalf("the replacement's refusal = %d %v, want 400 invalid_grant", status, after)
+	}
+	if s, _ := e.userinfo(t, second.AccessToken); s == http.StatusOK {
+		t.Errorf("the rotated access token is still active after the family revocation")
 	}
 
-	// A replay of the FIRST generation after two rotations: same refusal —
-	// there is no window where a two-generations-old token works again.
+	// A replay of the FIRST generation after a rotation: same refusal — there is
+	// no window where a replayed token works again.
 	clock.Advance(time.Second)
 	if _, status := e.refresh(t, e.webID, e.webSec, first); status != http.StatusBadRequest {
-		t.Fatalf("a two-generations-old token was accepted: %d", status)
+		t.Fatalf("a replayed first-generation token was accepted: %d", status)
+	}
+
+	// The id_token and expiry checks run off a SEPARATE fresh code flow: the first
+	// family is dead, so its tokens can no longer carry those assertions.
+	fresh := asTokens(t, e.codeFlow(t, []string{"openid", "account.id", "offline_access"}))
+	thirdResp, status := e.refresh(t, e.webID, e.webSec, fresh.RefreshToken)
+	if status != http.StatusOK {
+		t.Fatalf("the fresh family's first refresh was refused: %d %v", status, thirdResp)
 	}
 
 	// The refreshed id_token keeps sub (the P0-1 fix covers this path too).
@@ -201,48 +224,47 @@ func TestZ02RefreshReplayAndExpiry(t *testing.T) {
 	}
 }
 
-// Z02-5b (FINDING) — a replayed (spent) refresh token is refused, but nothing
-// is done about the generation the thief already holds. RFC 9700 §4.14.2: on
-// reuse of a rotated refresh token the AS SHOULD revoke the whole token
-// family, because the replay is itself the theft signal. Here the thief
-// rotates the stolen token (getting generation 3), the legitimate client then
-// replays its stolen copy (the AS refuses it — the theft is now detected),
-// and the thief's generation 3 keeps working as if nothing had happened.
-func TestZ02RefreshReplayDoesNotRevokeTheThiefsGeneration(t *testing.T) {
+// Z02-5b (G-1 regression) — RFC 9700 §4.14.2: on reuse of a rotated refresh
+// token the AS revokes the whole token family, because the replay is itself the
+// theft signal. Here the thief rotates the stolen token (getting a replacement
+// generation), the legitimate client replays its copy (the AS refuses it, and the
+// refusal is now the detection), and the thief's generation must die with it.
+//
+// This is the regression guard for the P0 G-1 finding: the family revocation is
+// what makes the thief's silent access stop at detection rather than run for the
+// rest of the 30-day refresh TTL.
+func TestZ02RefreshReplayRevokesTheThiefsGeneration(t *testing.T) {
 	e := newZoneEnv(t, zoneOptions{issuer: "https://issuer.z02"})
 
 	tokens := asTokens(t, e.codeFlow(t, []string{"account.id", "offline_access"}))
-	stolen := tokens.RefreshToken // the thief's copy of generation 2
+	stolen := tokens.RefreshToken // the thief's copy
 
-	// The thief rotates first; they now hold generation 3.
+	// The thief rotates first; they now hold a fresh generation.
 	thief, status := e.refresh(t, e.webID, e.webSec, stolen)
 	if status != http.StatusOK {
 		t.Fatalf("control failed: the thief could not rotate the stolen token: %d %v", status, thief)
 	}
 	thiefTokens := asTokens(t, thief)
+	if thiefTokens.RefreshToken == "" || thiefTokens.RefreshToken == stolen {
+		t.Fatalf("control failed: the thief's rotation produced no new generation: %v", thiefTokens)
+	}
 
-	// The legitimate client replays its copy: refused (single use held), and
-	// this refusal is the theft signal the family rule keys on.
+	// The legitimate client replays its copy: refused, and this refusal is the
+	// theft signal the family rule keys on.
 	replay, status := e.refresh(t, e.webID, e.webSec, stolen)
-	if status == http.StatusBadRequest && replay["error"] == "invalid_grant" {
-		t.Logf("the legitimate client's replay was refused with invalid_grant (theft detected)")
-	} else {
-		t.Fatalf("the replay was not refused as a spent token: %d %v", status, replay)
+	if status != http.StatusBadRequest || replay["error"] != "invalid_grant" {
+		t.Fatalf("the replay was not refused with 400 invalid_grant: %d %v", status, replay)
 	}
 
-	// The finding: the thief's generation must die with the detection, and it
-	// does not — the stolen authorization keeps minting access tokens.
+	// The guard: the thief's generation must die with the detection.
 	after, status := e.refresh(t, e.webID, e.webSec, thiefTokens.RefreshToken)
-	if status != http.StatusOK {
-		t.Fatalf("the thief's generation unexpectedly stopped working (finding does not hold): %d %v", status, after)
+	if status != http.StatusBadRequest || after["error"] != "invalid_grant" {
+		t.Fatalf("the thief's generation survived the detected replay: refresh = %d %v (RFC 9700 §4.14.2 "+
+			"requires the whole family to be revoked)", status, after)
 	}
-	afterTokens := asTokens(t, after)
-	if got, info, _ := e.introspect(t, afterTokens.AccessToken, e.webID, e.webSec); got != http.StatusOK || info["active"] != true {
-		t.Errorf("the thief's rotated access token is not active: %d %v", got, info)
+	if s, _ := e.userinfo(t, thiefTokens.AccessToken); s == http.StatusOK {
+		t.Fatalf("the thief's rotated access token is still active after the family revocation (userinfo = %d)", s)
 	}
-	t.Errorf("CONFIRMED: a detected refresh-token replay left the thief's chain alive — " +
-		"the replayed (stolen) token was refused, but the generation minted from it still works, " +
-		"so the thief keeps silent access for the rest of the 30-day refresh TTL")
 }
 
 // Z02-8 guards — revocation of one half kills the pair (RFC 7009 §2.1 via

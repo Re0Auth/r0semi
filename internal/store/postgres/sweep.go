@@ -33,6 +33,7 @@ var expiredTables = []struct{ table, column string }{
 	{"oidc_codes", "expires_at"},
 	{"oidc_access_tokens", "expires_at"},
 	{"oidc_refresh_tokens", "expires_at"},
+	{"oidc_refresh_token_tombstones", "expires_at"},
 	{"oidc_devices", "expires_at"},
 }
 

@@ -52,6 +52,7 @@ var guardExpectedTables = []string{
 	"oidc_devices",
 	"oidc_access_tokens",
 	"oidc_refresh_tokens",
+	"oidc_refresh_token_tombstones",
 	"oauth_access_tokens",
 	"oauth_refresh_tokens",
 	"oauth_codes",

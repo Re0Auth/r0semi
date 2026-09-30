@@ -12,19 +12,20 @@ import (
 // static check below enforces: a table with a `subject` or `user_id` column that
 // appears in neither this map nor accountTablesIgnored fails the build.
 var erasureHandledTables = map[string]string{
-	"accounts_identities":         "accounts.DeleteUser (ON DELETE CASCADE)",
-	"vault_credentials":           "vault.DeleteSubject",
-	"federation_bindings":         "bindings.RevokeUserBindings",
-	"federation_bind_flows":       "flows.PurgeUserFlows",
-	"session_subjects":            "sessions.RevokeSubjectSessions",
-	"oidc_auth_requests":          "oidc.PurgeSubject",
-	"oidc_devices":                "oidc.PurgeSubject",
-	"oidc_access_tokens":          "tokens.RevokeTokens",
-	"oidc_refresh_tokens":         "tokens.RevokeTokens",
-	"oauth_access_tokens":         "tokens.RevokeTokens (legacy)",
-	"oauth_refresh_tokens":        "tokens.RevokeTokens (legacy)",
-	"oauth_codes":                 "legacy.PurgeLegacySubject",
-	"oauth_device_authorizations": "legacy.PurgeLegacySubject",
+	"accounts_identities":           "accounts.DeleteUser (ON DELETE CASCADE)",
+	"vault_credentials":             "vault.DeleteSubject",
+	"federation_bindings":           "bindings.RevokeUserBindings",
+	"federation_bind_flows":         "flows.PurgeUserFlows",
+	"session_subjects":              "sessions.RevokeSubjectSessions",
+	"oidc_auth_requests":            "oidc.PurgeSubject",
+	"oidc_devices":                  "oidc.PurgeSubject",
+	"oidc_access_tokens":            "tokens.RevokeTokens",
+	"oidc_refresh_tokens":           "tokens.RevokeTokens",
+	"oidc_refresh_token_tombstones": "tokens.RevokeTokens",
+	"oauth_access_tokens":           "tokens.RevokeTokens (legacy)",
+	"oauth_refresh_tokens":          "tokens.RevokeTokens (legacy)",
+	"oauth_codes":                   "legacy.PurgeLegacySubject",
+	"oauth_device_authorizations":   "legacy.PurgeLegacySubject",
 }
 
 // createTableRE captures a table name and its column block from a CREATE TABLE.

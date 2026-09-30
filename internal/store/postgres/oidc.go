@@ -476,18 +476,81 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Claim the presented token first. Under READ COMMITTED a concurrent DELETE of
-	// the same row blocks, then finds nothing once the winner commits — so exactly
-	// one of two racing requests sees a row to consume.
+	// familyID names the chain the new refresh token belongs to. A first issuance
+	// mints one; a rotation inherits the spent row's, which is what makes the set
+	// of generations descended from one authorization revocable together.
+	familyID := ""
 	if currentRefreshToken != "" {
-		tag, err := tx.Exec(ctx,
-			`DELETE FROM oidc_refresh_tokens WHERE token_hash = $1`, hashValue(currentRefreshToken))
-		if err != nil {
+		// Claim the presented token first. Under READ COMMITTED a concurrent DELETE
+		// of the same row blocks, then finds nothing once the winner commits — so
+		// exactly one of two racing requests sees a row to consume. The `expires_at`
+		// predicate is the second half: an expired token is not "spent and
+		// re-minted", and it is refused here even if a caller reached rotation
+		// without the read path.
+		//
+		// RETURNING carries the spent row's family, its paired access-token hash and
+		// its owner out of the DELETE: the row is gone after this statement, so this
+		// is the last moment they are reachable, and they are exactly what the
+		// tombstone and the replacement need.
+		var spent refreshTokenSpentRow
+		err := tx.QueryRow(ctx, `
+			DELETE FROM oidc_refresh_tokens
+			 WHERE token_hash = $1 AND expires_at > $2
+			RETURNING family_id, id_hash, client_id, subject, expires_at`,
+			hashValue(currentRefreshToken), now).
+			Scan(&spent.FamilyID, &spent.IDHash, &spent.ClientID, &spent.Subject, &spent.ExpiresAt)
+		switch {
+		case err == nil:
+			familyID = spent.FamilyID
+			if familyID == "" {
+				// Migration 0024 backfills, so this is unreachable on a migrated
+				// database; it keeps a malformed row from turning the family
+				// revocation into a no-op.
+				familyID = hashValue(currentRefreshToken)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO oidc_refresh_token_tombstones
+					(token_hash, family_id, id_hash, client_id, subject, expires_at)
+				VALUES ($1,$2,$3,$4,$5,$6)`,
+				hashValue(currentRefreshToken), familyID, spent.IDHash,
+				spent.ClientID, spent.Subject, spent.ExpiresAt); err != nil {
+				return "", "", time.Time{}, fmt.Errorf("postgres: record spent refresh token: %w", err)
+			}
+		case noRows(err):
+			// The live row is already gone, so the read path that normally turns a
+			// replay into a family revocation was bypassed. If a tombstone still
+			// names the family, revoke it here too rather than answering with a bare
+			// refusal while the thief's generation stays live. The revocation is
+			// committed before the refusal, because the deferred Rollback would
+			// otherwise undo it.
+			var family string
+			tombErr := tx.QueryRow(ctx, `
+				SELECT family_id FROM oidc_refresh_token_tombstones
+				 WHERE token_hash = $1 AND expires_at > $2`,
+				hashValue(currentRefreshToken), now).Scan(&family)
+			switch {
+			case tombErr == nil:
+				if err := revokeFamilyTx(ctx, tx, family); err != nil {
+					return "", "", time.Time{}, fmt.Errorf("postgres: revoke refresh token family: %w", err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					return "", "", time.Time{}, err
+				}
+			case !noRows(tombErr):
+				// A database that could not answer did not answer "unknown"; fail
+				// closed and let the transaction roll back.
+				return "", "", time.Time{}, fmt.Errorf("postgres: look up spent refresh token: %w", tombErr)
+			}
+			return "", "", time.Time{}, ErrRefreshTokenSpent
+		default:
 			return "", "", time.Time{}, fmt.Errorf("postgres: rotate refresh token: %w", err)
 		}
-		if tag.RowsAffected() == 0 {
-			return "", "", time.Time{}, ErrRefreshTokenSpent
+	} else {
+		id, err := oidcstore.RandomValue()
+		if err != nil {
+			return "", "", time.Time{}, err
 		}
+		familyID = id
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)
@@ -497,10 +560,10 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO oidc_refresh_tokens
-			(token_hash, id_hash, client_id, subject, scopes, amr, audience, auth_time, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			(token_hash, id_hash, client_id, subject, scopes, amr, audience, auth_time, family_id, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		hashValue(value), hashValue(accessID), clientIDOf(request), request.GetSubject(),
-		scopes, amr, audience, authTime, now.Add(s.refreshTTL),
+		scopes, amr, audience, authTime, familyID, now.Add(s.refreshTTL),
 	); err != nil {
 		return "", "", time.Time{}, fmt.Errorf("postgres: create refresh token: %w", err)
 	}
@@ -509,6 +572,42 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 	}
 	s.record(ctx, "oidc.token", request.GetSubject(), clientIDOf(request), audit.OutcomeOK)
 	return accessID, value, expires, nil
+}
+
+// refreshTokenSpentRow is the projection the rotation claim's RETURNING clause
+// hands back: everything the tombstone and the replacement need to inherit from
+// the row the DELETE just removed.
+type refreshTokenSpentRow struct {
+	FamilyID  string    `db:"family_id"`
+	IDHash    string    `db:"id_hash"`
+	ClientID  string    `db:"client_id"`
+	Subject   string    `db:"subject"`
+	ExpiresAt time.Time `db:"expires_at"`
+}
+
+// revokeFamilyTx deletes a whole refresh-token family and the access tokens each
+// generation was paired with. The order matters: the access delete joins through
+// both the live rows and the tombstones, so it must run before either of those
+// tables loses the rows that name the access hashes.
+//
+// The caller supplies the transaction because a family revocation is never the
+// whole of what a caller is doing: the rotation path commits a tombstone with it,
+// and the read path commits the revocation before it returns the refusal.
+func revokeFamilyTx(ctx context.Context, tx pgx.Tx, familyID string) error {
+	for _, q := range []string{`
+		DELETE FROM oidc_access_tokens
+		 WHERE id_hash IN (
+		       SELECT id_hash FROM oidc_refresh_tokens WHERE family_id = $1
+		       UNION
+		       SELECT id_hash FROM oidc_refresh_token_tombstones WHERE family_id = $1)`,
+		`DELETE FROM oidc_refresh_tokens WHERE family_id = $1`,
+		`DELETE FROM oidc_refresh_token_tombstones WHERE family_id = $1`,
+	} {
+		if _, err := tx.Exec(ctx, q, familyID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // refreshRequestRow is one oidc_refresh_tokens row as TokenRequestByRefreshToken
@@ -524,15 +623,59 @@ type refreshRequestRow struct {
 }
 
 // TokenRequestByRefreshToken implements op.Storage.
+//
+// The live-row SELECT is the ordinary path. When it finds nothing, the token may
+// still be one this store already rotated: rotation leaves a tombstone keyed by
+// the spent hash, and a replay of that hash against the tombstone is the theft
+// signal RFC 9700 §4.14.2 keys on. In that case the whole family is revoked, in
+// one transaction, and the caller is refused with ErrRefreshTokenSpent — which
+// the library maps to invalid_grant, so the client still sees a 400 and never a
+// 500.
+//
+// The library calls this method FIRST on a refresh grant, before it can reach
+// CreateAccessAndRefreshTokens, so this is the only place the replay is visible.
 func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string) (op.RefreshTokenRequest, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id_hash, client_id, subject, scopes, amr, audience, auth_time
-		  FROM oidc_refresh_tokens WHERE token_hash = $1`, hashValue(value))
+		  FROM oidc_refresh_tokens WHERE token_hash = $1 AND expires_at > $2`, hashValue(value), s.now())
 	if err != nil {
 		return nil, errors.New("postgres: invalid refresh token")
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[refreshRequestRow])
 	if err != nil {
+		if !noRows(err) {
+			return nil, errors.New("postgres: invalid refresh token")
+		}
+		// The live row is gone. The tombstone rotation left for the spent hash is
+		// the only surviving pointer to the family, and finding one is the theft
+		// signal: revoke the whole chain. Lookup and revocation share one
+		// transaction, and it is committed before the refusal is returned — the
+		// deferred rollback would otherwise undo the only lasting effect.
+		tx, txErr := s.pool.Begin(ctx)
+		if txErr != nil {
+			return nil, fmt.Errorf("postgres: revoke replayed refresh token family: %w", txErr)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		var familyID string
+		lookupErr := tx.QueryRow(ctx, `
+			SELECT family_id FROM oidc_refresh_token_tombstones
+			 WHERE token_hash = $1 AND expires_at > $2`, hashValue(value), s.now()).Scan(&familyID)
+		switch {
+		case lookupErr == nil:
+			if err := revokeFamilyTx(ctx, tx, familyID); err != nil {
+				return nil, fmt.Errorf("postgres: revoke replayed refresh token family: %w", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, fmt.Errorf("postgres: revoke replayed refresh token family: %w", err)
+			}
+			return nil, ErrRefreshTokenSpent
+		case !noRows(lookupErr):
+			// A database that could not answer did not answer "no family"; fail
+			// closed and let the transaction roll back rather than pass the replay
+			// as an ordinary unknown token.
+			return nil, fmt.Errorf("postgres: revoke replayed refresh token family: %w", lookupErr)
+		}
 		return nil, errors.New("postgres: invalid refresh token")
 	}
 	r := oidcstore.RefreshRequest{
@@ -563,6 +706,10 @@ func (s *OIDCStore) TerminateSession(ctx context.Context, userID, clientID strin
 	for _, q := range []string{
 		`DELETE FROM oidc_access_tokens WHERE subject = $1 AND client_id = $2`,
 		`DELETE FROM oidc_refresh_tokens WHERE subject = $1 AND client_id = $2`,
+		// The spent generations of those refresh tokens go too: a tombstone is not
+		// a credential, but it still names a paired access row, and the replay path
+		// is what would otherwise clear it.
+		`DELETE FROM oidc_refresh_token_tombstones WHERE subject = $1 AND client_id = $2`,
 	} {
 		if _, err := tx.Exec(ctx, q, userID, clientID); err != nil {
 			return err
@@ -583,8 +730,17 @@ func (s *OIDCStore) TerminateSession(ctx context.Context, userID, clientID strin
 func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, clientID string) *oidc.Error {
 	h := hashValue(tokenOrTokenID)
 
+	// Each lookup below classifies its error. Only pgx.ErrNoRows may fall through
+	// to the next shape, because that is the one answer that says the row is
+	// absent. A connection error, a failover, a statement timeout or a cancelled
+	// context must surface as server_error: RFC 7009's "unknown token is success"
+	// is a statement about the database's answer, and a database that did not
+	// answer made none. Collapsing the two turned an outage into a revocation
+	// that answered 200, revoked nothing and audited nothing.
 	var owner string
-	if err := s.pool.QueryRow(ctx, `SELECT client_id FROM oidc_access_tokens WHERE id_hash = $1`, h).Scan(&owner); err == nil {
+	err := s.pool.QueryRow(ctx, `SELECT client_id FROM oidc_access_tokens WHERE id_hash = $1`, h).Scan(&owner)
+	switch {
+	case err == nil:
 		if owner != clientID {
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
@@ -593,11 +749,14 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 		if err := s.revokeInOneTx(ctx, []string{
 			`DELETE FROM oidc_access_tokens WHERE id_hash = $1`,
 			`DELETE FROM oidc_refresh_tokens WHERE id_hash = $1`,
+			`DELETE FROM oidc_refresh_token_tombstones WHERE id_hash = $1`,
 		}, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)
 		}
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
+	case !noRows(err):
+		return oidc.ErrServerError().WithParent(err)
 	}
 
 	// The access row is gone but its refresh half may not be: exactly the residue
@@ -605,22 +764,29 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	// Without this the retry finds nothing, answers RFC 7009's "unknown token is
 	// success", and the refresh token keeps minting — which is how a revocation
 	// that errored once became a revocation that never happened.
-	if err := s.pool.QueryRow(ctx,
-		`SELECT client_id FROM oidc_refresh_tokens WHERE id_hash = $1`, h).Scan(&owner); err == nil {
+	err = s.pool.QueryRow(ctx,
+		`SELECT client_id FROM oidc_refresh_tokens WHERE id_hash = $1`, h).Scan(&owner)
+	switch {
+	case err == nil:
 		if owner != clientID {
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
 		if err := s.revokeInOneTx(ctx, []string{
 			`DELETE FROM oidc_refresh_tokens WHERE id_hash = $1`,
 			`DELETE FROM oidc_access_tokens WHERE id_hash = $1`,
+			`DELETE FROM oidc_refresh_token_tombstones WHERE id_hash = $1`,
 		}, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)
 		}
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
+	case !noRows(err):
+		return oidc.ErrServerError().WithParent(err)
 	}
 
-	if err := s.pool.QueryRow(ctx, `SELECT client_id FROM oidc_refresh_tokens WHERE token_hash = $1`, h).Scan(&owner); err == nil {
+	err = s.pool.QueryRow(ctx, `SELECT client_id FROM oidc_refresh_tokens WHERE token_hash = $1`, h).Scan(&owner)
+	switch {
+	case err == nil:
 		if owner != clientID {
 			return oidc.ErrInvalidClient().WithDescription("token was not issued for this client")
 		}
@@ -629,11 +795,14 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 			DELETE FROM oidc_access_tokens
 			 WHERE id_hash IN (SELECT id_hash FROM oidc_refresh_tokens WHERE token_hash = $1)`,
 			`DELETE FROM oidc_refresh_tokens WHERE token_hash = $1`,
+			`DELETE FROM oidc_refresh_token_tombstones WHERE token_hash = $1`,
 		}, h); err != nil {
 			return oidc.ErrServerError().WithParent(err)
 		}
 		s.record(ctx, "oidc.revoke", userID, clientID, audit.OutcomeOK)
 		return nil
+	case !noRows(err):
+		return oidc.ErrServerError().WithParent(err)
 	}
 	// RFC 7009: revoking an unknown token is success.
 	return nil
@@ -669,10 +838,19 @@ func (s *OIDCStore) revokeInOneTx(ctx context.Context, statements []string, arg 
 // It is not a disclosure: this method is given the raw token as its argument.
 func (s *OIDCStore) GetRefreshTokenInfo(ctx context.Context, clientID, token string) (string, string, error) {
 	var subject string
-	if err := s.pool.QueryRow(ctx, `
+	err := s.pool.QueryRow(ctx, `
 		SELECT subject FROM oidc_refresh_tokens WHERE token_hash = $1 AND client_id = $2`,
-		hashValue(token), clientID).Scan(&subject); err != nil {
-		return "", "", op.ErrInvalidRefreshToken
+		hashValue(token), clientID).Scan(&subject)
+	if err != nil {
+		if noRows(err) {
+			return "", "", op.ErrInvalidRefreshToken
+		}
+		// Not "unknown": the database could not answer. The library's revocation
+		// handler treats op.ErrInvalidRefreshToken as "try the other token shapes"
+		// and reserves every other error for a 500 server_error, so collapsing an
+		// outage into the sentinel walks the request into a revocation that
+		// answers success.
+		return "", "", oidc.ErrServerError().WithParent(err)
 	}
 	return subject, token, nil
 }
@@ -1182,6 +1360,12 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_refresh_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
 		return err
 	}
+	// The spent generations of those refresh tokens are part of the same grant:
+	// removing them keeps the paired access rows from being reachable by the
+	// replay path after the grant was revoked.
+	if _, err := tx.Exec(ctx, `DELETE FROM oidc_refresh_token_tombstones WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
+		return err
+	}
 	// A device authorization for this client and subject outlives its tokens:
 	// leaving it would let the holder of the device_code mint a fresh pair after
 	// the user revoked the grant.
@@ -1235,6 +1419,13 @@ func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int,
 
 	total, err := revokeMatching(ctx, tx, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
 	if err != nil {
+		return 0, err
+	}
+	// The tombstones of the revoked families go with them, on the same
+	// client/subject filter they carry. Their count is discarded: the number this
+	// method returns is tokens, and a Kill Switch report that counted residue
+	// would overstate what was cut.
+	if _, err := revokeMatching(ctx, tx, []string{"oidc_refresh_token_tombstones"}, f); err != nil {
 		return 0, err
 	}
 	// A pending authorization request whose code has not been redeemed is a

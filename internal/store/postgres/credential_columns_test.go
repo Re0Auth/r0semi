@@ -27,9 +27,12 @@ var credentialColumnAllowed = map[string]string{
 	"oauth_access_tokens.token_hash":  "sha256 of the access token",
 	"oauth_refresh_tokens.token_hash": "sha256 of the refresh token",
 	"oidc_refresh_tokens.token_hash":  "sha256 of the refresh token",
-	"sessions.token_hash":             "sha256 of the session cookie",
-	"session_subjects.token_hash":     "sha256 of the session cookie",
-	"oauth_clients.secret_hash":       "sha256 of the client secret",
+	// The hash of a token that was already rotated, kept so a replay can be traced
+	// to its family (RFC 9700 §4.14.2). Same value as the row it outlived.
+	"oidc_refresh_token_tombstones.token_hash": "sha256 of the spent refresh token",
+	"sessions.token_hash":                      "sha256 of the session cookie",
+	"session_subjects.token_hash":              "sha256 of the session cookie",
+	"oauth_clients.secret_hash":                "sha256 of the client secret",
 
 	// A PKCE verifier cannot be stored as a hash: the exchange has to send it. It is
 	// short-lived, single-use, and useless alone — completing the exchange also

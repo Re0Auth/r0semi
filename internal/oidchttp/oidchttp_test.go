@@ -606,12 +606,33 @@ func TestApproveKeepsOpenIDWhenTheConsentScreenOmitsIt(t *testing.T) {
 	}
 }
 
+// bearerStatus asks userinfo for one bearer and returns the status code. It is
+// the liveness check for an access token: a revoked or family-revoked row is gone
+// from the store, so userinfo answers 401.
+func bearerStatus(t testing.TB, f fixture, bearer string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, f.server.URL+"/oauth/userinfo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
 // The refresh grant had no test in this package at all, so rotation was never
 // exercised end to end — which is how a two-step read-then-rotate could go
 // unnoticed. This asserts the ordinary path (a presented token is rotated and the
-// replacement works) so that tightening rotation into a claim cannot silently
-// break refreshing; the concurrent case is pinned deterministically in the store
-// tests, where the interleaving can be written out instead of raced.
+// replacement works) AND the family rule the replay triggers: RFC 9700 §4.14.2
+// says a replayed rotated token is the theft signal, so the whole family goes —
+// the replacement the honest client is holding included. A control from a fresh
+// code flow shows rotation still works, so the test cannot pass by refusing
+// everything.
 func TestRefreshGrantRotatesAndSpendsTheOldToken(t *testing.T) {
 	f := newFixture(t)
 	// offline_access is what makes the engine issue a refresh token at all.
@@ -636,6 +657,14 @@ func TestRefreshGrantRotatesAndSpendsTheOldToken(t *testing.T) {
 	if second == "" || second == first {
 		t.Fatalf("rotation did not happen: first=%q second=%q", first, second)
 	}
+	secondAccess, _ := rotated["access_token"].(string)
+	if secondAccess == "" {
+		t.Fatalf("the rotation issued no access token: %v", rotated)
+	}
+	// Control, before any replay: the rotated generation is live.
+	if got := bearerStatus(t, f, secondAccess); got != http.StatusOK {
+		t.Fatalf("the rotated access token is not live before any replay: userinfo = %d", got)
+	}
 
 	// Spent, not merely superseded. The refusal must be a protocol error the
 	// client can act on: 400 invalid_grant, not 500 server_error.
@@ -649,10 +678,37 @@ func TestRefreshGrantRotatesAndSpendsTheOldToken(t *testing.T) {
 	if replay["error"] != "invalid_grant" {
 		t.Fatalf("replay error = %v, want invalid_grant", replay["error"])
 	}
-	// And the replacement is the live one, so the fix did not simply refuse
-	// everything.
-	if _, status := refresh(second); status != http.StatusOK {
-		t.Fatalf("the replacement refresh token was rejected: %d", status)
+
+	// The family died with the detection: the replacement the honest client held
+	// is refused too, and the access token rotated alongside it is no longer live.
+	after, status := refresh(second)
+	if status == http.StatusOK {
+		t.Fatalf("the replacement survived the replay: the token family was not revoked: %v", after)
+	}
+	if status != http.StatusBadRequest || after["error"] != "invalid_grant" {
+		t.Fatalf("the replacement's refusal = %d %v, want 400 invalid_grant", status, after)
+	}
+	if got := bearerStatus(t, f, secondAccess); got == http.StatusOK {
+		t.Fatal("the rotated access token is still active after the family revocation")
+	}
+
+	// The control: a FRESH code flow still rotates normally and its replacement is
+	// live, so the refusal above is the family rule and not a blanket one.
+	control := codeFlow(t, f, []string{"openid", "account.id", "offline_access"})
+	controlFirst, _ := control["refresh_token"].(string)
+	if controlFirst == "" {
+		t.Fatalf("the control code flow issued no refresh token: %v", control)
+	}
+	controlRotated, status := refresh(controlFirst)
+	if status != http.StatusOK {
+		t.Fatalf("control refresh status = %d: %v", status, controlRotated)
+	}
+	controlSecond, _ := controlRotated["refresh_token"].(string)
+	if controlSecond == "" || controlSecond == controlFirst {
+		t.Fatalf("control rotation did not happen: first=%q second=%q", controlFirst, controlSecond)
+	}
+	if _, status := refresh(controlSecond); status != http.StatusOK {
+		t.Fatalf("the control's replacement refresh token was rejected: %d", status)
 	}
 }
 

@@ -113,6 +113,9 @@ func TestSweepExpiredRemovesDatedRows(t *testing.T) {
 		{"oidc_refresh_tokens", `INSERT INTO oidc_refresh_tokens
 			(token_hash, id_hash, client_id, subject, scopes, expires_at)
 			VALUES ($1, 'h', 'cli', 'usr', '{}', $2)`},
+		{"oidc_refresh_token_tombstones", `INSERT INTO oidc_refresh_token_tombstones
+			(token_hash, family_id, id_hash, client_id, subject, expires_at)
+			VALUES ($1, 'fam', 'h', 'cli', 'usr', $2)`},
 		// user_code doubles as the row key: the canonical user code carries a
 		// UNIQUE index, so the live and dead rows must not collide on it.
 		{"oidc_devices", `INSERT INTO oidc_devices
