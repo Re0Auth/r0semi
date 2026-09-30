@@ -1,7 +1,7 @@
 # P2 · 中（MEDIUM）
 
 > 前提较高，或影响有界但确定。
-> **条目数：46** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-09-29）。
+> **条目数：46** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-09-30）。
 > 严重度取**对抗性复核后的裁定**；同一机制多编号者已合并，别名写在 ID 列。
 
 
@@ -48,8 +48,8 @@
 | G-24 | P2 | `/.well-known/oauth-protected-resource` 对非 GET 动词答 404（同族另两份文档答 405），且 405 不带 `Allow` 头（RFC 9110 §15.5.6 MUST） | `internal/httpapi/server.go:522`；`internal/oidchttp/oidchttp.go:256/263` 不设 Allow | OPEN | 动词闸门与另两份 well-known 文档同形，并补 `Allow` 头 |
 | k1 | P2 | 账号抹除后原始 `usr_…` 仍随 `slog.Warn("...erasure", "user", string(user))` 进**进程日志**，假名密钥销毁够不到 | `internal/httpapi/account_routes.go:54-74`（日志在 `:73`） | OPEN | 删掉该行的 `"user"` 属性（`request_id` 已够定位）或改记形状｜来源：`docs/audit-5/findings/crypto-keys.md:51` |
 | KIT-2 | P2 | 一次请求可声明两个客户端身份：`ClientCredentials` Basic 赢者通吃，表单里的第二个身份完全不比对（未观察到提权，风险是下游按表单判身份时与 kit 不一致） | `oauth/http.go:33-38` | OPEN | 把 `internal/oidchttp` 已裁定的「一请求一身份」搬进 `oauth.ClientCredentials`：两身份同时出现且不一致 → `invalid_client`｜来源：`docs/audit-5/findings/_fragment_kit.md:82` |
-| KIT-4 | P2 | `ConsumeCode` 在任何绑定校验之前执行 ⇒ 知道 code 就足以无凭据烧掉它（低成本定向 DoS），且失败不写审计、不可观测 | `oauth/as.go:165`（校验在 `:175`/`:178`/`:181`） | OPEN | 消费移到全部校验之后，或 store 提供 `ConsumeCodeIf`/`DELETE ... WHERE ... RETURNING` 原子谓词；失败补审计。PG 形态仅读码级证据（无库）｜来源：`docs/audit-5/findings/_fragment_kit.md:154` |
-| KIT-5 | P2 | `describe()` 只查非空 + S256，1 字符/padded/大写 `code_challenge` 也发码，该码永远换不出令牌；叠加 KIT-4 后 code 被烧，用户白授权且需重走全流程 | `oauth/as.go:104-106` | OPEN | 在 `describe()` 加与兑换侧同源的形状校验（S256 必为 43 字符 base64url），或抽公共函数防两处漂移｜来源：`docs/audit-5/findings/_fragment_kit.md:189` |
+| KIT-4 | P2 | `ConsumeCode` 在任何绑定校验之前执行 ⇒ 知道 code 就足以无凭据烧掉它（低成本定向 DoS），且失败不写审计、不可观测 | `oauth/as.go:165`（校验在 `:175`/`:178`/`:181`） | FIXED（7cfbdb5） | 已按建议的最小形状落地：非破坏性 `GetCode` → 全绑定校验 → `ConsumeCode` 原子门（单次使用/并发窗口不变），失败记 `oauth.exchange_failed`。守卫：`oauth/as_test.go`、`oauth/tokens_test.go`、kit `TestC1_`/`TestC2_`、postgres 无 DB 源码守卫。注：OP 面（`oidchttp`+`OIDCStore.AuthRequestByCode`）仍是 consume-on-read 的同形兄弟项，本条不含。｜来源：`docs/audit-5/findings/_fragment_kit.md:154` |
+| KIT-5 | P2 | `describe()` 只查非空 + S256，1 字符/padded/大写 `code_challenge` 也发码，该码永远换不出令牌；KIT-4 已修后该码不再被烧，但仍是死码，用户白授权且需重走全流程 | `oauth/as.go:104-106` | OPEN | 在 `describe()` 加与兑换侧同源的形状校验（S256 必为 43 字符 base64url），或抽公共函数防两处漂移｜来源：`docs/audit-5/findings/_fragment_kit.md:189` |
 | KIT-6 | P2 | `RestoreClient` 故意不重校验重定向 URI，而 authorize 路径没有第二道检查 ⇒ registry 里的 `javascript:`/`data:` 历史行照单全收（现代浏览器 `Location` 不执行，风险在渲染成链接的源实现） | `oauth/client.go:180-192`、`:159-166`（`AllowsRedirect` 纯字符串） | OPEN | 在 `AllowsRedirect` 里补 `validRedirectURI`。**涉及裁定**：`docs/admin.md:69` 把 registry 写入方视为可信运维，not-doing §四.2 主张正式降为提示｜来源：`docs/audit-5/findings/_fragment_kit.md:226` |
 | KIT-7 | P2 | 一致性套件对客户端认证零断言：声明 `client_secret_basic` 却谁都不认证的源零 error 通过（含无认证 cascade 判 PASS）⇒ 假「合规」保证 | `upstreamkit/conformance/conformance.go:183-205` | OPEN | 加「未知 client 打已宣告端点必须 4xx」与「正确凭据 200 / 错误凭据 401」两组断言，并把 `token_endpoint_auth_methods_supported` 与实收方式比对｜来源：`docs/audit-5/findings/_fragment_kit.md:263` |
 | A-FE-5（别名 P2-20） | P2 | CI 前端依赖审计门是 `pnpm audit --audit-level high`，树里唯一告警 `cookie@0.6.0` 恰在门槛下 ⇒ 这道门永远不会响 | `.github/workflows/ci.yml:335-337` | OPEN | 降到 `--audit-level low` 并把结果条数落进 job summary，或在 `docs/dependencies.md` 显式写下「low 以下不阻断」的理由 — 来源：`docs/audit-5/findings/frontend.md:119（第 5 轮）` |

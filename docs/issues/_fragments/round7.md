@@ -247,7 +247,7 @@
 - RP-7 — 既有 KNOWN-OPEN（同意重定向可重放 / 并发得三份码）：一次同意仍只产生一份可兑换 grant，只属死码残留级 — 依据：`22-audit5-red-reconciliation.md:193`
 - RP-6 — 既有 KNOWN-OPEN（`clearFlow` 在 provider 比对之前执行，走错 provider 的回调烧掉待完成登录）：可用性级、需会话内 state，非安全 — 依据：`22-audit5-red-reconciliation.md:199`
 - P1-4 的 audit5 探针（#18、#19）— DECIDED-NONGOAL：P1-4 已由 `0e6b701` 修复，探针断言的是修复前缺陷（#19 的红仅是文档化的 `readinessTTL` 1s 代价） — 依据：`22-audit5-red-reconciliation.md:63`
-- k1/k6、FO-03、KIT-2、KIT-4、KIT-5、KIT-6、KIT-7、KIT-8、KIT-9、KIT-10、RP-5、RP-8 — 16 条 `KNOWN-OPEN` 的既有编号，本轮 19 探针归因确认为既有、不重报（含 `RP-7` 覆盖的两条探针） — 依据：`22-audit5-red-reconciliation.md:44`
+- k1/k6、FO-03、KIT-2、KIT-4（已修，见 P2-medium）、KIT-5、KIT-6、KIT-7、KIT-8、KIT-9、KIT-10、RP-5、RP-8 — 16 条 `KNOWN-OPEN` 的既有编号，本轮 19 探针归因确认为既有、不重报（含 `RP-7` 覆盖的两条探针） — 依据：`22-audit5-red-reconciliation.md:44`
 - ADR-0008「Down 应分可回退 schema 步 / 不可回退完整性步（后者 no-op + 文档化）」与「审计只追加是部署形态而非控制」 — 报告自陈为文档化判断、不是 finding — 依据：`Z21-VERIFIED.md:162`
 - §4-1 `postgres/oidc.go:834` 的 `auth_time = COALESCE(auth_time, now())` — 第六轮已按 P2-32 裁定为 display-only 回退、无期限裁决读它，不是新发现 — 依据：`docs/audit-7/findings/00-MAIN-VERIFICATION.md:659-661`
 - §4-2 `TestZ06LimiterKeyStaysOnThePlaneOfThePathAsSent` 的红 — 夹具把 `Config.OIDC` 设成永远答 200 的桩，属夹具假象，不进清单 — 依据：`docs/audit-7/findings/00-MAIN-VERIFICATION.md:662`

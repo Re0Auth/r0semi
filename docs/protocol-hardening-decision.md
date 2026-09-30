@@ -32,7 +32,10 @@
    `authorize` 前置检查里被拒（回客户端一个带 `iss` 的重定向错误）。「接受 form_post 再往库生成的
    HTML 里注 `iss`」被否决：那是改写库的渲染产物，比只收 query 脆。ADR-0005 §5 与 §6 由此一致。
 7. **PKCE 按 RFC 7636 校验语法**：challenge 与 verifier 均为 43–128 unreserved 字符。
-8. **授权码在查询时即被消费，并检查过期。** 消除并发双兑换窗口；过期码不依赖 sweep 才失效。
+8. **授权码先读取并校验全部绑定，通过后再原子消费。** 兑换先 `GetCode`（非破坏性读）判断过期、
+   客户端、`redirect_uri` 与 PKCE，全部通过才 `ConsumeCode`（单条原子删除），并只从被认领的那条记录
+   签发。单次使用与并发双兑换窗口仍由那次原子删除关闭（只有赢得 DELETE 的请求会签发）；失败的那次
+   不再烧掉 code，并补一条 `oauth.exchange_failed` 审计。过期码当场被拒，不依赖 sweep。
 9. **refresh token 重放是 `400 invalid_grant`**，不是 `500 server_error`。
 10. **内省默认只允许查看自己的 token。** 资源服务器需在
     `server.introspection_clients` / `RE0AUTH_INTROSPECTION_CLIENTS` 中显式登记；跨 client 查询
@@ -61,8 +64,11 @@
   `active=false` 是 RFC 7662 里“不可用”的诚实答案，且不泄露 token 是否存在。
   **前提是“已通过客户端认证”为真**：对公开客户端那条认证是空转的（见决策 10b），所以在那里
   401 才是诚实的答案——它不是“权限不足”，而是“你没有可以用来认证的东西”。
-- **为什么授权码在读取时删除**：失败会烧掉 code，但这是 fail-closed 方向；一次失败要求用户
-  重新授权，比并发双兑换可接受。
+- **为什么授权码在「校验通过后」才删除**：旧形状（读取时即删除）把「第一次尝试」当成「第一次成功兑换」，
+  于是不需要 verifier 或客户端凭据、只要知道 code 就能把它烧掉，构成低成本定向 DoS（第五轮 KIT-4）。
+  改为非破坏性读取 → 全部绑定校验 → 原子消费后，并发双兑换窗口仍由那次原子删除关闭（只有赢得 DELETE
+  的请求会签发），而失败不再有副作用，并有 `oauth.exchange_failed` 审计。OP 面（`internal/oidchttp` +
+  `OIDCStore.AuthRequestByCode`，consume-on-read）仍是同一形状，属另一引擎的同族项。
 
 ## 后果
 
@@ -77,5 +83,7 @@
   client auth challenge、discovery 真实性。
 - `internal/store/memory`、`internal/store/postgres`：授权码单次消费/过期、整链撤销、
   pending 码撤销、设备 scope 与轮询节流、`auth_time` 保留。
+- `oauth`：授权码绑定失败不消费（KIT-4 回归守卫）、并发双兑换只成功一次、
+  `oauth.exchange_failed` 审计；`internal/zzprobe/protocol/kit` 的 `TestC1_`/`TestC2_` 端到端压同一条路。
 - `internal/httpapi/plane_test.go`：浏览器面压缩拒绝形状。
 - `internal/oidcstore`：scope 收窄语义、签名密钥校验。
