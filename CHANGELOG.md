@@ -6,7 +6,80 @@
 > `docs/*-decision.md` 的 ADR 里。升级步骤见 [docs/operations.md](docs/operations.md)
 > 的「升级」一节，它的第一步就是先读这里与受影响的 ADR。
 
-## Unreleased
+## v0.0.0-rc.4
+
+**本轮把 P0/P1 全部收掉**（逐条与守卫见 [docs/issues/P0-blockers.md](docs/issues/P0-blockers.md)
+与 [docs/issues/P1-high.md](docs/issues/P1-high.md)）。下面先列部署者/下游必须知道的变化，
+其后是自 rc.3 以来累积的条目。
+
+> 与 rc.3 一样，rc.4 验证的仍是 **tag → CI → 产物** 这条链路，**不是可以部署的版本**：
+> rc.1 一节列出的适用条件全部成立。另需记录在 release notes 里的一条：rc.3 已公开的归档中
+> Svelte/SvelteKit 代码缺少版权/许可声明（第五轮 SUP-1），**已发出的产物无法回溯**；自 rc.4 起
+> 归档随附 `re0auth_<ver>_npm-attribution.json` 许可清单（`make npm-attribution`，
+> 与 `SHA256SUMS` 一同发布，见本节 P2-21 条）。
+>
+> **发布动作（两步，顺序不能反）**：① 在 `main` 上打 `v0.0.0-rc.4` 并推送——`release.yml` 以
+> `ci.yml` 为门禁，门禁过了才发布产物；② 随后用**单独一次提交**把 `deploy/k8s/base` 的 pin 与
+> [docs/operations.md](docs/operations.md) 的「最近一个真正发布过的 tag」换到 rc.4。pin 有守卫：
+> `internal/archtest` 要求它指向仓库里**真实存在**的 `v*` tag，所以第二步必须等 tag 推上去之后
+> ——rc.3 就是这么换的（提交 `632e00b`），rc.1 一节的教训也在这里。
+
+- **refresh 重放即撤销整条令牌族（RFC 9700 §4.14.2，P0 G-1）**：此前重放一个已轮换的 refresh token
+  只被拒，小偷已换出的那一代继续有效到 TTL 结束。现在轮换在被消费的行上留墓碑（族标识 + 配对
+  access 的 id），读路径命中墓碑即在一个事务里撤销该族全部 refresh 与 access，然后仍按
+  `400 invalid_grant` 拒绝。检测必须落在读路径，是库的调用顺序决定的
+  （`TokenRequestByRefreshToken` 先于轮换被调用）。
+  **升级影响**：新迁移 `0024` 给 `oidc_refresh_tokens` 加 `family_id`（存量行回填为自身
+  `token_hash`，即「各自成族」，与既有行为一致）并建墓碑表，启动时自动执行。**行为变化**：
+  检测到重放后，该族里先前仍可用的 access token 也会立即失效——这正是本条的目的。
+
+- **Postgres 后端开始裁决 refresh 的过期（P0 G-2）**：refresh 读路径与轮换声明此前都没有
+  `expires_at` 谓词，30 天 TTL 只由 15 分钟一轮的 sweep 执行（sweep 连续失败则窗口继续延长）；
+  两处现在都按 store 时钟 `$n` 判定，与内存后端同形。**行为变化**：过期 refresh 不再能换出新的
+  30 天令牌对，不再依赖 sweep。
+
+- **RFC 7009 撤销在数据库故障时不再回答 200（P0 G-3 / G-13）**：`RevokeToken` 的三个属主查找
+  此前以 `err == nil` 为进入条件，任何库错误（断连、故障切换、`statement_timeout`、ctx 取消）
+  都落穿成「未知令牌即成功」且不写审计；`GetRefreshTokenInfo` 把同样的错误折叠成
+  `invalid_grant`，使库的 5xx 分支不可达。现在只有 `pgx.ErrNoRows` 算「未知」，其余如实返回
+  `server_error`。**行为变化**：库故障时撤销端点会失败（客户端应按 RFC 7009 重试），而不是
+  谎报成功。
+
+- **公开库 `oauth` 的破坏性变更（仅影响直接实现 `oauth.Store` 的代码）**：新增族谱与墓碑——
+  `AccessToken`/`RefreshToken` 增加 `FamilyID`；新增 `ErrRefreshTokenReused` 与
+  `*RefreshReuseError`；`ConsumeRefresh` 现在必须把「已被本店消费过」的值报成
+  `*RefreshReuseError`（而不是 `ErrTokenNotFound`），并保留被消费值的族归属（墓碑）；新增
+  `RevokeRefreshFamily(ctx, familyID)` 与只读 `GetCode(ctx, value)`。服务侧同时收掉两条同形缺陷：
+  刷新的归属在消费**之前**判定（此前他方客户端可把持有者的 refresh 一次性烧掉），授权码先读、
+  校验全部绑定、通过后才原子消费（失败的兑换不再烧码，并新增 `oauth.exchange_failed` 审计）。
+  **升级影响**：第三方 `oauth.Store` 实现需补 `RevokeRefreshFamily`/`GetCode` 并承担
+  `ConsumeRefresh` 的新义务，否则编译不过；Postgres 形态随迁移 `0025`（两张 legacy token 表加
+  `family_id` + 墓碑表）自动执行。背景见 ADR-0005 §8 与
+  [docs/authorization-engines-decision.md](docs/authorization-engines-decision.md)。
+
+- **`prompt=login` 与 `max_age` 现在会强制重新认证（G-4）**：此前两者被完全忽略，id_token 携带
+  旧会话的 `auth_time`，step-up 请求既不重新认证也不回 `login_required`。现在按 OIDC Core
+  §3.1.2.1：无活会话或 `max_age` 超龄时经 `redirect_uri` 返回 `error=login_required`（带 `iss`）。
+
+- **设备流端点对机密客户端强制认证（G-6）**：`POST /oauth/device_authorization` 此前对任何客户端
+  （含机密）都不要求认证，而验证页会把该客户端的注册名展示给任何跟着 `user_code` 走的人；现在与
+  token 端点同形，机密客户端未认证即 401。**行为变化**：匿名发起设备流的机密客户端会开始收到 401。
+
+- **`[client]` 首次 seed 之后的漂移拒绝启动（Z12-3）**：此前改 `secret_env` / `redirect_uris` /
+  scopes 被静默忽略——轮换 secret 时旧 secret 仍有效，删掉的生产回调仍留在白名单。现在
+  `seedClient` 命中后逐字段比对，不一致**拒绝启动**并点名字段。**行为变化**：与既有注册行不一致的
+  配置会启动失败（这是一次有意的裁定）。
+
+- **抗 DoS：探针、限流桶与 in-flight 槽位不再被单个匿名调用方独占（Z11-1/4/5/V1）**：`/readyz`
+  的就绪检查改用不随调用方取消的上下文（取消不再把结果缓存成 503，健康副本不再被摘流）；限流的
+  overflow 桶按调用方分摊并保持有界；in-flight 槽位按（平面, 客户端）分摊；探针豁免现在也跳过
+  会话中间件（带 Cookie 的匿名探针不再每请求一次连接池往返）。**升级影响**：无配置变化；
+  容量口径见 [docs/operations.md](docs/operations.md)。
+
+- **抹除链失败的那一步现在入审计（Z07-2）**：`Destroy` 失败时，审计里唯一一条记录此前写的是
+  `outcome=ok` + `pseudonym_destroyed=true`（假名钥匙仍在、仍可归因），运维据此得到
+  「历史已不可链接」的错误结论。现在失败分支补记一条 `outcome=error`，与
+  [docs/operations.md](docs/operations.md)「数据删除与保留」一节的口径一致。
 
 - **设备路径的期限改由 store 时钟裁决（P2-32）**：postgres 适配器的三条设备 SQL
   （poll 节流的 `last_poll`、`ApproveDevice` 的 `expires_at` 谓词与 `auth_time` 戳）
@@ -194,7 +267,7 @@
 
 ## v0.0.0-rc.3
 
-**目前唯一带产物的预发布**：release 里有六个平台的归档、`SHA256SUMS` 及其 cosign 签名、以及 SBOM。
+**首个带产物的预发布**（rc.4 之前唯一一个）：release 里有六个平台的归档、`SHA256SUMS` 及其 cosign 签名、以及 SBOM。
 它验证的仍是 **tag → CI → 产物** 这条链路，所以它和下面各条一样**不是可以部署的版本**——
 rc.1 那节列出的适用条件全部成立。
 
