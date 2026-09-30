@@ -195,25 +195,43 @@ func TestEverySweptReadPathAdjudicatesItsDeadline(t *testing.T) {
 		file   string
 		marker string
 		note   string
+		// open names the read method of a known gap. It must NOT yet carry a
+		// deadline predicate: the exemption then goes red the moment G-7/Z07-1
+		// land instead of silently exempting a fixed path.
+		open string
 	}{
-		"oidc_codes":                    {"oidc.go", "expires_at > $2", ""},
-		"oidc_access_tokens":            {"oidc.go", "ExpiresAt.After(s.now())", ""},
-		"oidc_refresh_tokens":           {"oidc.go", "expires_at > $2", ""},
-		"oidc_refresh_token_tombstones": {"oidc.go", "expires_at > $2", ""},
-		"oidc_auth_requests":            {"oidc.go", "", "Z07-1: the by-id read judges no deadline yet; delete this exemption when it lands"},
-		"oidc_devices":                  {"oidc.go", "", "G-7: the consume predicate judges no deadline yet; delete this exemption when it lands"},
-		"oauth_codes":                   {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read"},
-		"oauth_access_tokens":           {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read"},
-		"oauth_refresh_tokens":          {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read"},
-		"oauth_refresh_tombstones":      {"oauth.go", "expires_at > $2", ""},
-		"oauth_device_authorizations":   {"oauth.go", "", "service: oauth/device.go judges expiry before the store is read"},
-		"federation_bind_flows":         {"federation.go", "", "service: internal/federation/bind.go judges expiry"},
+		"oidc_codes":                    {"oidc.go", "expires_at > $2", "", ""},
+		"oidc_access_tokens":            {"oidc.go", "ExpiresAt.After(s.now())", "", ""},
+		"oidc_refresh_tokens":           {"oidc.go", "expires_at > $2", "", ""},
+		"oidc_refresh_token_tombstones": {"oidc.go", "expires_at > $2", "", ""},
+		"oidc_auth_requests":            {"oidc.go", "", "Z07-1: the by-id read judges no deadline yet; delete this exemption when it lands", "AuthRequestByID"},
+		"oidc_devices":                  {"oidc.go", "", "G-7: the consume predicate judges no deadline yet; delete this exemption when it lands", "GetDeviceAuthorizatonState"},
+		"oauth_codes":                   {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
+		"oauth_access_tokens":           {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
+		"oauth_refresh_tokens":          {"oauth.go", "", "service: oauth/as.go judges expiry before the store is read", ""},
+		"oauth_refresh_tombstones":      {"oauth.go", "expires_at > $2", "", ""},
+		"oauth_device_authorizations":   {"oauth.go", "", "service: oauth/device.go judges expiry before the store is read", ""},
+		"federation_bind_flows":         {"federation.go", "", "service: internal/federation/bind.go judges expiry", ""},
 	}
 	for _, tc := range expiredTables {
 		entry, ok := adjudicated[tc.table]
 		if !ok {
 			t.Errorf("swept table %q has no read-path adjudication entry: name the predicate that refuses an "+
 				"expired row, or cite the service layer that owns the deadline (N-01)", tc.table)
+			continue
+		}
+		if entry.open != "" {
+			// Red-gated exemption: while the gap is open the method must not
+			// judge the deadline. If it does, the fix landed and this entry must
+			// be replaced by a real marker (N-01).
+			body := oidcStoreMethod(t, files["oidc.go"], entry.open)
+			for _, marker := range []string{"expires_at >", "ExpiresAt.After("} {
+				if strings.Contains(body, marker) {
+					t.Errorf("swept table %q is exempted as %q, but %s now contains %q: the gap appears fixed — "+
+						"delete the exemption and give this table a deadline marker (N-01)",
+						tc.table, entry.note, entry.open, marker)
+				}
+			}
 			continue
 		}
 		if entry.marker == "" {
