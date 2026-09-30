@@ -145,6 +145,8 @@
 | `sigstore/cosign`（keyless） | `release.yml` | 对 `SHA256SUMS` 做**无密钥**签名：身份来自 GitHub Actions 的 OIDC，证书写明是哪个 workflow 产出的，签名进 Rekor 透明日志。没有密钥要保管、泄露或轮换——对一个无资金项目，这比维护一个 GPG key 更可辩护 |
 | `golangci-lint`（v2.14.0） | `ci.yml` 的 `lint` 作业 | Go 静态分析的聚合器。只启用**标准分析器**加少数针对本项目的检查（泄漏的响应体、与哨兵错误的 `==`、被吞掉的错误、`//nolint` 的规范性），规则与各自理由写在 `.golangci.yml`。**不启用**那些会跟着风格漂移把绿灯变红的规则——会因此变红的门禁最后都会被人删掉 |
 | `gitleaks`（v8.30.1） | `ci.yml` 的 `secrets` 作业 | 扫**全量历史**的密钥扫描器。提交进公开仓库的凭据就是必须轮换的凭据，所以它每次改动都跑，而不是只在发布时跑。扩展默认规则集；唯一的豁免（`.gitleaks.toml`）是审计报告里引用的 PoC 输出，那些令牌来自一次性的本地运行、从未在任何地方有效 |
+| `Semgrep`（OSS，`1.178.0`，失败时回退到未固定） | `semgrep.yml` | 规则型 SAST，与 CodeQL（taint 分析）和 gosec（全默认规则）互补：`p/golang` + `p/jwt` 抓库误用、危险 API、弱哈希/JWT 模式。**只报警不阻断**（扫描步 `continue-on-error`，SARIF 进 artifact）。pip 安装不受 `uses:`-SHA 守卫覆盖，所以版本固定带一个显式回退：固定过期时退化为“未固定”，而不是“什么都没扫” |
+| `openid/conformance-suite`（浮 tag）、`caddy:2`、`curlimages/curl:latest` | `conformance.yml` | OpenID 官方一致性套件的**连通性 spike**（自签 TLS + Caddy 反代 + 套件容器；JVM `cacerts` 由现场构建的派生镜像导入 CA）。当前实验性、非阻断；升为门禁时必须像基础镜像一样按 digest 固定，见 [conformance.md](conformance.md) |
 
 **两个“不撒谎”的细节**：SBOM 的文件名让 checksum 的通配符能匹配到它（一个*看起来完整*却漏掉某个产物的
 checksum 文件比没有更糟），签名签的是 `SHA256SUMS` 本身——于是全部产物被一次签名锁住；CI 里还对 SBOM 的
@@ -162,6 +164,7 @@ checksum 文件比没有更糟），签名签的是 `SHA256SUMS` 本身——于
   （`TestDockerfileBaseImagesArePinned`）与 workflow 里每个远程 `uses:` 的 commit SHA
   （`TestWorkflowActionsArePinnedToFullSHAs`）。工具版本（`go install …@vX.Y.Z`）那一半仍靠评审，
   没有守卫——它写在同一批 workflow 里，改动会被评审看到，但没有测试会在它漂移时变红。
+  `semgrep.yml` 的 pip 版本与 `conformance.yml` 的三个容器 tag 属于同一类：已记录、未守卫。
 - **不做的**：**不声明任何 SLSA 等级**；**不校验依赖自身的来源证明**——没有对模块做 sigstore 验证，
   边界就是 `go.sum` 与 Go 的校验和数据库（`sum.golang.org`）：它能发现被替换或篡改的模块，
   **不能**保证上游仓库本身没被入侵；也不为不在构建图里的模块（如测试专用的 `yaml.v3`）伪造记录。

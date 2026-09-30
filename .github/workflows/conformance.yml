@@ -1,0 +1,76 @@
+name: conformance
+
+# Step 3/4 of the launch plan: an OpenID Foundation Conformance Suite spike that
+# runs nightly and on demand.
+#
+# It is EXPERIMENTAL and REPORT-ONLY for now (`continue-on-error` on the spike
+# step). The point of this job today is to prove the wiring — self-signed TLS via
+# Caddy, the OP behind it, and a container that can reach the issuer the way the
+# suite will — and, when a plan payload is supplied, to run it to a verdict.
+#
+# Once a plan has been observed green here, dispatch this workflow with
+# `require_plan: true` (or set the env after dropping `continue-on-error`) and make
+# it a release gate. See docs/conformance.md for the remaining gaps.
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_json:
+        description: 'Repo-relative path to a JSON payload for POST /api/runner (optional)'
+        required: false
+        default: ''
+      require_plan:
+        description: 'Fail when the plan does not finish cleanly (use once nightly is green)'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '40 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Connectivity spike
+        # Experimental: a red run here is information, not a broken main. Flip this
+        # off once a full suite plan has been observed green.
+        continue-on-error: true
+        env:
+          SPIKE_ARTIFACTS: ${{ github.workspace }}/conformance-artifacts
+          CONFORMANCE_PLAN_JSON: ${{ inputs.plan_json }}
+          CONFORMANCE_REQUIRE_PLAN: ${{ inputs.require_plan && '1' || '0' }}
+        run: |
+          mkdir -p "${SPIKE_ARTIFACTS}"
+          bash scripts/conformance/spike.sh
+
+      - name: Publish the report to the run summary
+        # This is what "check last night's report" reads: the milestone table and
+        # the plan verdict, without downloading an artifact.
+        if: always()
+        run: |
+          if [ -f conformance-artifacts/summary.md ]; then
+            cat conformance-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '## OIDF conformance spike' >> "$GITHUB_STEP_SUMMARY"
+            echo 'No summary was produced; inspect the job log.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload spike artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-spike
+          path: conformance-artifacts/
+          if-no-files-found: warn

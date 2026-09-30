@@ -1,0 +1,118 @@
+name: semgrep
+
+# Step 2 of the launch plan: a second static-analysis pair of eyes next to CodeQL
+# and gosec. It is REPORT-ONLY by design — the scan step carries
+# `continue-on-error`, so a finding never blocks a merge here. It exists to surface
+# the class of defect that pattern rules catch well (crypto/rand misuse, weak
+# hashing, JWT library misuse, dangerous APIs), not to re-litigate what CodeQL's
+# taint analysis and gosec's full default rule set already cover.
+#
+# Why not `semgrep ci`: that path needs a Semgrep Cloud token and is not the OSS
+# product. `semgrep scan` with registry configs is the free, token-free route.
+#
+# The rule packs are named, so a pack that stops existing fails the job loudly
+# instead of silently scanning nothing. `p/golang` and `p/jwt` are the two the
+# plan asked for; add packs deliberately rather than with a wildcard.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The nightly slot that turns this into a standing check (step 4).
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+
+    env:
+      # Pinned deliberately, to the release current when this was written
+      # (verified against the PyPI index, 2025). The repository's `uses:`-SHA guard
+      # does not cover a pip install, and docs/dependencies.md §7 records that the
+      # tool-version half of the supply chain is unguarded. The fallback below
+      # exists so a pin that ages out degrades to "unpinned" rather than to
+      # "scanned nothing".
+      SEMGREP_VERSION: '1.178.0'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Semgrep OSS
+        # A venv, not `pip install --user`: ubuntu-latest's system Python is
+        # externally managed (PEP 668), where a --user install is refused, and the
+        # venv also gives the scan step an exact binary instead of assuming
+        # ~/.local/bin is on PATH.
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/semgrep-venv"
+          pip="${RUNNER_TEMP}/semgrep-venv/bin/pip"
+          "${pip}" install --quiet "semgrep==${SEMGREP_VERSION}" || "${pip}" install --quiet semgrep
+          echo "SEMGREP_BIN=${RUNNER_TEMP}/semgrep-venv/bin/semgrep" >> "$GITHUB_ENV"
+
+      - name: Scan (report only)
+        id: scan
+        # A finding is information here, not a gate. The summary step below turns
+        # it into a workflow warning so it is still visible on the run.
+        continue-on-error: true
+        run: |
+          "${SEMGREP_BIN}" scan \
+            --config p/golang \
+            --config p/jwt \
+            --sarif --output semgrep.sarif \
+            --metrics=off \
+            --no-error
+
+      - name: Summarise findings
+        if: always()
+        run: |
+          if [ ! -s semgrep.sarif ]; then
+            echo "::warning::Semgrep produced no report; the scan did not complete"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo '## Semgrep (report only)'
+                echo
+                echo 'The scan did not produce a report; inspect the job log.'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+          count=$(python3 - <<'PY'
+          import json
+          with open("semgrep.sarif", encoding="utf-8") as fh:
+              data = json.load(fh)
+          # Suppressed results stay in the SARIF with a `suppressions` marker; only
+          # unsuppressed ones are findings. Counting the raw array would report the
+          # inline-reviewed sites as new findings on every run.
+          count = 0
+          for run in data.get("runs") or []:
+              for result in run.get("results") or []:
+                  if not result.get("suppressions"):
+                      count += 1
+          print(count)
+          PY
+          )
+          echo "Semgrep findings: ${count}"
+          if [ "${count}" -gt 0 ]; then
+            echo "::warning::Semgrep reported ${count} finding(s). This job is report-only; see the semgrep.sarif artifact."
+          fi
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo '## Semgrep (report only)'
+              echo
+              echo "Findings: **${count}**"
+              echo
+              echo 'Rule packs: `p/golang`, `p/jwt`. Results suppressed in source (`// nosemgrep`) are excluded; the SARIF artifact keeps them marked.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload SARIF report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: warn
