@@ -58,6 +58,32 @@
   不再回显配置或密钥原文。**行为变化**：启动日志里这些错误的文案不再带变量名或值，
   排障时以字段名 + 手上的配置文件定位。
 
+### T2 · 首发窗口必修（本轮先收 6 条，`6665193`）
+
+- **`X-Request-Id` 只采信短且合法的形状（Z11-3）**：此前调用方写的任意长度/字符集被
+  原样回显进响应头、problem body 与访问日志，一个 60 000 字节的头就产生同量级日志行。
+  现在仅 `len <= 128` 且 `[A-Za-z0-9._-]` 时采信，否则替换为生成 id。
+  **行为变化**：不合形状的 id 不再被回显（下游若依赖透传，需自己生成合法 id）。
+- **`backup-keys.sh` 的守卫提前到它们保护的动作之前（Z13-4）**：`umask 077` 移到
+  `mkdir` 之前，`age` 存在性检查移到首次写入之前；加密失败会清理半成品。
+  **行为变化**：设置 `BACKUP_AGE_RECIPIENT` 但未安装 `age` 时，脚本不再留下明文密钥
+  文件（此前会写出后再以 1 退出）。
+- **上游字节预算加 per-caller 分摊（Z09-4）**：此前是全局先到先得，一个调用方的若干慢读
+  即可把其他调用方的满额读 shed 成 503。现在每个调用方有份额
+  （`max(2*maxBody, limit/4)`），超出份额者被 shed，而不是占用他人余量。
+  **行为变化**：单个主体并发超过约 4 个满额读会开始收到 503（此前是挤掉别人）；
+  [docs/capacity-planning.md](docs/capacity-planning.md) 与
+  [docs/operations-decision.md](docs/operations-decision.md) 写明该性质。
+- **刷新路径的库故障可观测（N-02）**：库把刷新查询的任何错误硬编码成 `invalid_grant`
+  （见 [docs/dependencies.md](docs/dependencies.md)），因此 store 现在用
+  `oauth.ErrTokenNotFound` 表示「本签发者从未发出」，其余保留原因；`internal/oidchttp`
+  的 store 装饰器把基础设施故障计入新增的 `re0auth_store_unavailable_total`。
+  **运维影响**：新增指标，协议面无变化。
+- **进程日志不再带账号标识（G-23）**：admin / auth / federation / httpapi 的 6 处告警
+  去掉原始 `usr_…`，保留 action / game / source / request_id。**行为变化**：日志文案变化。
+- **台账更正（G-13）**：`GetRefreshTokenInfo` 的错误分类早在 `79d7333` 随 G-3 修好，
+  本条此前是陈旧登记；探针已是回归守卫。
+
 - **refresh 重放即撤销整条令牌族（RFC 9700 §4.14.2，P0 G-1）**：此前重放一个已轮换的 refresh token
   只被拒，小偷已换出的那一代继续有效到 TTL 结束。现在轮换在被消费的行上留墓碑（族标识 + 配对
   access 的 id），读路径命中墓碑即在一个事务里撤销该族全部 refresh 与 access，然后仍按

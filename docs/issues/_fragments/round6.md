@@ -83,7 +83,7 @@
 | G-9 | P2 | 刷新后的 id_token 丢掉 `nonce`（OIDC Core §12.2 要求保留），检查 nonce 的 RP 每次刷新都失败 | `internal/oidcstore/oidcstore.go`（`RefreshRequest` 无 nonce 字段；探针 `internal/zzprobe/audit6/z01protocolauth/regress_test.go:394`） | FIXED（17914d4） | refresh 路径签发的 id_token 带上原始 nonce（两 store 需持久化） |
 | G-10 | P2 | 设备流 token 轮询拒绝 discovery 广告的 `client_secret_post`，且被拒的 401 把 device_code 烧掉 | `pkg/op/device.go:217`（机制）/ `:235`；修法在 `internal/oidchttp` 边界 | OPEN | 设备授予接受 `client_secret_post`，且 401 **不得**先跑消费谓词烧掉 device_code |
 | G-11 | P3 | `/readyz` 在「已有一次检查在跑」且**从未产生结论**时答 200（`running` 分支返回零值 `nil`） | `internal/httpapi/health.go:111` | OPEN | `c.running && !c.checked` 时 fail-closed 回 503；已下调 P3（出厂清单下 kubelet 撞不到） |
-| G-13 | P2 | `GetRefreshTokenInfo` 把数据库错误折叠成 `op.ErrInvalidRefreshToken`，废掉库的 500 分支 | `internal/store/postgres/oidc.go:561` | OPEN-PG | `noRows(err) → 哨兵；其余原样返回（wrap）`；与 G-3 同批收口 |
+| G-13 | P2 | `GetRefreshTokenInfo` 把数据库错误折叠成 `op.ErrInvalidRefreshToken`，废掉库的 500 分支 | `internal/store/postgres/oidc.go:561` | FIXED（79d7333） | `noRows(err) → 哨兵；其余原样返回（wrap）`；与 G-3 同批收口 |
 | G-14 | P3 | `oidc_devices` 是第七张没有 `client_id` 前导索引的 client-only 批量撤销表，守卫手写清单也漏了它 | `internal/store/postgres/oidc.go:1075`、`internal/store/postgres/migrations/0022_bulk_revoke_client_indexes.sql` | OPEN | 迁移 0023 补 `oidc_devices(client_id)`；守卫改为从 `revokeMatching` 调用点反推表集合 |
 | G-15 | P3 | 设备路径 `slow_down` 节流锚点分叉：内存锚「上一次尝试」、PG 锚「上一次放行」 | `internal/store/memory/oidc.go:884` vs `internal/store/postgres/oidc.go:773` | OPEN | 裁定一个语义（建议锚「上一次尝试」），PG 改为无条件写 `last_poll`；无安全后果 |
 | G-16 | P3 | 内存 `cloneAuthRequest` 仍共享 `CodeChallenge`/`AuthTime` 两个指针字段，写穿即改库 | `internal/store/memory/oidc.go:435` | OPEN | 两字段深拷贝；机制成立但今天无写穿调用方（可达性已降格，留作潜在缺陷） |
@@ -93,7 +93,7 @@
 | G-20 | P3 | `Enroll` 先落库后写审计：审计失败时凭据已存、调用方被告知失败，绑定路径不回滚不记日志 | `vault/service.go:209`、`internal/federation/bind.go:191` | OPEN | 与兄弟分支 `bind.go:198-213` 对齐：失败尝试 `vault.Revoke` 回滚，失败则 slog + `errors.Join` |
 | G-21 | P3 | vault 错误文本内嵌原始 `usr_…`，经 `-rotate-keys` die 路径与 unbind/cascade warn 路径进进程日志 | `vault/repo.go:29`、`vault/service.go:273`、`vault/rotate.go:113` | OPEN | 错误里用形状代替身份（只报 provider + kek_id）；attr 守卫结构上看不见这个通道 |
 | G-22 | P3 | 三把 32 字节密钥可共用同一值被无提示接受（KEK == token key，乃至 audit key） | `cmd/re0auth/config.go:719`、`cmd/re0auth/main.go:1385` | OPEN | `loadConfig` 解析完三把密钥后两两比较，相同即拒绝启动（或至少 Warn） |
-| G-23 | P2 | 第五轮仍红的 7 处 `usr_…` 进 slog attr，确认仍未修 | `internal/admin/admin.go:499`、`internal/auth/auth.go:231`、`internal/federation/bind.go:208`、`internal/federation/refresh.go:155/160`、`internal/httpapi/account_routes.go:80`、`internal/httpapi/binding_routes.go:57` | OPEN | 统一改记形状（`"self", bool` / 只记 action）；与 G-21 是同一不变量的两半，一起收 |
+| G-23 | P2 | 第五轮仍红的 7 处 `usr_…` 进 slog attr，确认仍未修 | `internal/admin/admin.go:499`、`internal/auth/auth.go:231`、`internal/federation/bind.go:208`、`internal/federation/refresh.go:155/160`、`internal/httpapi/account_routes.go:80`、`internal/httpapi/binding_routes.go:57` | FIXED（6665193） | 统一改记形状（`"self", bool` / 只记 action）；与 G-21 是同一不变量的两半，一起收 |
 | G-24 | P2 | `/.well-known/oauth-protected-resource` 对非 GET 动词答 404（同族另两份文档答 405），且 405 不带 `Allow` 头（RFC 9110 §15.5.6 MUST） | `internal/httpapi/server.go:522`；`internal/oidchttp/oidchttp.go:256/263` 不设 Allow | OPEN | 动词闸门与另两份 well-known 文档同形，并补 `Allow` 头 |
 | 04-7 | P3 | 0022 一类索引迁移在单个 goose 事务里非并发建索引：在役升级窗口对相关表是写冻结 | `internal/store/postgres/migrations/0022_bulk_revoke_client_indexes.sql` | OPEN-PG | 记录在 migration-decision；表会大时改 `CREATE INDEX CONCURRENTLY` + `-- +goose NO TRANSACTION`（0017-0022 同形） |
 | P-02 | P3 | 设备流批准不检查 `ExplicitConsent`，与同意面不对称（机制在、闸门缺） | `internal/httpapi/device_routes.go:114`、`internal/store/memory/oidc.go:1086` | OPEN | `ApproveDevice`（含 Postgres）在 `Resolve` 后调 `RequireExplicitConsent` 并把 `explicit` 一路传下去；今天目录无此类 scope 故不可达 |
@@ -110,6 +110,8 @@
 - P1-1/P1-2 — vault 轮换窄写/CAS（lost-update）；第 6 轮新探针验证「修对、修全」（`03-crypto-vault.md:173-193`）。
 - P2-32 — 设备路径单时钟（bf81b2a）；三处 SQL 参数化，未引入新洞（`03-crypto-vault.md:195-201`）。
 - G-9 — 刷新签发的 id_token 保留原 nonce（OIDC Core §12.2）：`RefreshRequest`/`NonceOf`、两个 store 在 refresh 行上持久化并随轮换继承、`SetUserinfoFromRequest`、迁移 `0026`；audit6 里原本断言「刷新后没有 nonce」的探针翻转为断言保留 — `17914d4`
+- G-23 — 6 处原始 `usr_…` 不再进 slog（admin/auth/federation bind+refresh/httpapi binding_routes；第 7 处 account_routes 由 k1 收掉）；audit5 静态守卫由红翻绿 — `6665193`
+- G-13 — `GetRefreshTokenInfo` 现在把 `noRows` 报成哨兵、其余报 `oidc.ErrServerError`（库的 500 分支恢复可达）；经查在 `79d7333` 随 G-3 一并修掉，注册表此前陈旧 — `79d7333`
 
 ## 有意不做 / 已裁定
 

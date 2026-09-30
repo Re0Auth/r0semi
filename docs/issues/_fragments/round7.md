@@ -78,7 +78,7 @@
 | Z08V-1 | P3 | 「开放重定向面」的绿是假守卫：内存模式无 IdP，`/auth/{p}/start` 回 404、`/bind` 匿名回 401，探针永远到不了任何重定向 sink（产品无洞，是报告守卫无效） | `internal/zzprobe/audit7/z08frontendbrowser/realproc_test.go` | OPEN | 删掉该条「探过没破」，或用已配 provider 的全接线夹具走完 start→callback 再断言 `Location`；依据 `Z08-VERIFIED.md:25`、`Z08-VERIFIED.md:114-128` |
 | Z08V-2 | P3 | Z08-3 的「构建产物无 `version.json` 引用」是错的：产物 `chunks/DqohD3-m.js` 确实带 `fetch(.../_app/version.json)` 与版本比对逻辑（方向是低估风险） | `docs/audit-7/findings/Z08-frontend-browser.md:133` | OPEN | 更正该事实，并据此给 `_app/version.json` 明确缓存指令；依据 `Z08-VERIFIED.md:26`、`Z08-VERIFIED.md:130-136` |
 | Z09-1 | P2 | `sources[].status` 无词汇表闸门：任何拼写变体（`Retired`/`retired `/`disabled`）被静默当作可服务源继续读取，并继续决定**另一个源**的 scope 闸门 | `internal/federation/federation.go:53-62` | OPEN | 照 `token_class` 同形在 `NewRegistry` 加显式 switch、词表外值拒绝启动（拒绝 vs 归一化是裁定）；同时更正 CS-4 的假文档断言 | 
-| Z09-4 | P2 | 缓冲预算全局先到先得、无 per-subject 分摊：15 个 raw 并发读（零字节或 ≥4 MiB body）即把其他用户的满额读 shed 成 503 | `internal/federation/service.go:108-113` | OPEN | 三选一（裁定）：按调用方配额 / 按已读字节预留 / 首字节期限；并在 `MaxBufferedBytes` 注释写明"全局先到先得" | 
+| Z09-4 | P2 | 缓冲预算全局先到先得、无 per-subject 分摊：15 个 raw 并发读（零字节或 ≥4 MiB body）即把其他用户的满额读 shed 成 503 | `internal/federation/service.go:108-113` | FIXED（6665193） | 三选一（裁定）：按调用方配额 / 按已读字节预留 / 首字节期限；并在 `MaxBufferedBytes` 注释写明"全局先到先得" | 
 | Z09V-1 | P2 | 共享 per-host 熔断器把"一个账号凭据坏了"当"源坏了"：5 次 401 让**其他账号** 30s 内读不到该源 | `httpclient/circuitbreaker.go:196-204` | OPEN | 401 按调用方/binding 计失败而非 host 熔断（裁定）；P1-3 目标用"同一 binding 连续 N 次 401 ⇒ 该 binding 冷却"达成 | 
 | Z09-2 | P3 | 归一化读没有"超过上限即拒绝"：4 MiB 上游体被静默截断后作为完整的 200 交出（`json.Valid` 接受尾随空白） | `internal/federation/service.go:760-775` | OPEN | 照抄 raw 两行：`LimitReader(..., maxBody+1)` + `len(body)>maxBody → ErrResponseTooLarge` | 
 | Z09-3 | P3 | 已退役的源仍可被绑定：`BeginBind`/`CompleteBind` 无 `Status` 判据，上游令牌被存进 vault 而数据面永不使用 | `internal/federation/bind.go:127-152` | OPEN | `registry.Get` 之后加 `Status == StatusRetired → ErrSourceRetired`（两处都要） | 
@@ -95,7 +95,7 @@
 | Z10V-1 | P3 | Kill Switch **失败路径**审计行漏记 `sessions_revoked`（会话已被切掉，持久记录里没有这个数） | `internal/admin/admin.go:389-391` | OPEN | 三条失败路径 Detail 加 `sessions_revoked`，或统一让失败路径走 `killDetail` | 
 | Z10V-2 | P3 | 内部监听器排空**没有自己的预算**：排在公网监听器之后共享同一个 30s `drainCtx`，第一个吃满时第二个得 0s | `cmd/re0auth/main.go:840-849` | OPEN | 每个 endpoint 各自 deadline / 内部监听器直接 `Close` / 改写 `shutdownTimeout` 语义并同步注释（裁定） | 
 | Z11-2 | P2 | 上游字节预算在写响应体之前就释放：预算约束的是读，不是被持有的 body（P0-3 修复不全）。**复核更正**：探针「body 被持有」前提在本机不成立（48/48 handler 已返回），证据等级由「探针测到」降为「源级 CONFIRMED + Linux 平台推论」 | `internal/federation/service.go:725-729`（写 body `internal/httpapi/federation_routes.go:296-297`） | OPEN | 预留生命周期挂到 body 持有者（`RawResult` 携带 `release`，`w.Write` 后释放），或按「已读+已写字节」计费 |
-| Z11-3 | P2 | 调用方写的 `X-Request-Id` 无长度/字符集上限，被原样回显进响应头并写进访问日志（60 000 字节 ⇒ `echoed=60000 logged=60157`） | `internal/httpapi/middleware.go:138-142`（`:262` 入日志） | OPEN | 仅 `len <= 128` 且字符集 `[A-Za-z0-9._-]` 时采信，否则生成新值；回显与日志都用清洗后的值 |
+| Z11-3 | P2 | 调用方写的 `X-Request-Id` 无长度/字符集上限，被原样回显进响应头并写进访问日志（60 000 字节 ⇒ `echoed=60000 logged=60157`） | `internal/httpapi/middleware.go:138-142`（`:262` 入日志） | FIXED（6665193） | 仅 `len <= 128` 且字符集 `[A-Za-z0-9._-]` 时采信，否则生成新值；回显与日志都用清洗后的值 |
 | Z12-1 | P2 | 缺 `id:` 前缀的 `RE0AUTH_OIDC_RETIRED_TOKEN_KEYS` 把密钥原文打进启动日志（退役密钥仍解密轮换前签发的 access token） | `cmd/re0auth/main.go:1410`（`:1414` 同形） | FIXED（17914d4） | 消息只报位置/形状；CS-8 守卫补 plant 该变量 |
 | Z12-2 | P2 | `-rotate-keys` 扫到 0 条时退 0，恰好满足文档写下的放行闸门（「`rewrapped=0 skipped=0` 且退出 0」） | `cmd/re0auth/main.go:1209-1231`（文档闸门 `config/re0auth.example.toml:229-231`） | OPEN | `Scanned == 0` 时非零退出 |
 | Z12-4 | P2 | 文件里配的列表无法被环境清空（`RE0AUTH_ADMIN_SUBJECTS=""` ≠ 无人）：空串被当未设置，`/v1/admin` 仍挂着且无日志 | `cmd/re0auth/config.go:799`（`:564`、`:655`） | OPEN | 与 `rate_limit` 同形用指针区分缺省与显式空，或启动日志公布三个列表生效长度 |
@@ -103,7 +103,7 @@
 | Z12-9 | P2 | 文件里的池大小被截断到 int32（`4294967297` 读成 1、`4294967296` 读成 0），环境变量路径却拒绝越界值——两路径语义不一致 | `cmd/re0auth/config.go:1062-1067`（环境路径 `:1116-1126`） | OPEN-PG | 先做 `math.MinInt32/MaxInt32` 范围检查，或字段声明为 `*int32`；真 pgxpool 实际池大小只能在真 Postgres 上定论 |
 | Z13-1 | P2 | 两个备份脚本默认输出目录 `./backups` 既不在 `.gitignore` 也不在 `.dockerignore`；一次 `git add -A` 送上 KEK 与全部长期密钥 | `scripts/backup.sh:12`、`scripts/backup-keys.sh:23` | FIXED（17914d4） | `.gitignore` 与 `.dockerignore` 各加 `/backups/`、`*.dump`、`*.env`（或默认落点改 `$TMPDIR`/必填） |
 | Z13-3 | P2 | 运行镜像不带 npm 归属清单，而 Makefile 自己要求它随「每个二进制、归档和镜像」分发（SPA 经 `go:embed` 进同一二进制） | `Dockerfile:74`（`Makefile:205-221`） | FIXED（17914d4） | web 阶段落 `pnpm licenses list --json` 到 `/out/`，runtime `COPY`，并更新 `workflows_test.go:21-41` 与 `artifacts_test.go:606` 两处白名单 |
-| Z13-4 | P2（age 半）/ P3（umask 半） | `backup-keys.sh` 的 umask 与 age 检查都在它们该保护的东西之后：age 缺失时明文密钥 env 残留（复核升 P2、与 P2-14 同形）；`mkdir` 早于 `umask 077`（umask 半维持 P3，权限位本机 noacl 无效、不采信） | `scripts/backup-keys.sh:24`（`:72`、`:73/:45`、`:100`） | OPEN | `umask 077` 提到 `:24` 之前；age 存在性与 recipient 检查提到 `: > "$out"` 之前，或整段写入放 `mktemp -d` 并失败清理 |
+| Z13-4 | P2（age 半）/ P3（umask 半） | `backup-keys.sh` 的 umask 与 age 检查都在它们该保护的东西之后：age 缺失时明文密钥 env 残留（复核升 P2、与 P2-14 同形）；`mkdir` 早于 `umask 077`（umask 半维持 P3，权限位本机 noacl 无效、不采信） | `scripts/backup-keys.sh:24`（`:72`、`:73/:45`、`:100`） | FIXED（6665193） | `umask 077` 提到 `:24` 之前；age 存在性与 recipient 检查提到 `: > "$out"` 之前，或整段写入放 `mktemp -d` 并失败清理 |
 | Z13V-1 | P2 | `.dockerignore` 只覆盖了 `.gitignore` 的一部分：审计工作区（`scratchpad/`，内含真 `keys.env` KEK + OIDC PEM 私钥）也进构建上下文与 backend 层 | `.dockerignore`（无行号；`.gitignore:70/:37/:46/:23/:29`） | FIXED（17914d4） | `.dockerignore` 加 `scratchpad`、`go.work`、`go.work.sum`、`*.local.toml`、`*.out`、`bench.txt`、`load.txt`、`report.md` |
 | Z11-6 | P3 | `ResponseHeaderTimeout` 默认 30s 高于出站客户端默认 `Timeout` 20s，与自身注释相反。**复核更正影响句**：报告称「错误退化为 `context deadline exceeded`」是错的，Go 仍写成 `(Client.Timeout exceeded while awaiting headers)`、仍点名 headers 阶段 | `httpclient/outbound.go:36-39`（默认 `:53-63`、`:261`；`cmd/re0auth/main.go:492-507`） | OPEN | 把默认值改到低于整体 `Timeout`（如 15s）；无安全影响 |
 | Z12-5 | P3 | `-migrate-down` 先跑整套 serving 期校验，缺审计链密钥就无法回滚（拒绝理由与回滚无关） | `cmd/re0auth/main.go:332`（`:369-371`、`:1158-1166`） | OPEN | 给 `loadConfig` 一个「只解析 DSN/池」的模式（仍拒它真用得到的坏值）。这是一次裁定 |
@@ -168,8 +168,8 @@
 | Z21-4 | P3 | 设备码 user code 唯一性两表不对称：`oidc_devices` 有同名表达式 UNIQUE 索引，`oauth_device_authorizations` 只有非唯一索引；`SaveDevice` 是裸 INSERT、`freeUserCode` 查重与插入之间无约束，撞码时审批可能落到另一条流（同账号自己的设备申报，非跨账号泄露） | `internal/store/postgres/migrations/0001_init.sql:94-95` | OPEN | 新迁移给该表补表达式 UNIQUE 索引；`SaveDevice` 用 `isUniqueViolation` 走「重新生成 user code」路径；内存后端同步（其 `byUser` 是无条件覆盖，比 PG 更确定地丢前一条）。（来源：`Z21-VERIFIED.md:74`） |
 | Z21-3 | P3 | 21 个迁移共 39 条 `CREATE INDEX`，0 个 `NO TRANSACTION`、0 条 `CONCURRENTLY`，goose 单事务 ⇒ 每条文件的索引总时长即写冻结窗口；多索引文件 8 个，最坏 `0012` 一次 9 条（跨 7 表），`0009` 还在同事务里 `ADD COLUMN … NOT NULL DEFAULT now()` 全表重写。第六轮 04-7 只点了 0022 的 4 条（时长部分 HYPOTHESIS，需真库 `pg_locks`） | `internal/store/postgres/migrations/0012_indexes.sql`（未记录行号） | OPEN | ADR-0008 §2 补记「索引迁移在役升级按表规模线性冻结写」并点名 0012/0008；后续索引迁移改 `NO TRANSACTION`+`CONCURRENTLY`；拆开 0009 这类「加列+建索引同文件」。（来源：`Z21-VERIFIED.md:63`） |
 | 22-2 | P3 | round-5 给 FO-04 作证的 `TestProbeRegistryAcceptsPathEscapingNames` 循环里只有 `t.Logf`、无任何断言，结构上不可能失败而在 HEAD PASS；FO-04 的「畸形 game/name 被接受」这一半实际无守卫，回归不会被发现（证据链缺陷，非运行时攻击面） | `internal/zzprobe/federation/raw_test.go:284-317` | OPEN | 改成真断言（`..`、含 `/`、`?`、`#`、`\`、NUL、CR/LF、首尾空白、4096 字节等必须被 `NewRegistry` 拒绝）；或在 FO-04 结案前从证据清单移除、只留 `TestProbeScopeInjectionFromRegistry`。（来源：`22-audit5-red-reconciliation.md:146`） |
-| N-01 | P2 | 两个后端的 sweep 注释都用一个**假的不变量**为自己开脱：refresh 读路径与设备消费路径实际上都不判期限 | `internal/store/postgres/sweep.go:10-13`、`internal/store/memory/oidc.go:935-944` | OPEN | 给两处读路径补期限谓词（= G-2/G-7 的修法），改写注释，并加逐表守卫测试断言「过期行在 sweep 前已被读路径拒绝」 |
-| N-02 | P2 | refresh 热路径的数据库故障被**无条件**折叠成 `400 invalid_grant`，且库层硬编码、改 store 也换不来 500 | `internal/store/postgres/oidc.go:434-436`、`internal/store/memory/oidc.go:574` | OPEN | ①store 先分类（`pgx.ErrNoRows`→无效，其余 `%w` 保留）；②本项目边界补计数/告警（或依赖 readyz 摘实例）；③把库限制记入 `docs/dependencies.md` |
+| N-01 | P2 | 两个后端的 sweep 注释都用一个**假的不变量**为自己开脱：refresh 读路径与设备消费路径实际上都不判期限 | `internal/store/postgres/sweep.go:10-13`、`internal/store/memory/oidc.go:935-944` | FIXED（6665193） | 给两处读路径补期限谓词（= G-2/G-7 的修法），改写注释，并加逐表守卫测试断言「过期行在 sweep 前已被读路径拒绝」 |
+| N-02 | P2 | refresh 热路径的数据库故障被**无条件**折叠成 `400 invalid_grant`，且库层硬编码、改 store 也换不来 500 | `internal/store/postgres/oidc.go:434-436`、`internal/store/memory/oidc.go:574` | FIXED（6665193） | ①store 先分类（`pgx.ErrNoRows`→无效，其余 `%w` 保留）；②本项目边界补计数/告警（或依赖 readyz 摘实例）；③把库限制记入 `docs/dependencies.md` |
 | N-03 | P3 | 公开引擎 `oauth/` 仍**完全静默**地吞掉审计失败——P2-1 的修复只覆盖了 OP store | `oauth/as.go:338-346` | OPEN | 照抄 OP store 形状（`slog.Error` + 计数指标），并把 P2-1 的守卫扩到 `oauth/` 包调用点 |
 | N-04 | P2 | 全部安全探针（184 个文件）**不在 CI 里**：CI 全文 0 处 `-tags`，所有 P0/P1 修复没有回归防线 | `.github/workflows/ci.yml:158-162` | OPEN | CI 增作业按**已知绿集合**跑 `-tags audit5\|audit6\|audit7`；仍红的 19 条 audit5 探针要么修、要么 `t.Skip` 并写明编号/原因，不许靠标签藏起来 |
 
@@ -198,6 +198,12 @@
   - Z13V-1 — `.dockerignore` 补 `scratchpad` 与其余被 gitignore 的本地状态 — `17914d4`
   - Z21-2 / Z21V-1 — 0013/0014 的 Down 改空段、Up 幂等，`MigrateDown` 在链上有行时拒退；ADR-0008 §5 — `17914d4`
   - Z14-3 — `jwks_uri` 默认同源、显式配置精确匹配；`Credentials.JWKSURL` 与 `idp.*.jwks_uri` 提供跨源出口 — `17914d4`
+- 第七轮 T2 批次（「首发窗口必修」；见 `docs/issues/P2-triage.md`，本轮先收 6 条）：
+  - Z11-3 — `X-Request-Id` 仅在 `len<=128` 且 `[A-Za-z0-9._-]` 时采信；原本恒红的探针改写为回归守卫 — `6665193`
+  - Z13-4 — `backup-keys.sh` 的 umask/age 守卫提前到它们保护的动作之前，age 失败清理半成品；黑盒探针翻转为断言不残留 — `6665193`
+  - Z09-4 — 上游字节预算加 per-caller 分摊（镜像 `max_in_flight` 的既有裁定），注释与容量/决策文档同步 — `6665193`
+  - N-01 — sweep 注释不再宣称假不变量；postgres 逐表守卫（显式豁免）+ memory 逐表守卫（G-7/Z07-1 带编号 `t.Skip`） — `6665193`
+  - N-02 — 刷新热路径库故障与「未知令牌」分离（哨兵 + `%w`），`internal/oidchttp` 装饰器计入 `re0auth_store_unavailable_total`，库硬编码 `invalid_grant` 记入 `docs/dependencies.md` — `6665193`
 
 ## 有意不做 / 已裁定
 

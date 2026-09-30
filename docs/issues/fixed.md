@@ -28,6 +28,12 @@
 - Z13V-1 — `.dockerignore` 补 `scratchpad` 与其余被 gitignore 的本地状态 — `17914d4`
 - Z21-2 / Z21V-1 — 0013/0014 的 Down 改空段、Up 幂等，`MigrateDown` 在链上有行时拒退；ADR-0008 §5 — `17914d4`
 - Z14-3 — `jwks_uri` 默认同源、显式配置精确匹配；`Credentials.JWKSURL` 与 `idp.*.jwks_uri` 提供跨源出口 — `17914d4`
+- 第七轮 T2 批次（「首发窗口必修」；见 `docs/issues/P2-triage.md`，本轮先收 6 条）：
+- Z11-3 — `X-Request-Id` 仅在 `len<=128` 且 `[A-Za-z0-9._-]` 时采信；原本恒红的探针改写为回归守卫 — `6665193`
+- Z13-4 — `backup-keys.sh` 的 umask/age 守卫提前到它们保护的动作之前，age 失败清理半成品；黑盒探针翻转为断言不残留 — `6665193`
+- Z09-4 — 上游字节预算加 per-caller 分摊（镜像 `max_in_flight` 的既有裁定），注释与容量/决策文档同步 — `6665193`
+- N-01 — sweep 注释不再宣称假不变量；postgres 逐表守卫（显式豁免）+ memory 逐表守卫（G-7/Z07-1 带编号 `t.Skip`） — `6665193`
+- N-02 — 刷新热路径库故障与「未知令牌」分离（哨兵 + `%w`），`internal/oidchttp` 装饰器计入 `re0auth_store_unavailable_total`，库硬编码 `invalid_grant` 记入 `docs/dependencies.md` — `6665193`
 
 ### 第 6 轮
 
@@ -40,6 +46,8 @@
 - P1-1/P1-2 — vault 轮换窄写/CAS（lost-update）；第 6 轮新探针验证「修对、修全」（`03-crypto-vault.md:173-193`）。
 - P2-32 — 设备路径单时钟（bf81b2a）；三处 SQL 参数化，未引入新洞（`03-crypto-vault.md:195-201`）。
 - G-9 — 刷新签发的 id_token 保留原 nonce（OIDC Core §12.2）：`RefreshRequest`/`NonceOf`、两个 store 在 refresh 行上持久化并随轮换继承、`SetUserinfoFromRequest`、迁移 `0026`；audit6 里原本断言「刷新后没有 nonce」的探针翻转为断言保留 — `17914d4`
+- G-23 — 6 处原始 `usr_…` 不再进 slog（admin/auth/federation bind+refresh/httpapi binding_routes；第 7 处 account_routes 由 k1 收掉）；audit5 静态守卫由红翻绿 — `6665193`
+- G-13 — `GetRefreshTokenInfo` 现在把 `noRows` 报成哨兵、其余报 `oidc.ErrServerError`（库的 500 分支恢复可达）；经查在 `79d7333` 随 G-3 一并修掉，注册表此前陈旧 — `79d7333`
 
 ### 第 5 轮
 
