@@ -77,6 +77,12 @@ for candidate in python3 python; do
   fi
 done
 [[ -n "${PYTHON}" ]] || fail "a working python3 (or python) is required"
+# This machine's Python defaults its text I/O to the locale codec (GBK on a Chinese
+# Windows install) while every API response here is UTF-8: `json.load(sys.stdin)`
+# died with "Expecting ',' delimiter" after GBK mangled a non-ASCII commit author.
+# Force UTF-8 for every child instead of depending on the locale.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
 
 # The dispatch body: every input is a string in the REST API.
 INPUTS="$("$PYTHON" -c '
