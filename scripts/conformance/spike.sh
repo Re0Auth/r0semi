@@ -368,6 +368,7 @@ if (( PLAN_REQUESTED )); then
     --timeout "${CONFORMANCE_PLAN_TIMEOUT_SECONDS:-1800}" \
     --module-timeout "${CONFORMANCE_PLAN_MODULE_TIMEOUT_SECONDS:-180}" \
     --visit-rounds "${CONFORMANCE_PLAN_VISIT_ROUNDS:-3}" \
+    --visit-delay "${CONFORMANCE_PLAN_VISIT_DELAY_SECONDS:-1}" \
     --max-modules "${CONFORMANCE_PLAN_MAX_MODULES:-0}" \
     > "${WORK}/plan-run.json" 2> "${WORK}/plan-run.err"
   run_rc=$?

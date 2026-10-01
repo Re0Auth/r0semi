@@ -104,7 +104,7 @@ def run_runner(api, payload_path):
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     return subprocess.run(
         [sys.executable, "scripts/conformance/run-plan.py", "--api", api, "--payload", payload_path,
-         "--module-timeout", "20", "--visit-rounds", "2"],
+         "--module-timeout", "20", "--visit-rounds", "2", "--visit-delay", "0"],
         capture_output=True, text=True, cwd=root)
 
 

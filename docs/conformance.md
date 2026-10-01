@@ -90,8 +90,8 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 `CONFORMANCE_REQUIRE_PLAN=1`, `CONFORMANCE_REDIRECT_URI`,
 `CONFORMANCE_PLAN_MAX_MODULES`, `CONFORMANCE_PLAN_TIMEOUT_SECONDS`,
 `CONFORMANCE_PLAN_MODULE_TIMEOUT_SECONDS`, `CONFORMANCE_PLAN_VISIT_ROUNDS`,
-`CONFORMANCE_CLIENT_SECRET`. The OP-side exemption is
-`RE0AUTH_CLIENT_ALLOW_MISSING_PKCE`; the script writes
+`CONFORMANCE_PLAN_VISIT_DELAY_SECONDS`, `CONFORMANCE_CLIENT_SECRET`. The OP-side
+exemption is `RE0AUTH_CLIENT_ALLOW_MISSING_PKCE`; the script writes
 `[client] allow_missing_pkce = true` itself once a plan is requested.
 
 ## The first real finding: mandatory PKCE vs the Basic OP profile
