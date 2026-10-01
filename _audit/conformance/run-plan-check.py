@@ -99,13 +99,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             else:
                 # The suite's implicitCallback page: the flow only advances when the
-                # JavaScript POST runs, which the runner must emulate.
+                # JavaScript POST runs, which the runner must emulate. The URL is
+                # deliberately RELATIVE, exactly as the suite renders it, so the
+                # check also pins the browser-style urljoin resolution.
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 page = ("<html><script>"
-                        "xhr.open('POST', \"http://127.0.0.1:%d/implicit/abc\", true);"
-                        "xhr.send(window.location.hash);</script></html>"
-                        % self.server.server_address[1])
+                        "xhr.open('POST', \"/implicit/abc\", true);"
+                        "xhr.send(window.location.hash);</script></html>")
                 body = page.encode("utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()

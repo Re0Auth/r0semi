@@ -117,7 +117,12 @@ def submit_implicit_page(final_url, body, insecure):
     match = IMPLICIT_SUBMIT_RE.search(body or "")
     if not match:
         return None
-    submit_url = match.group("url")
+    # A browser resolves the script's URL against the page it came from; the suite
+    # renders it relatively (base_url + "/implicit/<random>"), and urllib would
+    # otherwise fail with "no host given".
+    submit_url = urllib.parse.urljoin(final_url, match.group("url"))
+    if not urllib.parse.urlsplit(submit_url).netloc:
+        return "implicit submit skipped: unresolvable URL %r (page %s)" % (match.group("url"), final_url)
     fragment = urllib.parse.urlsplit(final_url).fragment
     opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(),
