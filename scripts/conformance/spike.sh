@@ -479,7 +479,7 @@ if lines:
     print()
     print("### Why modules did not pass")
     print()
-    for line in lines[:40]:
+    for line in lines[:200]:
         print(line)
 PY
     fi

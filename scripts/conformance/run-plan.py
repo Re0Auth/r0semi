@@ -296,19 +296,25 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_ro
         if state in TERMINAL_STATUSES:
             status = state
             break
-        # Not terminal: offer any front-channel URL it is waiting on, then give the
-        # flow more time. Only a round that offers nothing new counts as idle, and
-        # an idle round waits before the next one rather than spinning.
+        # Not terminal: offer any front-channel URL it is waiting on. A module that
+        # is RUNNING (a second authorization, a userinfo round) is making progress
+        # and must not be given up on; only a WAITING module with nothing new to
+        # visit is genuinely stuck.
+        current = request(api, "GET", "/api/info/" + urllib.parse.quote(test_id),
+                          insecure=insecure).get("status")
         outcomes, new, urls = visit_front_channel(api, test_id, insecure, seen, visit_delay)
         seen.update(urls)
         visits.extend(outcomes)
         if new:
             idle = 0
             continue
-        idle += 1
-        if idle >= visit_rounds:
-            stuck_exit = True
-            break
+        if current == "WAITING":
+            idle += 1
+            if idle >= visit_rounds:
+                stuck_exit = True
+                break
+        else:
+            idle = 0
         time.sleep(2)
     info = request(api, "GET", "/api/info/" + urllib.parse.quote(test_id), insecure=insecure)
     result = info.get("result")
