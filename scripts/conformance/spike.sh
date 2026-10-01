@@ -110,6 +110,9 @@ export RE0AUTH_ISSUER="${ISSUER}"
 export RE0AUTH_COOKIE_SECURE=true
 export CONFORMANCE_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET:-spike-secret}"
 export RE0AUTH_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET}"
+# The plan's second client (see the [[clients]] block below).
+export CONFORMANCE_CLIENT2_SECRET="${CONFORMANCE_CLIENT2_SECRET:-spike-secret-2}"
+export RE0AUTH_CLIENT2_SECRET="${CONFORMANCE_CLIENT2_SECRET}"
 
 # The suite's redirect URI is generated per deployment; override it with
 # CONFORMANCE_REDIRECT_URI once the suite shows you its client configuration. It
@@ -138,8 +141,25 @@ fi
 # actually requested — a connectivity-only run keeps the ordinary, fully strict
 # client.
 PKCE_EXEMPT_LINE=""
+SECOND_CLIENT_BLOCK=""
 if (( PLAN_REQUESTED )); then
   PKCE_EXEMPT_LINE="allow_missing_pkce = true"
+  # The Basic OP plan's second client is a SEPARATE registration. Its refresh
+  # module ends with "Attempting to use refresh_token issued to client 2 with
+  # client 1", which must answer invalid_grant; while both plan clients pointed at
+  # one registration the request legitimately succeeded and the module was red for
+  # the harness's reason, not the OP's. The suite uses the same redirect URI for
+  # both clients, so only the credentials differ. Registry-side, [[clients]] is an
+  # ordinary additional client: same validation, same drift refusal.
+  SECOND_CLIENT_BLOCK=$(cat <<TOMLEOF
+
+[[clients]]
+id = "conformance2"
+secret_env   = "RE0AUTH_CLIENT2_SECRET"
+redirect_uris = ["${REDIRECT_URI}"]
+allow_missing_pkce = true
+TOMLEOF
+)
 fi
 cat > "${WORK}/re0auth.toml" <<TOMLEOF
 [server]
@@ -152,6 +172,7 @@ id = "conformance"
 secret_env   = "RE0AUTH_CLIENT_SECRET"
 redirect_uris = ["${REDIRECT_URI}"]
 ${PKCE_EXEMPT_LINE}
+${SECOND_CLIENT_BLOCK}
 TOMLEOF
 
 # ---- 1. the OP --------------------------------------------------------------

@@ -21,14 +21,26 @@ export RE0AUTH_OIDC_SIGNING_KEY="$(cat "${WORK}/signing-key")"
 export RE0AUTH_ISSUER="https://re0auth.test:8443"
 export RE0AUTH_COOKIE_SECURE=true
 export RE0AUTH_CLIENT_SECRET="spike-secret"
+export RE0AUTH_CLIENT2_SECRET="spike-secret-2"
 REDIRECT_URI="https://oidf-suite:8443/test/a/conformance/callback"
 
 # Mirror the spike: the mandatory-PKCE exemption for the suite's client is written
-# only when the run is expected to execute a plan (here: a conformance-tagged build).
+# only when the run is expected to execute a plan (here: a conformance-tagged build),
+# and a plan also seeds the suite's SECOND client as its own registration.
 TAGS="${CHECK_TAGS:-}"
 PKCE_EXEMPT_LINE=""
+SECOND_CLIENT_BLOCK=""
 if [[ -n "${TAGS}" ]]; then
   PKCE_EXEMPT_LINE="allow_missing_pkce = true"
+  SECOND_CLIENT_BLOCK=$(cat <<TOMLEOF
+
+[[clients]]
+id = "conformance2"
+secret_env = "RE0AUTH_CLIENT2_SECRET"
+redirect_uris = ["${REDIRECT_URI}"]
+allow_missing_pkce = true
+TOMLEOF
+)
 fi
 
 cat > "${WORK}/re0auth.toml" <<TOMLEOF
@@ -42,6 +54,7 @@ id = "conformance"
 secret_env = "RE0AUTH_CLIENT_SECRET"
 redirect_uris = ["${REDIRECT_URI}"]
 ${PKCE_EXEMPT_LINE}
+${SECOND_CLIENT_BLOCK}
 TOMLEOF
 
 if [[ -n "${TAGS}" ]]; then
@@ -82,6 +95,9 @@ if [ "${ok}" -eq 1 ]; then
     grep -q "exempt from mandatory PKCE" "${WORK}/op.log" \
       && echo "PKCE_EXEMPT_STARTUP_WARNING_PRESENT" \
       || { echo "allow_missing_pkce was configured but startup did not report the exemption"; exit 1; }
+    grep -q "client_id=conformance2" "${WORK}/op.log" \
+      && echo "SECOND_CLIENT_REGISTERED" \
+      || { echo "the [[clients]] entry was not registered"; tail -n 10 "${WORK}/op.log"; exit 1; }
   fi
   curl -fsS "http://127.0.0.1:8080/.well-known/openid-configuration" | head -c 200; echo
 else

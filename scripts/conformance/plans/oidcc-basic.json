@@ -14,8 +14,8 @@
       "client_secret": "spike-secret"
     },
     "client2": {
-      "client_id": "conformance",
-      "client_secret": "spike-secret"
+      "client_id": "conformance2",
+      "client_secret": "spike-secret-2"
     },
     "client_secret_post": {
       "client_id": "conformance",

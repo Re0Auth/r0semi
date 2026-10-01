@@ -35,7 +35,8 @@ placeholders for another plan. What must line up:
 | `variant` keys | **only the variants that plan leaves to the user.** The Basic OP plan offers just `server_metadata` (`static`/`discovery`) and `client_registration` (`static_client`/`dynamic_client`) — it fixes `response_type`, `client_auth_type` and `response_mode` itself. Sending a plan-fixed variant is a 400: `Variant 'client_auth_type' has been set by user, but test plan already sets this variant for module 'oidcc-server'`. |
 | `config.server.discoveryUrl` | the OP's discovery URL, `https://re0auth.test:8443/.well-known/openid-configuration` |
 | `config.client.client_id` / `client_secret` | `conformance` / `CONFORMANCE_CLIENT_SECRET` (default `spike-secret`) — what the spike seeds in `[client]` |
-| `config.client2`, `config.client_secret_post` | the plan lists `client2.client_secret` and `client_secret_post.client_secret` as required fields; the spike points both at the same seeded client |
+| `config.client2` | a **separate** seeded client: `conformance2` / `CONFORMANCE_CLIENT2_SECRET` (default `spike-secret-2`), seeded as a `[[clients]]` entry when a plan is requested. The plan's refresh module uses it to try "client 2's refresh token with client 1" and expects `invalid_grant`, which can only be exercised by two real registrations. |
+| `config.client_secret_post` | the plan lists `client_secret_post.client_secret` as a required field; the spike points it at the same `conformance` registration, because it selects the client-auth *method*, not a different client. |
 | `config.alias` | the path segment the suite puts in its redirect URI |
 
 The catalogue entry for each plan lists its `variants` (with `variantValues`) and
@@ -48,8 +49,11 @@ the TLS front the spike runs). The spike seeds exactly that into the OP's `[clie
 unless `redirect_uri` is overridden, so `alias: "conformance"` matches by default.
 
 If the plan has modules that need a **second client** (the Basic OP plan has a
-`client_secret_post` group), add those fields too — see the
-`client_secret_post` block in `oidcc-basic.json`.
+`client_secret_post` group and a `client2` refresh check), add those fields too —
+see the `client2` and `client_secret_post` blocks in `oidcc-basic.json`. A distinct
+`client2` requires the spike to seed a second registration, which it does through
+the OP's `[[clients]]` array; a plan whose `client2` reuses the first client's id
+cannot make the cross-client refresh check fail.
 
 A mismatch surfaces as `redirect_uri is not registered` from the OP, or a suite
 complaint that the authorization response went to the wrong place.
