@@ -34,6 +34,9 @@ DRY_RUN=0
 REQUIRE_PASS=0
 NO_DOWNLOAD=0
 SELF_TEST=0
+# --run-id attaches to a run that already exists (no dispatch, no lookup): the way
+# to read a run someone else triggered, or one whose dispatch already happened.
+ATTACH_RUN_ID=""
 
 log()  { printf 'dispatch: %s\n' "$*"; }
 warn() { printf 'dispatch: WARN — %s\n' "$*" >&2; }
@@ -54,6 +57,7 @@ while (( $# )); do
     --redirect-uri)  REDIRECT_URI="$2"; shift 2 ;;
     --require-plan)  REQUIRE_PLAN=1; shift ;;
     --out)           OUT_DIR="$2"; shift 2 ;;
+    --run-id)        ATTACH_RUN_ID="$2"; shift 2 ;;
     --artifact)      ARTIFACT="$2"; shift 2 ;;
     --interval)      INTERVAL="$2"; shift 2 ;;
     --timeout)       TIMEOUT="$2"; shift 2 ;;
@@ -158,14 +162,21 @@ api() { # <method> <path> [json-body]
 }
 
 # ---- dispatch ---------------------------------------------------------------
+if [[ -n "${ATTACH_RUN_ID}" ]]; then
+  RUN_ID="${ATTACH_RUN_ID}"
+  RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+  log "attaching to run ${RUN_ID} (no dispatch)"
+else
 log "dispatching ${WORKFLOW} on ${REF} (plan_json=${PLAN_JSON:-<empty>}, max_modules=${MAX_MODULES})"
 DISPATCH_AT="$(date -u +%s)"
 api POST "/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches" "${INPUTS}" >/dev/null \
   || fail "the dispatch was refused: check the token's 'workflow' scope and that ${WORKFLOW} has workflow_dispatch"
+fi
 
 # ---- find the run -----------------------------------------------------------
 # The cron also triggers this workflow, so the run is matched by event, branch and
-# creation time rather than assumed to be the newest.
+# creation time rather than assumed to be the newest. --run-id skips this entirely.
+if [[ -z "${RUN_ID}" ]]; then
 RUN_ID=""
 RUN_URL=""
 for _ in $(seq 1 24); do
@@ -196,6 +207,7 @@ print("%s|%s|%s|%s" % best[1:] if best else "")
   sleep 5
 done
 [[ -n "${RUN_ID}" ]] || fail "the dispatched run never appeared (token may lack Actions: read)"
+fi
 
 RUN_URL="${RUN_URL:-https://github.com/${REPO}/actions/runs/${RUN_ID}}"
 log "run ${RUN_ID}: ${RUN_URL}"
