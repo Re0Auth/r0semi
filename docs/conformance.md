@@ -121,9 +121,11 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 `CONFORMANCE_REQUIRE_PLAN=1`, `CONFORMANCE_REDIRECT_URI`,
 `CONFORMANCE_PLAN_MAX_MODULES`, `CONFORMANCE_PLAN_TIMEOUT_SECONDS`,
 `CONFORMANCE_PLAN_MODULE_TIMEOUT_SECONDS`, `CONFORMANCE_PLAN_VISIT_ROUNDS`,
-`CONFORMANCE_PLAN_VISIT_DELAY_SECONDS`, `CONFORMANCE_CLIENT_SECRET`. The OP-side
-exemption is `RE0AUTH_CLIENT_ALLOW_MISSING_PKCE`; the script writes
-`[client] allow_missing_pkce = true` itself once a plan is requested.
+`CONFORMANCE_PLAN_VISIT_DELAY_SECONDS`, `CONFORMANCE_CLIENT_SECRET`,
+`CONFORMANCE_CLIENT2_SECRET`. The OP-side exemption is
+`RE0AUTH_CLIENT_ALLOW_MISSING_PKCE`; the script writes
+`[client] allow_missing_pkce = true` itself once a plan is requested, and also seeds
+the plan's second client as a `[[clients]]` entry (see the known gap below).
 
 ## The first real finding: mandatory PKCE vs the Basic OP profile
 
@@ -173,18 +175,26 @@ exemption — check `op.log` for the startup WARN and for
   authorization code + PKCE + refresh + device, and not dynamic registration or
   PAR. The plan allowlist must name what is supported and record the rest as
   intentionally out of scope, never silently skipped.
-- **One seeded client vs the plan's two.** `[client]` seeds exactly one downstream
-  client, so the spike points the Basic OP plan's `client2` at the same registration.
-  The plan's refresh module ends with "Attempting to use refresh_token issued to
-  client 2 with client 1" and expects `invalid_grant`; with one shared client the
-  request legitimately succeeds and the module reports a failure that is a fixture
-  limitation, not an OP defect. The behaviour is enforced (the engine's
-  `AuthorizeRefreshClient` rejects a client mismatch, and `oauth/as.go` returns
-  `invalid_grant` for a token issued to another client) and pinned by
+- **`oidcc-server`'s `client_id` warning is known behaviour, not a defect.** The
+  engine's `NewIDTokenClaims` always writes a non-standard `client_id` claim into the
+  `id_token` and offers no override point. The value is the RP's own `client_id` — no
+  new information — and OIDC Core does not forbid extra claims, so removing it would
+  mean re-signing the JWT at the token layer for no gain. Recorded as O-10 in
+  [oidc-decision.md](./oidc-decision.md); that module stays a WARNING by decision.
+- **Two plan clients, two registrations (addressed by `[[clients]]`).** The Basic OP
+  plan's refresh module ends with "Attempting to use refresh_token issued to client 2
+  with client 1" and expects `invalid_grant`. While the plan's `client2` pointed at
+  the same registration as `client`, that request legitimately succeeded and the
+  module was red for the harness's reason, not the OP's. The OP now seeds a second
+  client through the `[[clients]]` array, and the spike writes
+  `client2.client_id = "conformance2"` with its own secret
+  (`CONFORMANCE_CLIENT2_SECRET`, default `spike-secret-2`), so the check is real. The
+  behaviour itself was already enforced (the engine's `AuthorizeRefreshClient` rejects
+  a client mismatch, and `oauth/as.go` returns `invalid_grant` for a token issued to
+  another client) and is pinned by
   `internal/oidchttp/refresh_client_binding_test.go`
-  (`TestRefreshTokenIsBoundToItsClient`: foreign client → 400 `invalid_grant`, and
-  the refusal does not consume the token). A deployment that wants that module green
-  needs two real client registrations — a config feature this OP does not have yet.
+  (`TestRefreshTokenIsBoundToItsClient`: foreign client → 400 `invalid_grant`, and the
+  refusal does not consume the token).
 - **Headless authorization (addressed by the `conformance` build tag).** The spike's
   OP has no identity provider ("nobody can sign in") and answers every authorization
   with an interactive consent screen by design, so a plan that drives an

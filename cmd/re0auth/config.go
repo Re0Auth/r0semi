@@ -34,14 +34,20 @@ import (
 
 // file is the on-disk schema.
 type file struct {
-	Server   serverSection         `toml:"server"`
-	Storage  storageSection        `toml:"storage"`
-	Upstream upstreamSection       `toml:"upstream"`
-	Vault    vaultSection          `toml:"vault"`
-	Client   clientSection         `toml:"client"`
-	Admin    adminSection          `toml:"admin"`
-	IdP      map[string]idpSection `toml:"idp"`
-	Sources  []sourceSection       `toml:"sources"`
+	Server   serverSection   `toml:"server"`
+	Storage  storageSection  `toml:"storage"`
+	Upstream upstreamSection `toml:"upstream"`
+	Vault    vaultSection    `toml:"vault"`
+	Client   clientSection   `toml:"client"`
+	// Clients adds downstream clients beyond the primary [client] section, one
+	// [[clients]] entry each. They are registered with the same validation, the
+	// same drift refusal and the same PKCE default as [client]; see
+	// docs/architecture.md. An entry may also be the only client a deployment has,
+	// in which case the [client] section is left out entirely.
+	Clients []clientSection       `toml:"clients"`
+	Admin   adminSection          `toml:"admin"`
+	IdP     map[string]idpSection `toml:"idp"`
+	Sources []sourceSection       `toml:"sources"`
 }
 
 // upstreamSection governs the outbound clients — the data plane's source calls
@@ -206,6 +212,26 @@ type clientSection struct {
 	AllowMissingPKCE bool `toml:"allow_missing_pkce"`
 }
 
+// isZero reports whether the section was left out of the file entirely, which is
+// what lets a deployment that configures only [[clients]] entries avoid a stray
+// default `[client]`.
+func (c clientSection) isZero() bool {
+	return c.ID == "" && c.Name == "" && c.SecretEnv == "" &&
+		len(c.RedirectURIs) == 0 && len(c.Scopes) == 0 && !c.AllowMissingPKCE
+}
+
+// clientSpec is one resolved additional client: the [[clients]] entry with its
+// secret already read from the environment. The primary [client] section keeps its
+// own settings fields so a single-client deployment is unchanged.
+type clientSpec struct {
+	ID               string
+	Name             string
+	Secret           string
+	RedirectURIs     []string
+	Scopes           []string
+	AllowMissingPKCE bool
+}
+
 type idpSection struct {
 	ClientID        string `toml:"client_id"`
 	ClientSecretEnv string `toml:"client_secret_env"`
@@ -319,6 +345,13 @@ type settings struct {
 	// clientAllowMissingPKCE is the operator's explicit exemption from mandatory
 	// PKCE for this client. False unless `[client] allow_missing_pkce = true`.
 	clientAllowMissingPKCE bool
+	// extraClients are the resolved [[clients]] entries, in file order. Each goes
+	// through the same validation, registration and drift refusal as [client].
+	extraClients []clientSpec
+	// noPrimaryClient is set when the file has no [client] section at all and
+	// [[clients]] entries take its place: the default `cli` client is then NOT
+	// seeded, because a registration nobody asked for is still a registration.
+	noPrimaryClient bool
 
 	idpCredentials []idp.Credentials
 	sources        []federation.Source
@@ -452,6 +485,45 @@ func configSecretEnvNames(path string) ([]string, error) {
 	}
 	sort.Strings(lines)
 	return lines, nil
+}
+
+// resolveClientSpec turns one [[clients]] entry into the shape the registry is
+// seeded from, reading its secret from the named environment variable. A secret is
+// named in the file, never written there, exactly as for [client].
+//
+// An entry must name an id and at least one redirect URI: guessing a redirect for
+// a client the operator listed explicitly is how a client ends up allowlisted on
+// an origin nobody intended. Name and scopes keep [client]'s defaults.
+func resolveClientSpec(index int, entry clientSection) (clientSpec, error) {
+	id := strings.TrimSpace(entry.ID)
+	if id == "" {
+		return clientSpec{}, fmt.Errorf("clients[%d]: id is required", index)
+	}
+	if len(entry.RedirectURIs) == 0 {
+		return clientSpec{}, fmt.Errorf("clients[%d] (%s): redirect_uris is required "+
+			"(no default redirect is guessed for a client that was listed explicitly)", index, id)
+	}
+	spec := clientSpec{
+		ID:               id,
+		Name:             strings.TrimSpace(entry.Name),
+		RedirectURIs:     entry.RedirectURIs,
+		Scopes:           entry.Scopes,
+		AllowMissingPKCE: entry.AllowMissingPKCE,
+	}
+	if spec.Name == "" {
+		spec.Name = id
+	}
+	if len(spec.Scopes) == 0 {
+		spec.Scopes = []string{"account.id"}
+	}
+	if entry.SecretEnv != "" {
+		value, err := config.Secret(entry.SecretEnv, fmt.Sprintf("clients[%d].secret_env", index))
+		if err != nil {
+			return clientSpec{}, err
+		}
+		spec.Secret = value
+	}
+	return spec, nil
 }
 
 // loadConfig reads the TOML file at path (empty = environment only), applies the
@@ -796,32 +868,59 @@ func loadConfig(path string) (settings, error) {
 		cfg.RetiredKEKs = append(cfg.RetiredKEKs, retiredKEK{ID: retired.KEKID, KEK: key})
 	}
 
-	// Downstream client.
-	cfg.clientID = config.FirstNonEmpty(os.Getenv("RE0AUTH_CLIENT_ID"), f.Client.ID, "cli")
-	cfg.clientName = config.FirstNonEmpty(os.Getenv("RE0AUTH_CLIENT_NAME"), f.Client.Name, "First-party client")
-	cfg.clientRedirects = f.Client.RedirectURIs
-	if len(cfg.clientRedirects) == 0 {
-		cfg.clientRedirects = []string{cfg.Issuer + "/callback"}
-	}
-	cfg.clientScopes = f.Client.Scopes
-	if len(cfg.clientScopes) == 0 {
-		cfg.clientScopes = []string{"account.id"}
-	}
-	if f.Client.SecretEnv != "" {
-		value, err := config.Secret(f.Client.SecretEnv, "client.secret_env")
+	// Downstream clients. [client] is the primary one and keeps the environment
+	// overrides; it may be omitted only when [[clients]] entries take its place, so
+	// a deployment that configures its clients as an array never also gets the
+	// default `cli` registration it did not ask for.
+	clientEnvID := strings.TrimSpace(os.Getenv("RE0AUTH_CLIENT_ID"))
+	cfg.noPrimaryClient = len(f.Clients) > 0 && f.Client.isZero() && clientEnvID == ""
+	if !cfg.noPrimaryClient {
+		cfg.clientID = config.FirstNonEmpty(clientEnvID, f.Client.ID, "cli")
+		cfg.clientName = config.FirstNonEmpty(os.Getenv("RE0AUTH_CLIENT_NAME"), f.Client.Name, "First-party client")
+		cfg.clientRedirects = f.Client.RedirectURIs
+		if len(cfg.clientRedirects) == 0 {
+			cfg.clientRedirects = []string{cfg.Issuer + "/callback"}
+		}
+		cfg.clientScopes = f.Client.Scopes
+		if len(cfg.clientScopes) == 0 {
+			cfg.clientScopes = []string{"account.id"}
+		}
+		if f.Client.SecretEnv != "" {
+			value, err := config.Secret(f.Client.SecretEnv, "client.secret_env")
+			if err != nil {
+				return settings{}, err
+			}
+			cfg.clientSecret = value
+		}
+		// The one exemption from mandatory PKCE, off unless the file (or the env)
+		// turns it on. It is resolved here so an invalid env value is a startup error
+		// rather than a silently ignored typo.
+		allowMissingPKCE, err := config.Bool("RE0AUTH_CLIENT_ALLOW_MISSING_PKCE", f.Client.AllowMissingPKCE)
 		if err != nil {
 			return settings{}, err
 		}
-		cfg.clientSecret = value
+		cfg.clientAllowMissingPKCE = allowMissingPKCE
 	}
-	// The one exemption from mandatory PKCE, off unless the file (or the env)
-	// turns it on. It is resolved here so an invalid env value is a startup error
-	// rather than a silently ignored typo.
-	allowMissingPKCE, err := config.Bool("RE0AUTH_CLIENT_ALLOW_MISSING_PKCE", f.Client.AllowMissingPKCE)
-	if err != nil {
-		return settings{}, err
+
+	// Additional downstream clients, in file order. Client ids must be unique
+	// across [client] and [[clients]]: two sections describing one client would make
+	// the drift refusal ambiguous, and the registry can only hold one row.
+	seenClientIDs := map[string]string{}
+	if !cfg.noPrimaryClient {
+		seenClientIDs[cfg.clientID] = "the [client] section"
 	}
-	cfg.clientAllowMissingPKCE = allowMissingPKCE
+	for i, entry := range f.Clients {
+		spec, err := resolveClientSpec(i, entry)
+		if err != nil {
+			return settings{}, err
+		}
+		if source, duplicate := seenClientIDs[spec.ID]; duplicate {
+			return settings{}, fmt.Errorf("clients[%d] (%s): this client_id is already configured by %s",
+				i, spec.ID, source)
+		}
+		seenClientIDs[spec.ID] = fmt.Sprintf("clients[%d]", i)
+		cfg.extraClients = append(cfg.extraClients, spec)
+	}
 
 	// Operator plane. Off unless a deployment names at least one account: an admin
 	// API is not something to expose by accident, and an empty allowlist that

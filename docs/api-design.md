@@ -205,11 +205,13 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 
 硬约束：
 - PKCE S256 强制，**默认对所有客户端（含 confidential）**——这是 OAuth 2.1 的要求；库只对 public
-  client 强制，故在 `validateAuthorize` 里独立兜底。唯一例外是 `[client] allow_missing_pkce = true`
-  显式豁免的那一个客户端（OIDF 认证套件、或无法发送 `code_challenge` 的遗留 RP）：豁免按客户端、
-  零值即为强制、启动时写日志、每次实际生效时再记一条 WARN，且**不**放松 method 与语法校验（带了
-  challenge 仍必须是合法 S256）。豁免仅对机密客户端有效：公开客户端 + 无 PKCE 会在 token 端点失去
-  唯一绑定，启动即拒绝。禁 implicit、禁 ROPC；重定向 URI 精确匹配。
+  client 强制，故在 `validateAuthorize` 里独立兜底。唯一例外是 `[client]`（或某个 `[[clients]]` 条目）
+  里 `allow_missing_pkce = true` 显式豁免的那一个客户端（OIDF 认证套件、或无法发送 `code_challenge`
+  的遗留 RP）：豁免按客户端、零值即为强制、启动时写日志、每次实际生效时再记一条 WARN，且**不**放松
+  method 与语法校验（带了 challenge 仍必须是合法 S256）。豁免仅对机密客户端有效：公开客户端 + 无
+  PKCE 会在 token 端点失去唯一绑定，启动即拒绝。`[client]` 是主客户端（保留环境变量覆盖），
+  `[[clients]]` 追加任意多个下游客户端，寄存器与漂移拒绝规则完全相同；禁 implicit、禁 ROPC；
+  重定向 URI 精确匹配。
 - discovery 的 `scopes_supported` 必须包含 OIDC 核心 scope `openid` 与 `offline_access`
   （OIDC Discovery 1.0 §3：`openid` MUST 支持，OpenID Core 定义的 scope SHOULD 列出）。
   少列不会让库出错（它照样接受），但会毁掉 RP：严格按 `scopes_supported` 协商的客户端永远不会

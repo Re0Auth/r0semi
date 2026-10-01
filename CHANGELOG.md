@@ -45,6 +45,21 @@
 - 其余修复：OIDC discovery/JWKS 响应体 1 MiB 上限（S06-1）、压缩协商失败不再绕过限流与并发上限
   （S13-1）、绑定完成与解绑改为按绑定串行（S14-2）。
 
+### 新增能力
+
+- **`[[clients]]`：一份配置可以注册多个下游客户端。** 此前只有单个 `[client]` 段。现在每个
+  `[[clients]]` 条目都会像 `[client]` 一样被注册、校验（`redirect_uris` 必填，`name` 默认取 id，
+  `scopes` 默认 `["account.id"]`，`secret_env` 仍只写变量名），并**共用同一套启动漂移拒绝**：
+  某条注册与配置不一致就拒绝启动并逐字段列出差异；客户端 id 在 `[client]` 与所有条目间必须唯一。
+  `allow_missing_pkce` 逐客户端生效，公开客户端 + 豁免仍被拒绝。文件里完全没有 `[client]` 段而只有
+  `[[clients]]` 时，默认的 `cli` 客户端不会被凭空种下（`RE0AUTH_CLIENT_ID` 存在则仍视为主客户端）。
+  单客户端部署行为不变。样例见
+  [config/re0auth.example.toml](config/re0auth.example.toml) 的 `[[clients]]` 段。
+- **`id_token` 里的非标准 `client_id` 声明是已知行为，不修**（O-10）。库无条件写入且无覆盖点；
+  该值就是 RP 自己请求里的 `client_id`，OIDC Core 不禁止多余声明，去掉它需要在令牌层重签 JWT。
+  OIDF `oidcc-server` 会因此报一条 WARNING，属**接受**的差异。见
+  [docs/oidc-decision.md](docs/oidc-decision.md) O-10。
+
 ### 防护网
 
 - CI 新增 `semgrep`（`p/golang` + `p/jwt`，**只报警不阻断**）。

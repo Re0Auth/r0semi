@@ -282,6 +282,26 @@ scopes        = ["account.id", "phigros.profile.read"]
 # Environment override: RE0AUTH_CLIENT_ALLOW_MISSING_PKCE=true
 # allow_missing_pkce = false
 
+# Additional downstream clients. Each [[clients]] entry is registered with exactly
+# the same validation, the same mandatory-PKCE default and the same startup drift
+# refusal as [client] above; the only differences are that an entry must name its
+# own `id` and at least one `redirect_uri` (no redirect is guessed for a client
+# listed explicitly), and that `name`/`scopes` default to the id / ["account.id"].
+#
+# Client ids must be unique across [client] and every entry. When the file has no
+# [client] section at all and only [[clients]] entries, the default `cli` client is
+# NOT seeded — the primary is skipped rather than invented — unless
+# RE0AUTH_CLIENT_ID says otherwise. Read the note above: once a client is
+# registered, editing its entry refuses the next start instead of being applied.
+#
+# [[clients]]
+# id            = "re0auth-cli"
+# name          = "Re0Auth CLI"
+# secret_env    = "RE0AUTH_CLI_CLIENT_SECRET"
+# redirect_uris = ["http://127.0.0.1:8910/callback"]
+# scopes        = ["account.id"]
+# allow_missing_pkce = false
+
 [admin]
 # The operator allowlist: account ids (usr_…) allowed to use /v1/admin. Empty, or
 # the section absent, means the operator plane is not mounted at all. There are no

@@ -33,12 +33,12 @@
    HTML 里注 `iss`」被否决：那是改写库的渲染产物，比只收 query 脆。ADR-0005 §5 与 §6 由此一致。
 7. **PKCE 按 RFC 7636 校验语法**：challenge 与 verifier 均为 43–128 unreserved 字符。
 7b. **PKCE 强制的唯一例外是显式豁免的客户端。** `[client] allow_missing_pkce = true`（或
-    `RE0AUTH_CLIENT_ALLOW_MISSING_PKCE`）把一个客户端注册为免 PKCE，供 OIDF 认证套件这类
-    无法发送 `code_challenge` 的客户端使用。该字段默认 false（零值即强制），被纳入
-    `seedClient` 的启动漂移检查（文件与已注册行不一致 → 拒绝启动），启用时打日志，且每次豁免
-    真正生效时再记一条 WARN。豁免只覆盖“没有 challenge”：带了 challenge 仍必须是合法 S256；
-    且仅对**机密客户端**有效——公开客户端没有 secret，省掉 PKCE 等于授权码可被任何看到它的人兑换，
-    启动即拒绝。
+    `[[clients]]` 中某个客户端的同名字段，或 `RE0AUTH_CLIENT_ALLOW_MISSING_PKCE` 对主客户端）
+    把一个客户端注册为免 PKCE，供 OIDF 认证套件这类无法发送 `code_challenge` 的客户端使用。该字段
+    默认 false（零值即强制），被纳入启动漂移检查（文件与已注册行不一致 → 拒绝启动），启用时打日志，
+    且每次豁免真正生效时再记一条 WARN。豁免只覆盖“没有 challenge”：带了 challenge 仍必须是合法
+    S256；且仅对**机密客户端**有效——公开客户端没有 secret，省掉 PKCE 等于授权码可被任何看到它的
+    人兑换，启动即拒绝（对 `[client]` 与每个 `[[clients]]` 条目同样成立）。
     OIDF Basic OP 与强制 PKCE 的冲突、以及为什么选择逐客户端开关，见
     [docs/conformance.md](./conformance.md)。
 8. **授权码先读取并校验全部绑定，通过后再原子消费。** 兑换先 `GetCode`（非破坏性读）判断过期、

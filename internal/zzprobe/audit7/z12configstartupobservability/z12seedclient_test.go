@@ -1,6 +1,6 @@
 //go:build audit7
 
-// Z12-3: seedClient must refuse a registration that drifts from [client].
+// Z12-3: the seeding path must refuse a registration that drifts from [client].
 package z12configstartupobservability
 
 import (
@@ -15,11 +15,12 @@ import (
 )
 
 // overlaySeedClientTest is compiled INTO package main through `go test -overlay`.
-// seedClient is unexported package-main code, so a probe living in
+// The seeding path is unexported package-main code, so a probe living in
 // internal/zzprobe cannot call it (and importing package main is impossible); the
 // overlay adds a throwaway _test.go to cmd/re0auth at build time without writing a
-// single file into the checkout. The test drives the production seedClient against
-// the same in-memory ClientRegistry the composition root passes.
+// single file into the checkout. The test drives the production seeding path
+// (seedClients, the entry point the composition root uses) against the same
+// in-memory ClientRegistry the composition root passes.
 const overlaySeedClientTest = `package main
 
 import (
@@ -41,7 +42,7 @@ func TestOverlayZ12SeedClientDrift(t *testing.T) {
 		clientRedirects: []string{"https://app.example/callback"},
 		clientScopes:    []string{"account.id"},
 	}
-	if err := seedClient(ctx, fresh, cfg); err != nil {
+	if err := seedClients(ctx, fresh, cfg); err != nil {
 		t.Fatalf("control: seeding an empty registry failed: %v", err)
 	}
 	if _, err := fresh.Get(ctx, "cli"); err != nil {
@@ -49,12 +50,12 @@ func TestOverlayZ12SeedClientDrift(t *testing.T) {
 	}
 
 	// Control B: the SAME configuration, already registered, still boots.
-	if err := seedClient(ctx, fresh, cfg); err != nil {
+	if err := seedClients(ctx, fresh, cfg); err != nil {
 		t.Fatalf("control: an unchanged configuration was refused: %v", err)
 	}
 
-	// The guard: the registered client differs in every field seedClient compares
-	// (type via the secret, redirect_uris, scopes, secret digest).
+	// The guard: the registered client differs in every field the drift check
+	// compares (type via the secret, redirect_uris, scopes, secret digest).
 	drifted := settings{
 		clientID:        "cli",
 		clientName:      "First-party client",
@@ -62,9 +63,9 @@ func TestOverlayZ12SeedClientDrift(t *testing.T) {
 		clientRedirects: []string{"https://newapp.example/callback"},
 		clientScopes:    []string{"account.id", "phigros.profile.read"},
 	}
-	err := seedClient(ctx, fresh, drifted)
+	err := seedClients(ctx, fresh, drifted)
 	if err == nil {
-		t.Fatalf("seedClient accepted a registration that differs from [client] in type, redirect_uris, scopes and secret")
+		t.Fatalf("seedClients accepted a registration that differs from [client] in type, redirect_uris, scopes and secret")
 	}
 	for _, field := range []string{"type", "redirect_uris", "scopes", "secret"} {
 		if !strings.Contains(err.Error(), field) {
@@ -85,18 +86,18 @@ func TestOverlayZ12SeedClientDrift(t *testing.T) {
 `
 
 // TestZ12SeedClientRefusesADriftedRegistration is the re-derived Z12-3 guard. The
-// old probe of this name never called seedClient and ended in an unconditional
+// old probe of this name never called the seeding path and ended in an unconditional
 // t.Errorf, so it could never pass once the finding was fixed. This one passes on
 // the fixed code and fails if the drift refusal is removed.
 //
 // Two layers:
-//   - a real-process control: an unchanged [client] boots through seedClient and
+//   - a real-process control: an unchanged [client] boots through the seeding path and
 //     reaches the listen stage;
-//   - a behavioural guard of the production seedClient itself, compiled into
+//   - a behavioural guard of the production seeding path itself (seedClients), compiled into
 //     package main with `go test -overlay` (no checkout file is added or changed),
 //     because the in-memory registry cannot carry a client across process boots
 //     (each memory boot starts empty, so no second boot can present a drifted
-//     registration) and seedClient is unexported.
+//     registration) and the seeding path is unexported.
 func TestZ12SeedClientRefusesADriftedRegistration(t *testing.T) {
 	z12SeedClientGuard(t)
 }
@@ -117,14 +118,14 @@ func z12SeedClientGuard(t *testing.T) {
 
 	// Control, real process: the unchanged [client] section seeds cleanly and the
 	// run moves on to the listener (which fails by design, because
-	// RE0AUTH_ADDR is unbindable). The prefix is the production seedClient path.
+	// RE0AUTH_ADDR is unbindable). The prefix is the production seeding path.
 	clientTOML := serverOnly +
 		"\n[client]\nid = \"cli\"\nname = \"First-party client\"\n" +
 		"redirect_uris = [\"https://app.example/callback\"]\nscopes = [\"account.id\"]\n"
 	path := writeConfig(t, "client.toml", clientTOML)
 	boot := runBinary(t, serveEnv(), "-config", path)
 	if !strings.Contains(boot.out, "registered downstream client") {
-		t.Fatalf("the real binary never reached seedClient's registration path:\n%s", boot.out)
+		t.Fatalf("the real binary never reached the seeding path:\n%s", boot.out)
 	}
 	if !strings.Contains(boot.out, "stage=listen") {
 		t.Fatalf("the unchanged [client] did not reach the listen stage:\n%s", boot.out)
@@ -158,7 +159,7 @@ func z12SeedClientGuard(t *testing.T) {
 	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Errorf("the production seedClient does not refuse a registration that drifts from [client]: %v\n%s",
+		t.Errorf("the production seeding path does not refuse a registration that drifts from [client]: %v\n%s",
 			err, out)
 		return
 	}

@@ -443,8 +443,8 @@ func run() error {
 		return rotateAndReport(ctx, vaultService)
 	}
 
-	if err := seedClient(ctx, store.clients, cfg); err != nil {
-		return die("seed client", err)
+	if err := seedClients(ctx, store.clients, cfg); err != nil {
+		return die("seed clients", err)
 	}
 
 	idpRegistry, err := idp.NewRegistry(idp.RegistryConfig{
@@ -1669,33 +1669,64 @@ func auditVerifier(l audit.Logger) chainVerifier {
 	return nil
 }
 
-// configuredClient builds the client the [client] section describes. The
-// first-time registration and the drift check below share this one shape, so a
-// field can never be validated differently in the two places.
-func configuredClient(cfg settings) (oauth.Client, error) {
+// buildClient turns one configured client's fields into an oauth.Client. The
+// first-time registration and the drift check share this shape, and so do the
+// primary [client] section and every [[clients]] entry: a field can never be
+// validated one way in one place and another way in the next.
+func buildClient(id, name, secret string, redirects, scopes []string, allowMissingPKCE bool) (oauth.Client, error) {
 	typ := oauth.ClientPublic
-	if cfg.clientSecret != "" {
+	if secret != "" {
 		typ = oauth.ClientConfidential
 	}
 	// A public client that skips PKCE has no binding left at all: it holds no
 	// secret, so the authorization code would be redeemable by anyone who saw it.
 	// The exemption is therefore refused where it would remove the only binding
 	// there is, and the operator has to make the client confidential first.
-	if cfg.clientAllowMissingPKCE && typ == oauth.ClientPublic {
+	if allowMissingPKCE && typ == oauth.ClientPublic {
 		return oauth.Client{}, errors.New("client.allow_missing_pkce requires a confidential client: " +
 			"a public client with no PKCE has no credential binding at the token endpoint (set secret_env)")
 	}
-	scopes := make([]oauth.Scope, 0, len(cfg.clientScopes))
-	for _, s := range cfg.clientScopes {
-		scopes = append(scopes, oauth.Scope(s))
+	allowed := make([]oauth.Scope, 0, len(scopes))
+	for _, s := range scopes {
+		allowed = append(allowed, oauth.Scope(s))
 	}
-	client, err := oauth.NewClient(cfg.clientID, cfg.clientName, typ, cfg.clientSecret, cfg.clientRedirects, scopes)
+	client, err := oauth.NewClient(id, name, typ, secret, redirects, allowed)
 	if err != nil {
 		return oauth.Client{}, err
 	}
 	// The exemption is applied after construction, so NewClient's default (PKCE
 	// required) stays the only shape a caller can reach by omission.
-	return client.WithAllowMissingPKCE(cfg.clientAllowMissingPKCE), nil
+	return client.WithAllowMissingPKCE(allowMissingPKCE), nil
+}
+
+// configuredClient builds the client the [client] section describes.
+func configuredClient(cfg settings) (oauth.Client, error) {
+	return buildClient(cfg.clientID, cfg.clientName, cfg.clientSecret, cfg.clientRedirects, cfg.clientScopes, cfg.clientAllowMissingPKCE)
+}
+
+// configuredClients is every downstream client a deployment configures: the
+// primary [client] section first (unless the file deliberately omits it and names
+// [[clients]] entries instead), then each [[clients]] entry in file order.
+func configuredClients(cfg settings) ([]oauth.Client, error) {
+	var clients []oauth.Client
+	if !cfg.noPrimaryClient {
+		primary, err := configuredClient(cfg)
+		if err != nil {
+			return nil, err
+		}
+		clients = append(clients, primary)
+	}
+	for i, spec := range cfg.extraClients {
+		client, err := buildClient(spec.ID, spec.Name, spec.Secret, spec.RedirectURIs, spec.Scopes, spec.AllowMissingPKCE)
+		if err != nil {
+			return nil, fmt.Errorf("clients[%d] (%s): %w", i, spec.ID, err)
+		}
+		clients = append(clients, client)
+	}
+	if len(clients) == 0 {
+		return nil, errors.New("no downstream client is configured: provide [client] or at least one [[clients]] entry")
+	}
+	return clients, nil
 }
 
 // clientDrift names every way the registered client disagrees with [client].
@@ -1751,23 +1782,41 @@ func sameSet[T comparable](a, b []T) bool {
 	return true
 }
 
-// seedClient registers the first-party downstream client, or refuses to start
-// when an existing registration disagrees with the [client] section.
+// seedClients registers every configured downstream client, or refuses to start
+// when an existing registration disagrees with its configuration. A deployment
+// with one client behaves exactly as it did when only [client] existed; the
+// [[clients]] entries go through the same registration, the same drift check and
+// the same refusal.
+func seedClients(ctx context.Context, clients oauth.ClientRegistry, cfg settings) error {
+	configured, err := configuredClients(cfg)
+	if err != nil {
+		return err
+	}
+	for i, client := range configured {
+		source := fmt.Sprintf("the [[clients]] entry %q", client.ID)
+		if i == 0 && !cfg.noPrimaryClient {
+			source = "the [client] section"
+		}
+		if err := seedRegisteredClient(ctx, clients, client, source); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// seedRegisteredClient registers one configured client, or refuses to start when
+// an existing registration disagrees with it.
 //
 // Registration happens exactly once, against an empty registry. After that the
 // registry is authoritative: no code path rewrites a client's type,
 // redirect_uris or scopes, and nothing re-derives them from this file, so a
-// changed [client] has no route into effect. Carrying on anyway is the
+// changed section has no route into effect. Carrying on anyway is the
 // dangerous half — a rotated secret_env would leave the previous secret valid,
 // a deleted redirect_uri would stay allowlisted, and a scope change would be
 // dropped. A mismatch is therefore a refusal that names every differing field;
-// the operator either reverts [client] to what was seeded, or deletes the
+// the operator either reverts the section to what was seeded, or deletes the
 // registration and restarts to re-seed it from the new configuration.
-func seedClient(ctx context.Context, clients oauth.ClientRegistry, cfg settings) error {
-	configured, err := configuredClient(cfg)
-	if err != nil {
-		return err
-	}
+func seedRegisteredClient(ctx context.Context, clients oauth.ClientRegistry, configured oauth.Client, source string) error {
 	if configured.AllowMissingPKCE {
 		// Logged on every start, not only at registration: an operator reading the
 		// log of a running deployment should not have to remember that this client
@@ -1777,7 +1826,7 @@ func seedClient(ctx context.Context, clients oauth.ClientRegistry, cfg settings)
 			"client_id", configured.ID, "allow_missing_pkce", true)
 	}
 
-	registered, err := clients.Get(ctx, cfg.clientID)
+	registered, err := clients.Get(ctx, configured.ID)
 	switch {
 	case errors.Is(err, oauth.ErrClientNotFound):
 		if err := clients.Create(ctx, configured); err != nil {
@@ -1792,14 +1841,14 @@ func seedClient(ctx context.Context, clients oauth.ClientRegistry, cfg settings)
 	if drift := clientDrift(registered, configured); len(drift) > 0 {
 		// Logged as well as returned: the error stops the process, but the
 		// field-by-field list is what an operator greps the startup log for.
-		slog.Error("downstream client does not match the configured [client] section; refusing to start",
-			"client_id", cfg.clientID, "differences", drift)
-		return fmt.Errorf("registered downstream client %q does not match the [client] configuration: %s; "+
+		slog.Error("downstream client does not match its configuration; refusing to start",
+			"client_id", configured.ID, "source", source, "differences", drift)
+		return fmt.Errorf("registered downstream client %q does not match %s: %s; "+
 			"the registry is authoritative once a client exists and startup will not rewrite it — "+
-			"revert the [client] section to the registered values, or delete the registered client and restart to re-seed",
-			cfg.clientID, strings.Join(drift, "; "))
+			"revert %s to the registered values, or delete the registered client and restart to re-seed",
+			configured.ID, source, strings.Join(drift, "; "), source)
 	}
-	slog.Info("downstream client already registered and matches the configured [client] section",
-		"client_id", cfg.clientID)
+	slog.Info("downstream client already registered and matches its configuration",
+		"client_id", configured.ID, "source", source)
 	return nil
 }
