@@ -57,7 +57,9 @@ have caught them on every commit.
    once interrupts the suite's configuration (30 of 35 modules ended INTERRUPTED on
    the first real run). Failures carry their `GET /api/log/<id>` reasons into the
    summary, and a module that stops for a human is tagged
-   `interactive: human-step` rather than read as a protocol bug.
+   `interactive: human-step` rather than read as a protocol bug — that includes the
+   suite's `REVIEW` placeholders, e.g. `oidcc-prompt-login`'s "a screenshot of this
+   must be uploaded".
    `max_modules` caps the run for a smoke test (milestones 6–7). The payload shape and
    the ready-made Basic OP file are in `scripts/conformance/plans/`.
 
@@ -147,6 +149,18 @@ exemption — check `op.log` for the startup WARN and for
   authorization code + PKCE + refresh + device, and not dynamic registration or
   PAR. The plan allowlist must name what is supported and record the rest as
   intentionally out of scope, never silently skipped.
+- **One seeded client vs the plan's two.** `[client]` seeds exactly one downstream
+  client, so the spike points the Basic OP plan's `client2` at the same registration.
+  The plan's refresh module ends with "Attempting to use refresh_token issued to
+  client 2 with client 1" and expects `invalid_grant`; with one shared client the
+  request legitimately succeeds and the module reports a failure that is a fixture
+  limitation, not an OP defect. The behaviour is enforced (the engine's
+  `AuthorizeRefreshClient` rejects a client mismatch, and `oauth/as.go` returns
+  `invalid_grant` for a token issued to another client) and pinned by
+  `internal/oidchttp/refresh_client_binding_test.go`
+  (`TestRefreshTokenIsBoundToItsClient`: foreign client → 400 `invalid_grant`, and
+  the refusal does not consume the token). A deployment that wants that module green
+  needs two real client registrations — a config feature this OP does not have yet.
 - **Headless authorization (addressed by the `conformance` build tag).** The spike's
   OP has no identity provider ("nobody can sign in") and answers every authorization
   with an interactive consent screen by design, so a plan that drives an
