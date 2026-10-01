@@ -167,6 +167,33 @@ def submit_implicit_page(final_url, body, insecure, opener=None):
     return last
 
 
+def module_human_step(api, test_id, insecure):
+    """The suite's placeholder entries, i.e. work only a person can do.
+
+    A module waiting on one is not stuck on the OP. The line can be anywhere in the
+    log (oidcc-prompt-login's "a screenshot of this must be uploaded" sits before
+    several later SUCCESS entries), so the whole log is scanned rather than its
+    tail. Returns the suite's own sentence, or "".
+    """
+    try:
+        entries = request(api, "GET", "/api/log/" + urllib.parse.quote(test_id), insecure=insecure)
+    except RuntimeError:
+        return ""
+    if not isinstance(entries, list):
+        return ""
+    pattern = re.compile(r"screenshot|upload|paste|placeholder|must ask the user|"
+                         r"manually|on the browser", re.IGNORECASE)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        message = str(entry.get("msg") or "")
+        if entry.get("result") == "REVIEW" and message:
+            return message[:200]
+        if pattern.search(json.dumps(entry)):
+            return message[:200] or "the suite is waiting for a human"
+    return ""
+
+
 def dump_module_log(api, test_id, log_dir, insecure, name):
     """Write a module's full suite log into the artifact.
 
@@ -363,13 +390,10 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_ro
             # Some modules deliberately stop for a human: a screenshot of an error
             # page, a pasted URI, a confirmation that a page was shown. Name that,
             # so it is not read as a protocol bug.
-            interactive = re.compile(r"screenshot|upload|paste|show .{0,30}(page|error)|"
-                                     r"manually|on the browser", re.IGNORECASE)
-            if any(interactive.search(text) for text in tail):
+            human = module_human_step(api, test_id, insecure)
+            if human:
                 module["interactive"] = "human-step"
-                messages.insert(0, "INTERACTIVE STEP: the suite asks for a human (a screenshot, "
-                                   "a pasted URI or a page confirmation); this module cannot "
-                                   "finish in a headless run")
+                messages.insert(0, "INTERACTIVE STEP: the suite is waiting for a human: " + human)
         # A request the suite deliberately sends without PKCE meets a policy this
         # repository chose: mandatory PKCE S256 for every client
         # (docs/api-design.md §207). Name it, so it is not read as an OP bug.

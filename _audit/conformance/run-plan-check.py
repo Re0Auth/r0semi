@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 RESULT = {"value": "SUCCESS"}
 WAIT_ALWAYS = {"value": False}
 DIVERGE = {"value": False}
+INTERACTIVE = {"value": False}
 WAITED = defaultdict(int)
 VISITED = []
 IMPLICIT = []
@@ -85,11 +86,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"status": "WAITING" if WAIT_ALWAYS["value"] else "FINISHED",
                         "result": None if WAIT_ALWAYS["value"] else RESULT["value"]})
         elif self.path.startswith("/api/log/"):
+            entries = []
             if RESULT["value"] != "PASSED":
-                self._json([{"result": "FAILURE", "msg": "stub failure reason"},
-                            {"result": "INFO", "msg": "ignored"}])
-            else:
-                self._json([{"result": "INFO", "msg": "ok"}])
+                entries.append({"result": "FAILURE", "msg": "stub failure reason"})
+            if INTERACTIVE["value"]:
+                # The suite's placeholder line, as oidcc-prompt-login logs it.
+                entries.append({"result": "REVIEW",
+                                "msg": "The server must ask the user to login for a second "
+                                       "time; a screenshot of this must be uploaded."})
+            if not entries:
+                entries.append({"result": "INFO", "msg": "ok"})
+            self._json(entries)
         elif self.path == "/front":
             if DIVERGE["value"]:
                 self.send_response(302)
@@ -198,6 +205,21 @@ def main():
     if proc.returncode != 2 or not diverged \
             or not any("POLICY DIVERGENCE" in m for m in (diverged[0].get("messages") or [])):
         print("FAIL divergence case: rc=%s out=%s" % (proc.returncode, out))
+        ok = False
+
+    # 4. A module waiting on a placeholder (a screenshot the tester must upload) is
+    #    a human step, not a stuck module and not a protocol bug.
+    WAITED.clear()
+    VISITED.clear()
+    IMPLICIT.clear()
+    RESULT["value"] = "PASSED"
+    INTERACTIVE["value"] = True
+    proc = run_runner(api, payload, log_dir)
+    out = parse(proc)
+    modules = (out or {}).get("modules") or []
+    human = [m for m in modules if m.get("interactive") == "human-step"]
+    if not human or not any("INTERACTIVE STEP" in m for m in (human[0].get("messages") or [])):
+        print("FAIL human-step case: rc=%s out=%s" % (proc.returncode, out))
         ok = False
 
     os.unlink(payload)
