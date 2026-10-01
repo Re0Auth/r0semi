@@ -45,7 +45,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-TERMINAL_OK = {"SUCCESS", "WARNING", "REVIEW", "SKIPPED"}
+# The suite's Result enum is PASSED / FAILED / WARNING / REVIEW / SKIPPED
+# (TestModule.Result). "SUCCESS" is kept as an alias for older releases.
+TERMINAL_OK = {"PASSED", "SUCCESS", "WARNING", "REVIEW", "SKIPPED"}
 TERMINAL_STATUSES = {"FINISHED", "INTERRUPTED", "STOPPED"}
 LOG_INTERESTING = {"FAILURE", "ERROR", "WARNING"}
 
@@ -316,7 +318,10 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_ro
     module = {"testModule": name, "testId": test_id, "status": status, "result": result}
     if visits:
         module["visits"] = visits[-8:]
-    if result not in TERMINAL_OK:
+    # Anything that is not a clean PASSED carries reasons worth keeping: a WARNING
+    # from the suite names what it was unhappy about, and a FAILED/INTERRUPTED one
+    # names the failure.
+    if result != "PASSED":
         messages = module_messages(api, test_id, insecure)
         if stuck_exit:
             # The test's own log tail (INFO included) is what says whether the
@@ -396,7 +401,8 @@ def main():
 
     ok = all(module.get("result") in TERMINAL_OK for module in results)
     if ok:
-        overall = "SUCCESS"
+        # The suite's own word for a clean run (TestModule.Result.PASSED).
+        overall = "PASSED"
     else:
         # Name the reason: the first non-success result, or FAILED when a module
         # never produced one (INTERRUPTED with no verdict).

@@ -5,8 +5,8 @@ Starts a stub that mimics the suite endpoints the runner uses — plan creation,
 creation, the wait-state long poll, the front-channel browser URLs, the per-test log —
 then asserts three verdicts:
 
-* every module succeeds            -> exit 0, result SUCCESS, front channel visited
-* a module FAILURE                 -> exit 2, result FAILURE, with its log message
+* every module succeeds            -> exit 0, result PASSED, front channel visited
+* a module FAILED                  -> exit 2, result FAILED, with its log message
 * a module stuck on a request the suite sent without PKCE -> exit 2, INTERRUPTED,
   tagged `divergence: pkce-required`
 
@@ -84,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"status": "WAITING" if WAIT_ALWAYS["value"] else "FINISHED",
                         "result": None if WAIT_ALWAYS["value"] else RESULT["value"]})
         elif self.path.startswith("/api/log/"):
-            if RESULT["value"] == "FAILURE":
+            if RESULT["value"] != "PASSED":
                 self._json([{"result": "FAILURE", "msg": "stub failure reason"},
                             {"result": "INFO", "msg": "ignored"}])
             else:
@@ -146,11 +146,11 @@ def main():
 
     ok = True
 
-    # 1. Everything succeeds.
-    RESULT["value"] = "SUCCESS"
+    # 1. Everything succeeds (the suite's own word is PASSED, not SUCCESS).
+    RESULT["value"] = "PASSED"
     proc = run_runner(api, payload)
     out = parse(proc)
-    if proc.returncode != 0 or not out or out.get("result") != "SUCCESS" or len(out.get("modules") or []) != 2:
+    if proc.returncode != 0 or not out or out.get("result") != "PASSED" or len(out.get("modules") or []) != 2:
         print("FAIL success case: rc=%s out=%s" % (proc.returncode, out))
         ok = False
     if not VISITED:
@@ -164,11 +164,11 @@ def main():
     WAITED.clear()
     VISITED.clear()
     IMPLICIT.clear()
-    RESULT["value"] = "FAILURE"
+    RESULT["value"] = "FAILED"
     proc = run_runner(api, payload)
     out = parse(proc)
     messages = [m for module in (out or {}).get("modules") or [] for m in (module.get("messages") or [])]
-    if proc.returncode != 2 or not out or out.get("result") != "FAILURE" \
+    if proc.returncode != 2 or not out or out.get("result") != "FAILED" \
             or not any("stub failure reason" in m for m in messages):
         print("FAIL failure case: rc=%s out=%s" % (proc.returncode, out))
         ok = False
@@ -178,7 +178,7 @@ def main():
     WAITED.clear()
     VISITED.clear()
     IMPLICIT.clear()
-    RESULT["value"] = "SUCCESS"
+    RESULT["value"] = "PASSED"
     WAIT_ALWAYS["value"] = True
     DIVERGE["value"] = True
     proc = run_runner(api, payload)
