@@ -33,6 +33,7 @@ TIMEOUT="${CONFORMANCE_WAIT_SECONDS:-3600}"
 DRY_RUN=0
 REQUIRE_PASS=0
 NO_DOWNLOAD=0
+SELF_TEST=0
 
 log()  { printf 'dispatch: %s\n' "$*"; }
 warn() { printf 'dispatch: WARN — %s\n' "$*" >&2; }
@@ -57,6 +58,7 @@ while (( $# )); do
     --interval)      INTERVAL="$2"; shift 2 ;;
     --timeout)       TIMEOUT="$2"; shift 2 ;;
     --dry-run)       DRY_RUN=1; shift ;;
+    --self-test)     SELF_TEST=1; shift ;;
     --require-pass)  REQUIRE_PASS=1; shift ;;
     --no-download)   NO_DOWNLOAD=1; shift ;;
     -h|--help)       usage; exit 0 ;;
@@ -95,6 +97,20 @@ if require not in ("", "0"):
     inputs["require_plan"] = "true"
 print(json.dumps({"ref": sys.argv[5], "inputs": inputs}))
 ' "${PLAN_JSON}" "${MAX_MODULES}" "${REDIRECT_URI}" "${REQUIRE_PLAN}" "${REF}")"
+
+if (( SELF_TEST )); then
+  # The run lookup used to split its fields on spaces, so an empty conclusion
+  # (a run still in progress) shifted every later column and the run URL came out
+  # empty. Pipe-delimited fields keep their positions; this pins that.
+  picked="12345|in_progress||https://github.com/o/r/actions/runs/12345"
+  IFS='|' read -r rid rstatus rconclusion rurl <<<"${picked}"
+  if [[ "${rid}" != "12345" || "${rstatus}" != "in_progress" || -n "${rconclusion}" \
+        || "${rurl}" != "https://github.com/o/r/actions/runs/12345" ]]; then
+    fail "self-test: run-pick parse failed for '${picked}'"
+  fi
+  log "self-test OK"
+  exit 0
+fi
 
 if (( DRY_RUN )); then
   log "dry run — the workflow was NOT dispatched"
@@ -168,10 +184,12 @@ for run in json.load(sys.stdin).get("workflow_runs", []):
         continue
     if when >= cut and (best is None or when > best[0]):
         best = (when, run["id"], run.get("status") or "", run.get("conclusion") or "", run["html_url"])
-print("%s %s %s %s" % best[1:] if best else "")
+print("%s|%s|%s|%s" % best[1:] if best else "")
 ' "$(( DISPATCH_AT - 15 ))" <<<"${RUNS}")"
     if [[ -n "${picked}" ]]; then
-      read -r RUN_ID RUN_STATUS _ RUN_URL <<<"${picked}"
+      # Pipe-delimited: an empty conclusion (a run still in progress) would shift
+      # every later column if the fields were whitespace-separated.
+      IFS='|' read -r RUN_ID RUN_STATUS _ RUN_URL <<<"${picked}"
       break
     fi
   fi
@@ -179,6 +197,7 @@ print("%s %s %s %s" % best[1:] if best else "")
 done
 [[ -n "${RUN_ID}" ]] || fail "the dispatched run never appeared (token may lack Actions: read)"
 
+RUN_URL="${RUN_URL:-https://github.com/${REPO}/actions/runs/${RUN_ID}}"
 log "run ${RUN_ID}: ${RUN_URL}"
 STARTED="$(date -u +%s)"
 

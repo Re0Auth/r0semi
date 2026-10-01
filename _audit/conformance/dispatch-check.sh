@@ -50,4 +50,7 @@ fi
 out="$(env -u GH_TOKEN -u GITHUB_TOKEN bash "${SCRIPT}" --dry-run)"
 grep -q 'dry run' <<<"${out}" || { echo "FAIL: dry run without a token failed"; echo "${out}"; exit 1; }
 
+# 6. The run-pick parse, where an empty field must not shift the columns.
+bash "${SCRIPT}" --self-test >/dev/null || { echo "FAIL: --self-test failed"; exit 1; }
+
 echo "dispatch.sh self-check OK"
