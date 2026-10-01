@@ -107,9 +107,17 @@ if (( DRY_RUN )); then
 fi
 
 # ---- credentials ------------------------------------------------------------
+# gh may be installed but absent from this shell's PATH (a Git Bash opened before
+# the installer ran, or a non-interactive shell), so the Windows default location is
+# tried too rather than falling through to "no credential".
+GH_BIN="$(command -v gh 2>/dev/null || true)"
+if [[ -z "${GH_BIN}" && -x "/c/Program Files/GitHub CLI/gh.exe" ]]; then
+  GH_BIN="/c/Program Files/GitHub CLI/gh.exe"
+fi
+
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-if [[ -z "${TOKEN}" ]] && command -v gh >/dev/null 2>&1; then
-  TOKEN="$(gh auth token 2>/dev/null || true)"
+if [[ -z "${TOKEN}" && -n "${GH_BIN}" ]]; then
+  TOKEN="$("${GH_BIN}" auth token 2>/dev/null || true)"
 fi
 [[ -n "${TOKEN}" ]] || fail "no credential: set GH_TOKEN (needs the 'workflow' scope) or install and log in to the gh CLI"
 
