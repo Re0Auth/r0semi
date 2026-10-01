@@ -90,6 +90,35 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 `CONFORMANCE_REQUIRE_PLAN=1`, `CONFORMANCE_TIMEOUT_SECONDS` (default 600),
 `CONFORMANCE_REDIRECT_URI`.
 
+## Known divergence: mandatory PKCE vs the Basic OP profile
+
+The first real plan run produced one substantive result, and it is a policy choice
+rather than a bug:
+
+- The suite's OP tests send an authorization request **without `code_challenge`**
+  (`oidcc-server`'s front-channel URL carries only client_id, nonce, redirect_uri,
+  response_type, scope, state).
+- Re0Auth **mandates PKCE S256 for every client, confidential ones included**
+  (`internal/oidchttp/oidchttp.go`'s PKCE gate; `docs/api-design.md` §207; guarded by
+  `TestAuthorizeRequiresPKCE` and `TestZZAudit_ConfidentialClientNeedsPKCE`).
+- The OP therefore answers, correctly for its own policy,
+  `error=invalid_request&error_description=code_challenge is required`, and the module
+  stays `WAITING` forever. `run-plan.py` stops it after a few unproductive rounds and
+  tags it `divergence: pkce-required` with
+  `POLICY DIVERGENCE: the suite sent no code_challenge…`.
+
+Two ways forward, and it is a product decision:
+
+1. **Keep mandatory PKCE (OAuth 2.1 / RFC 9700 stance).** Then the Basic OP
+   certification plan is not a fit: expect most of its modules to report this
+   divergence. Use it only to exercise the modules that do send PKCE
+   (`oidcc-ensure-request-with-valid-pkce-succeeds`) and the discovery/config plans.
+2. **Relax the gate to public clients only**, matching the library's default. That
+   contradicts ADR §207's stated OAuth 2.1 rationale, needs the ADR changed, and
+   removes the verifier binding from confidential clients' authorization codes.
+
+Nothing in the spike decides this; the runner only reports it.
+
 ## Known gaps (the reason this is still a spike)
 
 - **JVM trust store.** Addressed by milestone 4b: the script builds a derived image

@@ -197,6 +197,7 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_ro
     visits = []
     seen = set()
     stuck = 0
+    stuck_exit = False
     while time.time() < module_deadline:
         status = wait_state(api, test_id, insecure,
                             ["CONFIGURED", "WAITING", "FINISHED", "INTERRUPTED", "STOPPED"])
@@ -210,21 +211,30 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_ro
             # burning the per-module budget and say so, instead of waiting it out.
             stuck = 0 if new else stuck + 1
             if stuck >= visit_rounds:
-                status = "INTERRUPTED"
+                stuck_exit = True
                 break
             continue
         # CONFIGURED (or an empty long-poll timeout): wait again.
     info = request(api, "GET", "/api/info/" + urllib.parse.quote(test_id), insecure=insecure)
-    status = info.get("status") or status
     result = info.get("result")
+    # The suite keeps a module at WAITING when the front channel never completed it,
+    # which is exactly the case worth reporting as interrupted.
+    status = "INTERRUPTED" if stuck_exit else (info.get("status") or status)
     module = {"testModule": name, "testId": test_id, "status": status, "result": result}
     if visits:
         module["visits"] = visits[-8:]
     if result not in TERMINAL_OK:
         messages = module_messages(api, test_id, insecure)
-        if status == "INTERRUPTED" and stuck >= visit_rounds:
-            messages.insert(0, "stuck in WAITING after %d rounds with no new front-channel URL"
+        if stuck_exit:
+            messages.insert(0, "stayed WAITING after %d front-channel rounds with nothing new"
                             % visit_rounds)
+        # A request the suite deliberately sends without PKCE meets a policy this
+        # repository chose: mandatory PKCE S256 for every client
+        # (docs/api-design.md §207). Name it, so it is not read as an OP bug.
+        if any("error=invalid_request" in v and "code_challenge" in v for v in visits):
+            module["divergence"] = "pkce-required"
+            messages.insert(0, "POLICY DIVERGENCE: the suite sent no code_challenge while "
+                               "Re0Auth mandates PKCE S256 for every client (docs/api-design.md §207)")
         module["messages"] = messages + [v for v in visits[-4:] if v not in messages]
     return module
 

@@ -64,6 +64,11 @@ whole plan (or leave it at `0` for the nightly). The runner is
 [`run-plan.py`](../run-plan.py); per-module failure reasons are pulled from
 `GET /api/log/<id>` and appear under *Why modules did not pass* in the run summary.
 
+**Expect a policy divergence first.** The suite's OP tests send no `code_challenge`,
+while Re0Auth mandates PKCE S256 for every client, so most Basic OP modules come back
+`invalid_request: code_challenge is required` and the runner tags them
+`divergence: pkce-required`. See [docs/conformance.md](../../../docs/conformance.md).
+
 ## Before you pick a plan
 
 The spike's OP has no identity provider and no automated consent on the ordinary
