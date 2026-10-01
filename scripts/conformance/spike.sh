@@ -33,8 +33,11 @@ warn() { printf 'WARN %s\n' "$*" | tee -a "${MILESTONES}"; log "$*"; }
 
 cleanup() {
   [[ -n "${OP_PID}" ]] && kill "${OP_PID}" 2>/dev/null || true
-  docker rm -f "${CADDY_NAME}" "${SUITE_NAME}" "${MONGO_NAME}" >/dev/null 2>&1 || true
-  docker network rm "${SPIKE_NET}" >/dev/null 2>&1 || true
+  # Defaults: an early failure (the docker check) runs this trap before the
+  # container names are assigned, and `set -u` would turn the real error into an
+  # "unbound variable" line that hides it.
+  docker rm -f "${CADDY_NAME}" "${SUITE_NAME:-}" "${MONGO_NAME:-}" >/dev/null 2>&1 || true
+  docker network rm "${SPIKE_NET:-}" >/dev/null 2>&1 || true
   rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -113,6 +116,18 @@ export RE0AUTH_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET}"
 # follows the suite's public origin (SUITE_PUBLIC), which is where its own callback
 # lives; set the plan's `alias` to match the trailing path segment.
 REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-${SUITE_PUBLIC}/test/a/conformance/callback}"
+
+# Is a plan requested? Decided HERE, before the config is written, because both the
+# tagged build and the client's PKCE exemption depend on it. A path that was given
+# but does not exist is a failure, not "no plan": silently running the connectivity
+# milestones instead is how a typo in plan_json looked like a successful run.
+PLAN_REQUESTED=0
+if [[ -n "${CONFORMANCE_PLAN_JSON:-}" ]]; then
+  [[ -f "${CONFORMANCE_PLAN_JSON}" ]] \
+    || fail "plan_json is '${CONFORMANCE_PLAN_JSON}', which is not a file in this checkout"
+  PLAN_REQUESTED=1
+fi
+
 # `[client]` keys come from cmd/re0auth/config.go's clientSection: id, name,
 # secret_env, redirect_uris, scopes, allow_missing_pkce. `client_id` belongs to
 # [idp.*] and is an unknown key here, which the config loader refuses by design.
@@ -123,7 +138,7 @@ REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-${SUITE_PUBLIC}/test/a/conformance/cal
 # actually requested — a connectivity-only run keeps the ordinary, fully strict
 # client.
 PKCE_EXEMPT_LINE=""
-if [[ -n "${CONFORMANCE_PLAN_JSON:-}" && -f "${CONFORMANCE_PLAN_JSON}" ]]; then
+if (( PLAN_REQUESTED )); then
   PKCE_EXEMPT_LINE="allow_missing_pkce = true"
 fi
 cat > "${WORK}/re0auth.toml" <<TOMLEOF
@@ -146,13 +161,11 @@ TOMLEOF
 # whose auto-login path is compiled out of every production build
 # (cmd/re0auth/conformance_stub.go) and inert until this opt-in is set. Without a
 # plan, the OP is the ordinary binary and nothing is bypassed.
-if [[ -n "${CONFORMANCE_PLAN_JSON:-}" && -f "${CONFORMANCE_PLAN_JSON}" ]]; then
-  PLAN_REQUESTED=1
+if (( PLAN_REQUESTED )); then
   export RE0AUTH_CONFORMANCE_AUTOLOGIN=1
   log "a plan was requested; building the OP with -tags conformance (auto-login ON)"
   ( cd "${ROOT}" && go build -tags conformance -o "${WORK}/re0auth" ./cmd/re0auth )
 else
-  PLAN_REQUESTED=0
   log "no plan requested; building the ordinary OP"
   ( cd "${ROOT}" && go build -o "${WORK}/re0auth" ./cmd/re0auth )
 fi
@@ -432,6 +445,9 @@ if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
     printf 'Plan: %s%s\n' "${PLAN_STATUS}" "${PLAN_RESULT:+ (${PLAN_RESULT})}"
     echo
     printf 'Suite: %s | issuer %s | seeded redirect_uri `%s`\n' "${SUITE_IMAGE}" "${ISSUER}" "${REDIRECT_URI}"
+    printf 'Inputs: plan_json `%s` | max_modules %s | redirect_uri `%s`\n' \
+      "${CONFORMANCE_PLAN_JSON:-(empty)}" "${CONFORMANCE_PLAN_MAX_MODULES:-0}" \
+      "${CONFORMANCE_REDIRECT_URI:-(script default)}"
     if [[ "${PLAN_STATUS}" != "not-run" && -s "${WORK}/plan-run.json" ]]; then
       echo
       echo "### Plan modules"
@@ -469,7 +485,7 @@ PY
     fi
     if [[ "${PLAN_STATUS}" == "not-run" ]]; then
       echo
-      echo "No plan payload was supplied. This run proved connectivity; pick a plan below,"
+      echo "\`plan_json\` was empty. This run proved connectivity only; dispatch again with"
       echo "then dispatch again with \`plan_json\` (see scripts/conformance/plans/README.md)."
       echo
       echo "### Available plans (first 60; full list in plan-catalogue.json)"
