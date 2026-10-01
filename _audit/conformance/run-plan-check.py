@@ -100,12 +100,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # The suite's implicitCallback page: the flow only advances when the
                 # JavaScript POST runs, which the runner must emulate. The URL is
-                # deliberately RELATIVE, exactly as the suite renders it, so the
-                # check also pins the browser-style urljoin resolution.
+                # RELATIVE and JSON-escaped exactly as Thymeleaf renders it, so the
+                # check pins both the urljoin resolution and the \/ decoding.
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 page = ("<html><script>"
-                        "xhr.open('POST', \"/implicit/abc\", true);"
+                        "xhr.open('POST', \"\\/implicit\\/abc\", true);"
                         "xhr.send(window.location.hash);</script></html>")
                 body = page.encode("utf-8")
                 self.send_header("Content-Length", str(len(body)))

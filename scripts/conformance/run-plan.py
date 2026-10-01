@@ -123,15 +123,23 @@ def submit_implicit_page(final_url, body, insecure, opener=None):
     match = IMPLICIT_SUBMIT_RE.search(body or "")
     if not match:
         return None
+    # Thymeleaf renders the inline JavaScript string as a JSON literal, so the URL
+    # arrives with escaped slashes (`https:\/\/host\/path`). Decoding it is not
+    # cosmetic: using the raw text produced a path full of backslashes, which Tomcat
+    # rejected as an invalid request target (HTTP 400).
+    raw = match.group("url")
+    try:
+        decoded = json.loads('"%s"' % raw)
+    except ValueError:
+        decoded = raw.replace("\\/", "/")
     # A browser resolves the script's URL against the page it came from; the suite
     # renders it relatively (base_url + "/implicit/<random>"), and urllib would
     # otherwise fail with "no host given".
-    raw = match.group("url")
-    submit_url = urllib.parse.urljoin(final_url, raw)
+    submit_url = urllib.parse.urljoin(final_url, decoded)
     if not urllib.parse.urlsplit(submit_url).netloc:
-        return "implicit submit skipped: unresolvable URL %r (page %s)" % (raw, final_url)
+        return "implicit submit skipped: unresolvable URL %r (page %s)" % (decoded, final_url)
     fragment = urllib.parse.urlsplit(final_url).fragment
-    origin_note = "" if raw == submit_url else " (page said %r)" % raw
+    origin_note = "" if decoded == submit_url else " (page said %r)" % decoded
     # The page's XHR sends text/plain; if the deployment rejects that, a form-encoded
     # retry is the next shape a browser-adjacent client would try, and both outcomes
     # go into the report so the next run is diagnosable either way.
