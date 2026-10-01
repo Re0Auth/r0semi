@@ -382,6 +382,7 @@ if (( PLAN_REQUESTED )); then
     --module-timeout "${CONFORMANCE_PLAN_MODULE_TIMEOUT_SECONDS:-180}" \
     --visit-rounds "${CONFORMANCE_PLAN_VISIT_ROUNDS:-3}" \
     --visit-delay "${CONFORMANCE_PLAN_VISIT_DELAY_SECONDS:-1}" \
+    --log-dir "${WORK}/suite-logs" \
     --max-modules "${CONFORMANCE_PLAN_MAX_MODULES:-0}" \
     > "${WORK}/plan-run.json" 2> "${WORK}/plan-run.err"
   run_rc=$?
@@ -427,6 +428,10 @@ PY
 if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
   mkdir -p "${SPIKE_ARTIFACTS}"
   cp "${WORK}/plan-catalogue.json" "${WORK}/available.json" "${WORK}/plan-run.json" "${SPIKE_ARTIFACTS}/" 2>/dev/null || true
+  # The full suite log of every module that did not pass: the summary can only carry
+  # a few lines, and a reason like "Invalid http status" needs the request the suite
+  # actually sent.
+  cp -r "${WORK}/suite-logs" "${SPIKE_ARTIFACTS}/suite-logs" 2>/dev/null || true
   # The OP log is where the conformance auto-login shows up (its startup line and one
   # WARN per auto-approved request); without it a stuck module cannot be told apart
   # from an OP that never authenticated.

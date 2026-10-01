@@ -37,6 +37,7 @@ Exit code 0 when every module result is SUCCESS/WARNING/REVIEW/SKIPPED, 2 otherw
 
 import argparse
 import json
+import os
 import re
 import ssl
 import sys
@@ -164,6 +165,30 @@ def submit_implicit_page(final_url, body, insecure, opener=None):
             return "implicit submit %s%s (%s) failed: %s" % (
                 submit_url, origin_note, content_type, err.reason)
     return last
+
+
+def dump_module_log(api, test_id, log_dir, insecure, name):
+    """Write a module's full suite log into the artifact.
+
+    The run summary can only carry a few lines, and a WARNING/FAILED reason like
+    "Invalid http status" needs the request the suite actually sent. `GET /api/log/
+    <id>` has it; keeping the file next to plan-run.json makes the next round
+    diagnosable without another run.
+    """
+    if not log_dir:
+        return
+    try:
+        entries = request(api, "GET", "/api/log/" + urllib.parse.quote(test_id), insecure=insecure)
+    except RuntimeError as err:
+        entries = [{"result": "ERROR", "msg": "could not fetch the suite log: %s" % err}]
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "module")
+        with open(os.path.join(log_dir, "%s.%s.json" % (safe, test_id)), "w",
+                  encoding="utf-8") as fh:
+            json.dump(entries, fh, indent=1)
+    except OSError as err:
+        print("could not write the suite log for %s: %s" % (name, err), file=sys.stderr)
 
 
 def module_list(plan_response):
@@ -335,12 +360,16 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_ro
             messages.insert(0, "stayed WAITING after %d idle front-channel rounds" % visit_rounds)
             tail = module_messages(api, test_id, insecure, limit=6, include_info=True)
             messages += tail
-            # Some modules deliberately stop for a human (a screenshot of an error
-            # page, a pasted URI). Name that, so it is not read as a protocol bug.
-            if any("screenshot" in text.lower() for text in tail):
-                module["interactive"] = "screenshot-required"
-                messages.insert(0, "INTERACTIVE STEP: the suite asks for an uploaded screenshot; "
-                                   "this module cannot finish in a headless run")
+            # Some modules deliberately stop for a human: a screenshot of an error
+            # page, a pasted URI, a confirmation that a page was shown. Name that,
+            # so it is not read as a protocol bug.
+            interactive = re.compile(r"screenshot|upload|paste|show .{0,30}(page|error)|"
+                                     r"manually|on the browser", re.IGNORECASE)
+            if any(interactive.search(text) for text in tail):
+                module["interactive"] = "human-step"
+                messages.insert(0, "INTERACTIVE STEP: the suite asks for a human (a screenshot, "
+                                   "a pasted URI or a page confirmation); this module cannot "
+                                   "finish in a headless run")
         # A request the suite deliberately sends without PKCE meets a policy this
         # repository chose: mandatory PKCE S256 for every client
         # (docs/api-design.md §207). Name it, so it is not read as an OP bug.
@@ -362,6 +391,8 @@ def main():
                     help="stop a module after this many front-channel rounds that offer nothing new")
     ap.add_argument("--visit-delay", type=float, default=1.0,
                     help="seconds to pause before fetching a front-channel URL (emulates a page load)")
+    ap.add_argument("--log-dir", default="",
+                    help="directory to write the full suite log of every non-PASSED module into")
     ap.add_argument("--max-modules", type=int, default=0, help="0 = every module in the plan")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed front)")
     args = ap.parse_args()
@@ -404,6 +435,9 @@ def main():
                       "messages": [str(err)]}
         if result:
             results.append(result)
+            if result.get("result") != "PASSED":
+                dump_module_log(args.api, result.get("testId"), args.log_dir, args.insecure,
+                                result.get("testModule"))
 
     ok = all(module.get("result") in TERMINAL_OK for module in results)
     if ok:

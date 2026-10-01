@@ -15,6 +15,7 @@ then asserts three verdicts:
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -117,11 +118,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({}, 404)
 
 
-def run_runner(api, payload_path):
+def run_runner(api, payload_path, log_dir):
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     return subprocess.run(
         [sys.executable, "scripts/conformance/run-plan.py", "--api", api, "--payload", payload_path,
-         "--module-timeout", "20", "--visit-rounds", "2", "--visit-delay", "0"],
+         "--module-timeout", "20", "--visit-rounds", "2", "--visit-delay", "0",
+         "--log-dir", log_dir],
         capture_output=True, text=True, cwd=root)
 
 
@@ -143,12 +145,13 @@ def main():
                    "variant": {"client_registration": "static_client"},
                    "config": {"alias": "conformance"}}, fh)
         payload = fh.name
+    log_dir = tempfile.mkdtemp(prefix="run-plan-logs-")
 
     ok = True
 
     # 1. Everything succeeds (the suite's own word is PASSED, not SUCCESS).
     RESULT["value"] = "PASSED"
-    proc = run_runner(api, payload)
+    proc = run_runner(api, payload, log_dir)
     out = parse(proc)
     if proc.returncode != 0 or not out or out.get("result") != "PASSED" or len(out.get("modules") or []) != 2:
         print("FAIL success case: rc=%s out=%s" % (proc.returncode, out))
@@ -159,18 +162,25 @@ def main():
     if not IMPLICIT:
         print("FAIL: the runner did not run the implicitCallback page's POST")
         ok = False
+    if os.listdir(log_dir):
+        print("FAIL: a PASSED run wrote suite-log dumps: %s" % os.listdir(log_dir))
+        ok = False
 
-    # 2. A module fails: the log message must reach the report.
+    # 2. A module fails: the log message must reach the report, and its full suite
+    #    log must land in the log directory.
     WAITED.clear()
     VISITED.clear()
     IMPLICIT.clear()
     RESULT["value"] = "FAILED"
-    proc = run_runner(api, payload)
+    proc = run_runner(api, payload, log_dir)
     out = parse(proc)
     messages = [m for module in (out or {}).get("modules") or [] for m in (module.get("messages") or [])]
     if proc.returncode != 2 or not out or out.get("result") != "FAILED" \
             or not any("stub failure reason" in m for m in messages):
         print("FAIL failure case: rc=%s out=%s" % (proc.returncode, out))
+        ok = False
+    if not os.listdir(log_dir):
+        print("FAIL: no suite-log dump was written for the failing modules")
         ok = False
 
     # 3. A module the suite will never complete because it sent no PKCE: stuck, named
@@ -181,7 +191,7 @@ def main():
     RESULT["value"] = "PASSED"
     WAIT_ALWAYS["value"] = True
     DIVERGE["value"] = True
-    proc = run_runner(api, payload)
+    proc = run_runner(api, payload, log_dir)
     out = parse(proc)
     modules = (out or {}).get("modules") or []
     diverged = [m for m in modules if m.get("divergence") == "pkce-required"]
@@ -191,6 +201,7 @@ def main():
         ok = False
 
     os.unlink(payload)
+    shutil.rmtree(log_dir, ignore_errors=True)
     server.shutdown()
 
     if not ok:

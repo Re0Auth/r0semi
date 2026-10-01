@@ -57,7 +57,7 @@ have caught them on every commit.
    once interrupts the suite's configuration (30 of 35 modules ended INTERRUPTED on
    the first real run). Failures carry their `GET /api/log/<id>` reasons into the
    summary, and a module that stops for a human is tagged
-   `interactive: screenshot-required` rather than read as a protocol bug.
+   `interactive: human-step` rather than read as a protocol bug.
    `max_modules` caps the run for a smoke test (milestones 6–7). The payload shape and
    the ready-made Basic OP file are in `scripts/conformance/plans/`.
 
