@@ -90,6 +90,12 @@ done
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
+# Initialized before anything reads it: under `set -u`, the run lookup's own
+# `[[ -z "${RUN_ID}" ]]` guard aborts when the variable does not exist yet — which
+# is how a dispatch succeeded and the script then died before waiting for it.
+RUN_ID="${ATTACH_RUN_ID}"
+RUN_URL=""
+
 # The dispatch body: every input is a string in the REST API.
 INPUTS="$("$PYTHON" -c '
 import json, sys
@@ -111,6 +117,11 @@ if (( SELF_TEST )); then
   if [[ "${rid}" != "12345" || "${rstatus}" != "in_progress" || -n "${rconclusion}" \
         || "${rurl}" != "https://github.com/o/r/actions/runs/12345" ]]; then
     fail "self-test: run-pick parse failed for '${picked}'"
+  fi
+  # RUN_ID must exist before the lookup reads it, or `set -u` aborts right after a
+  # successful dispatch (the bug this pins).
+  if [[ -z "${RUN_ID+x}" || -n "${RUN_ID}" ]]; then
+    fail "self-test: RUN_ID must be pre-initialized and empty without --run-id"
   fi
   log "self-test OK"
   exit 0
@@ -163,7 +174,6 @@ api() { # <method> <path> [json-body]
 
 # ---- dispatch ---------------------------------------------------------------
 if [[ -n "${ATTACH_RUN_ID}" ]]; then
-  RUN_ID="${ATTACH_RUN_ID}"
   RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
   log "attaching to run ${RUN_ID} (no dispatch)"
 else
@@ -177,8 +187,6 @@ fi
 # The cron also triggers this workflow, so the run is matched by event, branch and
 # creation time rather than assumed to be the newest. --run-id skips this entirely.
 if [[ -z "${RUN_ID}" ]]; then
-RUN_ID=""
-RUN_URL=""
 for _ in $(seq 1 24); do
   RUNS="$(api GET "/repos/${REPO}/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&branch=${REF}&per_page=10" || true)"
   if [[ -n "${RUNS}" ]]; then
