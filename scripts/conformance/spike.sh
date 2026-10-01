@@ -356,6 +356,7 @@ if (( PLAN_REQUESTED )); then
     --api "${API}" --insecure --payload "${CONFORMANCE_PLAN_JSON}" \
     --timeout "${CONFORMANCE_PLAN_TIMEOUT_SECONDS:-1800}" \
     --module-timeout "${CONFORMANCE_PLAN_MODULE_TIMEOUT_SECONDS:-180}" \
+    --visit-rounds "${CONFORMANCE_PLAN_VISIT_ROUNDS:-3}" \
     --max-modules "${CONFORMANCE_PLAN_MAX_MODULES:-0}" \
     > "${WORK}/plan-run.json" 2> "${WORK}/plan-run.err"
   run_rc=$?
@@ -401,6 +402,10 @@ PY
 if [[ -n "${SPIKE_ARTIFACTS:-}" ]]; then
   mkdir -p "${SPIKE_ARTIFACTS}"
   cp "${WORK}/plan-catalogue.json" "${WORK}/available.json" "${WORK}/plan-run.json" "${SPIKE_ARTIFACTS}/" 2>/dev/null || true
+  # The OP log is where the conformance auto-login shows up (its startup line and one
+  # WARN per auto-approved request); without it a stuck module cannot be told apart
+  # from an OP that never authenticated.
+  cp "${WORK}/op.log" "${SPIKE_ARTIFACTS}/op.log" 2>/dev/null || true
   docker logs "${SUITE_NAME}" > "${SPIKE_ARTIFACTS}/suite.log" 2>&1 || true
   docker logs "${CADDY_NAME}" > "${SPIKE_ARTIFACTS}/caddy.log" 2>&1 || true
   {

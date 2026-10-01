@@ -121,30 +121,39 @@ def wait_state(api, test_id, insecure, states, timeout_ms=15000):
     return response.get("state") or ""
 
 
-def visit_front_channel(api, test_id, insecure):
-    """Visit every URL the module is waiting on and report each as visited."""
+def visit_front_channel(api, test_id, insecure, seen):
+    """Visit the URLs the module is waiting on; report each as visited.
+
+    Returns (outcomes, new_count, urls): outcomes are human-readable lines for the
+    report, new_count counts URLs not seen before, and urls is the full list so the
+    caller can remember it.
+    """
     try:
         browser = request(api, "GET", "/api/runner/browser/" + urllib.parse.quote(test_id),
                           insecure=insecure)
-    except RuntimeError:
-        return 0
-    urls = browser.get("urls") or []
-    visited = 0
-    for entry in urls:
-        url = entry.get("url") if isinstance(entry, dict) else entry
-        if not url or not isinstance(url, str):
-            continue
+    except RuntimeError as err:
+        return ["browser status unavailable: %s" % err], 0, []
+    raw_urls = browser.get("urls") or []
+    urls = [entry.get("url") if isinstance(entry, dict) else entry for entry in raw_urls]
+    urls = [url for url in urls if url and isinstance(url, str)]
+    outcomes = []
+    new = 0
+    for url in urls:
+        if url not in seen:
+            new += 1
         try:
-            fetch_front_channel(url, insecure)
+            status, final = fetch_front_channel(url, insecure)
+            outcomes.append("visited %s -> %s %s" % (url, status, final))
         except Exception as err:  # noqa: BLE001 - the suite must still be told we tried
-            print("visit %s failed: %s" % (url, err), file=sys.stderr)
+            outcomes.append("visit %s failed: %s" % (url, err))
         try:
             request(api, "POST", "/api/runner/browser/%s/visit" % urllib.parse.quote(test_id),
                     query={"url": url}, insecure=insecure)
-            visited += 1
         except RuntimeError as err:
-            print("could not report visit: %s" % err, file=sys.stderr)
-    return visited
+            outcomes.append("could not report visit of %s: %s" % (url, err))
+    if not urls:
+        outcomes.append("the suite offered no front-channel URL")
+    return outcomes, new, urls
 
 
 def module_messages(api, test_id, insecure, limit=4):
@@ -169,7 +178,7 @@ def module_messages(api, test_id, insecure, limit=4):
     return out
 
 
-def run_module(api, plan_id, entry, insecure, deadline, module_timeout):
+def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_rounds):
     name = module_name(entry)
     if not name:
         return None
@@ -185,22 +194,38 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout):
 
     module_deadline = min(deadline, time.time() + module_timeout)
     status = ""
+    visits = []
+    seen = set()
+    stuck = 0
     while time.time() < module_deadline:
         status = wait_state(api, test_id, insecure,
                             ["CONFIGURED", "WAITING", "FINISHED", "INTERRUPTED", "STOPPED"])
         if status in TERMINAL_STATUSES:
             break
         if status == "WAITING":
-            if visit_front_channel(api, test_id, insecure) == 0:
-                time.sleep(2)
+            outcomes, new, urls = visit_front_channel(api, test_id, insecure, seen)
+            seen.update(urls)
+            visits.extend(outcomes)
+            # A round that offers nothing new means the module is not moving; stop
+            # burning the per-module budget and say so, instead of waiting it out.
+            stuck = 0 if new else stuck + 1
+            if stuck >= visit_rounds:
+                status = "INTERRUPTED"
+                break
             continue
         # CONFIGURED (or an empty long-poll timeout): wait again.
     info = request(api, "GET", "/api/info/" + urllib.parse.quote(test_id), insecure=insecure)
     status = info.get("status") or status
     result = info.get("result")
     module = {"testModule": name, "testId": test_id, "status": status, "result": result}
+    if visits:
+        module["visits"] = visits[-8:]
     if result not in TERMINAL_OK:
-        module["messages"] = module_messages(api, test_id, insecure)
+        messages = module_messages(api, test_id, insecure)
+        if status == "INTERRUPTED" and stuck >= visit_rounds:
+            messages.insert(0, "stuck in WAITING after %d rounds with no new front-channel URL"
+                            % visit_rounds)
+        module["messages"] = messages + [v for v in visits[-4:] if v not in messages]
     return module
 
 
@@ -210,6 +235,8 @@ def main():
     ap.add_argument("--payload", required=True, help="plan payload JSON file")
     ap.add_argument("--timeout", type=int, default=1800, help="seconds for the whole plan")
     ap.add_argument("--module-timeout", type=int, default=180, help="seconds per module")
+    ap.add_argument("--visit-rounds", type=int, default=3,
+                    help="stop a module after this many front-channel rounds that offer nothing new")
     ap.add_argument("--max-modules", type=int, default=0, help="0 = every module in the plan")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (self-signed front)")
     args = ap.parse_args()
@@ -245,7 +272,8 @@ def main():
                             "result": None, "messages": ["plan deadline reached before this module"]})
             continue
         try:
-            result = run_module(args.api, plan_id, entry, args.insecure, deadline, args.module_timeout)
+            result = run_module(args.api, plan_id, entry, args.insecure, deadline,
+                                args.module_timeout, args.visit_rounds)
         except RuntimeError as err:
             result = {"testModule": module_name(entry), "status": "INTERRUPTED", "result": None,
                       "messages": [str(err)]}
