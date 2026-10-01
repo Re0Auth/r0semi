@@ -85,17 +85,23 @@ def request(api, method, path, body=None, query=None, insecure=False):
         raise RuntimeError("%s %s -> non-JSON response: %s" % (method, url, raw[:300])) from None
 
 
-def fetch_front_channel(url, insecure):
+def new_browser(insecure):
+    """A browser-like opener: its own cookie jar, so the callback's session cookie is
+    sent with the implicit submission exactly as a real browser would."""
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(),
+        urllib.request.HTTPSHandler(context=context(insecure)),
+    )
+
+
+def fetch_front_channel(url, insecure, opener=None):
     """Drive one front-channel URL the way a browser would: follow every redirect.
 
     Returns (status, final_url, body). The body matters: the suite's callback does
     not finish the flow itself, it returns a page whose JavaScript posts the URL
     fragment back to a one-time /implicit/<random> URL (see submit_implicit_page).
     """
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(),
-        urllib.request.HTTPSHandler(context=context(insecure)),
-    )
+    opener = opener or new_browser(insecure)
     req = urllib.request.Request(url, headers={"User-Agent": "r0semi-conformance-spike"})
     with opener.open(req, timeout=60) as resp:
         return resp.status, resp.geturl(), resp.read().decode("utf-8", "replace")
@@ -106,7 +112,7 @@ def fetch_front_channel(url, insecure):
 IMPLICIT_SUBMIT_RE = re.compile(r"""xhr\.open\(\s*['"]POST['"]\s*,\s*(['"])(?P<url>[^'"]+)\1""")
 
 
-def submit_implicit_page(final_url, body, insecure):
+def submit_implicit_page(final_url, body, insecure, opener=None):
     """Run the one piece of JavaScript our HTTP client cannot: the suite's callback
     returns `implicitCallback`, whose script POSTs `window.location.hash` to a
     one-time /implicit/<random> endpoint. Without that POST the module stays WAITING
@@ -120,18 +126,34 @@ def submit_implicit_page(final_url, body, insecure):
     # A browser resolves the script's URL against the page it came from; the suite
     # renders it relatively (base_url + "/implicit/<random>"), and urllib would
     # otherwise fail with "no host given".
-    submit_url = urllib.parse.urljoin(final_url, match.group("url"))
+    raw = match.group("url")
+    submit_url = urllib.parse.urljoin(final_url, raw)
     if not urllib.parse.urlsplit(submit_url).netloc:
-        return "implicit submit skipped: unresolvable URL %r (page %s)" % (match.group("url"), final_url)
+        return "implicit submit skipped: unresolvable URL %r (page %s)" % (raw, final_url)
     fragment = urllib.parse.urlsplit(final_url).fragment
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(),
-        urllib.request.HTTPSHandler(context=context(insecure)),
-    )
-    req = urllib.request.Request(submit_url, data=fragment.encode("utf-8"), method="POST",
-                                 headers={"Content-Type": "text/plain"})
-    with opener.open(req, timeout=30) as resp:
-        return "implicit submit -> %s %s" % (resp.status, submit_url)
+    origin_note = "" if raw == submit_url else " (page said %r)" % raw
+    # The page's XHR sends text/plain; if the deployment rejects that, a form-encoded
+    # retry is the next shape a browser-adjacent client would try, and both outcomes
+    # go into the report so the next run is diagnosable either way.
+    opener = opener or new_browser(insecure)
+    last = None
+    for content_type in ("text/plain", "application/x-www-form-urlencoded"):
+        req = urllib.request.Request(submit_url, data=fragment.encode("utf-8"), method="POST",
+                                     headers={"Content-Type": content_type})
+        try:
+            with opener.open(req, timeout=30) as resp:
+                return "implicit submit %s%s (%s, fragment %d bytes) -> %s" % (
+                    submit_url, origin_note, content_type, len(fragment), resp.status)
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode("utf-8", "replace")[:300]
+            last = "implicit submit %s%s (%s) -> HTTP %s: %s" % (
+                submit_url, origin_note, content_type, err.code, detail)
+            if err.code != 400:
+                return last
+        except urllib.error.URLError as err:
+            return "implicit submit %s%s (%s) failed: %s" % (
+                submit_url, origin_note, content_type, err.reason)
+    return last
 
 
 def module_list(plan_response):
@@ -191,10 +213,14 @@ def visit_front_channel(api, test_id, insecure, seen, delay=0.0):
         new += 1
         if delay:
             time.sleep(delay)
+        # One browser per visit: the fetch and the implicit submission share its
+        # cookie jar, which is what a real browser does with the session the callback
+        # page may set.
+        browser = new_browser(insecure)
         try:
-            status, final, body = fetch_front_channel(url, insecure)
+            status, final, body = fetch_front_channel(url, insecure, browser)
             outcomes.append("visited %s -> %s %s" % (url, status, final))
-            implicit = submit_implicit_page(final, body, insecure)
+            implicit = submit_implicit_page(final, body, insecure, browser)
             if implicit:
                 outcomes.append(implicit)
         except Exception as err:  # noqa: BLE001 - the suite must still be told we tried
