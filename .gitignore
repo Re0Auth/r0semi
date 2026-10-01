@@ -80,3 +80,8 @@ docs/*.pdf
 # under internal/zzprobe/. Anchored so it cannot shadow a deeper directory of the
 # same name.
 /scratchpad/
+
+# Downloaded conformance artifacts (scripts/conformance/dispatch.sh): one directory
+# per run, holding the summary, plan-run.json and the suite logs. They are per-run
+# evidence, not source.
+/conformance-runs/

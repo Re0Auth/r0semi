@@ -93,6 +93,30 @@ to a real payload, fill it from that catalogue, and dispatch again with
 `plan_json` set (plus `redirect_uri` if the suite's value differs from the seeded
 one).
 
+## Dispatch it in one command
+
+[`scripts/conformance/dispatch.sh`](../scripts/conformance/dispatch.sh) dispatches
+the workflow through the REST API, waits for the run, downloads the
+`conformance-spike` artifact and prints the summary and the verdict — no web UI, no
+manual download:
+
+```sh
+scripts/conformance/dispatch.sh                  # the ready-made Basic OP plan, all modules
+scripts/conformance/dispatch.sh --max-modules 5  # smoke run
+scripts/conformance/dispatch.sh --dry-run        # print the REST call, send nothing
+```
+
+Credentials come from `GH_TOKEN` / `GITHUB_TOKEN`, or from `gh auth token` when the
+CLI is installed (this host has no `gh`, so the REST path is the one in use). The
+token needs `workflow` (classic PAT) or *Actions: read and write* (fine-grained);
+artifact download needs it even for a public repository. Runs land in
+`conformance-runs/<timestamp>/` (git-ignored): `summary.md` is the table the run's
+step summary shows, `plan-run.json` holds every module's verdict and reasons, and
+`suite-logs/` holds the full suite log of each module that did not pass. Exit code
+`0` means the plan passed (or none ran), `2` means the run finished without passing,
+`1` is an operational failure. `_audit/conformance/dispatch-check.sh` pins the
+argument parsing and the payload it would send.
+
 Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 `CONFORMANCE_REQUIRE_PLAN=1`, `CONFORMANCE_REDIRECT_URI`,
 `CONFORMANCE_PLAN_MAX_MODULES`, `CONFORMANCE_PLAN_TIMEOUT_SECONDS`,
