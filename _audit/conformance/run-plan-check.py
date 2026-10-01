@@ -28,6 +28,7 @@ WAIT_ALWAYS = {"value": False}
 DIVERGE = {"value": False}
 WAITED = defaultdict(int)
 VISITED = []
+IMPLICIT = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -53,6 +54,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"id": "plan-1", "modules": [{"testModule": "m-one"}, {"testModule": "m-two"}]})
         elif path.startswith("/api/runner/browser/") and path.endswith("/visit"):
             VISITED.append(path)
+            self._empty()
+        elif path.startswith("/implicit/"):
+            # The page's JavaScript would POST here; the runner has to do it instead.
+            IMPLICIT.append(path)
             self._empty()
         elif path.startswith("/api/runner"):
             test = (query.get("test") or ["?"])[0]
@@ -93,7 +98,18 @@ class Handler(BaseHTTPRequestHandler):
                     % self.server.server_address[1])
                 self.end_headers()
             else:
-                self._json({"ok": True})
+                # The suite's implicitCallback page: the flow only advances when the
+                # JavaScript POST runs, which the runner must emulate.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                page = ("<html><script>"
+                        "xhr.open('POST', \"http://127.0.0.1:%d/implicit/abc\", true);"
+                        "xhr.send(window.location.hash);</script></html>"
+                        % self.server.server_address[1])
+                body = page.encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
         elif self.path.startswith("/cb"):
             self._json({"done": True})
         else:
@@ -139,10 +155,14 @@ def main():
     if not VISITED:
         print("FAIL: the runner never visited a front-channel URL")
         ok = False
+    if not IMPLICIT:
+        print("FAIL: the runner did not run the implicitCallback page's POST")
+        ok = False
 
     # 2. A module fails: the log message must reach the report.
     WAITED.clear()
     VISITED.clear()
+    IMPLICIT.clear()
     RESULT["value"] = "FAILURE"
     proc = run_runner(api, payload)
     out = parse(proc)
@@ -156,6 +176,7 @@ def main():
     #    as a policy divergence rather than an OP bug.
     WAITED.clear()
     VISITED.clear()
+    IMPLICIT.clear()
     RESULT["value"] = "SUCCESS"
     WAIT_ALWAYS["value"] = True
     DIVERGE["value"] = True

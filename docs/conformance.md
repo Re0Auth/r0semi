@@ -49,12 +49,17 @@ have caught them on every commit.
    `POST /api/runner?test=<module>&plan=<id>`, long-poll
    `GET /api/runner/<id>/wait-state`, **visit the front-channel URLs** the suite
    lists (`GET /api/runner/browser/<id>` → real GET → `POST …/visit`) and read the
-   final `GET /api/info/<id>`. Modules run one at a time — creating a whole plan's
-   worth at once interrupts the suite's configuration (30 of 35 modules ended
-   INTERRUPTED on the first real run). Failures carry their `GET /api/log/<id>`
-   reasons into the summary. `max_modules` caps the run for a smoke test (milestones
-   6–7). The payload shape and the ready-made Basic OP file are in
-   `scripts/conformance/plans/`.
+   final `GET /api/info/<id>`. The visit also runs the one piece of JavaScript a plain
+   HTTP client cannot: the suite's callback answers with the `implicitCallback` page,
+   whose script POSTs the URL fragment (empty for a query-mode response) to a one-time
+   `/implicit/<random>` URL — without that POST the module waits forever and the code
+   is never exchanged. Modules run one at a time — creating a whole plan's worth at
+   once interrupts the suite's configuration (30 of 35 modules ended INTERRUPTED on
+   the first real run). Failures carry their `GET /api/log/<id>` reasons into the
+   summary, and a module that stops for a human is tagged
+   `interactive: screenshot-required` rather than read as a protocol bug.
+   `max_modules` caps the run for a smoke test (milestones 6–7). The payload shape and
+   the ready-made Basic OP file are in `scripts/conformance/plans/`.
 
 Every milestone is written to `conformance-artifacts/summary.md`, which the
 workflow appends to the run's **step summary** — that table is what the nightly

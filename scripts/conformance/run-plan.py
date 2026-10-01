@@ -37,6 +37,7 @@ Exit code 0 when every module result is SUCCESS/WARNING/REVIEW/SKIPPED, 2 otherw
 
 import argparse
 import json
+import re
 import ssl
 import sys
 import time
@@ -85,14 +86,47 @@ def request(api, method, path, body=None, query=None, insecure=False):
 
 
 def fetch_front_channel(url, insecure):
-    """Drive one front-channel URL the way a browser would: follow every redirect."""
+    """Drive one front-channel URL the way a browser would: follow every redirect.
+
+    Returns (status, final_url, body). The body matters: the suite's callback does
+    not finish the flow itself, it returns a page whose JavaScript posts the URL
+    fragment back to a one-time /implicit/<random> URL (see submit_implicit_page).
+    """
     opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(),
         urllib.request.HTTPSHandler(context=context(insecure)),
     )
     req = urllib.request.Request(url, headers={"User-Agent": "r0semi-conformance-spike"})
     with opener.open(req, timeout=60) as resp:
-        return resp.status, resp.geturl()
+        return resp.status, resp.geturl(), resp.read().decode("utf-8", "replace")
+
+
+# The suite's implicitCallback page submits with a literal JS call; both quote styles
+# appear across versions, and Thymeleaf renders the URL inline.
+IMPLICIT_SUBMIT_RE = re.compile(r"""xhr\.open\(\s*['"]POST['"]\s*,\s*(['"])(?P<url>[^'"]+)\1""")
+
+
+def submit_implicit_page(final_url, body, insecure):
+    """Run the one piece of JavaScript our HTTP client cannot: the suite's callback
+    returns `implicitCallback`, whose script POSTs `window.location.hash` to a
+    one-time /implicit/<random> endpoint. Without that POST the module stays WAITING
+    forever and the authorization code is never exchanged.
+
+    Returns a status line for the report, or None when the page is not that one.
+    """
+    match = IMPLICIT_SUBMIT_RE.search(body or "")
+    if not match:
+        return None
+    submit_url = match.group("url")
+    fragment = urllib.parse.urlsplit(final_url).fragment
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(),
+        urllib.request.HTTPSHandler(context=context(insecure)),
+    )
+    req = urllib.request.Request(submit_url, data=fragment.encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "text/plain"})
+    with opener.open(req, timeout=30) as resp:
+        return "implicit submit -> %s %s" % (resp.status, submit_url)
 
 
 def module_list(plan_response):
@@ -153,8 +187,11 @@ def visit_front_channel(api, test_id, insecure, seen, delay=0.0):
         if delay:
             time.sleep(delay)
         try:
-            status, final = fetch_front_channel(url, insecure)
+            status, final, body = fetch_front_channel(url, insecure)
             outcomes.append("visited %s -> %s %s" % (url, status, final))
+            implicit = submit_implicit_page(final, body, insecure)
+            if implicit:
+                outcomes.append(implicit)
         except Exception as err:  # noqa: BLE001 - the suite must still be told we tried
             outcomes.append("visit %s failed: %s" % (url, err))
         try:
@@ -246,7 +283,14 @@ def run_module(api, plan_id, entry, insecure, deadline, module_timeout, visit_ro
             # The test's own log tail (INFO included) is what says whether the
             # callback was ingested or the flow stopped one step earlier.
             messages.insert(0, "stayed WAITING after %d idle front-channel rounds" % visit_rounds)
-            messages += module_messages(api, test_id, insecure, limit=6, include_info=True)
+            tail = module_messages(api, test_id, insecure, limit=6, include_info=True)
+            messages += tail
+            # Some modules deliberately stop for a human (a screenshot of an error
+            # page, a pasted URI). Name that, so it is not read as a protocol bug.
+            if any("screenshot" in text.lower() for text in tail):
+                module["interactive"] = "screenshot-required"
+                messages.insert(0, "INTERACTIVE STEP: the suite asks for an uploaded screenshot; "
+                                   "this module cannot finish in a headless run")
         # A request the suite deliberately sends without PKCE meets a policy this
         # repository chose: mandatory PKCE S256 for every client
         # (docs/api-design.md §207). Name it, so it is not read as an OP bug.
