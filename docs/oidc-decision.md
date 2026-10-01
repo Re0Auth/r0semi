@@ -38,7 +38,7 @@ Re0Auth 从"纯 OAuth 2.0 授权服务器"变为 **OpenID Provider（OP）+ 数�
 | O-3a | **授权交互 handle 不绑 origin / 设备 / 方法**：同意页与设备决策用的 handle 只绑「创建它的会话 + 账号」（[ADR-0004](./consent-binding-decision.md)），失败一律 404。残余危害仅是「用户看到一个他没请求过的同意页」——而批准它得到的授权，请求者本就能拿到（他必须是持有 `client_id` 与精确 `redirect_uri` 的客户端）。不做 origin 绑定：那会与 ADR-0004 §3「handle 跨登录存活」的设计冲突，且需要记录发起方（PAR 不在契约内，见 O-9）。 |
 | O-4 | **`sub` = Re0Auth 的 `usr_...`**：随机、稳定、伪匿名。 |
 | O-5 | **access token 仍是不透明引用令牌 + introspect**（[api-design.md](./api-design.md) D-2 不变）；`id_token` 是唯一的 JWT。 |
-| O-6 | **refresh token 总是签发**。`offline_access` 是**兼容性空操作**：客户端带上它不报错、不要求、也不对外呈现（token `scope` / introspect / grants 都不含它）；仅内部用它触发 refresh token 的签发。是否将来收紧为“必须显式请求”留待后续。 |
+| O-6 | **refresh token 总是签发**。`offline_access` 是**兼容性空操作**：客户端带上它不报错、不要求、也不对外呈现（token `scope` / introspect / grants 都不含它）；仅内部用它触发 refresh token 的签发。因为它在**入库前**就被剥离，refresh 请求里回显它时（OIDF 一致性套件按自己的客户端配置发送）会在库的「请求 scope 必须是原始授权 scope 子集」校验上被误拒，所以 refresh 这条腿上同样**忽略**它——其余 scope 仍严格执行子集校验，refresh 不能借此放宽。是否将来收紧为“必须显式请求”留待后续。 |
 | O-7 | **scope 语义不变**：未知 / 未授权的 scope → `invalid_scope`，**不是静默丢弃**（库默认会静默丢弃，迁移必须补校验）。 |
 | O-8 | **设备码流（RFC 8628）保持**，由 OP 原生提供。 |
 | O-8a | **`prompt=none` 实现**（OIDC Core §3.1.2.1）：无活会话时经 `redirect_uri` 返回 `error=login_required`（带 `iss`），绝不渲染交互 UI；`prompt=none` 与其它值组合返回 `invalid_request`。实现方式是给 `oidchttp.Config` 注入会话查询钩子（`Sessions`）；未注入即无会话，fail-closed 到 `login_required`。**有活会话也不同**：本 OP 不保存可复用的历史同意，每次授权都要经同意页，所以静默请求只能经 `redirect_uri` 回 `error=consent_required`，绝不把同意 UI 交给 RP 的 iframe（第九轮 S02-2）。这是对一条 MUST 的补齐，不是可选项。 |

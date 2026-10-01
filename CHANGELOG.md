@@ -22,6 +22,10 @@
   静默请求无法在无 UI 的情况下完成；此前会把同意页（交互 UI）交给 RP，现按 OIDC Core §3.1.2.1
   经 `redirect_uri` 回 `consent_required`。用 `prompt=none` 做静默 SSO 的 RP 需要处理该错误。
 - **`return_to` 超过 2048 字节时被替换为 `/`**（S03-1）。此前无长度上限且整段写进服务端 session。
+- **refresh 请求里的 `offline_access` 现在被忽略**（O-6 的同一口径）。此前客户端在 refresh 请求中回显
+  该 scope（OIDF 一致性套件按自己的客户端配置发送，从不读我们的 granted scope）会被 `invalid_scope`
+  拒绝：库的校验要求「请求 scope ⊆ 原始授权 scope」，而 O-6 从不把 `offline_access` 存进那份请求。
+  现在它在 refresh 这条腿上被忽略，其余 scope 仍严格执行子集校验（refresh 不能借此放宽）。
 
 ### 配置与运维影响
 

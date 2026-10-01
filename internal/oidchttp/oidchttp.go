@@ -632,6 +632,15 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// O-6 (revised): a refresh request may echo the offline_access no-op scope back
+	// — the OIDF suite does, from its own client configuration — and the library's
+	// subset check reads the stored request, where this OP never keeps it. Ignore
+	// it here, for the same reason the response never shows it. Placed after every
+	// gate that reads the request, so nothing validates one form and serves another.
+	if r.URL.Path == "/"+pathToken && r.Method == http.MethodPost &&
+		form.Get("grant_type") == string(oidc.GrantTypeRefreshToken) {
+		dropRefreshNoOpScope(r, form)
+	}
 
 	const tokenPath = "/" + pathToken
 	// Path-only, not POST-only. `op.Exchange` dispatches on the `grant_type` it
@@ -913,6 +922,55 @@ func requestedScopes(form url.Values) []string {
 		out = append(out, strings.Fields(raw)...)
 	}
 	return out
+}
+
+// dropRefreshNoOpScope removes the O-6 no-op scope from a refresh request's
+// `scope` parameter, in place, before the library validates it.
+//
+// Re0Auth accepts offline_access, never stores it and never surfaces it, and
+// issues a refresh token whether or not it was asked for (ADR-0001 O-6,
+// revised). The library's refresh check is "every requested scope must be a
+// subset of the original request's", and the stored request deliberately has no
+// offline_access — so a client that echoes the scope back (the OIDF conformance
+// suite takes it from its own client configuration, never from our response) was
+// refused with invalid_scope for asking for a scope this OP has no record of.
+// Ignoring it on the refresh leg is the same stance the rest of the endpoint
+// takes: the scope is a compatibility no-op here.
+//
+// Nothing else is touched. A refresh still may not widen: after this the subset
+// check enforces the rule that matters, and every other scope must have been
+// granted.
+func dropRefreshNoOpScope(r *http.Request, form url.Values) {
+	raw, ok := form["scope"]
+	if !ok {
+		return
+	}
+	cleaned := make([]string, 0, len(raw))
+	changed := false
+	for _, value := range raw {
+		fields := strings.Fields(value)
+		kept := make([]string, 0, len(fields))
+		for _, field := range fields {
+			if field == oidc.ScopeOfflineAccess {
+				changed = true
+				continue
+			}
+			kept = append(kept, field)
+		}
+		cleaned = append(cleaned, strings.Join(kept, " "))
+	}
+	if !changed {
+		return
+	}
+	form["scope"] = cleaned
+	// form IS r.Form (requestParams returns it), which is what the library reads.
+	// The body-only map is kept consistent so nothing that reaches for r.PostForm
+	// sees the removed value either.
+	if r.PostForm != nil {
+		if _, present := r.PostForm["scope"]; present {
+			r.PostForm["scope"] = append([]string(nil), cleaned...)
+		}
+	}
 }
 
 // scopeProblem returns the first requested scope this client may not ask for, or
