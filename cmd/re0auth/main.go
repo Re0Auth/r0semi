@@ -1677,11 +1677,25 @@ func configuredClient(cfg settings) (oauth.Client, error) {
 	if cfg.clientSecret != "" {
 		typ = oauth.ClientConfidential
 	}
+	// A public client that skips PKCE has no binding left at all: it holds no
+	// secret, so the authorization code would be redeemable by anyone who saw it.
+	// The exemption is therefore refused where it would remove the only binding
+	// there is, and the operator has to make the client confidential first.
+	if cfg.clientAllowMissingPKCE && typ == oauth.ClientPublic {
+		return oauth.Client{}, errors.New("client.allow_missing_pkce requires a confidential client: " +
+			"a public client with no PKCE has no credential binding at the token endpoint (set secret_env)")
+	}
 	scopes := make([]oauth.Scope, 0, len(cfg.clientScopes))
 	for _, s := range cfg.clientScopes {
 		scopes = append(scopes, oauth.Scope(s))
 	}
-	return oauth.NewClient(cfg.clientID, cfg.clientName, typ, cfg.clientSecret, cfg.clientRedirects, scopes)
+	client, err := oauth.NewClient(cfg.clientID, cfg.clientName, typ, cfg.clientSecret, cfg.clientRedirects, scopes)
+	if err != nil {
+		return oauth.Client{}, err
+	}
+	// The exemption is applied after construction, so NewClient's default (PKCE
+	// required) stays the only shape a caller can reach by omission.
+	return client.WithAllowMissingPKCE(cfg.clientAllowMissingPKCE), nil
 }
 
 // clientDrift names every way the registered client disagrees with [client].
@@ -1708,6 +1722,13 @@ func clientDrift(registered, configured oauth.Client) []string {
 	if !bytes.Equal(registered.SecretHash(), configured.SecretHash()) {
 		drift = append(drift, "secret: the registered digest differs from the configured client secret "+
 			"(the previous secret would otherwise stay valid)")
+	}
+	// A stricter value in the file must not be silently ignored: turning the
+	// exemption OFF again is a change to what the client may do, so it refuses the
+	// start like every other field.
+	if registered.AllowMissingPKCE != configured.AllowMissingPKCE {
+		drift = append(drift, fmt.Sprintf("allow_missing_pkce: registered %t, configured %t",
+			registered.AllowMissingPKCE, configured.AllowMissingPKCE))
 	}
 	return drift
 }
@@ -1746,6 +1767,14 @@ func seedClient(ctx context.Context, clients oauth.ClientRegistry, cfg settings)
 	configured, err := configuredClient(cfg)
 	if err != nil {
 		return err
+	}
+	if configured.AllowMissingPKCE {
+		// Logged on every start, not only at registration: an operator reading the
+		// log of a running deployment should not have to remember that this client
+		// is the one exception to the PKCE rule.
+		slog.Warn("downstream client is exempt from mandatory PKCE: "+
+			"authorization requests without code_challenge will be accepted",
+			"client_id", configured.ID, "allow_missing_pkce", true)
 	}
 
 	registered, err := clients.Get(ctx, cfg.clientID)

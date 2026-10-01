@@ -21,7 +21,15 @@ export RE0AUTH_OIDC_SIGNING_KEY="$(cat "${WORK}/signing-key")"
 export RE0AUTH_ISSUER="https://re0auth.test:8443"
 export RE0AUTH_COOKIE_SECURE=true
 export RE0AUTH_CLIENT_SECRET="spike-secret"
-REDIRECT_URI="https://localhost:9443/test/a/conformance/callback"
+REDIRECT_URI="https://oidf-suite:8443/test/a/conformance/callback"
+
+# Mirror the spike: the mandatory-PKCE exemption for the suite's client is written
+# only when the run is expected to execute a plan (here: a conformance-tagged build).
+TAGS="${CHECK_TAGS:-}"
+PKCE_EXEMPT_LINE=""
+if [[ -n "${TAGS}" ]]; then
+  PKCE_EXEMPT_LINE="allow_missing_pkce = true"
+fi
 
 cat > "${WORK}/re0auth.toml" <<TOMLEOF
 [server]
@@ -33,9 +41,9 @@ cookie_secure = true
 id = "conformance"
 secret_env = "RE0AUTH_CLIENT_SECRET"
 redirect_uris = ["${REDIRECT_URI}"]
+${PKCE_EXEMPT_LINE}
 TOMLEOF
 
-TAGS="${CHECK_TAGS:-}"
 if [[ -n "${TAGS}" ]]; then
   go build -tags "${TAGS}" -o "${WORK}/re0auth.exe" ./cmd/re0auth
   export RE0AUTH_CONFORMANCE_AUTOLOGIN=1
@@ -71,6 +79,9 @@ if [ "${ok}" -eq 1 ]; then
     grep -q "CONFORMANCE BUILD" "${WORK}/op.log" \
       && echo "AUTOLOGIN_STARTUP_WARNING_PRESENT" \
       || { echo "the conformance build started without its startup warning"; exit 1; }
+    grep -q "exempt from mandatory PKCE" "${WORK}/op.log" \
+      && echo "PKCE_EXEMPT_STARTUP_WARNING_PRESENT" \
+      || { echo "allow_missing_pkce was configured but startup did not report the exemption"; exit 1; }
   fi
   curl -fsS "http://127.0.0.1:8080/.well-known/openid-configuration" | head -c 200; echo
 else

@@ -87,37 +87,42 @@ to a real payload, fill it from that catalogue, and dispatch again with
 one).
 
 Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
-`CONFORMANCE_REQUIRE_PLAN=1`, `CONFORMANCE_TIMEOUT_SECONDS` (default 600),
-`CONFORMANCE_REDIRECT_URI`.
+`CONFORMANCE_REQUIRE_PLAN=1`, `CONFORMANCE_REDIRECT_URI`,
+`CONFORMANCE_PLAN_MAX_MODULES`, `CONFORMANCE_PLAN_TIMEOUT_SECONDS`,
+`CONFORMANCE_PLAN_MODULE_TIMEOUT_SECONDS`, `CONFORMANCE_PLAN_VISIT_ROUNDS`,
+`CONFORMANCE_CLIENT_SECRET`. The OP-side exemption is
+`RE0AUTH_CLIENT_ALLOW_MISSING_PKCE`; the script writes
+`[client] allow_missing_pkce = true` itself once a plan is requested.
 
-## Known divergence: mandatory PKCE vs the Basic OP profile
+## The first real finding: mandatory PKCE vs the Basic OP profile
 
-The first real plan run produced one substantive result, and it is a policy choice
-rather than a bug:
+The first plan run produced one substantive result, and it was a policy collision
+rather than an OP bug:
 
 - The suite's OP tests send an authorization request **without `code_challenge`**
   (`oidcc-server`'s front-channel URL carries only client_id, nonce, redirect_uri,
   response_type, scope, state).
-- Re0Auth **mandates PKCE S256 for every client, confidential ones included**
-  (`internal/oidchttp/oidchttp.go`'s PKCE gate; `docs/api-design.md` §207; guarded by
-  `TestAuthorizeRequiresPKCE` and `TestZZAudit_ConfidentialClientNeedsPKCE`).
-- The OP therefore answers, correctly for its own policy,
-  `error=invalid_request&error_description=code_challenge is required`, and the module
-  stays `WAITING` forever. `run-plan.py` stops it after a few unproductive rounds and
-  tags it `divergence: pkce-required` with
-  `POLICY DIVERGENCE: the suite sent no code_challenge…`.
+- Re0Auth **mandates PKCE S256 for every client** (`internal/oidchttp/oidchttp.go`'s
+  PKCE gate; `docs/api-design.md` §207; guarded by `TestAuthorizeRequiresPKCE` and
+  `TestZZAudit_ConfidentialClientNeedsPKCE`), so the OP answered the only way its own
+  policy allows: `error=invalid_request&error_description=code_challenge is required`.
+  The module then stayed `WAITING`; `run-plan.py` stopped it after a few unproductive
+  rounds and reported `divergence: pkce-required`.
 
-Two ways forward, and it is a product decision:
+**Resolution: a per-client exemption, defaulting to strict.** `[client]
+allow_missing_pkce = true` (or `RE0AUTH_CLIENT_ALLOW_MISSING_PKCE`) registers one
+client that may omit `code_challenge` — the shape a certification suite or a legacy
+RP needs. It is opt-in (the field's zero value keeps PKCE mandatory), it is compared
+by the startup drift check like every other field, the startup log says the client is
+exempt, and each authorization that actually uses the exemption logs a WARN. A
+challenge that *is* sent still has to be a well-formed S256 value: the switch covers
+"no PKCE", not "any PKCE". See ADR-0005 §7b.
 
-1. **Keep mandatory PKCE (OAuth 2.1 / RFC 9700 stance).** Then the Basic OP
-   certification plan is not a fit: expect most of its modules to report this
-   divergence. Use it only to exercise the modules that do send PKCE
-   (`oidcc-ensure-request-with-valid-pkce-succeeds`) and the discovery/config plans.
-2. **Relax the gate to public clients only**, matching the library's default. That
-   contradicts ADR §207's stated OAuth 2.1 rationale, needs the ADR changed, and
-   removes the verifier binding from confidential clients' authorization codes.
-
-Nothing in the spike decides this; the runner only reports it.
+The spike writes the exemption only when a plan is requested (`CONFORMANCE_PLAN_JSON`
+points at a file), so a connectivity-only run keeps the fully strict client. If the
+modules still report `divergence: pkce-required`, the OP was started without the
+exemption — check `op.log` for the startup WARN and for
+`authorization request without PKCE accepted for an exempt client`.
 
 ## Known gaps (the reason this is still a spike)
 

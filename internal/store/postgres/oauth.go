@@ -689,29 +689,34 @@ func (s *Clients) Create(ctx context.Context, c oauth.Client) error {
 		status = oauth.ClientActive
 	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO oauth_clients (id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		INSERT INTO oauth_clients (id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at, allow_missing_pkce)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		c.ID, c.Name, string(c.Type), string(status), nullableBytes(c.SecretHash()),
-		c.RedirectURIs, scopeArray(c.AllowedScopes), c.CreatedAt)
+		c.RedirectURIs, scopeArray(c.AllowedScopes), c.CreatedAt, c.AllowMissingPKCE)
 	return err
 }
 
 // clientRow is one oauth_clients row, named so scanning matches by column rather
 // than by position.
 type clientRow struct {
-	ID            string    `db:"id"`
-	Name          string    `db:"name"`
-	Type          string    `db:"type"`
-	Status        string    `db:"status"`
-	SecretHash    []byte    `db:"secret_hash"`
-	RedirectURIs  []string  `db:"redirect_uris"`
-	AllowedScopes []string  `db:"allowed_scopes"`
-	CreatedAt     time.Time `db:"created_at"`
+	ID               string    `db:"id"`
+	Name             string    `db:"name"`
+	Type             string    `db:"type"`
+	Status           string    `db:"status"`
+	SecretHash       []byte    `db:"secret_hash"`
+	RedirectURIs     []string  `db:"redirect_uris"`
+	AllowedScopes    []string  `db:"allowed_scopes"`
+	CreatedAt        time.Time `db:"created_at"`
+	AllowMissingPKCE bool      `db:"allow_missing_pkce"`
 }
 
 func (r clientRow) client() (oauth.Client, error) {
-	return oauth.RestoreClientWithStatus(r.ID, r.Name, oauth.ClientType(r.Type), oauth.ClientStatus(r.Status),
+	c, err := oauth.RestoreClientWithStatus(r.ID, r.Name, oauth.ClientType(r.Type), oauth.ClientStatus(r.Status),
 		r.SecretHash, r.RedirectURIs, scopesFrom(r.AllowedScopes), r.CreatedAt)
+	if err != nil {
+		return c, err
+	}
+	return c.WithAllowMissingPKCE(r.AllowMissingPKCE), nil
 }
 
 // Get implements oauth.ClientRegistry. A suspended client is reported as not
@@ -719,7 +724,7 @@ func (r clientRow) client() (oauth.Client, error) {
 // not as one that is merely forbidden.
 func (s *Clients) Get(ctx context.Context, id string) (oauth.Client, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at
+		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at, allow_missing_pkce
 		  FROM oauth_clients WHERE id = $1 AND status <> 'suspended'`, id)
 	if err != nil {
 		return oauth.Client{}, err
@@ -731,7 +736,7 @@ func (s *Clients) Get(ctx context.Context, id string) (oauth.Client, error) {
 // admin view is exactly the place they must remain visible.
 func (s *Clients) List(ctx context.Context) ([]oauth.Client, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at
+		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at, allow_missing_pkce
 		  FROM oauth_clients ORDER BY id`)
 	if err != nil {
 		return nil, err

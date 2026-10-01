@@ -45,6 +45,10 @@ type fixture struct {
 	// named its absence as the reason the device-flow client-identity hypothesis
 	// could not be reproduced; round 4 needed exactly this shape.
 	narrowID string
+	// exemptID is the one client registered with allow_missing_pkce: it may
+	// authorize without a code_challenge (the certification-suite escape hatch).
+	exemptID  string
+	exemptSec string
 	// sessions backs prompt=none's "is the browser signed in" question. Flipping
 	// its user changes the answer without rebuilding the handler.
 	sessions *stubSessions
@@ -75,6 +79,7 @@ func newFixture(t testing.TB) fixture {
 	suffix := randSuffix()
 	webID, deviceID := "http-web-"+suffix, "http-device-"+suffix
 	narrowID := "http-narrow-" + suffix
+	exemptID, exemptSec := "http-exempt-"+suffix, "exempt-secret"
 
 	clients := oauth.NewMemoryClientRegistry()
 	web, err := oauth.NewClient(webID, "Web", oauth.ClientConfidential, "s3cret",
@@ -95,7 +100,13 @@ func newFixture(t testing.TB) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []oauth.Client{web, device, narrow} {
+	exempt, err := oauth.NewClient(exemptID, "Exempt", oauth.ClientConfidential, exemptSec,
+		[]string{"https://client.example/cb"},
+		[]oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []oauth.Client{web, device, narrow, exempt.WithAllowMissingPKCE(true)} {
 		if err := clients.Create(ctx, c); err != nil {
 			t.Fatal(err)
 		}
@@ -142,7 +153,8 @@ func newFixture(t testing.TB) fixture {
 	}
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID, narrowID: narrowID, sessions: sessions}
+	return fixture{server: srv, handler: handler, store: store, webID: webID, deviceID: deviceID,
+		narrowID: narrowID, exemptID: exemptID, exemptSec: exemptSec, sessions: sessions}
 }
 
 func get(t testing.TB, client *http.Client, u string) *http.Response {

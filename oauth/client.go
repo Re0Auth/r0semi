@@ -53,8 +53,26 @@ type Client struct {
 	CreatedAt     time.Time
 	RedirectURIs  []string
 	AllowedScopes []Scope
+	// AllowMissingPKCE opts this client out of the mandatory-PKCE rule the
+	// protocol plane enforces on every authorization code request. It exists for
+	// clients that cannot send a code_challenge (a certification suite, a legacy
+	// RP) and is set only by an explicit `[client] allow_missing_pkce = true`.
+	//
+	// The zero value is false, so every client built by NewClient, restored from
+	// storage, or created through the admin API still requires PKCE; the exemption
+	// cannot be reached by accident, by a missing field, or by a request
+	// parameter.
+	AllowMissingPKCE bool
 
 	secretHash []byte
+}
+
+// WithAllowMissingPKCE returns a copy of c with the exemption set. It is the only
+// way to grant the exemption, so the call sites are greppable: registration of
+// the configured first-party client, and the tests that pin this behaviour.
+func (c Client) WithAllowMissingPKCE(allow bool) Client {
+	c.AllowMissingPKCE = allow
+	return c
 }
 
 // NewClient validates and constructs a client. A confidential client must have
@@ -127,6 +145,10 @@ func RestoreClient(id, name string, typ ClientType, secretHash []byte, redirects
 
 // RestoreClientWithStatus is RestoreClient plus the persisted lifecycle status,
 // for a registry that stores it.
+//
+// The PKCE exemption is deliberately NOT a parameter here: a store that persists
+// it applies WithAllowMissingPKCE to the result after restoring, so a storage
+// layer that never learned the field cannot silently grant the exemption.
 func RestoreClientWithStatus(id, name string, typ ClientType, status ClientStatus, secretHash []byte, redirects []string, allowed []Scope, createdAt time.Time) (Client, error) {
 	if status != ClientActive && status != ClientSuspended {
 		return Client{}, fmt.Errorf("oauth: invalid client status %q", status)

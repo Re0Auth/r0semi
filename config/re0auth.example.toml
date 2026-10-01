@@ -271,6 +271,16 @@ name = "First-party client"
 # secret_env = "RE0AUTH_CLIENT_SECRET"
 redirect_uris = ["https://app.example/callback"]
 scopes        = ["account.id", "phigros.profile.read"]
+# Exempt this one client from the mandatory-PKCE rule, for a client that cannot
+# send a code_challenge (a certification suite, a legacy RP). Confidential clients
+# only: a public client has no secret, so without PKCE its authorization code would
+# be redeemable by anyone who saw it, and startup refuses the combination. Default
+# false: every other client still requires PKCE S256, and a challenge that IS sent
+# must still be a valid S256 value. The exemption is per client, is compared by the
+# startup drift check like every other field, and is logged on startup and on each
+# use.
+# Environment override: RE0AUTH_CLIENT_ALLOW_MISSING_PKCE=true
+# allow_missing_pkce = false
 
 [admin]
 # The operator allowlist: account ids (usr_…) allowed to use /v1/admin. Empty, or

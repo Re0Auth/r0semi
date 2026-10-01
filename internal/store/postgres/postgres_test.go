@@ -1100,6 +1100,59 @@ func TestSessionsStoreNoPlaintextCookie(t *testing.T) {
 	}
 }
 
+func TestClientsRoundTripPKCEExemption(t *testing.T) {
+	db := openTestDB(t)
+	clients := db.Clients()
+	ctx := context.Background()
+
+	base, err := oauth.NewClient("pkce-exempt", "Exempt", oauth.ClientConfidential, "s3cret",
+		[]string{"https://app.example/cb"}, []oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clients.Create(ctx, base.WithAllowMissingPKCE(true)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := clients.Get(ctx, "pkce-exempt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.AllowMissingPKCE {
+		t.Fatal("the exemption was not persisted")
+	}
+
+	// A row written without the exemption comes back without it: the column's
+	// default is false, so the migration exempts nobody.
+	plain, err := oauth.NewClient("pkce-required", "Plain", oauth.ClientConfidential, "s3cret",
+		[]string{"https://app.example/cb"}, []oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clients.Create(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := clients.Get(ctx, "pkce-required")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.AllowMissingPKCE {
+		t.Fatal("a client created without the exemption came back exempt")
+	}
+
+	// List goes through its own query and struct scan.
+	all, err := clients.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, c := range all {
+		seen[c.ID] = c.AllowMissingPKCE
+	}
+	if !seen["pkce-exempt"] || seen["pkce-required"] {
+		t.Fatalf("List reported the wrong exemptions: %v", seen)
+	}
+}
+
 func TestClientsRoundTripKeepsSecretHashOnly(t *testing.T) {
 	db := openTestDB(t)
 	clients := db.Clients()

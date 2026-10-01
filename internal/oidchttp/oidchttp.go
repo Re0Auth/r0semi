@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -1049,19 +1050,32 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 	}
 	// OAuth 2.1 requires PKCE on every authorization code request, confidential
 	// clients included. The engine only demands it of a public client, so the
-	// requirement is enforced here rather than left to the library. The failure is
-	// a redirect, not a 400 body: once redirect_uri is validated, RFC 6749
-	// §4.1.2.1 says the client is informed through the redirect.
+	// requirement is enforced here rather than left to the library. A client that
+	// cannot send one is exempt only when an operator registered it with
+	// allow_missing_pkce (`[client] allow_missing_pkce = true`); the exemption is
+	// never reachable from the request. The failure is a redirect, not a 400 body:
+	// once redirect_uri is validated, RFC 6749 §4.1.2.1 says the client is
+	// informed through the redirect.
 	challenge := q.Get("code_challenge")
 	method := q.Get("code_challenge_method")
-	if challenge == "" || method != "S256" {
-		description := "code_challenge is required"
-		if challenge != "" {
-			description = "code_challenge_method must be S256"
+	if challenge == "" {
+		if !client.AllowMissingPKCE {
+			params := map[string]string{
+				"error":             "invalid_request",
+				"error_description": "code_challenge is required",
+				"state":             q.Get("state"),
+				"iss":               h.issuerFor(r),
+			}
+			http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+			return true
 		}
+		// The one path that weakens the default: leave a record of who used it.
+		slog.Warn("authorization request without PKCE accepted for an exempt client",
+			"client_id", client.ID, "event", "pkce_exempt_authorize")
+	} else if method != "S256" {
 		params := map[string]string{
 			"error":             "invalid_request",
-			"error_description": description,
+			"error_description": "code_challenge_method must be S256",
 			"state":             q.Get("state"),
 			"iss":               h.issuerFor(r),
 		}
@@ -1071,7 +1085,8 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 	// RFC 7636 §4.1/§4.2: the challenge is 43–128 characters from the unreserved
 	// set. The library only compares hashes, so a malformed value was accepted and
 	// stored; rejecting it at the entrance keeps the code record well-formed.
-	if !validPKCEValue(challenge) {
+	// An exempt client that sends a challenge gets it validated like any other.
+	if challenge != "" && !validPKCEValue(challenge) {
 		params := map[string]string{
 			"error":             "invalid_request",
 			"error_description": "code_challenge must be 43-128 unreserved characters",

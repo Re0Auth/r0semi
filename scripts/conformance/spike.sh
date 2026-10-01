@@ -114,8 +114,18 @@ export RE0AUTH_CLIENT_SECRET="${CONFORMANCE_CLIENT_SECRET}"
 # lives; set the plan's `alias` to match the trailing path segment.
 REDIRECT_URI="${CONFORMANCE_REDIRECT_URI:-${SUITE_PUBLIC}/test/a/conformance/callback}"
 # `[client]` keys come from cmd/re0auth/config.go's clientSection: id, name,
-# secret_env, redirect_uris, scopes. `client_id` belongs to [idp.*] and is an
-# unknown key here, which the config loader refuses by design.
+# secret_env, redirect_uris, scopes, allow_missing_pkce. `client_id` belongs to
+# [idp.*] and is an unknown key here, which the config loader refuses by design.
+#
+# The suite's OP tests send an authorization request with no code_challenge, while
+# Re0Auth requires PKCE S256 for every client unless an operator exempts one. The
+# exemption is per client, defaults to false, and is written only when a plan is
+# actually requested — a connectivity-only run keeps the ordinary, fully strict
+# client.
+PKCE_EXEMPT_LINE=""
+if [[ -n "${CONFORMANCE_PLAN_JSON:-}" && -f "${CONFORMANCE_PLAN_JSON}" ]]; then
+  PKCE_EXEMPT_LINE="allow_missing_pkce = true"
+fi
 cat > "${WORK}/re0auth.toml" <<TOMLEOF
 [server]
 issuer = "${ISSUER}"
@@ -126,6 +136,7 @@ cookie_secure = true
 id = "conformance"
 secret_env   = "RE0AUTH_CLIENT_SECRET"
 redirect_uris = ["${REDIRECT_URI}"]
+${PKCE_EXEMPT_LINE}
 TOMLEOF
 
 # ---- 1. the OP --------------------------------------------------------------

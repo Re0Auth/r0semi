@@ -200,6 +200,10 @@ type clientSection struct {
 	SecretEnv    string   `toml:"secret_env"`
 	RedirectURIs []string `toml:"redirect_uris"`
 	Scopes       []string `toml:"scopes"`
+	// AllowMissingPKCE exempts this client from the mandatory-PKCE rule, for a
+	// client that cannot send a code_challenge (a certification suite, a legacy
+	// RP). Default false: every other client still requires PKCE S256.
+	AllowMissingPKCE bool `toml:"allow_missing_pkce"`
 }
 
 type idpSection struct {
@@ -312,6 +316,9 @@ type settings struct {
 	clientSecret    string
 	clientRedirects []string
 	clientScopes    []string
+	// clientAllowMissingPKCE is the operator's explicit exemption from mandatory
+	// PKCE for this client. False unless `[client] allow_missing_pkce = true`.
+	clientAllowMissingPKCE bool
 
 	idpCredentials []idp.Credentials
 	sources        []federation.Source
@@ -807,6 +814,14 @@ func loadConfig(path string) (settings, error) {
 		}
 		cfg.clientSecret = value
 	}
+	// The one exemption from mandatory PKCE, off unless the file (or the env)
+	// turns it on. It is resolved here so an invalid env value is a startup error
+	// rather than a silently ignored typo.
+	allowMissingPKCE, err := config.Bool("RE0AUTH_CLIENT_ALLOW_MISSING_PKCE", f.Client.AllowMissingPKCE)
+	if err != nil {
+		return settings{}, err
+	}
+	cfg.clientAllowMissingPKCE = allowMissingPKCE
 
 	// Operator plane. Off unless a deployment names at least one account: an admin
 	// API is not something to expose by accident, and an empty allowlist that
