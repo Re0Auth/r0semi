@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Re0Auth/r0semi/oauth"
@@ -655,12 +656,49 @@ func (r deviceRow) device() oauth.DeviceAuthorizationRecord {
 }
 
 // SaveDevice implements oauth.DeviceStore.
+//
+// The canonical unique index 0033 added to oauth_device_authorizations makes this
+// write the authoritative uniqueness gate (S04-5): the service's GET-then-INSERT
+// probe left a window two concurrent flows could both pass. A user-code collision
+// is surfaced as oauth.ErrUserCodeConflict — the one condition the service retries
+// on — and anything else keeps its own identity.
 func (s *Devices) SaveDevice(ctx context.Context, deviceCode string, d oauth.DeviceAuthorizationRecord) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO oauth_device_authorizations (`+deviceCols+`)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		oauth.TokenHash(deviceCode), d.UserCode, d.ClientID, scopeArray(d.Scopes),
 		string(d.Status), d.Subject, scopeArray(d.Explicit), d.ExpiresAt, nullTime(d.LastPoll))
+	return deviceSaveError(err)
+}
+
+// deviceUserCodeConflict reports the canonical user-code unique violation 0033
+// creates. The constraint name is checked when the driver supplies one, so a
+// collision on the device-code primary key (cryptographically negligible, but a
+// different failure) is not misfiled as "redraw the user code"; a driver that
+// omits the name falls back to "any 23505 on this insert is the user-code index",
+// which makes the service redraw rather than fail the flow.
+func deviceUserCodeConflict(err error) bool {
+	if !isUniqueViolation(err) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.ConstraintName != "" {
+		return pgErr.ConstraintName == "oauth_device_authorizations_user_code_uniq"
+	}
+	return true
+}
+
+// deviceSaveError maps ONLY the canonical user-code conflict to the typed error
+// the oauth layer retries on. Every other failure is returned unchanged, so an
+// infrastructure fault is never retried as a collision and never loses its cause
+// (S04-5).
+func deviceSaveError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if deviceUserCodeConflict(err) {
+		return fmt.Errorf("postgres: device user code already in use: %w", oauth.ErrUserCodeConflict)
+	}
 	return err
 }
 
@@ -809,29 +847,62 @@ func (s *Clients) Get(ctx context.Context, id string) (oauth.Client, error) {
 	return scanClient(rows)
 }
 
-// List implements oauth.ClientAdmin. Suspended clients are included, because the
-// admin view is exactly the place they must remain visible.
-func (s *Clients) List(ctx context.Context) ([]oauth.Client, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at, allow_missing_pkce
-		  FROM oauth_clients ORDER BY id`)
+// ListClients implements oauth.ClientAdmin as a keyset-paged read. The cursor
+// predicate is a plain `id > $n`, so the primary key's index serves both the
+// filter and the ORDER BY and the page costs a bounded index scan rather than a
+// full sort of the table. It asks for one row more than the page so the caller
+// can tell "this is the last page" from "there is one more" without a second
+// query. Suspended clients are included, because the admin view is exactly the
+// place they must remain visible.
+//
+// The cursor is the previous page's last id and the order is `id`, so the
+// comparison is a string comparison in the database's collation. Client ids are
+// ASCII (generated as `cli_…`, or seeded names), where every collation orders
+// them the same way, and the in-memory registry sorts by the same key.
+func (s *Clients) ListClients(ctx context.Context, limit int, cursor string) ([]oauth.Client, string, error) {
+	limit, err := oauth.ResolveClientPageLimit(limit)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	after, err := oauth.DecodeClientCursor(cursor)
+	if err != nil {
+		return nil, "", err
+	}
+
+	const cols = `id, name, type, status, secret_hash, redirect_uris, allowed_scopes, created_at, allow_missing_pkce`
+	query := `SELECT ` + cols + ` FROM oauth_clients`
+	args := []any{limit + 1}
+	if after != "" {
+		query += ` WHERE id > $1 ORDER BY id LIMIT $2`
+		args = []any{after, limit + 1}
+	} else {
+		query += ` ORDER BY id LIMIT $1`
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, "", err
 	}
 	scanned, err := pgx.CollectRows(rows, pgx.RowToStructByName[clientRow])
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	var out []oauth.Client
+	hasMore := len(scanned) > limit
+	if hasMore {
+		scanned = scanned[:limit]
+	}
+	out := make([]oauth.Client, 0, len(scanned))
 	for _, r := range scanned {
 		c, err := r.client()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	if hasMore && len(out) > 0 {
+		return out, oauth.EncodeClientCursor(out[len(out)-1].ID), nil
+	}
+	return out, "", nil
 }
 
 // ClientNames implements oauth.ClientNameLookup: every name for a grants page in
@@ -881,11 +952,50 @@ func (s *Clients) SetStatus(ctx context.Context, id string, status oauth.ClientS
 	return nil
 }
 
-// Delete implements oauth.ClientAdmin. An absent row is success, so an operator
-// retrying a revocation is not told it failed at the last step.
+// Delete implements oauth.ClientAdmin. It removes the registration and, in the
+// same transaction, every credential the client holds.
+//
+// The revocation is part of the delete because a deleted client that keeps a
+// live token has not been deleted in any sense the deployment can defend: the
+// protocol plane reports the client as unknown, but the token row is still a
+// capability until it expires, and an unredeemed code can mint a fresh pair. The
+// rows are removed through the same predicates the bulk revocations use
+// (revokeMatching / revokePredicate / revokePendingAuthorizations), so this
+// method and Tokens.RevokeTokens / OIDCStore.RevokeTokens cannot drift about
+// what "this client's credentials" means. Both engines' tables are covered:
+// the OP's oidc_* tables, and the retired hand-rolled engine's oauth_* tables a
+// migrated deployment may still hold rows in.
+//
+// One transaction, so a failure leaves the client and its tokens intact rather
+// than half-revoked. An absent client is success: the DELETE simply matches no
+// row, and the token deletes are idempotent.
 func (s *Clients) Delete(ctx context.Context, id string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM oauth_clients WHERE id = $1`, id)
-	return err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	f := oauth.TokenFilter{ClientID: id}
+	// The OpenID Provider's tables.
+	for _, tables := range [][]string{
+		{"oidc_access_tokens", "oidc_refresh_tokens", "oidc_refresh_token_tombstones", "oidc_devices"},
+		// The retired engine's, for a deployment migrated from it.
+		{"oauth_access_tokens", "oauth_refresh_tokens", "oauth_codes", "oauth_refresh_tombstones", "oauth_device_authorizations"},
+	} {
+		if _, err := revokeMatching(ctx, tx, tables, f); err != nil {
+			return err
+		}
+	}
+	// Pending authorization requests and the codes minted from them are
+	// capabilities too, and their only link to the client is the request row.
+	if _, err := revokePendingAuthorizations(ctx, tx, f); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM oauth_clients WHERE id = $1`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // RotateSecret implements oauth.ClientAdmin. Only a confidential client has a
@@ -895,6 +1005,15 @@ func (s *Clients) Delete(ctx context.Context, id string) error {
 func (s *Clients) RotateSecret(ctx context.Context, id string, secretHash []byte) error {
 	if len(secretHash) == 0 {
 		return errors.New("postgres: a rotation needs a secret hash")
+	}
+	// A non-empty but malformed digest must be refused here, not stored: the
+	// reader (oauth.RestoreClientWithStatus / Authenticate) admits only the
+	// salted encoding NewSecretHash produces, so persisting a legacy bare SHA-256
+	// value would silently turn the client into an unknown client at the next
+	// restore. oauth.ValidSecretHash is the same shape check the reader uses, so
+	// the two cannot drift (S01-10).
+	if !oauth.ValidSecretHash(secretHash) {
+		return errors.New("postgres: a rotation needs a secret hash this service can verify")
 	}
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE oauth_clients SET secret_hash = $2 WHERE id = $1 AND type = 'confidential'`,

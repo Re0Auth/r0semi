@@ -269,13 +269,13 @@ func TestOPTokenTimesComeFromTheStoreClock(t *testing.T) {
 func TestDeviceDecisionsAuditTheClient(t *testing.T) {
 	body := sourceOf(t, "oidc.go")
 
-	approve := oidcStoreMethod(t, body, "ApproveDevice")
+	approve := oidcStoreMethod(t, body, "approveDevice")
 	if !strings.Contains(approve, "RETURNING client_id") {
-		t.Error("ApproveDevice does not return the client_id it just approved, so its audit row cannot name " +
+		t.Error("approveDevice does not return the client_id it just approved, so its audit row cannot name " +
 			"the client (G-17)")
 	}
 	if strings.Contains(approve, `s.record(ctx, "oidc.device.approve", subject, ""`) {
-		t.Error("ApproveDevice still records an empty client_id (G-17)")
+		t.Error("approveDevice still records an empty client_id (G-17)")
 	}
 
 	deny := oidcStoreMethod(t, body, "DenyDevice")

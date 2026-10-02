@@ -69,6 +69,22 @@ var (
 	ScopePhigrosB30     = MustScope("phigros.b30.read")
 )
 
+// RawScope names the explicit scope that gates a game's raw passthrough:
+// "<game>.raw.read".
+//
+// It is a function rather than a catalogue constant because <game> is operator
+// configuration, not a fixed entry: the descriptors are built at composition time
+// from the configured sources (cmd/re0auth). The spelling lives here so the
+// registration side and the gate that checks it (internal/httpapi) cannot drift
+// apart on what the scope is called.
+//
+// The result is returned unvalidated. A game name may contain '-' (federation
+// allows it in a source name) while Scope.valid does not, so the registrar — not
+// this helper — decides whether the derived scope can be registered.
+func RawScope(game string) string {
+	return game + ".raw.read"
+}
+
 // Risk classifies the blast radius of granting a scope.
 type Risk int
 

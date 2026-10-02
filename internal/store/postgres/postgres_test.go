@@ -82,7 +82,7 @@ func openTestDBWith(t testing.TB, opts PoolOptions, options ...Option) *DB {
 		         -- the next appended row carries a non-empty prev_hash and Verify
 		         -- rejects it as "does not point at the genesis hash", which fails
 		         -- every audit test after the first one in the package.
-		         audit_chain, audit_subject_keys
+		         audit_chain, audit_subject_keys, audit_subject_tombstones
 		CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -1177,7 +1177,7 @@ func TestClientsRoundTripPKCEExemption(t *testing.T) {
 	}
 
 	// List goes through its own query and struct scan.
-	all, err := clients.List(ctx)
+	all, _, err := clients.ListClients(ctx, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1387,7 +1387,7 @@ func TestClientAdminLifecycleAndSuspension(t *testing.T) {
 		t.Fatalf("suspended get = %v, want ErrClientNotFound", err)
 	}
 	// ... but the admin view still shows it.
-	all, err := reg.List(ctx)
+	all, _, err := reg.ListClients(ctx, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}

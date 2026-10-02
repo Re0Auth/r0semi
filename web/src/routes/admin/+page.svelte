@@ -25,8 +25,15 @@
 	let actionError = $state('');
 	let csrf = $state('');
 	let clients = $state<AdminClient[]>([]);
+	// The inventory is cursor-paged. This holds the cursor of the page after the
+	// last loaded one; empty means every client has been read.
+	let nextCursor = $state('');
 	let reauth = $state(false);
 	let busy = $state<string | null>(null);
+
+	// The server's default and ceiling are both 100, and it refuses anything
+	// outside that range rather than clamping.
+	const pageSize = 100;
 
 	let regName = $state('');
 	let regType = $state<'public' | 'confidential'>('public');
@@ -68,8 +75,9 @@
 
 	async function refresh() {
 		try {
-			const res = await api.listAdminClients();
+			const res = await api.listAdminClients({ limit: pageSize });
 			clients = res.data;
+			nextCursor = res.next_cursor ?? '';
 			if (res.csrf_token) csrf = res.csrf_token;
 			phase = 'ready';
 		} catch (err) {
@@ -85,6 +93,28 @@
 			}
 			detail = messageOf(err);
 			phase = 'failed';
+		}
+	}
+
+	// Fetch the page after the last one and append it. The cursor names a client
+	// id, so a client registered in the meantime lands after the loaded rows
+	// instead of shifting them and being shown twice.
+	async function loadMore() {
+		if (!nextCursor) return;
+		busy = 'more';
+		actionError = '';
+		try {
+			const res = await api.listAdminClients({ limit: pageSize, cursor: nextCursor });
+			clients = [...clients, ...res.data];
+			nextCursor = res.next_cursor ?? '';
+		} catch (err) {
+			if (err instanceof ApiError && err.needsSignIn) {
+				phase = 'anonymous';
+				return;
+			}
+			actionError = messageOf(err);
+		} finally {
+			busy = null;
 		}
 	}
 
@@ -337,7 +367,7 @@
 
 		<Card>
 			<div class="flex items-center justify-between border-b border-line px-4 py-3">
-				<p class="text-sm font-medium">客户端（{clients.length}）</p>
+				<p class="text-sm font-medium">客户端（已加载 {clients.length}）</p>
 				<Button variant="quiet" onclick={refresh}>刷新</Button>
 			</div>
 			{#if clients.length === 0}
@@ -388,6 +418,18 @@
 						</li>
 					{/each}
 				</ul>
+			{/if}
+			{#if nextCursor}
+				<div
+					class="flex flex-wrap items-center justify-between gap-2 border-t border-line px-4 py-3"
+				>
+					<p class="text-xs text-ink-muted">还有更多客户端没有显示。</p>
+					<Button
+						variant="quiet"
+						loading={busy === 'more'}
+						onclick={loadMore}>加载更多</Button
+					>
+				</div>
 			{/if}
 		</Card>
 	</div>

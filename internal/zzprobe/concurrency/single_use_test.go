@@ -174,7 +174,7 @@ func TestDeviceCodeApprovalIsConsumedExactlyOnceUnderAGoroutineRace(t *testing.T
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ApproveDevice(ctx, "RACE-CODE", "usr_1", nil); err != nil {
+	if err := st.DecideDeviceAuthorization(ctx, "RACE-CODE", "usr_1", true, nil, nil); err != nil {
 		t.Fatal("the approval was refused; the probe never reached the consumption path")
 	}
 
@@ -216,7 +216,7 @@ func TestConcurrentDeviceApprovalsProduceOneApprover(t *testing.T) {
 	wins := race(2, func() bool {
 		// Both goroutines try both subjects, so the write order is a race.
 		for _, s := range subjects {
-			if err := st.ApproveDevice(ctx, "APPR-CODE", s, nil); err == nil {
+			if err := st.DecideDeviceAuthorization(ctx, "APPR-CODE", s, true, nil, nil); err == nil {
 				atomic.AddInt32(&ok, 1)
 				return true
 			}

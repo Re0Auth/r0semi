@@ -383,7 +383,7 @@ func (e zoneEnv) deviceFlow(t *testing.T, clientID, basicID, basicSecret string,
 	if err := json.Unmarshal(raw, &deviceResp); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.store.ApproveDevice(context.Background(), deviceResp.UserCode, subject, nil); err != nil {
+	if err := e.store.DecideDeviceAuthorization(context.Background(), deviceResp.UserCode, subject, true, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// The memory store throttles a poll that comes sooner than the advertised

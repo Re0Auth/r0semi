@@ -138,16 +138,19 @@ func (w *LocalKeyWrapper) open(nonce, ct, aad []byte) ([]byte, error) {
 
 // bindingAAD encodes the credential identity unambiguously. Length prefixes
 // make "a" + "bc" differ from "ab" + "c".
+//
+// Each length is a uvarint, not a fixed-width uint32. A uint32 prefix truncates
+// a field length at or above 2^32, so two different identities could produce the
+// same AAD; a uvarint covers every length a Go slice can hold, so the prefix is
+// unambiguous on its own (S07-11, G115). Identity.validate still caps fields at
+// maxIdentityFieldLen, but that is now store hygiene rather than what keeps the
+// encoding collision-free.
 func bindingAAD(version byte, subject, provider string) []byte {
-	b := make([]byte, 0, 1+4+len(subject)+4+len(provider))
+	b := make([]byte, 0, 1+binary.MaxVarintLen64+len(subject)+binary.MaxVarintLen64+len(provider))
 	b = append(b, version)
-	// The prefix is uint32 by the AAD's own layout, and Identity.validate refuses a
-	// field longer than maxIdentityFieldLen. That bound — not the hope that no store
-	// holds a 4 GiB identity — is what makes the conversion below unable to truncate
-	// (S07-11, G115).
-	b = binary.BigEndian.AppendUint32(b, uint32(len(subject))) //nolint:gosec // G115: validate caps identity fields at maxIdentityFieldLen
+	b = binary.AppendUvarint(b, uint64(len(subject)))
 	b = append(b, subject...)
-	b = binary.BigEndian.AppendUint32(b, uint32(len(provider))) //nolint:gosec // G115: validate caps identity fields at maxIdentityFieldLen
+	b = binary.AppendUvarint(b, uint64(len(provider)))
 	b = append(b, provider...)
 	return b
 }

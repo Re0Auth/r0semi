@@ -20,9 +20,11 @@ import (
 )
 
 type harness struct {
-	server   *httptest.Server
-	manager  *Manager
-	accounts *account.MemoryStore
+	server  *httptest.Server
+	manager *Manager
+	// accounts is the store under test. It is the interface, not MemoryStore,
+	// so a probe can supply a wrapper whose one method fails.
+	accounts account.Store
 	client   *http.Client
 	// oidc is the fake OpenID Provider behind the Google login. Tests must echo
 	// its nonce, because Google is an OIDC provider and its id_token is verified.
@@ -69,6 +71,14 @@ func fakeIDP(t *testing.T) *httptest.Server {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWithStore(t, account.NewMemoryStore())
+}
+
+// newHarnessWithStore is newHarness with the account store supplied by the
+// caller, so a probe can observe the HTTP plane when one store method fails
+// without standing up a second copy of this fixture.
+func newHarnessWithStore(t *testing.T, accounts account.Store) *harness {
+	t.Helper()
 	fake := fakeIDP(t)
 	oidc := testoidc.New()
 	t.Cleanup(oidc.Close)
@@ -103,7 +113,6 @@ func newHarness(t *testing.T) *harness {
 
 	auditLog := audit.NewMemoryLogger()
 	manager := NewManager(Options{Secure: false, Audit: auditLog})
-	accounts := account.NewMemoryStore()
 	handler, err := NewHandler(manager, registry, accounts, WithAudit(auditLog))
 	if err != nil {
 		t.Fatal(err)
@@ -305,7 +314,9 @@ func TestLinkAddsIdentityToCurrentUser(t *testing.T) {
 }
 
 // I-3 through the HTTP plane: linking an identity owned by another user is
-// refused rather than silently merged.
+// refused rather than silently merged — and refused with the same outward code
+// as any other link failure, so the return URL is not an existence oracle
+// (Z07-8; the audit detail keeps the distinction).
 func TestLinkRejectsTakenIdentity(t *testing.T) {
 	h := newHarness(t)
 	if _, _, err := h.accounts.CreateWithIdentity(context.Background(), idp.Identity{
@@ -324,8 +335,12 @@ func TestLinkRejectsTakenIdentity(t *testing.T) {
 
 	resp = h.get(t, h.server.URL+"/auth/discord/callback?code=c&state="+state)
 	defer resp.Body.Close()
-	if loc := resp.Header.Get("Location"); !strings.Contains(loc, "error=identity_taken") {
-		t.Fatalf("Location = %q, want identity_taken", loc)
+	loc := resp.Header.Get("Location")
+	if !strings.Contains(loc, "error="+codeLinkFailed) {
+		t.Fatalf("Location = %q, want the unified error=%s", loc, codeLinkFailed)
+	}
+	if strings.Contains(loc, codeIdentityTaken) {
+		t.Fatalf("Location = %q names the occupancy in the URL", loc)
 	}
 }
 

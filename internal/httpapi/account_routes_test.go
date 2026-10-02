@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alexedwards/scs/v2"
 	"github.com/alexedwards/scs/v2/memstore"
@@ -53,6 +54,13 @@ func newDeleteEnv(t *testing.T) deleteEnv {
 // test can make the post-erasure cookie cleanup the only failing step. sessions
 // may be nil, which is the in-memory default.
 func newDeleteEnvWithSessions(t *testing.T, sessions scs.Store) deleteEnv {
+	t.Helper()
+	return newDeleteEnvWithReauth(t, sessions, 0)
+}
+
+// newDeleteEnvWithReauth is newDeleteEnvWithSessions with Config.AccountReauthWindow
+// set, so a test can exercise the step-up window on account deletion (Z07-9).
+func newDeleteEnvWithReauth(t *testing.T, sessions scs.Store, reauth time.Duration) deleteEnv {
 	t.Helper()
 	ctx := context.Background()
 
@@ -120,16 +128,17 @@ func newDeleteEnvWithSessions(t *testing.T, sessions scs.Store) deleteEnv {
 	t.Cleanup(srv.Close)
 
 	api, err := New(Config{
-		Issuer:            srv.URL,
-		OIDC:              opHandler,
-		TokenIntrospector: opHandler,
-		GrantStore:        store,
-		DeviceStore:       store,
-		Authorization:     opHandler,
-		Sessions:          manager,
-		Accounts:          accounts,
-		Auth:              authHandler,
-		Deleter:           deleter,
+		Issuer:              srv.URL,
+		OIDC:                opHandler,
+		TokenIntrospector:   opHandler,
+		GrantStore:          store,
+		DeviceStore:         store,
+		Authorization:       opHandler,
+		Sessions:            manager,
+		Accounts:            accounts,
+		Auth:                authHandler,
+		Deleter:             deleter,
+		AccountReauthWindow: reauth,
 	})
 	if err != nil {
 		t.Fatal(err)

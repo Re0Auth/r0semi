@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -150,4 +151,40 @@ func trustedBy(addr netip.Addr, trusted []netip.Prefix) bool {
 		}
 	}
 	return false
+}
+
+// warnUntrustedProxyPeer emits one warning when a deployment declares
+// client_addr_header but the request reached us from a peer that is not a trusted
+// proxy (S15-5).
+//
+// In that state the declared header is deliberately ignored and the peer becomes
+// the rate-limit bucket key. That is the safe direction — a caller cannot choose
+// its own key — but it is almost never what the operator meant: they declared a
+// header because a reverse proxy sits in front, so every client behind it now
+// shares ONE bucket, and one noisy client exhausts the budget for everyone. The
+// distinction from the correctly-configured case is invisible in the config file,
+// so the server says it out loud, once.
+func (s *Server) warnUntrustedProxyPeer(r *http.Request) {
+	if s.clientAddrHeader != ClientAddrXForwardedFor {
+		return
+	}
+	peer := hostOnly(r.RemoteAddr)
+	addr, err := netip.ParseAddr(peer)
+	if err != nil {
+		return
+	}
+	addr = addr.Unmap()
+	if trustedBy(addr, s.trustedProxies) {
+		return
+	}
+	// Once per server: the condition is a property of the deployment, not of the
+	// request, and this runs on every request.
+	if !s.warnedUntrustedProxy.CompareAndSwap(false, true) {
+		return
+	}
+	slog.Warn("client_addr_header is declared but the peer is not in trusted_proxies; "+
+		"the header is ignored and every client behind this address shares one rate-limit bucket",
+		"peer", addr.String(),
+		"client_addr_header", s.clientAddrHeader.String(),
+		"trusted_proxies", len(s.trustedProxies))
 }

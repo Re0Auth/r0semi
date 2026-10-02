@@ -22,7 +22,11 @@ try {
 // Highest priority first: the later the round, the more authoritative its severity.
 // Round 9 is an independent audit of HEAD after rc.4 and carries the current
 // fix ledger (992710b), so it outranks every earlier round.
+// round10.md is not a new audit: it is a hand-maintained register pass that writes
+// already-ruled items (S11-1, FO-02) into the register as DECIDED-NONGOAL, so it
+// outranks everything (prio -3) and its S11-1 row replaces round9's OPEN one.
 const FRAGMENTS = [
+  { file: 'round10.md',    round: 10, prio: -3 },
   { file: 'round9.md',     round: 9, prio: -1 },
   { file: 'conformance.md', round: 9, prio: -2 },
   { file: 'round7.md',     round: 7, prio: 0 },

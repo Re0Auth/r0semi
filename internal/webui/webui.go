@@ -225,6 +225,13 @@ func isHTMLDocument(name string) bool {
 	}
 }
 
+// isFile is the routing contract's own stat: a request that does not name a file
+// falls through to the shell instead of a 404. ServeFileFS performs its own open
+// after this, so a static request costs two FS lookups (S12-11; it used to be
+// three). That is the floor without reimplementing ServeFileFS: its `..`→400
+// behaviour and confinement are relied on by TestHandlerNeutralizesTraversal, and
+// collapsing the last lookup into a cached index would add a startup-time scan for
+// negligible gain on an in-memory embed.FS.
 func isFile(fsys fs.FS, name string) bool {
 	info, err := fs.Stat(fsys, name)
 	return err == nil && !info.IsDir()

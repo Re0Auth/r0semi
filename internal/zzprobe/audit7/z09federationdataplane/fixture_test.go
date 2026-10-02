@@ -82,13 +82,14 @@ func zzCryptoKey() [32]byte {
 
 func zzOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry) (*oidchttp.Handler, *memory.OIDCStore) {
 	t.Helper()
+	registry := zzScopeRegistry(t)
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store, err := memory.NewOIDCStore(memory.OIDCOptions{
 		Clients:  clients,
-		Registry: oauth.DefaultRegistry(),
+		Registry: registry,
 		Signer:   oidcstore.NewSigner("test", key),
 		Login: func(_ context.Context, id string) string {
 			return "/login?authRequestID=" + url.QueryEscape(id)
@@ -104,13 +105,34 @@ func zzOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry) (*oi
 		CryptoKeyID:   "test",
 		AllowInsecure: true,
 		Clients:       clients,
-		Registry:      oauth.DefaultRegistry(),
+		Registry:      registry,
 		Consent:       store,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return h, store
+}
+
+// zzScopeRegistry is the shipped catalogue plus the raw-passthrough scope for
+// zzGame.
+//
+// The composition root registers one `<game>.raw.read` per configured game with a
+// raw_base (cmd/re0auth/main.go rawScopeDescriptors), and the data-plane probes
+// here drive raw endpoints that have one. Since Z20-2 that explicit scope is the
+// only thing that opens raw, so without this descriptor the OP refuses the scope
+// at authorize time and no probe could reach the raw success path.
+func zzScopeRegistry(t *testing.T) *oauth.Registry {
+	t.Helper()
+	reg, err := oauth.NewRegistry(append(oauth.DefaultDescriptors(), oauth.Descriptor{
+		Scope: oauth.Scope(oauth.RawScope(zzGame)), Title: "读取 " + zzGame + " 原生接口",
+		Description: "probe descriptor: the explicit scope the raw passthrough requires",
+		Risk:        oauth.RiskHigh,
+	})...)
+	if err != nil {
+		t.Fatalf("oauth.NewRegistry: %v", err)
+	}
+	return reg
 }
 
 func zzPKCE(verifier string) string {
@@ -242,7 +264,9 @@ func zzHarness(t *testing.T, reg *federation.Registry, binds []zzBind, tune func
 
 	// The client is registered for every scope any configured source declares, so
 	// each probe can mint a token for exactly one source's scope and watch what
-	// the gate does with it.
+	// the gate does with it. The game's raw scope is added too: the composition
+	// root registers it for every game with a raw_base, and since Z20-2 it is the
+	// only thing that opens a raw path.
 	seen := map[oauth.Scope]bool{}
 	var allowed []oauth.Scope
 	for _, src := range reg.AllSources() {
@@ -253,6 +277,11 @@ func zzHarness(t *testing.T, reg *federation.Registry, binds []zzBind, tune func
 			seen[oauth.Scope(res.Scope)] = true
 			allowed = append(allowed, oauth.Scope(res.Scope))
 		}
+	}
+	rawScope := oauth.Scope(oauth.RawScope(zzGame))
+	if !seen[rawScope] {
+		seen[rawScope] = true
+		allowed = append(allowed, rawScope)
 	}
 	clients := oauth.NewMemoryClientRegistry()
 	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{zzRedirect}, allowed)

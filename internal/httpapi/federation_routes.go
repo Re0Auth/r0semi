@@ -10,8 +10,8 @@ import (
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/federation"
-	"github.com/Re0Auth/r0semi/internal/safeurl"
 	"github.com/Re0Auth/r0semi/oauth"
+	"github.com/Re0Auth/r0semi/safeurl"
 )
 
 type federationResourceView struct {
@@ -227,30 +227,30 @@ func hasScopeString(scopes []oauth.Scope, want string) bool {
 	return slices.Contains(scopes, oauth.Scope(want))
 }
 
-func hasAnyScope(scopes []oauth.Scope, want []string) bool {
-	for _, w := range want {
-		if hasScopeString(scopes, w) {
-			return true
-		}
-	}
-	return false
+// rawScope is the explicit scope that gates a game's raw passthrough:
+// `<game>.raw.read`.
+//
+// It exists because the raw proxy hands a source's ENTIRE native API through in
+// the source's own dialect, which no resource-scoped grant covers: a token for
+// `phigros.profile.read` was enough to read the same source's scores endpoint
+// through raw even when the user had unchecked the scores permission on the
+// consent screen (Z20-2). The normalized, resource-named endpoint already
+// refused; this closes the asymmetry by naming the permission raw needs.
+func rawScope(game string) oauth.Scope {
+	return oauth.Scope(game + ".raw.read")
 }
 
-// sourceScopes returns a source's resource scopes, used as a coarse gate for
-// the raw proxy. A dedicated <game>.raw.read scope is future work.
-func (s *Server) sourceScopes(game, source string) ([]string, bool) {
+// rawGate resolves a game/source pair to the game's canonical name and the raw
+// scope it requires. The scope is built from the REGISTRY's spelling of the game
+// rather than the request's, so two spellings of one game cannot disagree about
+// which permission raw needs.
+func (s *Server) rawGate(game, source string) (oauth.Scope, bool) {
 	for _, src := range s.federate.Sources(game) {
 		if src.Name == source {
-			out := make([]string, 0, len(src.Resources))
-			for _, res := range src.Resources {
-				if res.Scope != "" {
-					out = append(out, res.Scope)
-				}
-			}
-			return out, true
+			return rawScope(src.Game), true
 		}
 	}
-	return nil, false
+	return "", false
 }
 
 // handleGameRaw proxies a source's native API verbatim. The body, status and
@@ -260,25 +260,17 @@ func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oaut
 	game := r.PathValue("game")
 	source := r.PathValue("source")
 
-	scopes, ok := s.sourceScopes(game, source)
+	// The gate is the game's explicit `<game>.raw.read` scope, and only it. The
+	// old rule — "any resource scope the source declares" — let a token minted for
+	// one resource read every other resource through raw, so a user who withheld
+	// `scores` on the consent screen still reached it here.
+	scope, ok := s.rawGate(game, source)
 	if !ok {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown game or source")
 		return
 	}
-	// The gate is "the token carries one of the source's resource scopes", and it
-	// must fail closed when the source declares none.
-	//
-	// `len(scopes) > 0 &&` made an empty scope set mean "no check at all". A
-	// source whose resource entry carries no `scope` — a config mistake the TOML
-	// decoder does not report, since it ignores unknown keys — therefore turned
-	// the raw proxy into "any live token reads the whole native API", including an
-	// identity-only account.id one. Round 4 confirmed it. The normalized path for
-	// the same source already refused (403), so this is the asymmetry closing
-	// rather than a new rule.
-	if len(scopes) == 0 || !hasAnyScope(info.Scopes, scopes) {
-		// No single scope is named: the raw proxy is gated coarsely, by any of the
-		// source's resource scopes.
-		s.insufficientScope(w, r, "", "this token does not grant access to "+game)
+	if !hasScopeString(info.Scopes, scope.String()) {
+		s.insufficientScope(w, r, scope.String(), "this token does not grant raw access to "+game)
 		return
 	}
 

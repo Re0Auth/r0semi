@@ -46,6 +46,20 @@ func LimitFormBody(w http.ResponseWriter, r *http.Request) error {
 // helper lives here, next to the cap and the sentinel, so they share one
 // classification.
 func IsBodyTooLarge(err error) bool {
-	var maxErr *http.MaxBytesError
-	return errors.As(err, &maxErr)
+	return errors.As(err, new(*http.MaxBytesError))
+}
+
+// FormReadStatus maps an error from reading a request form to the status an OAuth
+// plane answers. A body that overflowed the shared cap is 413; every other read
+// or parse failure is the 400 a malformed form has always produced.
+//
+// It is the one classification the callers share (S01-13/KIT-8): the kit's three
+// ParseForm sites all map through this, so the cap cannot become a 400 on one
+// endpoint and a 413 on another. Each plane still renders its own error shape —
+// this returns a status, not a response.
+func FormReadStatus(err error) int {
+	if IsBodyTooLarge(err) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
 }

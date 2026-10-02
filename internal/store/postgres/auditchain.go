@@ -438,10 +438,12 @@ func newAuditLogger(pool *pgxpool.Pool, key []byte) (*AuditLogger, error) {
 			auditChainKeySize, len(key))
 	}
 	l := &AuditLogger{
-		pool:  pool,
-		key:   append([]byte(nil), key...),
-		now:   time.Now,
-		cache: make(map[string]cachedSubjectKey, 64),
+		pool:                  pool,
+		key:                   append([]byte(nil), key...),
+		now:                   time.Now,
+		cache:                 make(map[string]cachedSubjectKey, 64),
+		tombstones:            make(map[string]struct{}),
+		tombstoneSyncInterval: tombstoneSyncInterval,
 	}
 	l.batch = newAuditBatcher(l.appendBatch)
 	return l, nil

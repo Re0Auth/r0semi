@@ -66,14 +66,14 @@ func TestDeviceDecisionsAreAuditedWithClientAttribution(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.store.ApproveDevice(ctx, "AUDT-0001", "usr_1", nil); err != nil {
+	if err := e.store.DecideDeviceAuthorization(ctx, "AUDT-0001", "usr_1", true, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.store.StoreDeviceAuthorization(ctx, probeClientID, "dc-audit-2", "AUDT-0002",
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.store.DenyDevice(ctx, "AUDT-0002"); err != nil {
+	if err := e.store.DenyDevice(ctx, "AUDT-0002", "usr_1"); err != nil {
 		t.Fatal(err)
 	}
 

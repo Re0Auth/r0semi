@@ -165,10 +165,21 @@ type Store interface {
 	// replay can be recognised. It mirrors GetAccess, and, like every other
 	// deadline in this interface, expiry is judged by the service, not the store.
 	GetRefresh(ctx context.Context, value string) (RefreshToken, error)
-	// ConsumeRefresh claims a live refresh value atomically and retires it. A
-	// live value returns its record; a value this store already consumed returns
-	// a *RefreshReuseError carrying that value's FamilyID; only a value never
-	// issued returns ErrTokenNotFound.
+	// ConsumeRefresh claims a refresh value atomically and retires it. The value
+	// does not have to be unexpired: whether it is still usable is judged by the
+	// CALLER, after the claim and with the injected clock, never by the store
+	// (S09-4). A value the store still holds returns its record — an expired one
+	// included; a value this store already consumed returns a *RefreshReuseError
+	// carrying that value's FamilyID; only a value never issued returns
+	// ErrTokenNotFound.
+	//
+	// Both shipped stores agree on that and differ only in how they hold the row.
+	// MemoryStore keeps Go maps and returns the record as-is. The PG store deletes
+	// the row with no `expires_at` predicate, so it too claims and returns an
+	// expired record. A store that filtered expired rows itself would make an
+	// expired token indistinguishable from one that never existed, so callers must
+	// not rely on the store for this; oauth/as.go judges expiry on the returned
+	// record.
 	ConsumeRefresh(ctx context.Context, value string) (RefreshToken, error)
 	DeleteRefresh(ctx context.Context, value string) error
 
@@ -511,9 +522,14 @@ func (s *MemoryStore) GetRefresh(_ context.Context, value string) (RefreshToken,
 	return t, nil
 }
 
-// ConsumeRefresh implements Store. A live value is claimed and retired in one
-// step; a value already spent leaves a tombstone its family can be read from, and
-// presenting it again is the replay the caller must revoke the family for.
+// ConsumeRefresh implements Store. A value the store still holds is claimed and
+// retired in one step; a value already spent leaves a tombstone its family can be
+// read from, and presenting it again is the replay the caller must revoke the
+// family for.
+//
+// It does not judge the record's own deadline (S09-4): the caller does, after the
+// claim. The PG store's delete likewise carries no `expires_at` predicate, so the
+// two implementations hand back an expired-but-retained value the same way.
 func (s *MemoryStore) ConsumeRefresh(_ context.Context, value string) (RefreshToken, error) {
 	key := TokenHash(value)
 

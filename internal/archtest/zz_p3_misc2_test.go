@@ -176,7 +176,7 @@ jobs:
 			"reading the workflows", jobs)
 	}
 	if grants == 0 {
-		t.Fatalf("no workflow job grants a write scope, but codeql.yml/analyze does: the parse is "+
+		t.Fatalf("no workflow job grants a write scope, but codeql.yml/analyze does: the parse is " +
 			"not seeing job permissions")
 	}
 	t.Logf("job-level permissions: %d jobs declare them, %d grant a write", jobs, grants)

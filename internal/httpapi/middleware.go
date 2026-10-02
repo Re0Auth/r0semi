@@ -566,6 +566,7 @@ func aggregateClientKey(key string) string {
 // the whole of the rate limit. Both facts are properties of the deployment, not of
 // the request, so the deployment states them: `server.client_addr_header`.
 func (s *Server) clientKey(r *http.Request) string {
+	s.warnUntrustedProxyPeer(r)
 	return clientAddr(r, s.trustedProxies, s.clientAddrHeader)
 }
 

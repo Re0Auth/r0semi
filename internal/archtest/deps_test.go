@@ -25,6 +25,7 @@ var publicLibraries = []string{
 	"idp",
 	"oauth",
 	"referencesource",
+	"safeurl",
 	"tapsign",
 	"taptapoauth",
 	"upstreamkit",

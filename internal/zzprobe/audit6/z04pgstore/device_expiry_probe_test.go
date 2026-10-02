@@ -88,15 +88,15 @@ func TestAnApprovedDeviceCodeCannotBeRedeemedAfterItsExpiry(t *testing.T) {
 		[]string{"account.id"}); err != nil {
 		t.Fatalf("store device authorization: %v", err)
 	}
-	if err := store.ApproveDevice(ctx, userCode, "usr_probe", []string{"account.id"}); err != nil {
+	if err := store.DecideDeviceAuthorization(ctx, userCode, "usr_probe", true, nil, nil); err != nil {
 		t.Fatalf("approve while live: %v", err)
 	}
 
-	// The premise: the code's writer now considers it expired. ApproveDevice
-	// refuses it in this state (that is P2-32's fix working) — which is what
-	// makes the consume path's silence the inconsistency.
+	// The premise: the code's writer now considers it expired. The approval
+	// entrance refuses it in this state (that is P2-32's fix working) — which is
+	// what makes the consume path's silence the inconsistency.
 	clock.now = clock.now.Add(11 * time.Minute)
-	if err := store.ApproveDevice(ctx, userCode, "usr_other", []string{"account.id"}); err == nil {
+	if err := store.DecideDeviceAuthorization(ctx, userCode, "usr_other", true, nil, nil); err == nil {
 		t.Fatal("the premise is broken: approving an expired code succeeded; the clock is not being consulted")
 	}
 

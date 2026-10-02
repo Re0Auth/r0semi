@@ -242,6 +242,31 @@ GET /v1/games/{game}/sources/{source}/raw/{path...}
 - raw 不受 schema 保证；下游选择 raw 即接受与上游耦合（上游一改就可能崩）。
 - Re0Auth 只负责鉴权、转发、限流与 provenance。
 
+### 9.1 授权边界：raw 需要显式的 `<game>.raw.read` scope（Z20-2）
+
+raw 透传把数据源的**整个原生 API**原样透出，因此它不能由任何单个资源的 scope 约束。自本版本起：
+
+- raw 请求**必须**持有显式的 `<game>.raw.read` scope（例如 `phigros.raw.read`），其中 `<game>` 是
+  登记表中该游戏名的**规范拼写**（由源登记项解析，不是请求路径里的原始拼写）。
+- 缺失时返回 `403 scope_not_granted`，并带
+  `WWW-Authenticate: Bearer error="insufficient_scope"` 与 `required_scope="<game>.raw.read"`
+  （错误形状见 [api-design.md](./api-design.md) §2.4）。
+- **旧的「持有该源任一资源 scope 即可 raw」规则已被移除。** 一个为 `phigros.profile.read` 签发的
+  令牌不能再经 raw 读取同一源的 scores 端点；用户在同意页取消勾选的权限**不再能从 raw 绕过**。
+- 该 scope 必须登记在 scope 目录中，客户端才可能申请到它。**它由组合根按配置自动登记**：
+  `cmd/re0auth/main.go` 的 `rawScopeDescriptors` 为每个「至少有一个声明了 `raw_base` 的源」的游戏
+  生成一条 `<game>.raw.read` 描述符（`Risk = high`，标题/说明写明它覆盖整个原生接口），
+  `registerRawScopes` 把它注册进 OP 的 scope 目录（`openOIDC` 里、构建数据面前调用）。
+  因此目录**不会广告一个没有端点支撑的能力**：全部源都没有 `raw_base` 的游戏没有条目。
+  - **客户端仍需被显式放行**：`[client]` / `[[clients]]` 的 `scopes` 默认只有 `["account.id"]`，
+    要用 raw 的客户端必须在配置里显式加上 `<game>.raw.read`（否则它请求不到、也就不可能持有）。
+  - **游戏名带 `-` 会让登记失败而不是被跳过**：scope 语法不允许 `-`，`registerRawScopes` 直接
+    拒绝启动并点名该 game（跳过会留下「客户端拿到了 scope、端点却永远 403」的静默拒绝）。
+- 同意页会以「系统必需」占位渲染目录未描述的已授予 scope，因此**显示集合覆盖授予集合**
+  （A-FE-3）：一个 scope 即使只在另一份目录里（组合根的 OP 目录与 `httpapi` 自己的
+  `Config.Scopes` 是两份，后者默认仍是 `oauth.DefaultRegistry()`），也会以占位出现，而不是被丢弃。
+  用户不在同意页勾选它就拿不到它——这正是 Z20-2 要的效果：raw 不能绕过收窄。
+
 ## 10. Provenance 与降级
 
 **来源永远可见、绝不静默换源。**
@@ -262,7 +287,8 @@ GET /v1/games/{game}/sources/{source}/raw/{path...}
 | `source_unavailable` | 503 | 指定的源当前不可用（不替换） |
 | `source_retired` | 410 | 源已下线 |
 
-- **raw 路径**：原样透传上游的 HTTP 状态与 body（由数据源定义）。
+- **raw 路径**：原样透传上游的 HTTP 状态与 body（由数据源定义）。raw **自己的** scope 门禁先于
+  转发：缺少 `<game>.raw.read` 时不发上游请求，直接 `403 scope_not_granted`（§9.1）。
 
 ## 12. 下游侧契约（简要）
 
@@ -271,7 +297,7 @@ GET /v1/games/{game}/sources/{source}/raw/{path...}
 ```
 GET /v1/games/{game}/{resource}                         归一化（可选 ?source=）
 GET /v1/games/{game}/sources                            列出源、能力、状态（公开）
-GET /v1/games/{game}/sources/{source}/raw/{path...}     原始透传
+GET /v1/games/{game}/sources/{source}/raw/{path...}     原始透传（需 <game>.raw.read，§9.1）
 ```
 
 **未绑定引导**：当用户尚未绑定所需源时，返回

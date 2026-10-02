@@ -3,6 +3,7 @@ package httpapi
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/Re0Auth/r0semi/internal/lifecycle"
 	"github.com/Re0Auth/r0semi/internal/observability"
@@ -36,6 +37,19 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	if !s.sessions.ValidCSRF(r) {
 		s.writeProblem(w, r, http.StatusForbidden, "invalid_request", "missing or invalid CSRF token")
 		return
+	}
+	// Step-up by re-login, exactly like a mutating admin call (requireAdminWrite).
+	// Erasure cannot be undone and it is only session-scoped, so a stolen or
+	// long-idle cookie must not be enough: once the window has passed the user has
+	// to sign in again (Z07-9). The acknowledgement body is deliberately NOT read
+	// before this check, so a refused request does not depend on a body at all.
+	if s.accountReauth > 0 {
+		at, ok := s.sessions.AuthenticatedAt(r.Context())
+		if !ok || time.Since(at) > s.accountReauth {
+			s.writeProblem(w, r, http.StatusForbidden, "reauth_required",
+				"sign in again to continue; deleting an account needs a recent authentication")
+			return
+		}
 	}
 
 	var body deleteAccountRequest

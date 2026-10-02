@@ -183,9 +183,26 @@ func TestDeviceAuthorizationWithStandardOIDCScopes(t *testing.T) {
 	signIn(t, browser, base)
 	view := decodeResp(t, getURL(t, browser, base+"/v1/device/verification?user_code="+url.QueryEscape(userCode)))
 	csrf, _ := view["csrf_token"].(string)
+	// The displayed set covers the granted set (A-FE-3): the catalogue scope plus
+	// the protocol scopes, the latter as system-required placeholders rather than
+	// being dropped from the screen while the grant still carries them.
 	scopes, _ := view["scopes"].([]any)
-	if len(scopes) != 1 {
-		t.Fatalf("verification page scopes = %v, want only the catalogue scope", view["scopes"])
+	displayed := make(map[string]bool, len(scopes))
+	for _, raw := range scopes {
+		row, _ := raw.(map[string]any)
+		name, _ := row["scope"].(string)
+		displayed[name] = true
+		if title, _ := row["title"].(string); title == "" {
+			t.Errorf("scope %q has no title in the device view", name)
+		}
+		if desc, _ := row["description"].(string); desc == "" {
+			t.Errorf("scope %q has no description in the device view", name)
+		}
+	}
+	for _, want := range []string{"account.id", "openid", "profile", "email"} {
+		if !displayed[want] {
+			t.Errorf("device view omitted granted scope %q: %v", want, displayed)
+		}
 	}
 
 	body, _ := json.Marshal(map[string]any{

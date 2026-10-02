@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -1868,11 +1869,21 @@ func (h *Handler) Introspect(ctx context.Context, token string) (oauth.TokenInfo
 	}
 	resp := new(oidc.IntrospectionResponse)
 	if err := h.provider.Storage().SetIntrospectionFromToken(ctx, resp, id, subject, ""); err != nil {
-		// An unknown or expired token is reported here as an error. Fail closed
-		// and answer "inactive": the routine invalid token and a storage fault
-		// are not distinguishable from this call, and the safe answer to both is
-		// to refuse the token.
-		return oauth.TokenInfo{Active: false}, nil //nolint:nilerr // unknown token means "inactive", not "error"
+		// S02-8: the store's answer and the store's failure are different
+		// things. A token the store has no live record for — unknown, revoked
+		// or expired — is reported with the same sentinel the rest of the token
+		// plane uses, and the honest answer to "is this active" is no. Any other
+		// error is the store itself failing, and folding it into Active=false
+		// made a database outage indistinguishable from mass token invalidation:
+		// /v1 answered 401 invalid_token, clients discarded live tokens and
+		// entered refresh loops against the failing store, and no 5xx was ever
+		// visible. Propagate it instead; withBearer turns it into a 500
+		// problem+json, and the counter makes the outage observable.
+		if errors.Is(err, oauth.ErrTokenNotFound) {
+			return oauth.TokenInfo{Active: false}, nil //nolint:nilerr // unknown token means "inactive", not "error"
+		}
+		h.metrics.ObserveStoreUnavailable("introspection")
+		return oauth.TokenInfo{}, err
 	}
 	scopes := make([]oauth.Scope, 0, len(resp.Scope))
 	for _, s := range resp.Scope {

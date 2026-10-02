@@ -226,66 +226,66 @@ func TestVerifyConsistentScopesCollapseTheDivergence(t *testing.T) {
 	}
 }
 
-// TestVerifyCollidingSourceKeyHasNoRequestPath executes the aliasing FO-04 raises
-// as a "键空间可碰撞" hole. The key is collidable, but the game lookup happens
-// first, so a request that would alias cannot reach the aliased source.
+// TestVerifyCollidingSourceKeyHasNoRequestPath is the regression guard for FO-04's
+// "键空间可碰撞" hole. The escaping game name that made keys collidable is now
+// refused at startup, so there is no registry to alias through at all; the pair
+// that would share a key is refused too. It was a finding-demonstrator before the
+// fix (the registry accepted the escaping pair).
 func TestVerifyCollidingSourceKeyHasNoRequestPath(t *testing.T) {
 	log := &[]string{}
 	srv := recordingServer(t, log, `{"served_by":"aliased"}`)
-	reg, err := federation.NewRegistry(federation.Source{
+
+	if _, err := federation.NewRegistry(federation.Source{
 		Game: "../..", Name: "src", Issuer: srv.URL, TokenClass: "revocable",
 		Resources: []federation.Resource{{Name: "profile", Scope: "x.y.read"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The pair the audit says aliases to the same key.
-	aliased, ok := reg.Get("..", "../src")
-	t.Logf(`registry.Get("..", "../src") -> ok=%v name=%q game=%q (sourceKey %q)`,
-		ok, aliased.Name, aliased.Game, aliased.Game+"/"+aliased.Name)
-
-	store := federation.NewMemoryBindingStore()
-	v := newTestVault(t)
-	svc, err := federation.NewService(federation.Config{
-		Registry: reg, Bindings: store, Vault: v, Doer: srv.Client(), HTTPClient: srv.Client(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, ferr := svc.Fetch(context.Background(), federation.FetchRequest{
-		User: "usr_1", Game: "..", Resource: "profile", Source: "../src",
-	})
-	t.Logf(`Fetch(game="..", source="../src") -> %v`, ferr)
-	if ferr == nil {
-		t.Errorf("the aliased pair reached a source: %v", ferr)
+	}); err == nil {
+		t.Fatal("a path-escaping game name was accepted: the colliding key has a request path again")
 	}
 
-	// Two entries that collide are rejected at startup rather than silently
+	// Two entries that collide must be rejected at startup rather than silently
 	// sharing a key.
-	_, err = federation.NewRegistry(
+	if _, err := federation.NewRegistry(
 		federation.Source{Game: "../..", Name: "src", Issuer: "https://a.example"},
 		federation.Source{Game: "..", Name: "../src", Issuer: "https://b.example"},
-	)
-	t.Logf("registering both colliding pairs -> %v", err)
-	if err == nil {
+	); err == nil {
 		t.Errorf("a key collision was accepted")
+	}
+
+	// Positive control: a benign source with the same resource still registers, so
+	// the refusals above are about the escaping names and not a broken registry.
+	if _, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "src", Issuer: srv.URL, TokenClass: "revocable",
+		Resources: []federation.Resource{{Name: "profile", Scope: "phigros.profile.read"}},
+	}); err != nil {
+		t.Fatalf("a benign source no longer registers: %v", err)
 	}
 }
 
-// TestVerifyDeclaredScopeReachesTheWireWithInjectedSpaces executes FO-04's scope
-// claim through production code (BeginBind -> oauthConfig -> AuthCodeURL) rather
-// than re-reading the fixture, which is all the reported probe does.
+// TestVerifyDeclaredScopeReachesTheWireWithInjectedSpaces is the regression guard
+// for FO-04's scope claim: a scope carrying whitespace would be sent as several
+// scopes, so the registry must refuse it at startup instead of reaching the wire.
+// It was a finding-demonstrator before the fix (the injected space did reach
+// AuthCodeURL).
 func TestVerifyDeclaredScopeReachesTheWireWithInjectedSpaces(t *testing.T) {
 	srv := recordingServer(t, nil, `{}`)
-	reg, err := federation.NewRegistry(federation.Source{
+	if _, err := federation.NewRegistry(federation.Source{
 		Game: "phigros", Name: "src", Issuer: srv.URL, TokenClass: "revocable", ClientID: "cli",
 		Resources: []federation.Resource{
 			{Name: "profile", Scope: "phigros.profile.read account.id"},
 			{Name: "scores", Scope: "phigros.score.read"},
 		},
+	}); err == nil {
+		t.Fatal("a whitespace-injected scope was accepted: the injection reaches AuthCodeURL")
+	}
+
+	// Positive control: the same source with one well-formed scope binds and asks
+	// the wire for exactly that scope.
+	reg, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "src", Issuer: srv.URL, TokenClass: "revocable", ClientID: "cli",
+		Resources: []federation.Resource{{Name: "profile", Scope: "phigros.profile.read"}},
 	})
 	if err != nil {
-		t.Fatalf("registry: %v", err)
+		t.Fatal(err)
 	}
 	store := federation.NewMemoryBindingStore()
 	v := newTestVault(t)
@@ -306,12 +306,20 @@ func TestVerifyDeclaredScopeReachesTheWireWithInjectedSpaces(t *testing.T) {
 	}
 	raw := u.Query().Get("scope")
 	t.Logf("authorize URL scope parameter = %q", raw)
-	t.Logf("the source is asked for %d scope(s): %v", len(strings.Fields(raw)), strings.Fields(raw))
-	if len(strings.Fields(raw)) != 4 {
-		t.Errorf("expected the injected space to add one scope on the wire (4 total), got %v", strings.Fields(raw))
+	got := strings.Fields(raw)
+	has := func(want string) bool {
+		for _, g := range got {
+			if g == want {
+				return true
+			}
+		}
+		return false
 	}
-	if !strings.Contains(raw, "account.id") {
-		t.Errorf("the injected scope did not reach the wire: %q", raw)
+	if len(got) != 2 || !has("phigros.profile.read") || !has("account.read") {
+		t.Errorf("authorize scope = %v, want the declared phigros.profile.read plus the frame's own account.read", got)
+	}
+	if has("account.id") {
+		t.Errorf("the injected scope reached the wire: %q", raw)
 	}
 }
 

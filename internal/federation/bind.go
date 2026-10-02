@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -285,6 +286,20 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,
 	}); err != nil {
+		// A failed store does not prove nothing was written: Enroll can return
+		// after the record landed (a refused audit write) or fail part-way, so
+		// roll the vault back and report the write failure only once no secret
+		// can be left behind. Revoke is idempotent and ignores a missing record,
+		// so this is safe when the write never happened.
+		if rerr := s.vault.Revoke(ctx, BindingIdentity(binding)); rerr != nil {
+			// The rollback failed too, so a decryptable secret may remain. Join
+			// both failures — the caller must still see the write failure, and an
+			// operator must see that the rollback did not complete. The subject
+			// is not logged (G-21); game/source locate the binding.
+			slog.ErrorContext(ctx, "could not roll back a binding secret after the vault write failed",
+				"game", binding.Game, "source", binding.Source, "err", rerr)
+			return Binding{}, flow, errors.Join(err, rerr)
+		}
 		return Binding{}, flow, err
 	}
 	return binding, flow, nil

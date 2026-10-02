@@ -163,7 +163,7 @@ func deviceGrant(t *testing.T, e env, subject string) tokenJSON {
 	if deviceCode == "" || userCode == "" {
 		t.Fatalf("device_authorization answered %s", raw)
 	}
-	if err := e.store.ApproveDevice(t.Context(), userCode, subject, nil); err != nil {
+	if err := e.store.DecideDeviceAuthorization(t.Context(), userCode, subject, true, nil, nil); err != nil {
 		t.Fatalf("approval: %v", err)
 	}
 	pollResp, pollRaw := e.postForm(t, "/oauth/token", url.Values{

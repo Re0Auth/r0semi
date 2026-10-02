@@ -139,12 +139,16 @@ func dataAPI(t *testing.T, cfg dataConfig) (*httptest.Server, string) {
 		t.Fatalf("NewService: %v", err)
 	}
 	api, err := httpapi.New(httpapi.Config{
-		Issuer:            "https://re0auth.test",
-		OIDC:              stubOIDC,
-		TokenIntrospector: stubIntrospector{info: oauth.TokenInfo{Active: true, Subject: "usr_v", ClientID: "cli", Scopes: []oauth.Scope{zzScope}}},
-		GrantStore:        stubGrants{},
-		DeviceStore:       stubDevices{},
-		Federation:        fed,
+		Issuer: "https://re0auth.test",
+		OIDC:   stubOIDC,
+		TokenIntrospector: stubIntrospector{info: oauth.TokenInfo{Active: true, Subject: "usr_v", ClientID: "cli",
+			// The live probes drive the RAW passthrough, which since Z20-2 needs the
+			// game's explicit `<game>.raw.read` scope; the resource scope rides along
+			// because some reads are normalized.
+			Scopes: []oauth.Scope{zzScope, oauth.Scope(oauth.RawScope(zzGame))}}},
+		GrantStore:  stubGrants{},
+		DeviceStore: stubDevices{},
+		Federation:  fed,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.New: %v", err)

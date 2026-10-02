@@ -98,7 +98,9 @@ introspection 默认只允许 client 查询自己的 token，资源服务器需�
 - `type` 指向可点击文档；`code` 是稳定机器码；`request_id` 用于排查。
 - `401` = 令牌缺失/无效（必须带 `WWW-Authenticate: Bearer error="invalid_token"`）；
   `403` = 令牌有效但 scope 不足，必须带 `WWW-Authenticate: Bearer error="insufficient_scope"`，
-  能指名单个 scope 时附 `scope="…"`。raw 透传按「该源任一资源 scope」粗粒度门禁，故省略 `scope=`。
+  能指名单个 scope 时附 `scope="…"`。raw 透传现在也指名单个 scope：缺
+  `<game>.raw.read` 时回 `required_scope="<game>.raw.read"`（Z20-2，
+  [upstream-protocol.md](./upstream-protocol.md) §9.1）。
   这是 RFC 6750 §3.1 区分「令牌不行」与「令牌太窄」的唯一标准手段——没有它，标准客户端只能看到
   一个裸 403，无法从协议层知道该去申请哪个 scope。
 - 初始错误码目录（当前实现；`credential_not_found`、`conflict`、`idempotency_key_reused` 已删除，见 §2.6）：
@@ -236,7 +238,7 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 | `GET` | `/v1/me` | `account.id` | r0semi 账号（`usr_` id、显示名） |
 | `GET` | `/v1/identities` | 会话 | 本账号已链接的 IdP 身份 |
 | `DELETE` | `/v1/identities/{id}` | 会话 + CSRF | 解绑一个身份（I-2 守护，最后一个返回 `409 last_identity`） |
-| `DELETE` | `/v1/account` | 会话 + CSRF + 显式确认 | **抹除本账号**：解绑并撤上游 → 撕碎 vault 凭据 → 撤销全部令牌 → 清会话 → 清在途请求 → 删账号行。**不可逆**；200 带「删了什么」的 body |
+| `DELETE` | `/v1/account` | 会话 + CSRF + 显式确认 + **近期登录**（`[account].reauth_window`，默认 15m，超时 `403 reauth_required`） | **抹除本账号**：解绑并撤上游 → 撕碎 vault 凭据 → 撤销全部令牌 → 清会话 → 清在途请求 → 删账号行。**不可逆**；200 带「删了什么」的 body |
 | `GET` | `/v1/account/export` | 会话 | **导出本账号数据**（profile / identities / bindings / grants），**不含任何凭据**；`Content-Disposition: attachment` |
 | `GET` | `/v1/games/phigros/me` | `phigros.profile.read` | 游戏内档案（rks 等） |
 | `GET` | `/v1/games/phigros/scores` | `phigros.score.read` | 成绩列表（游标分页） |
@@ -251,7 +253,7 @@ trace id 写入访问日志；未携带或格式非法时生成一个。**不运
 | `GET` | `/v1/sources` | — （公开） | 本部署提供的全部数据源（供「可连接」列表用） |
 | `GET` | `/v1/games/{game}/sources` | — （公开） | 该游戏的数据源、能力与 `token_class` |
 | `GET` | `/v1/games/{game}/{resource}` | **每一个可能服务这次读取的源各自声明的 scope**（见下） | 归一化数据；`?source=` 可 pin（已实现，见 architecture.md §4.11），pin 会把判据收窄到该源 |
-| `GET` | `/v1/games/{game}/sources/{source}/raw/{path...}` | 该源任一资源 scope（粗粒度） | 逐字透传源的原始 API；状态码/Content-Type/body 不改，另加路由级 CSP 与 `Content-Disposition: attachment`（浏览器不渲染、不执行脚本，见下） |
+| `GET` | `/v1/games/{game}/sources/{source}/raw/{path...}` | **`<game>.raw.read`**（显式、按游戏，见 upstream-protocol.md §9.1） | 逐字透传源的原始 API；状态码/Content-Type/body 不改，另加路由级 CSP 与 `Content-Disposition: attachment`（浏览器不渲染、不执行脚本，见下） |
 
 > **raw 响应为什么多两个头。** 媒体类型是源的，而响应落在**本服务的源**上——同一个持有会话 cookie、
 > 并在 `/v1/sessions/current` 发放 CSRF token 的源。全局 CSP 只有 `frame-ancestors`（SPA 的 `script-src`
@@ -310,6 +312,11 @@ PIPL / GDPR 要求「可删除」，这就是那个端点。它的编排在 `int
 **每一步都幂等**，所以中途失败后重试是安全的、也是预期的恢复方式；错误里会注明卡在哪一步。
 
 **为什么需要 `acknowledge`：** 和 `cascade_revocation` 同一个理由——不可逆动作不能让一个裸 `DELETE` 触发，调用方必须把后果写出来（常量 `deletes_my_account`）。
+
+**为什么还要「最近登录」（Z07-9）：** 抹除不可逆，所以它要求会话在 `[account].reauth_window`
+（默认 15 分钟；`RE0AUTH_ACCOUNT_REAUTH_WINDOW`）内被认证过，否则 `403 reauth_required`——与
+管理员面写操作（`[admin].reauth_window`）同一条 step-up 理由：一个被借走或长期挂着的会话不该能
+永久销毁账号。窗口取 `"0"` 即关闭该检查（`config/re0auth.example.toml` 的 `[account]`）。
 
 **响应为什么不是 204：** 请求返回时账号和会话都已经没了，调用方**无法自己核实**删没删干净。结果体逐 store 报告删了什么，这是它唯一能拿到的交代。
 

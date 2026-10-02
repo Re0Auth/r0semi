@@ -293,9 +293,10 @@ curl -fsS -H "Cookie: ..." https://auth.example.com/v1/admin/audit/verify
 2. 在 staging 跑一次恢复演练到新版本；
 3. 滚动更新（PDB 保证至少一个可用副本），观察 `/readyz`、错误率与 429/503；
    **关停顺序**：收到 SIGTERM 后，进程先把 `/readyz` 翻成 503，等 **`endpointRemovalWait`（5s）**
-   让编排系统把本实例摘出轮转，再开始 **`shutdownTimeout`（30s）** 的排空，最后才排空审计批次队列
+   让编排系统把本实例摘出轮转，再开始 **`shutdownTimeout`（45s，必须 ≥ `dataPlaneTimeout` 的 45s）**
+   的排空，最后才排空审计批次队列
    （**`auditDrainTimeout`（10s）**）。三段是**串行**的（审计排空在 HTTP 排空之后，不是并行），
-   合计 5 + 30 + 10 = 45s，所以 `terminationGracePeriodSeconds` 必须 ≥ 45s（出厂 45s）——小于
+   合计 5 + 45 + 10 = 60s，所以 `terminationGracePeriodSeconds` 必须 ≥ 60s（出厂 60s）——小于
    这个总数，审计排空的「过期拒绝」路径会在 SIGKILL 之前跑不完，在途审计行静默丢失。这四处的
    量级由 `TestGracefulShutdownWindowsAgree` 交叉校验。等待放在**进程内**而非 `preStop`：scratch
    镜像没有 `/bin/sleep` 可跑。
@@ -303,6 +304,23 @@ curl -fsS -H "Cookie: ..." https://auth.example.com/v1/admin/audit/verify
    迁移的兼容性规则与回滚策略见 [migration-decision.md](./migration-decision.md)（ADR-0008）：
    同一版本只做加法，破坏性变更延后一版；**回滚 = 从备份恢复**，`re0auth -migrate-down`
    只用于撤销最近一步。
+5. **`oauth_clients.secret_hash` 的格式换了一次（S01-10；破坏性但一次性）。** 客户端密钥的存储
+   摘要从「裸 SHA-256」换成**加盐的慢哈希** `$pbkdf2-sha256$i=<iterations>$<salt>$<dk>`
+   （PBKDF2-HMAC-SHA256，新写入 210000 次迭代，16 字节随机 salt，32 字节派生键，unpadded base64；
+   迭代数随每个值自带，日后可以只提高新值的代价而不动老值）。
+   - **存量旧格式行会被拒绝，不是被兼容。** `oauth.RestoreClientWithStatus` 只接受上面的形状，
+     读到一条旧的 32 字节 SHA-256 摘要时直接报错（`confidential client requires a secret hash`），
+     `seedRegisteredClient` 把该错误原样上抛 ⇒ **进程拒绝启动**，并在启动日志里点名；`RotateSecret`
+     同样拒绝写入旧式/畸形摘要。**不会**静默地把客户端当成未知。
+   - **升级动作：删掉存量行，让服务重新 seed**（注册表一旦有行就是权威，启动不会改写它——
+     只改配置里的明文密钥会命中漂移检查并被拒绝启动）：
+     ```sh
+     # 先备份；这一 DELETE 只影响客户端注册表
+     psql "$DATABASE_URL" -c 'DELETE FROM oauth_clients;'
+     # 然后重启服务：registry 为空时按配置的 [client] / [[clients]] 重新注册
+     ```
+   - **本项目尚未上线，默认无存量。** 全新部署（空库）第一次启动就是按新格式 seed，这一步是
+     空操作；只有从本改动**之前**的持久化部署升级时才需要执行上面的 DELETE。
 
 ## 容量
 

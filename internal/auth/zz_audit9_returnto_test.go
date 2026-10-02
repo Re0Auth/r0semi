@@ -11,7 +11,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
-	"github.com/Re0Auth/r0semi/internal/safeurl"
+	"github.com/Re0Auth/r0semi/safeurl"
 )
 
 // audit9Store is a minimal scs.Store that records the largest committed session

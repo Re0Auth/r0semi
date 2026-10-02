@@ -500,7 +500,7 @@ func TestProbeDeviceFlowIDTokenIsAlsoMissingTheSubject(t *testing.T) {
 	}
 
 	// The human approves, through the same store call the consent route makes.
-	if err := e.store.ApproveDevice(t.Context(), userCode, "usr_probe", nil); err != nil {
+	if err := e.store.DecideDeviceAuthorization(t.Context(), userCode, "usr_probe", true, nil, nil); err != nil {
 		t.Fatalf("approval: %v", err)
 	}
 

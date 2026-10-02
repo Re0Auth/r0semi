@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/oauth"
 )
 
 const zzVictimScope = "phigros.profile.read"
@@ -93,7 +94,10 @@ func TestZ09SleeperReadsShedAFullCapReadForAnotherUser(t *testing.T) {
 		{User: "usr_atk", Game: zzGame, Source: "sleeper", Access: "atk-token"},
 		{User: "usr_vic", Game: zzGame, Source: "victim", Access: "vic-token"},
 	}, nil)
-	atk := mint("usr_atk", zzSleeperScope)
+	// The sleeper's reads go through the raw passthrough, which since Z20-2 needs
+	// the explicit game raw scope; the reservation budget it exercises is the same
+	// one either way.
+	atk := mint("usr_atk", oauth.RawScope(zzGame))
 	vic := mint("usr_vic", zzVictimScope)
 
 	sleeperURL := srv.URL + "/v1/games/" + zzGame + "/sources/sleeper/raw/data"

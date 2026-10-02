@@ -125,7 +125,14 @@ const (
 	// shutdownTimeout is how long a graceful shutdown waits for in-flight
 	// requests to finish after a signal, before closing their connections anyway.
 	// It bounds the drain so a stuck handler cannot hold a deploy open forever.
-	shutdownTimeout = 30 * time.Second
+	//
+	// It must be at least dataPlaneTimeout (45s): the drain exists to let a
+	// request the data plane has already admitted finish and write its answer. A
+	// drain shorter than the data plane's own deadline cuts exactly the slow read
+	// the deadline was designed to answer with a readable 504, and closes the
+	// connection with no response at all (S08-7). The relation is asserted by
+	// TestW2ShutdownDrainOutlastsTheDataPlaneTimeout.
+	shutdownTimeout = 45 * time.Second
 
 	// endpointRemovalWait is how long shutdown waits, after flipping /readyz to
 	// 503, before it stops accepting connections. Kubernetes sends SIGTERM and
@@ -625,10 +632,11 @@ func run() error {
 	// The operator plane. It is mounted only when a deployment names at least one
 	// admin account; `httpapi.New` rejects a service with an empty allowlist, and
 	// this skips it entirely rather than mounting a door with no lock.
-	// Operator step-up window. Set unconditionally: it is inert when the operator
-	// plane is not mounted, and a value that only applies in some deployments is
-	// easier to reason about than one wired in two places.
-	apiConfig.AdminReauthWindow = cfg.AdminReauthWindow
+	// Step-up windows. Set unconditionally: they are inert when the surface they
+	// guard is not mounted, and a value that only applies in some deployments is
+	// easier to reason about than one wired in two places. The account window is
+	// the operator window's counterpart for DELETE /v1/account (Z07-9).
+	applyReauthWindows(&apiConfig, cfg)
 
 	// The effective access-control lists, logged once: their lengths are the
 	// operator-visible answer to "did my environment override take effect?", and
@@ -1388,6 +1396,60 @@ type oidcBackend interface {
 // instead of a goroutine starting itself somewhere inside a constructor.
 type oidcJanitor interface{ SweepExpired() int }
 
+// rawScopeDescriptors builds the catalogue entries for the raw passthroughs this
+// deployment actually offers: one `<game>.raw.read` per game with at least one
+// source that declares raw_base.
+//
+// It is keyed by game, not by source, because the gate is: every source of a game
+// requires the same scope (internal/httpapi's rawGate). A game whose sources all
+// lack a raw_base gets no entry, so the catalogue never advertises a capability
+// no endpoint can back.
+func rawScopeDescriptors(sources []federation.Source) []oauth.Descriptor {
+	seen := make(map[string]bool, len(sources))
+	out := make([]oauth.Descriptor, 0, len(sources))
+	for _, src := range sources {
+		if src.RawBase == "" || seen[src.Game] {
+			continue
+		}
+		seen[src.Game] = true
+		out = append(out, oauth.Descriptor{
+			Scope: oauth.Scope(oauth.RawScope(src.Game)),
+			Title: "读取 " + src.Game + " 原生接口",
+			Description: "通过 Re0Auth 原样转发 " + src.Game + " 数据源的原生 API。" +
+				"此项覆盖该源的整个原生接口，而不只是某一个归一化资源。",
+			Risk: oauth.RiskHigh,
+		})
+	}
+	return out
+}
+
+// registerRawScopes adds this deployment's raw-passthrough scopes to the catalogue.
+//
+// A game name may contain '-' (federation's source-name grammar allows it) while
+// a scope name may not, so a raw scope for such a game cannot be registered at
+// all. That is refused loudly here rather than skipped: a skipped entry leaves the
+// endpoint permanently 403 for a client that was granted the scope, which is the
+// silent denial this registration exists to remove.
+func registerRawScopes(registry *oauth.Registry, sources []federation.Source) error {
+	for _, d := range rawScopeDescriptors(sources) {
+		if err := registry.Register(d); err != nil {
+			return fmt.Errorf(
+				"raw scope for game %q: %w (a game name may contain '-', which the scope grammar does not; "+
+					"rename the game or remove its raw_base)", d.Scope.Provider(), err)
+		}
+	}
+	return nil
+}
+
+// applyReauthWindows copies the resolved step-up windows onto the HTTP server
+// configuration, so the operator plane and the account plane (self-erasure) share
+// one wire-up point. Both are inert when a window is 0 and the surface they guard
+// is not mounted.
+func applyReauthWindows(apiConfig *httpapi.Config, cfg settings) {
+	apiConfig.AdminReauthWindow = cfg.AdminReauthWindow
+	apiConfig.AccountReauthWindow = cfg.AccountReauthWindow
+}
+
 // openOIDC builds the OpenID Provider store and HTTP handler. The store is
 // Postgres when a database is configured and in-memory otherwise (ADR-0001 P4b);
 // the handler and every policy around it are identical either way.
@@ -1419,6 +1481,14 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 		return nil, nil, nil, err
 	}
 	registry := oauth.DefaultRegistry()
+	// The raw passthrough's scope is per configured game, so it cannot live in the
+	// static catalogue: it is registered here from the same source list the data
+	// plane is built from. Without this the scope is unknown to the OP, no client
+	// can be granted it, and the raw endpoint answers 403 to every real caller
+	// (Z20-2).
+	if err := registerRawScopes(registry, cfg.sources); err != nil {
+		return nil, nil, nil, err
+	}
 	scopes := make([]string, 0, len(registry.Descriptors()))
 	for _, d := range registry.Descriptors() {
 		scopes = append(scopes, d.Scope.String())
@@ -1833,11 +1903,13 @@ func configuredClients(cfg settings) ([]oauth.Client, error) {
 //
 // Redirect URIs and scopes are compared as SETS: reordering a list does not
 // change what the client may do, and refusing startup over it would be a false
-// alarm. The secret is compared by digest — the registry never holds the
-// plaintext, and neither does the message below. The display name is
-// deliberately not compared: it is cosmetic, and a rename is not a reason to
+// alarm. The secret is compared by verifying the configured plaintext against the
+// registered verifier — the registry never holds the plaintext, and neither does
+// the message below. It cannot be compared as bytes: NewSecretHash salts every
+// verifier, so two digests of the same secret differ (S01-10). The display name
+// is deliberately not compared: it is cosmetic, and a rename is not a reason to
 // refuse a start.
-func clientDrift(registered, configured oauth.Client) []string {
+func clientDrift(registered, configured oauth.Client, configuredSecret string) []string {
 	var drift []string
 	if registered.Type != configured.Type {
 		drift = append(drift, fmt.Sprintf("type: registered %q, configured %q", registered.Type, configured.Type))
@@ -1850,8 +1922,11 @@ func clientDrift(registered, configured oauth.Client) []string {
 		drift = append(drift, fmt.Sprintf("scopes: registered %v, configured %v",
 			registered.AllowedScopes, configured.AllowedScopes))
 	}
-	if !bytes.Equal(registered.SecretHash(), configured.SecretHash()) {
-		drift = append(drift, "secret: the registered digest differs from the configured client secret "+
+	// Only a confidential client has a secret to disagree about. A public client
+	// is compared by the absence of one, which registered.Type above already
+	// covers if the two clients differ.
+	if configured.Type == oauth.ClientConfidential && !registered.Authenticate(configuredSecret) {
+		drift = append(drift, "secret: the registered verifier does not match the configured client secret "+
 			"(the previous secret would otherwise stay valid)")
 	}
 	// A stricter value in the file must not be silently ignored: turning the
@@ -1894,14 +1969,35 @@ func seedClients(ctx context.Context, clients oauth.ClientRegistry, cfg settings
 	}
 	for i, client := range configured {
 		source := fmt.Sprintf("the [[clients]] entry %q", client.ID)
+		secret := registeredSecretFor(cfg, i)
 		if i == 0 && !cfg.noPrimaryClient {
 			source = "the [client] section"
 		}
-		if err := seedRegisteredClient(ctx, clients, client, source); err != nil {
+		if err := seedRegisteredClient(ctx, clients, client, secret, source); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// registeredSecretFor returns the plaintext configured for the i-th entry of
+// configuredClients, in the same order that function builds it: the primary
+// [client] section first (unless the file deliberately omits it), then each
+// [[clients]] entry. It is what clientDrift verifies against a registered
+// verifier, so the two lists cannot drift out of order without the secret check
+// noticing.
+func registeredSecretFor(cfg settings, i int) string {
+	if !cfg.noPrimaryClient && i == 0 {
+		return cfg.clientSecret
+	}
+	index := i
+	if !cfg.noPrimaryClient {
+		index--
+	}
+	if index < 0 || index >= len(cfg.extraClients) {
+		return ""
+	}
+	return cfg.extraClients[index].Secret
 }
 
 // seedRegisteredClient registers one configured client, or refuses to start when
@@ -1916,7 +2012,7 @@ func seedClients(ctx context.Context, clients oauth.ClientRegistry, cfg settings
 // dropped. A mismatch is therefore a refusal that names every differing field;
 // the operator either reverts the section to what was seeded, or deletes the
 // registration and restarts to re-seed it from the new configuration.
-func seedRegisteredClient(ctx context.Context, clients oauth.ClientRegistry, configured oauth.Client, source string) error {
+func seedRegisteredClient(ctx context.Context, clients oauth.ClientRegistry, configured oauth.Client, configuredSecret, source string) error {
 	if configured.AllowMissingPKCE {
 		// Logged on every start, not only at registration: an operator reading the
 		// log of a running deployment should not have to remember that this client
@@ -1938,7 +2034,7 @@ func seedRegisteredClient(ctx context.Context, clients oauth.ClientRegistry, con
 		return err
 	}
 
-	if drift := clientDrift(registered, configured); len(drift) > 0 {
+	if drift := clientDrift(registered, configured, configuredSecret); len(drift) > 0 {
 		// Logged as well as returned: the error stops the process, but the
 		// field-by-field list is what an operator greps the startup log for.
 		slog.Error("downstream client does not match its configuration; refusing to start",

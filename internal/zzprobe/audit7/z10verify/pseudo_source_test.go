@@ -13,67 +13,99 @@ import (
 	"testing"
 )
 
-// TestZ10VerifyPseudonymCacheIsHitBeforeTheDatabaseAndErasureIsProcessLocal
-// re-derives Z10-1's mechanism against the current cache shape. The claim is:
+// TestZ10VerifyPseudonymCacheIsHitBeforeTheDatabaseAndErasureIsProcessLocal is
+// the flipped form of Z10-1; the name is kept so the coverage matrix still maps
+// here.
 //
-//  1. loadKey answers from the in-process cache before its one pool query, so a
-//     warm entry means "the database is never consulted" — now through the
-//     cached()/remember() pair rather than a bare map index; and
-//  2. the staleness that creates across replicas is bounded by a TTL, while
-//     Destroy still evicts only the calling process's entry — there is no
-//     tombstone and no cross-process channel.
+// The finding was: the pseudonym cache was answered before the database and an
+// erasure only evicted the calling process's entry, with no tombstone and no
+// cross-process channel — so another replica kept pseudonymising an erased subject
+// for up to the cache TTL. The fix added a durable tombstone table
+// (audit_subject_tombstones) written in the SAME transaction as the key deletion,
+// plus a rate-limited per-replica mirror that is consulted BEFORE the cache
+// answers.
 //
-// If either changes, this probe goes red.
+// The guard pins the fixed mechanism: (1) loadKey answers through cachedAnswer,
+// which checks tombstones before the cache; (2) the warm hit still precedes the
+// one pool query; (3) Destroy writes the tombstone with the deletion and evicts
+// the local entry; (4) the mirror is refreshed from the table. Both anti-vacuity
+// controls feed the pre-fix shapes to the same predicates.
 func TestZ10VerifyPseudonymCacheIsHitBeforeTheDatabaseAndErasureIsProcessLocal(t *testing.T) {
 	const file = "internal/store/postgres/auditpseudo.go"
 	raw := repoFile(t, file)
 
 	load := funcBody(t, file, "loadKey")
-	if !cacheHitPrecedesTheQuery(load) {
-		t.Fatalf("loadKey no longer answers a warm subject from the cache before its pool query; "+
-			"Z10-1's mechanism must be re-derived. Body: %s", strings.Join(strings.Fields(load), " "))
+	if !tombstoneGatedCachePrecedesTheQuery(load) {
+		t.Fatalf("loadKey no longer answers a warm subject (through the tombstone-gated cache) before "+
+			"its pool query; Z10-1's fix has been re-derived. Body: %s", strings.Join(strings.Fields(load), " "))
 	}
-	// The cache read is a live-entry check with a TTL, not a bare map index: that
-	// TTL is what bounds how long another replica can keep pseudonymising an
-	// erased subject (Z10-1's mitigation), so its disappearance matters.
+	// The cache read is a live-entry check with a TTL; that TTL now bounds only the
+	// residue when the tombstone mirror cannot be refreshed, so its disappearance
+	// matters even more.
 	cached := funcBody(t, file, "cached")
 	if !strings.Contains(cached, "l.cache[subject]") {
 		t.Errorf("cached() no longer reads the per-logger map; the cache shape Z10-1 rests on changed")
 	}
 	if !strings.Contains(cached, "l.now().Before(entry.expires)") {
-		t.Errorf("cached() no longer checks the entry's expiry; unbounded cross-instance staleness is back")
+		t.Errorf("cached() no longer checks the entry's expiry; unbounded staleness is back")
 	}
 	if !regexp.MustCompile(`(?m)\bpseudoCacheTTL\s*=\s*\d+\s*\*\s*time\.Second`).MatchString(raw) {
-		t.Errorf("pseudoCacheTTL is no longer a declared TTL; the bound on cross-instance staleness is gone")
+		t.Errorf("pseudoCacheTTL is no longer a declared TTL; the residue bound is gone")
 	}
 
-	// Destroy: structural facts first (no literals), then the SQL it issues.
-	destroy := funcBody(t, file, "Destroy")
-	for _, forbidden := range []string{"tombstone", "destroyed", "notify", "broadcast", "subscribe", "publish"} {
-		if strings.Contains(destroy, forbidden) {
-			t.Errorf("Destroy's code mentions %q: the cross-process half of Z10-1 may have been fixed — re-derive it", forbidden)
-		}
+	// The tombstone check is what makes an erasure effective on another replica,
+	// and it must come before the cache answer.
+	cachedAnswer := funcBody(t, file, "cachedAnswer")
+	if !tombstoneCheckedBeforeTheCache(cachedAnswer) {
+		t.Errorf("cachedAnswer no longer consults the tombstone mirror before the local cache; an " +
+			"erasure committed elsewhere can be served from a warm entry again (Z10-1)")
 	}
-	if !strings.Contains(destroy, "delete(l.cache, subject)") {
+	sync := funcBodyRaw(t, file, "syncTombstones")
+	if !strings.Contains(sync, "audit_subject_tombstones WHERE seq > $1") {
+		t.Errorf("syncTombstones no longer pulls incrementally from audit_subject_tombstones; the " +
+			"cross-replica channel Z10-1 added is gone")
+	}
+
+	// Destroy: the deletion and the tombstone commit together, then the local
+	// entry is dropped. funcBodyRaw because the assertions are on the SQL text.
+	destroy := funcBodyRaw(t, file, "Destroy")
+	if !strings.Contains(destroy, "INSERT INTO audit_subject_tombstones") {
+		t.Errorf("Destroy no longer writes a tombstone; the cross-process half of Z10-1 is unfixed again")
+	}
+	if !strings.Contains(destroy, "l.forget(subject)") {
 		t.Errorf("Destroy no longer evicts the local cache; the single-process half of the claim changed")
 	}
 	if !strings.Contains(raw, "DELETE FROM audit_subject_keys") {
 		t.Errorf("Destroy no longer deletes the key row; Z10-1's premise changed")
 	}
-	// The eviction is on the map it holds, not on a shared structure: the cache
-	// field is declared per logger, in the AuditLogger struct itself.
-	if !strings.Contains(repoFile(t, "internal/store/postgres/audit.go"), "cache map[string]cachedSubjectKey") {
+	// The tombstone is in the same transaction as the deletion: both tx.Exec calls
+	// precede the commit.
+	deleteAt := strings.Index(destroy, "DELETE FROM audit_subject_keys")
+	tombAt := strings.Index(destroy, "INSERT INTO audit_subject_tombstones")
+	commitAt := strings.Index(destroy, "tx.Commit(ctx)")
+	if deleteAt < 0 || tombAt < 0 || commitAt < 0 || tombAt < deleteAt || commitAt < tombAt {
+		t.Errorf("the tombstone no longer commits with the deletion (delete %d, tombstone %d, commit %d); "+
+			"a replica could observe the tombstone while the key row exists (Z10-1)", deleteAt, tombAt, commitAt)
+	}
+
+	// Both the cache and the tombstone mirror are per-logger fields, which is why
+	// the cross-process channel was needed in the first place.
+	auditGo := repoFile(t, "internal/store/postgres/audit.go")
+	if !strings.Contains(auditGo, "cache map[string]cachedSubjectKey") {
 		t.Errorf("the pseudonym cache is no longer a per-logger field; Z10-1's cross-process gap depends on it")
 	}
-	// And the code itself says what a warm cache means, which is the strongest
-	// possible statement that the read path does not check the row.
+	if !strings.Contains(auditGo, "tombstones map[string]struct{}") {
+		t.Errorf("the tombstone mirror is no longer a per-logger field; the sync design changed")
+	}
+	// And the code itself says what a warm cache used to mean, which is the
+	// strongest statement that the eviction is required.
 	if !strings.Contains(raw, "a warm cache would keep pseudonymising the subject") {
 		t.Errorf("the comment that states the warm-cache hazard is gone; the zone-10 report quotes it as a premise")
 	}
 
-	// Anti-vacuity: a loadKey that queries before it consults the cache is the
+	// Anti-vacuity 1: a loadKey that queries before it consults the cache is the
 	// shape Z10-1 warns about. The predicate must reject it.
-	preFix := "func (l *AuditLogger) loadKey(ctx context.Context, subject string) ([]byte, error) {\n" +
+	preFixLoad := "func (l *AuditLogger) loadKey(ctx context.Context, subject string) ([]byte, error) {\n" +
 		"\tvar key []byte\n" +
 		"\terr := l.pool.QueryRow(ctx, `SELECT key FROM audit_subject_keys WHERE idx = $1`, l.subjectIndex(subject)).Scan(&key)\n" +
 		"\tif key, ok := l.cached(subject); ok {\n" +
@@ -82,19 +114,38 @@ func TestZ10VerifyPseudonymCacheIsHitBeforeTheDatabaseAndErasureIsProcessLocal(t
 		"\t_ = err\n" +
 		"\treturn key, nil\n" +
 		"}"
-	if cacheHitPrecedesTheQuery(preFix) {
+	if tombstoneGatedCachePrecedesTheQuery(preFixLoad) {
 		t.Fatal("the predicate accepts a loadKey that queries before consulting the cache; this guard would " +
 			"not fail on a revert and is vacuous")
 	}
+
+	// Anti-vacuity 2: the pre-fix cachedAnswer consulted the cache with no
+	// tombstone gate. The predicate must reject it.
+	preFixCachedAnswer := "func (l *AuditLogger) cachedAnswer(ctx context.Context, subject string) ([]byte, bool, error) {\n" +
+		"\tkey, ok := l.cached(subject)\n" +
+		"\treturn key, ok, nil\n" +
+		"}"
+	if tombstoneCheckedBeforeTheCache(preFixCachedAnswer) {
+		t.Fatal("the predicate accepts a cachedAnswer with no tombstone check; this guard would not fail " +
+			"on a revert and is vacuous")
+	}
 }
 
-// cacheHitPrecedesTheQuery reports whether loadKey consults the cache and returns
-// a hit before it issues its only pool query.
-func cacheHitPrecedesTheQuery(loadBody string) bool {
-	cacheCall := strings.Index(loadBody, "l.cached(subject)")
+// tombstoneGatedCachePrecedesTheQuery reports whether loadKey consults the
+// tombstone-gated cache and returns a hit before it issues its only pool query.
+func tombstoneGatedCachePrecedesTheQuery(loadBody string) bool {
+	cacheCall := strings.Index(loadBody, "l.cachedAnswer(")
 	cacheReturn := strings.Index(loadBody, "return key, nil")
 	dbQuery := strings.Index(loadBody, "l.pool.QueryRow(")
 	return cacheCall >= 0 && cacheReturn >= 0 && dbQuery >= 0 && cacheCall < cacheReturn && cacheReturn < dbQuery
+}
+
+// tombstoneCheckedBeforeTheCache reports whether cachedAnswer consults the
+// tombstone mirror before it reads the local cache.
+func tombstoneCheckedBeforeTheCache(cachedAnswerBody string) bool {
+	tomb := strings.Index(cachedAnswerBody, "l.tombstoned(ctx, subject)")
+	cache := strings.Index(cachedAnswerBody, "l.cached(subject)")
+	return tomb >= 0 && cache >= 0 && tomb < cache
 }
 
 // TestZ10VerifyAdminClientActionsCarryTheClientIDBothAsSubjectAndInDetail is the

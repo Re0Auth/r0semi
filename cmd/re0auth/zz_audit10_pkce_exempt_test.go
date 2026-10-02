@@ -76,18 +76,37 @@ func TestClientDriftNamesThePKCEExemption(t *testing.T) {
 	}
 
 	// The file turns the exemption on, the registry does not.
-	drift := clientDrift(registered, registered.WithAllowMissingPKCE(true))
+	drift := clientDrift(registered, registered.WithAllowMissingPKCE(true), "s3cret")
 	if len(drift) != 1 || !strings.Contains(drift[0], "allow_missing_pkce") {
 		t.Fatalf("drift = %v, want the PKCE exemption named", drift)
 	}
 	// The file turns it back off: a stricter value must not be ignored either.
-	drift = clientDrift(registered.WithAllowMissingPKCE(true), registered)
+	drift = clientDrift(registered.WithAllowMissingPKCE(true), registered, "s3cret")
 	if len(drift) != 1 || !strings.Contains(drift[0], "allow_missing_pkce") {
 		t.Fatalf("drift = %v, want the PKCE exemption named", drift)
 	}
 	// Unchanged: no drift at all.
-	if drift := clientDrift(registered, registered); len(drift) != 0 {
+	if drift := clientDrift(registered, registered, "s3cret"); len(drift) != 0 {
 		t.Fatalf("identical clients drifted: %v", drift)
+	}
+	// S01-10: the secret is compared by verifying the plaintext against the
+	// registered verifier. Two clients built from the same secret carry different
+	// salted digests, so byte equality would report drift on every start.
+	same, err := oauth.NewClient("cli", "CLI", oauth.ClientConfidential, "s3cret",
+		[]string{"https://app.example/cb"}, []oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := oauth.RestoreClient("cli", "CLI", oauth.ClientConfidential, same.SecretHash(),
+		[]string{"https://app.example/cb"}, []oauth.Scope{oauth.ScopeAccountID}, same.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drift := clientDrift(restored, registered, "s3cret"); len(drift) != 0 {
+		t.Fatalf("the same secret reported drift across two digests: %v", drift)
+	}
+	if drift := clientDrift(restored, registered, "rotated-secret"); len(drift) == 0 {
+		t.Fatal("a rotated secret was not reported as drift")
 	}
 }
 

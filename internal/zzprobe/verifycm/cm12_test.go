@@ -72,7 +72,7 @@ func TestCM1TheShippedSinkMakesTheCriticalSectionNanoseconds(t *testing.T) {
 		}
 		start := time.Now()
 		for i := 0; i < n; i++ {
-			if err := st.ApproveDevice(ctx, "UC-"+itoa(i), "usr_1", nil); err != nil {
+			if err := st.DecideDeviceAuthorization(ctx, "UC-"+itoa(i), "usr_1", true, nil, nil); err != nil {
 				t.Fatalf("approve %d: %v", i, err)
 			}
 		}

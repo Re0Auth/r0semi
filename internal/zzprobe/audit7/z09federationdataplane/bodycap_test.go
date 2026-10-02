@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/oauth"
 )
 
 func TestZ09NormalizedReadServesAnOverCapBodyAsComplete(t *testing.T) {
@@ -50,6 +51,9 @@ func TestZ09NormalizedReadServesAnOverCapBodyAsComplete(t *testing.T) {
 		{User: "usr_v", Game: zzGame, Source: "src", Access: "upstream-token"},
 	}, nil)
 	at := mint("usr_v", zzProfileScope)
+	// The raw path needs its own explicit scope since Z20-2; a profile-only token
+	// would be refused by the scope gate before the body cap is reached.
+	atRaw := mint("usr_v", oauth.RawScope(zzGame))
 
 	// The normalized read. The upstream wrote head+pad bytes; the cap is 4 MiB.
 	code, _, body := zzGet(t, srv.Client(), srv.URL+"/v1/games/"+zzGame+"/profile", at)
@@ -70,7 +74,7 @@ func TestZ09NormalizedReadServesAnOverCapBodyAsComplete(t *testing.T) {
 
 	// Control: the same upstream, the same body, the raw passthrough. This is the
 	// commit-18fed92 verdict, and it is what the normalized path lacks.
-	codeRaw, _, rawBody := zzGet(t, srv.Client(), srv.URL+"/v1/games/"+zzGame+"/sources/src/raw/data", at)
+	codeRaw, _, rawBody := zzGet(t, srv.Client(), srv.URL+"/v1/games/"+zzGame+"/sources/src/raw/data", atRaw)
 	t.Logf("raw control: status=%d bytes=%d body=%s", codeRaw, len(rawBody), firstN(rawBody, 120))
 	if codeRaw == http.StatusOK {
 		t.Errorf("the raw control answered 200 too, so the two paths do not differ and this probe proves " +

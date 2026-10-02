@@ -394,10 +394,10 @@
   此前收到 SIGTERM 立即 `Shutdown`（先关监听器），而 K8s 摘 Endpoint 与发信号是并发的，于是每次滚动
   更新都有一小段把新连接路由到已关监听器的窗口（502/503，消耗 S1 可用性预算）。现在进程先让
   `/readyz` 返 503，等 **`endpointRemovalWait`（5s，进程内，因为 scratch 没有 `/bin/sleep` 跑
-  `preStop`）** 让编排摘完端点，再走 **`shutdownTimeout`（30s）** 的排空，最后才排空审计批次队列
+  `preStop`）** 让编排摘完端点，再走 **`shutdownTimeout`（45s，≥ `dataPlaneTimeout`）** 的排空，最后才排空审计批次队列
   （**`auditDrainTimeout`（10s）**，由 `grace - removal - http` 反推——它串行发生在 HTTP 排空之后，
-  而不是并行）。三段相加 **5 + 30 + 10 = 45s**，所以部署方需要确保
-  `terminationGracePeriodSeconds ≥ 45s`（出厂基线 45s）；给得比三段总和小，审计排空的「过期拒绝」
+  而不是并行）。三段相加 **5 + 45 + 10 = 60s**，所以部署方需要确保
+  `terminationGracePeriodSeconds ≥ 60s`（出厂基线 60s）；给得比三段总和小，审计排空的「过期拒绝」
   路径就会先被 SIGKILL 打断，在途审计行静默丢失。
 
 - **协议面 `prompt=none` 实现（OIDC Core §3.1.2.1）**：此前不读 `prompt`，静默授权请求被当作普通

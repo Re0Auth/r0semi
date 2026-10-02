@@ -72,13 +72,19 @@ func TestZ20I001SpuriousConsentDenyOnSuccessfulExchange(t *testing.T) {
 // --- Z20-2: the raw passthrough gate is per source, not per resource ----------
 
 // TestZ20I002RawPassthroughIgnoresWhichResourceTheScopeNames checks Z20-2 (P2),
-// the security-relevant one.
+// the security-relevant one. It was written from the claim while the finding was
+// open; the finding has since been fixed, so it is now a regression guard for the
+// fixed behaviour. The name is kept so the cross-check matrix still maps here.
 //
-// Claim: with `raw_base` equal to the source's issuer, the raw passthrough
-// addresses the same upstream URL as the normalized route, but its gate is "the
-// token holds ANY of the source's resource scopes", so a token granted only
-// `phigros.profile.read` reads the scores resource that the normalized route
-// refuses with 403.
+// Claim (pre-fix): with `raw_base` equal to the source's issuer, the raw
+// passthrough addresses the same upstream URL as the normalized route, but its
+// gate was "the token holds ANY of the source's resource scopes", so a token
+// granted only `phigros.profile.read` read the scores the normalized route refuses.
+//
+// Fixed behaviour: raw requires the explicit `<game>.raw.read` scope and nothing
+// else opens it. The guard pins both directions, and the anti-spin is structural:
+// if the old per-source gate came back, control D (a score-only token must be
+// refused) and the profile-only attack check both go red.
 func TestZ20I002RawPassthroughIgnoresWhichResourceTheScopeNames(t *testing.T) {
 	e := newZAEnv(t, zAOpts{})
 
@@ -88,47 +94,71 @@ func TestZ20I002RawPassthroughIgnoresWhichResourceTheScopeNames(t *testing.T) {
 	}
 	identityOnly := e.zMintToken(zClientPublic, zVictim, "account.id")
 	scoreOnly := e.zMintToken(zClientPublic, zVictim, "phigros.score.read")
+	rawOnly := e.zMintToken(zClientPublic, zVictim, oauth.RawScope(zGame))
+	if rawOnly == "" {
+		t.Fatal("control: no raw token")
+	}
 
 	// Control A: the normalized route enforces per-resource scope.
 	st, _, body := e.zGet("/v1/games/"+zGame+"/scores", profileOnly)
-	t.Logf("CANDIDATE: normalized /v1/games/%s/scores (profile-only) -> %d %s", zGame, st, body)
+	t.Logf("control A: normalized /v1/games/%s/scores (profile-only) -> %d %s", zGame, st, body)
 	if st != http.StatusForbidden {
 		t.Fatalf("control A: the normalized route answered %d, want 403", st)
 	}
 
-	// Control B: the raw gate is alive — no resource scope of this source at all.
+	// Control B: the raw gate is alive — no scope of this source at all.
 	st, _, body = e.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", identityOnly)
-	t.Logf("control: raw .../resources/scores (account.id only) -> %d %s", st, body)
+	t.Logf("control B: raw .../resources/scores (account.id only) -> %d %s", st, body)
 	if st != http.StatusForbidden {
 		t.Fatalf("control B: the raw gate answered %d, want 403", st)
 	}
 
-	// Control C: the score scope really does open that raw path.
-	st, _, body = e.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", scoreOnly)
-	t.Logf("control: raw .../resources/scores (score) -> %d %s", st, body)
+	// Control C: the explicit raw scope opens that raw path, and nothing else is
+	// needed alongside it.
+	st, _, body = e.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", rawOnly)
+	t.Logf("control C: raw .../resources/scores (%s) -> %d %s", oauth.RawScope(zGame), st, body)
 	if st != http.StatusOK || !bytes.Contains(body, []byte(zScoresMarker)) {
-		t.Fatalf("control C: a score token was not served (%d %s)", st, body)
+		t.Fatalf("control C: a raw-scope token was not served (%d %s)", st, body)
 	}
 	if !e.up.hit("/resources/scores") {
 		t.Fatalf("control C: upstream never saw /resources/scores: %v", e.up.calls())
 	}
 
-	// The claim: the withheld resource is reachable through the raw entrance.
+	// Control D (the fixed fact): the resource scope that NAMES the path is not
+	// enough — this is the exact token the pre-fix gate served.
+	before := len(e.up.calls())
+	st, _, body = e.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", scoreOnly)
+	t.Logf("control D: raw .../resources/scores (score-only) -> %d %s", st, body)
+	if st != http.StatusForbidden {
+		t.Errorf("CONTRADICTS the Z20-2 fix (guard is RED): a score-only token was served through "+
+			"the raw passthrough (%d): %s\nupstream calls: %v", st, body, e.up.calls())
+	}
+	if !bytes.Contains(body, []byte(oauth.RawScope(zGame))) {
+		t.Errorf("the refusal did not name required_scope=%s: %s", oauth.RawScope(zGame), body)
+	}
+	if len(e.up.calls()) != before {
+		t.Errorf("a refused raw read reached the upstream: %v", e.up.calls())
+	}
+
+	// The withheld resource is no longer reachable through the raw entrance.
 	st, _, body = e.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", profileOnly)
 	t.Logf("CANDIDATE: raw .../resources/scores (PROFILE-only, same URL) -> %d %s", st, body)
 	if st == http.StatusOK && bytes.Contains(body, []byte(zScoresMarker)) {
-		t.Errorf("AGREES with Z20-2 (probe is RED): a profile-only token read the scores "+
-			"resource through the raw passthrough (%d): %s\nupstream calls: %v", st, body, e.up.calls())
+		t.Errorf("guard is RED: a profile-only token read the scores resource through the raw "+
+			"passthrough (%d): %s\nupstream calls: %v", st, body, e.up.calls())
 		return
 	}
-	t.Logf("CONTRADICTS Z20-2: the raw gate refused the withheld resource (%d %s)", st, body)
+	if st != http.StatusForbidden {
+		t.Errorf("the withheld raw read answered %d, want 403", st)
+	}
+	t.Logf("GUARDS the Z20-2 fix: the raw gate refused the withheld resource (%d %s)", st, body)
 }
 
 // TestZ20I002bRawGateIsBoundToTheNamedSource is the guard half.
 func TestZ20I002bRawGateIsBoundToTheNamedSource(t *testing.T) {
 	e := newZAEnv(t, zAOpts{})
-	score := e.zMintToken(zClientPublic, zVictim, "phigros.score.read")
-	st, _, body := e.zGet("/v1/games/"+zGame+"/sources/nosuchsource/raw/resources/scores", score)
+	raw := e.zMintToken(zClientPublic, zVictim, oauth.RawScope(zGame))
+	st, _, body := e.zGet("/v1/games/"+zGame+"/sources/nosuchsource/raw/resources/scores", raw)
 	t.Logf("raw unknown source -> %d %s", st, body)
 	if st != http.StatusNotFound {
 		t.Errorf("an unknown source answered %d, want 404", st)
@@ -138,47 +168,59 @@ func TestZ20I002bRawGateIsBoundToTheNamedSource(t *testing.T) {
 	}
 }
 
-// TestZ20I002cRawBaseSubPathDecidesWhetherTheWithheldResourceOverlaps is the
-// severity check for Z20-2.
-//
-// Z20-2's impact rests on raw_base and the normalized resource URL naming the
-// SAME upstream endpoint. That is true when `raw_base` is the source's issuer (or
-// an ancestor of `{issuer}/resources`), and false for the shape
-// `config/re0auth.example.toml:363` actually ships (`raw_base = {issuer}/v1`,
-// while the source's normalized resources live at `{issuer}/resources/{name}`,
-// docs/upstream-protocol.md:227). This probe measures both, so the finding's
-// precondition is stated rather than assumed.
+// TestZ20I002cRawBaseSubPathDecidesWhetherTheWithheldResourceOverlaps measured the
+// severity of Z20-2 while it was open: the finding's impact rested on raw_base and
+// the normalized resource URL naming the SAME upstream endpoint. The scope fix
+// makes that overlap irrelevant to the withheld-resource question — the raw gate
+// now demands `<game>.raw.read` regardless of raw_base — so this is rewritten as a
+// routing guard: the raw_base shape still decides WHICH native path raw addresses,
+// and the explicit raw scope is what reaches it (the name is kept for the matrix).
 func TestZ20I002cRawBaseSubPathDecidesWhetherTheWithheldResourceOverlaps(t *testing.T) {
-	// (1) raw_base == issuer: the two entrances address one upstream endpoint.
+	// (1) raw_base == issuer: raw's `resources/scores` addresses the normalized
+	// `/resources/scores` endpoint — but only the raw scope reaches it, and a
+	// score-only token does not.
 	same := newZAEnv(t, zAOpts{})
-	profile := same.zMintToken(zClientPublic, zVictim, "phigros.profile.read")
-	st, _, body := same.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", profile)
-	t.Logf("raw_base == issuer: profile-only token on the raw scores path -> %d %s", st, body)
-	overlaps := st == http.StatusOK && bytes.Contains(body, []byte(zScoresMarker))
-	t.Logf("  upstream calls: %v", same.up.calls())
-	if !overlaps {
-		t.Errorf("expected the overlap case to be reachable with raw_base == issuer")
+	raw := same.zMintToken(zClientPublic, zVictim, oauth.RawScope(zGame))
+	st, _, body := same.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", raw)
+	t.Logf("raw_base == issuer: raw-scope token on the raw scores path -> %d %s", st, body)
+	if st != http.StatusOK || !bytes.Contains(body, []byte(zScoresMarker)) {
+		t.Fatalf("the raw scope did not reach the overlapping endpoint under raw_base == issuer (%d %s)", st, body)
+	}
+	if !same.up.hit("/resources/scores") {
+		t.Fatalf("the overlapping endpoint was never addressed: %v", same.up.calls())
+	}
+	scoreOnly := same.zMintToken(zClientPublic, zVictim, "phigros.score.read")
+	if st, _, b := same.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", scoreOnly); st != http.StatusForbidden {
+		t.Errorf("a score-only token reached the raw path (%d %s); the overlap must not be usable by "+
+			"the resource scope that names it (Z20-2)", st, b)
+	}
+	profileOnly := same.zMintToken(zClientPublic, zVictim, "phigros.profile.read")
+	if st, _, b := same.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", profileOnly); st != http.StatusForbidden {
+		t.Errorf("a profile-only token reached the raw path (%d %s); the withheld resource is reachable "+
+			"again (Z20-2 regression)", st, b)
 	}
 
-	// (2) raw_base == {issuer}/v1, the shipped example: the raw path lands on the
-	// source's NATIVE surface, not on /resources/{name}.
+	// (2) raw_base == {issuer}/v1, the shipped example: raw lands on the source's
+	// NATIVE surface, not on /resources/{name}, and the normalized route still
+	// resolves to /resources/scores.
 	sub := newZAEnv(t, zAOpts{RawBaseSuffix: "/v1"})
-	profile2 := sub.zMintToken(zClientPublic, zVictim, "phigros.profile.read")
-	st, _, body = sub.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", profile2)
-	t.Logf("raw_base == issuer+/v1: profile-only token on the raw scores path -> %d %s", st, body)
+	raw2 := sub.zMintToken(zClientPublic, zVictim, oauth.RawScope(zGame))
+	st, _, body = sub.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/resources/scores", raw2)
+	t.Logf("raw_base == issuer+/v1: raw-scope token on the raw scores path -> %d %s", st, body)
 	t.Logf("  upstream calls: %v", sub.up.calls())
-	// Control: the normalized path still resolves to /resources/scores.
+	if st != http.StatusOK || !bytes.Contains(body, []byte(zNativeMarker)) {
+		t.Errorf("the sub-path raw_base did not address the native surface (%d %s): %v", st, body, sub.up.calls())
+	}
 	score := sub.zMintToken(zClientPublic, zVictim, "phigros.score.read")
 	if st2, _, b2 := sub.zGet("/v1/games/"+zGame+"/scores", score); st2 != http.StatusOK ||
 		!bytes.Contains(b2, []byte(zScoresMarker)) {
 		t.Fatalf("control: the normalized read under a sub-path raw_base = %d %s", st2, b2)
 	}
-	t.Logf("  upstream calls after the normalized read: %v", sub.up.calls())
 	if bytes.Contains(body, []byte(zScoresMarker)) {
 		t.Errorf("the sub-path raw_base still reached the normalized scores endpoint")
 	}
-	t.Logf("SEVERITY INPUT for Z20-2: overlap=%v with raw_base==issuer; no overlap with the "+
-		"shipped sub-path shape", overlaps)
+	t.Logf("routing guard: overlap reachable only through %s under raw_base==issuer; sub-path raw_base "+
+		"addresses the native surface", oauth.RawScope(zGame))
 }
 
 // --- Z20-3: the device approval records no scopes ----------------------------

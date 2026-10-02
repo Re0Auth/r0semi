@@ -45,12 +45,12 @@ func identityRef(id Identity) string {
 // ErrInvalidIdentity reports an empty or over-long subject or provider.
 var ErrInvalidIdentity = errors.New("vault: invalid identity")
 
-// maxIdentityFieldLen bounds one identity field. bindingAAD length-prefixes both
-// fields with a uint32, so a field at or above 2^32 would truncate in the prefix
-// and could collide with a different, shorter identity. A stored subject is
+// maxIdentityFieldLen bounds one identity field. A stored subject is
 // generated ("usr_" plus 16 hex characters) and a provider is a configured name,
-// so this bound is far above any real identity and far below the prefix's reach
-// (S07-11).
+// so this bound is far above any real identity. It is not what keeps bindingAAD
+// collision-free: that encoding length-prefixes each field with a uvarint, which
+// cannot truncate a Go-length field (S07-11). The bound is store hygiene — it
+// refuses an identity whose shape no caller could have meant.
 const maxIdentityFieldLen = 1024
 
 func (i Identity) validate() error {

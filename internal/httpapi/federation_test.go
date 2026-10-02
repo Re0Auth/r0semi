@@ -232,6 +232,27 @@ func TestGameResourceDataPlane(t *testing.T) {
 	resp.Body.Close()
 }
 
+// rawScopeFor builds the explicit raw-passthrough scope for a game. It is a test
+// helper, not a production one: the catalogue that makes the scope grantable
+// lives in the oauth package (see the progress note), so tests register it here.
+func rawScopeFor(game string) oauth.Scope { return oauth.Scope(game + ".raw.read") }
+
+// rawRegistry returns the default catalogue extended with one game's raw scope,
+// so the real OP will grant it.
+func rawRegistry(t *testing.T, game string) *oauth.Registry {
+	t.Helper()
+	reg, err := oauth.NewRegistry(append(oauth.DefaultDescriptors(), oauth.Descriptor{
+		Scope:       rawScopeFor(game),
+		Title:       "Raw API",
+		Description: "verbatim passthrough to a source's native API",
+		Risk:        oauth.RiskMedium,
+	})...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reg
+}
+
 func TestGameRawAndDegraded(t *testing.T) {
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -279,7 +300,9 @@ func TestGameRawAndDegraded(t *testing.T) {
 	}
 
 	clients := oauth.NewMemoryClientRegistry()
-	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{fedRedirect}, []oauth.Scope{oauth.ScopePhigrosProfile})
+	rawReg := rawRegistry(t, "phigros")
+	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{fedRedirect},
+		[]oauth.Scope{oauth.ScopePhigrosProfile, rawScopeFor("phigros")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +310,7 @@ func TestGameRawAndDegraded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, nil)
+	opHandler, store := newOPBackendRegistry(t, "https://re0auth.test", clients, nil, rawReg)
 	api, err := New(Config{
 		Issuer:            "https://re0auth.test",
 		OIDC:              opHandler,
@@ -295,6 +318,7 @@ func TestGameRawAndDegraded(t *testing.T) {
 		GrantStore:        store,
 		DeviceStore:       store,
 		Federation:        fed,
+		Scopes:            rawReg,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -303,6 +327,9 @@ func TestGameRawAndDegraded(t *testing.T) {
 	defer srv.Close()
 
 	at := mintToken(t, api.Handler(), store, "cli", "usr_test", oauth.ScopePhigrosProfile)
+	// The raw passthrough needs its own explicit scope; a resource scope must not
+	// open it (Z20-2).
+	atRaw := mintToken(t, api.Handler(), store, "cli", "usr_test", rawScopeFor("phigros"))
 
 	// a-src fails, b-src answers, and the response says so.
 	resp := authedGet(t, srv.URL+"/v1/games/phigros/profile", at)
@@ -318,7 +345,7 @@ func TestGameRawAndDegraded(t *testing.T) {
 	resp.Body.Close()
 
 	// Raw passthrough keeps the upstream body and content type.
-	resp = authedGet(t, srv.URL+"/v1/games/phigros/sources/b-src/raw/v1/native/scores", at)
+	resp = authedGet(t, srv.URL+"/v1/games/phigros/sources/b-src/raw/v1/native/scores", atRaw)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("raw = %d", resp.StatusCode)
 	}
@@ -349,7 +376,7 @@ func TestGameRawAndDegraded(t *testing.T) {
 	}
 
 	// A source without a raw base is a 404.
-	resp = authedGet(t, srv.URL+"/v1/games/phigros/sources/a-src/raw/x", at)
+	resp = authedGet(t, srv.URL+"/v1/games/phigros/sources/a-src/raw/x", atRaw)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("raw unsupported = %d", resp.StatusCode)
 	}
@@ -361,7 +388,7 @@ func TestGameRawAndDegraded(t *testing.T) {
 	// source (or a proxy in front of it) decodes into `..`. This is the entry
 	// point an attacker actually uses; the federation-level tests call Raw with an
 	// already-decoded path and so could never pin it.
-	resp = authedGet(t, srv.URL+"/v1/games/phigros/sources/b-src/raw/%252e%252e/v1/native/scores", at)
+	resp = authedGet(t, srv.URL+"/v1/games/phigros/sources/b-src/raw/%252e%252e/v1/native/scores", atRaw)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("a doubly-encoded traversal = %d, want 400", resp.StatusCode)
 	}
@@ -404,14 +431,16 @@ func TestRawProxyNeutralisesAnHTMLSource(t *testing.T) {
 	}
 
 	clients := oauth.NewMemoryClientRegistry()
-	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{fedRedirect}, []oauth.Scope{oauth.ScopePhigrosProfile})
+	rawReg := rawRegistry(t, "phigros")
+	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{fedRedirect},
+		[]oauth.Scope{oauth.ScopePhigrosProfile, rawScopeFor("phigros")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, nil)
+	opHandler, store := newOPBackendRegistry(t, "https://re0auth.test", clients, nil, rawReg)
 	api, err := New(Config{
 		Issuer:            "https://re0auth.test",
 		OIDC:              opHandler,
@@ -419,6 +448,7 @@ func TestRawProxyNeutralisesAnHTMLSource(t *testing.T) {
 		GrantStore:        store,
 		DeviceStore:       store,
 		Federation:        fed,
+		Scopes:            rawReg,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -426,7 +456,7 @@ func TestRawProxyNeutralisesAnHTMLSource(t *testing.T) {
 	srv := httptest.NewServer(api.Handler())
 	defer srv.Close()
 
-	at := mintToken(t, api.Handler(), store, "cli", "usr_test", oauth.ScopePhigrosProfile)
+	at := mintToken(t, api.Handler(), store, "cli", "usr_test", rawScopeFor("phigros"))
 	resp := authedGet(t, srv.URL+"/v1/games/phigros/sources/html-src/raw/index.html", at)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

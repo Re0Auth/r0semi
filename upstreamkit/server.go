@@ -242,9 +242,28 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}), http.StatusFound)
 }
 
+// parseForm reads the request form, answering with the shape this server speaks.
+//
+// The three POST handlers (token, revoke, cascade) all read a form, and all three
+// must answer the same way — including for a body with no Content-Length that
+// overflows the shared cap only while ParseForm reads it. Classifying that as a
+// malformed form turned the cap's promise of a 413 into a 400 (S01-13/KIT-8);
+// oauth.FormReadStatus is the one place the classification lives.
+func (s *Server) parseForm(w http.ResponseWriter, r *http.Request) bool {
+	err := r.ParseForm()
+	if err == nil {
+		return true
+	}
+	if oauth.FormReadStatus(err) == http.StatusRequestEntityTooLarge {
+		writeOAuthError(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
+		return false
+	}
+	writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
+	return false
+}
+
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
+	if !s.parseForm(w, r) {
 		return
 	}
 	clientID, clientSecret := oauth.ClientCredentials(r)
@@ -299,8 +318,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
+	if !s.parseForm(w, r) {
 		return
 	}
 	clientID, clientSecret := oauth.ClientCredentials(r)
@@ -331,8 +349,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // re-check them, but they are verified here first. ADR-0010 §4: a defect in the
 // public kit is an external defect.
 func (s *Server) handleCascadeRevocation(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		writeOAuthError(w, r, http.StatusBadRequest, "invalid_request", "malformed form body")
+	if !s.parseForm(w, r) {
 		return
 	}
 	if s.hooks.CascadeRevoke == nil {

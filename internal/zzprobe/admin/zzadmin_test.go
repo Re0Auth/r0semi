@@ -353,7 +353,7 @@ func TestZZAdmConsentDecisionIsNotAudited(t *testing.T) {
 		time.Now().Add(time.Hour), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "ABCD-1234", "usr_victim", []string{"account.id"}); err != nil {
+	if err := store.DecideDeviceAuthorization(ctx, "ABCD-1234", "usr_victim", true, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !zzAdmHasAction(logger, "oidc.device.approve") {

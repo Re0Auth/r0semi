@@ -35,9 +35,12 @@ func TestSuspendedClientIsUnknownToProtocolAndVisibleToAdmin(t *testing.T) {
 		t.Fatalf("suspended client Get = %v, want ErrClientNotFound", err)
 	}
 
-	all, err := reg.List(ctx)
+	all, next, err := reg.ListClients(ctx, 0, "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if next != "" {
+		t.Fatalf("next cursor = %q, want empty on a single-page listing", next)
 	}
 	if len(all) != 1 || all[0].Status != ClientSuspended {
 		t.Fatalf("admin list = %+v, want the suspended client", all)

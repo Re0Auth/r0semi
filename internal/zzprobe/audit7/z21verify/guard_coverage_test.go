@@ -10,27 +10,22 @@ import (
 	"testing"
 )
 
-// This probe falsifies one documented claim in the reviewed evidence.
+// This file guards the shape that made the reviewed coverage claim fail.
 //
-// The report's "探过但没破" #2 presents predicate_index_test.go::
-// TestEveryGoMutationPredicateHasALeadingIndex as the de-hand-listed guard for
-// mutation predicates, and that probe's own doc comment
-// (predicate_index_test.go:128-129) claims it "would have caught the
-// oidc_devices client_id gap (04-3) without anyone remembering to add the table
-// to a list".
-//
-// It cannot. The bulk-revocation statements do not exist as text anywhere:
-// oauth.go:288-298 and oidc.go:1064-1075 execute
+// The bulk-revocation statements do not exist as text anywhere: oauth.go and
+// oidc.go execute
 //
 //	`DELETE FROM ` + table + clause
 //
-// with `table` a []string argument and `clause` assembled by
-// revokePredicate (oauth.go:313-327) via `fmt.Sprintf("client_id = $%d", …)`.
-// A guard that walks Go string literals therefore never sees
-// `DELETE FROM oidc_devices WHERE client_id = $1` — the one statement 04-3 is
-// about. The guard passes oidc_devices only because the literals it *can* see
-// (oidc.go:750's consume claim and oidc.go:1016) carry device_code_hash or
-// subject predicates, i.e. the "PK 顺序论元" the report waves at.
+// with `table` a []string argument and `clause` assembled by revokePredicate via
+// `fmt.Sprintf("client_id = $%d", …)`. A guard that walks Go string literals can
+// therefore never see `DELETE FROM oidc_devices WHERE client_id = $1` — the one
+// statement 04-3 is about.
+//
+// The shipped guard (internal/store/postgres/revoke_predicate_test.go) was
+// rewritten to derive its table set from the revokeMatching call sites, which is
+// the shape the test below now pins: if it ever goes back to literal matching it
+// becomes blind to this statement again.
 
 var (
 	reRevokeMatchingCall = regexp.MustCompile(`(?s)revokeMatching\([^,]+,[^,]+,\s*\[\]string\{([^}]*)\}`)
@@ -69,8 +64,11 @@ func runtimeRevokeTables(t *testing.T) []string {
 	return out
 }
 
-// TestTheClientOnlyRevokeStatementsAreInvisibleToALiteralWalkingGuard is the red
-// probe for the guard's coverage claim.
+// TestTheClientOnlyRevokeStatementsAreInvisibleToALiteralWalkingGuard is the
+// guard for the guard: because the client-only bulk revocation is assembled at
+// run time, only a derivation guard can see it. This pins that the shipped guard
+// derives its table set from the revokeMatching call sites instead of walking
+// literal SQL, which is what made it blind to the 04-3 statement before.
 func TestTheClientOnlyRevokeStatementsAreInvisibleToALiteralWalkingGuard(t *testing.T) {
 	tables := runtimeRevokeTables(t)
 	t.Logf("revokeMatching is called with: %v", tables)
@@ -85,31 +83,27 @@ func TestTheClientOnlyRevokeStatementsAreInvisibleToALiteralWalkingGuard(t *test
 		t.Fatalf("premise changed: revokePredicate no longer builds the client predicate with Sprintf")
 	}
 
-	// The text the guard would have to see, for every table it claims to derive.
+	// Positive control: the plain per-table revokes still exist as literals, so the
+	// blob reader below is looking at real SQL rather than at nothing.
 	blob := allLiteralText(t)
-	var invisible []string
-	for _, table := range tables {
-		stmt := "DELETE FROM " + table + " WHERE client_id = $1"
-		if !strings.Contains(blob, stmt) {
-			invisible = append(invisible, table)
-		}
-	}
-	// Positive control: the literal-visible statements that the reviewed guard
-	// *does* attribute must be present, or this probe is looking at nothing.
 	if !strings.Contains(blob, "DELETE FROM oidc_devices") {
 		t.Fatalf("control failed: no literal `DELETE FROM oidc_devices` was collected")
 	}
-	if len(invisible) == 0 {
-		t.Log("premise changed: every client-only revoke now exists as text")
-		return
+
+	// The shipped guard must not depend on those literals. Because the client-only
+	// statement is assembled at run time (premises above), the only shape that can
+	// see it derives the table set from the revokeMatching call sites — which is
+	// what revoke_predicate_test.go does now. If it goes back to matching literal
+	// SQL it becomes blind to exactly this statement again.
+	guard := shippedSource(t, "revoke_predicate_test.go")
+	for _, needle := range []string{"revokeMatching(", "clientScopedRevokeTables"} {
+		if !strings.Contains(guard, needle) {
+			t.Fatalf("the shipped revoke guard no longer derives its table set from revokeMatching call "+
+				"sites (missing %q): a literal-walking guard cannot see the Sprintf'd client-only statement "+
+				"for any of %v", needle, tables)
+		}
 	}
-	t.Errorf("GUARD COVERAGE GAP: the client-only bulk-revocation statement exists as text for none of "+
-		"%v (missing for %v), because revokeMatching concatenates the table and revokePredicate Sprintf's "+
-		"the predicate. A guard over Go string literals can therefore never attribute "+
-		"`DELETE FROM oidc_devices WHERE client_id = $1` — the 04-3 statement — so "+
-		"predicate_index_test.go:128-129's claim that it would have caught 04-3 by derivation is false, and "+
-		"the report's 探过没破 #2 presents a guard that is blind exactly where the hand-written list was blind.",
-		tables, invisible)
+	t.Logf("the shipped guard derives from revokeMatching call sites and covers %v", tables)
 }
 
 // allLiteralText returns the contents of every backtick-quoted string in the

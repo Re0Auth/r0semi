@@ -28,10 +28,10 @@ func TestApproveDeviceRefusesASpentCode(t *testing.T) {
 	ctx := context.Background()
 	pendingDevice(t, store, "SPNT-0001", 5*time.Minute)
 
-	if err := store.ApproveDevice(ctx, "SPNT-0001", "usr_1", nil); err != nil {
+	if err := store.approveDevice(ctx, "SPNT-0001", "usr_1", nil); err != nil {
 		t.Fatalf("the first approval was refused: %v", err)
 	}
-	if err := store.ApproveDevice(ctx, "SPNT-0001", "usr_2", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+	if err := store.approveDevice(ctx, "SPNT-0001", "usr_2", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
 		t.Fatalf("second approval = %v, want ErrDeviceNotFound", err)
 	}
 	// The first approver is still the one recorded: a refused second write must
@@ -50,10 +50,10 @@ func TestApproveDeviceRefusesADeniedCode(t *testing.T) {
 	ctx := context.Background()
 	pendingDevice(t, store, "DENY-0001", 5*time.Minute)
 
-	if err := store.DenyDevice(ctx, "DENY-0001"); err != nil {
+	if err := store.DenyDevice(ctx, "DENY-0001", "usr_1"); err != nil {
 		t.Fatalf("deny was refused: %v", err)
 	}
-	if err := store.ApproveDevice(ctx, "DENY-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+	if err := store.approveDevice(ctx, "DENY-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
 		t.Fatalf("approving a denied code = %v, want ErrDeviceNotFound", err)
 	}
 }
@@ -63,7 +63,7 @@ func TestApproveDeviceRefusesAnExpiredCode(t *testing.T) {
 	ctx := context.Background()
 	pendingDevice(t, store, "EXPR-0001", -time.Minute)
 
-	if err := store.ApproveDevice(ctx, "EXPR-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+	if err := store.approveDevice(ctx, "EXPR-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
 		t.Fatalf("approving an expired code = %v, want ErrDeviceNotFound", err)
 	}
 }
@@ -73,10 +73,10 @@ func TestDenyDeviceRefusesASecondDenial(t *testing.T) {
 	ctx := context.Background()
 	pendingDevice(t, store, "TWIC-0001", 5*time.Minute)
 
-	if err := store.DenyDevice(ctx, "TWIC-0001"); err != nil {
+	if err := store.DenyDevice(ctx, "TWIC-0001", "usr_1"); err != nil {
 		t.Fatalf("the first denial was refused: %v", err)
 	}
-	if err := store.DenyDevice(ctx, "TWIC-0001"); !errors.Is(err, oauth.ErrDeviceNotFound) {
+	if err := store.DenyDevice(ctx, "TWIC-0001", "usr_1"); !errors.Is(err, oauth.ErrDeviceNotFound) {
 		t.Fatalf("second denial = %v, want ErrDeviceNotFound", err)
 	}
 }
@@ -88,10 +88,10 @@ func TestDenyDeviceOverridesAnApproval(t *testing.T) {
 	ctx := context.Background()
 	pendingDevice(t, store, "OVER-0001", 5*time.Minute)
 
-	if err := store.ApproveDevice(ctx, "OVER-0001", "usr_1", nil); err != nil {
+	if err := store.approveDevice(ctx, "OVER-0001", "usr_1", nil); err != nil {
 		t.Fatalf("approve was refused: %v", err)
 	}
-	if err := store.DenyDevice(ctx, "OVER-0001"); err != nil {
+	if err := store.DenyDevice(ctx, "OVER-0001", "usr_2"); err != nil {
 		t.Fatalf("deny after approve was refused: %v", err)
 	}
 	st, err := store.DeviceByUserCode(ctx, "OVER-0001")
@@ -105,7 +105,7 @@ func TestDenyDeviceOverridesAnApproval(t *testing.T) {
 
 func TestApproveDeviceRefusesAnUnknownCode(t *testing.T) {
 	store, _ := testStore(t)
-	if err := store.ApproveDevice(context.Background(), "NOPE-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+	if err := store.approveDevice(context.Background(), "NOPE-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
 		t.Fatalf("approving an unknown code = %v, want ErrDeviceNotFound", err)
 	}
 }
@@ -125,7 +125,7 @@ func TestApprovedDeviceCodePastExpiryIsNotDone(t *testing.T) {
 		clock.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "G7CD-0001", "usr_g7", nil); err != nil {
+	if err := store.approveDevice(ctx, "G7CD-0001", "usr_g7", nil); err != nil {
 		t.Fatalf("approve while live: %v", err)
 	}
 	st, err := store.GetDeviceAuthorizatonState(ctx, "cli", "g7-device-live")
@@ -141,7 +141,7 @@ func TestApprovedDeviceCodePastExpiryIsNotDone(t *testing.T) {
 		clock.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "G7CD-0002", "usr_g7", nil); err != nil {
+	if err := store.approveDevice(ctx, "G7CD-0002", "usr_g7", nil); err != nil {
 		t.Fatalf("approve while live: %v", err)
 	}
 	clock.Advance(11 * time.Minute)

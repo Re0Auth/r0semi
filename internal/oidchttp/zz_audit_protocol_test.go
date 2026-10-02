@@ -913,7 +913,7 @@ func TestZZAudit_DeviceCodeExpiryIsEnforced(t *testing.T) {
 	}
 	t.Logf("device code %q user code %q interval=%v expires_in=%v",
 		deviceCode, userCode, start["interval"], start["expires_in"])
-	if err := e.store.ApproveDevice(t.Context(), userCode, "usr_zz", nil); err != nil {
+	if err := e.store.DecideDeviceAuthorization(t.Context(), userCode, "usr_zz", true, nil, nil); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	resp, body, out := e.postForm(t, "/oauth/token", url.Values{
@@ -1195,7 +1195,7 @@ func TestZZAudit_IDTokenOnlyWithOpenID(t *testing.T) {
 		if deviceCode == "" {
 			t.Fatalf("no device code: %v", start)
 		}
-		if err := e.store.ApproveDevice(t.Context(), userCode, "usr_zz", nil); err != nil {
+		if err := e.store.DecideDeviceAuthorization(t.Context(), userCode, "usr_zz", true, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 		_, body, out := e.postForm(t, "/oauth/token", url.Values{

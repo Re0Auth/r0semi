@@ -8,15 +8,28 @@ name: conformance
 # Caddy, the OP behind it, and a container that can reach the issuer the way the
 # suite will — and, when a plan payload is supplied, to run it to a verdict.
 #
-# Once a plan has been observed green here, dispatch this workflow with
-# `require_plan: true` (or set the env after dropping `continue-on-error`) and make
-# it a release gate. See docs/conformance.md for the remaining gaps.
+# Two things this workflow does NOT do itself, and why they are here:
+#   * CONF-2 — the plan allowlist. `CONFORMANCE_ALLOWED_PLANS` (below) is the only
+#     set of plan names this gate will run; a payload naming anything else fails
+#     before the spike starts. Names are copied from the suite's own
+#     plan-catalogue.json, never guessed. DCR/PAR plans are out of scope by
+#     decision (docs/conformance.md, "Which plan").
+#   * CONF-1 — the four conformance images are floating tags. This workflow cannot
+#     invent their digests, so it observes them once and writes them to the run
+#     summary ("Record the image digests to pin"); pinning is a follow-up edit to
+#     scripts/conformance/spike.sh with an observed value.
+#
+# `workflow_call` below is the mechanical prerequisite for release.yml to call this
+# as a gate. Do NOT add it to release.yml while it is report-only: a non-blocking
+# job in the release graph reads as a gate without being one. Once a plan has been
+# observed green here, drop `continue-on-error`, pin the digests, and see the
+# checklist in docs/conformance.md ("Turning it into a gate") before wiring it in.
 
 on:
   workflow_dispatch:
     inputs:
       plan_json:
-        description: 'Repo-relative path to a plan payload (see scripts/conformance/plans/README.md). Leave EMPTY on the first run: the plan catalogue is printed to the summary.'
+        description: 'Repo-relative path to a plan payload (see scripts/conformance/plans/README.md). Leave EMPTY on the first run: the plan catalogue is printed to the summary. A non-empty value must name a plan on the allowlist or the job fails before the spike starts.'
         required: false
         default: ''
       redirect_uri:
@@ -32,6 +45,30 @@ on:
         type: boolean
         required: false
         default: false
+  # Same inputs, for release.yml once this is a gate. It is declared now so the
+  # eventual release.yml edit is one job, not a workflow-shape change.
+  workflow_call:
+    inputs:
+      plan_json:
+        description: 'Repo-relative path to a plan payload; must name a plan on CONFORMANCE_ALLOWED_PLANS'
+        required: false
+        type: string
+        default: ''
+      redirect_uri:
+        description: 'Redirect URI seeded into the OP client (blank = the script default)'
+        required: false
+        type: string
+        default: ''
+      max_modules:
+        description: 'How many modules to run (0 = the whole plan)'
+        required: false
+        type: string
+        default: '0'
+      require_plan:
+        description: 'Fail when the plan does not finish cleanly'
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: '40 3 * * *'
 
@@ -45,6 +82,15 @@ jobs:
     # full Basic OP pass is slower than the connectivity milestones.
     timeout-minutes: 45
 
+    env:
+      # CONF-2 — the plan allowlist. The ONLY plan names this workflow will run,
+      # comma-separated. Add a name only after copying it from the suite's own
+      # plan-catalogue.json (printed by a run with plan_json empty); never guess.
+      # DCR (client_registration: dynamic_client) and PAR plans are out of scope by
+      # decision (docs/oidc-decision.md O-9, docs/conformance.md "Which plan").
+      # The one observed so far is the authorization-code + PKCE Basic OP plan.
+      CONFORMANCE_ALLOWED_PLANS: 'oidcc-basic-certification-test-plan'
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -53,9 +99,64 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Enforce the plan allowlist
+        # CONF-2: an unlisted plan is a hard error. Silently running something else
+        # (or nothing) is how a typo in plan_json looked like a successful run.
+        if: inputs.plan_json != ''
+        env:
+          CONFORMANCE_PLAN_JSON: ${{ inputs.plan_json }}
+        run: |
+          # A schedule run supplies no plan_json; then there is nothing to check.
+          if [ -z "${CONFORMANCE_PLAN_JSON:-}" ]; then
+            echo "no plan_json supplied; allowlist check skipped"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          allowed = [p.strip() for p in os.environ["CONFORMANCE_ALLOWED_PLANS"].split(",") if p.strip()]
+          path = os.environ["CONFORMANCE_PLAN_JSON"]
+          try:
+              with open(path, encoding="utf-8") as fh:
+                  data = json.load(fh)
+          except Exception as exc:
+              sys.exit("plan payload %s is not readable JSON: %s" % (path, exc))
+          name = data.get("planName", "")
+          if name not in allowed:
+              sys.exit(
+                  "plan %r is not on the allowlist %s. Add it only after copying the "
+                  "exact name from the suite's plan-catalogue.json; DCR/PAR plans are "
+                  "intentionally out of scope (docs/conformance.md, Which plan)."
+                  % (name, allowed))
+          print("plan %r is on the allowlist" % name)
+          PY
+
+      - name: Record the image digests to pin (CONF-1)
+        # The four conformance images are floating tags. This step resolves the
+        # digest each tag points at TODAY and writes it to the run summary, so the
+        # observed value is recorded where the eventual pin can read it. The rule is
+        # "observe once, then pin" — never copy a digest from elsewhere. It never
+        # fails the job.
+        continue-on-error: true
+        run: |
+          {
+            echo '### Image digests observed (pin these — CONF-1)'
+            echo
+            echo '| image ref | digest |'
+            echo '|---|---|'
+            for ref in caddy:2 curlimages/curl:latest \
+                       registry.gitlab.com/openid/conformance-suite:latest mongo:6.0.13; do
+              digest="$(docker buildx imagetools inspect "$ref" \
+                --format '{{json .Manifest.Digest}}' 2>/dev/null || true)"
+              printf '| `%s` | `%s` |\n' "$ref" "${digest:-unresolved}"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Connectivity spike
         # Experimental: a red run here is information, not a broken main. Flip this
-        # off once a full suite plan has been observed green.
+        # off once a full suite plan has been observed green — and only then; see
+        # the blocking conditions in docs/conformance.md ("Turning it into a gate").
+        # `require_plan` already makes one dispatch fail hard, which is the step
+        # short of making the nightly blocking.
         continue-on-error: true
         env:
           SPIKE_ARTIFACTS: ${{ github.workspace }}/conformance-artifacts

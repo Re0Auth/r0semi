@@ -46,6 +46,7 @@ type file struct {
 	// in which case the [client] section is left out entirely.
 	Clients []clientSection       `toml:"clients"`
 	Admin   adminSection          `toml:"admin"`
+	Account accountSection        `toml:"account"`
 	IdP     map[string]idpSection `toml:"idp"`
 	Sources []sourceSection       `toml:"sources"`
 }
@@ -76,6 +77,18 @@ type adminSection struct {
 	// ReauthWindow is how long an operator's login stays fresh enough for a
 	// mutating admin call, as a Go duration string ("15m"). Empty takes the
 	// default; "0" disables the check.
+	ReauthWindow string `toml:"reauth_window"`
+}
+
+// accountSection configures the account plane — the signed-in user acting on
+// their own data — as distinct from [admin], which is the operator plane.
+type accountSection struct {
+	// ReauthWindow is how long the account's login stays fresh enough for its own
+	// erasure (DELETE /v1/account) to be accepted, as a Go duration string
+	// ("15m"). Empty takes the default; "0" disables the check. It is the
+	// account-plane counterpart of [admin].reauth_window and defaults to the same
+	// magnitude for the same reason: erasure cannot be undone, so a stolen or
+	// long-idle cookie must not be enough without signing in again.
 	ReauthWindow string `toml:"reauth_window"`
 }
 
@@ -312,6 +325,10 @@ type settings struct {
 	// AdminReauthWindow bounds how old an operator login may be for a mutating
 	// admin call. Zero disables the check.
 	AdminReauthWindow time.Duration
+	// AccountReauthWindow bounds how old a sign-in may be for the account's own
+	// erasure (DELETE /v1/account). Zero disables the check. It is the
+	// account-plane counterpart of AdminReauthWindow (Z07-9).
+	AccountReauthWindow time.Duration
 	// TrustedProxies are the networks whose X-Forwarded-For is believed when
 	// resolving the client address. Empty means no proxy is trusted.
 	TrustedProxies []netip.Prefix
@@ -427,6 +444,12 @@ const (
 	// for a mutating admin call. Long enough not to re-login mid-incident, short
 	// enough that a stolen session does not keep operator power for a working day.
 	defaultAdminReauthWindow = 15 * time.Minute
+
+	// defaultAccountReauthWindow is how long a sign-in stays fresh enough for the
+	// account's own erasure. Deliberately the same magnitude as the operator
+	// window: erasure is equally irreversible, so it asks for the same re-login
+	// (Z07-9).
+	defaultAccountReauthWindow = defaultAdminReauthWindow
 )
 
 // defaultMaxInFlightFor returns the concurrency cap a deployment gets when it has
@@ -1082,6 +1105,25 @@ func loadConfig(path string) (settings, error) {
 			return settings{}, errors.New("admin.reauth_window cannot be negative (use 0 to disable)")
 		}
 		cfg.AdminReauthWindow = d
+	}
+
+	// Account step-up window: the account plane's own re-login bound for
+	// DELETE /v1/account. Resolved unconditionally, like the operator one, so a
+	// typo is reported rather than discovered when someone tries to erase.
+	accountReauthRaw := strings.TrimSpace(f.Account.ReauthWindow)
+	if env := strings.TrimSpace(os.Getenv("RE0AUTH_ACCOUNT_REAUTH_WINDOW")); env != "" {
+		accountReauthRaw = env
+	}
+	cfg.AccountReauthWindow = defaultAccountReauthWindow
+	if accountReauthRaw != "" {
+		d, err := time.ParseDuration(accountReauthRaw)
+		if err != nil {
+			return settings{}, fmt.Errorf("account.reauth_window %q is not a duration (e.g. 15m)", accountReauthRaw)
+		}
+		if d < 0 {
+			return settings{}, errors.New("account.reauth_window cannot be negative (use 0 to disable)")
+		}
+		cfg.AccountReauthWindow = d
 	}
 
 	if err := loadIdP(&cfg, f.IdP); err != nil {

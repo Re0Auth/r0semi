@@ -14,9 +14,11 @@ import (
 
 	"github.com/alexedwards/scs/v2"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/auth"
+	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -57,6 +59,15 @@ func newFlowEnvWith(t *testing.T, fed federation.Service) (base string, accounts
 type flowEnvOptions struct {
 	Federation   federation.Service
 	SessionStore scs.Store
+	// Authorization substitutes the consent interaction. Nil uses the real OP
+	// handler; a test uses it to reach the seam's failure branches, which the OP
+	// never takes on its own (S04-7).
+	Authorization authorization.Interaction
+	// AuditLog is the write side this layer owns, exposed so a test can assert a
+	// fault was recorded. Nil records nothing.
+	AuditLog audit.Logger
+	// DeviceStore substitutes the device engine seam. Nil uses the OP store.
+	DeviceStore DeviceStore
 }
 
 // newFlowEnvWithOptions is the one implementation behind the two helpers above.
@@ -128,17 +139,26 @@ func newFlowEnvWithOptions(t *testing.T, opts flowEnvOptions) (string, *account.
 		t.Fatal(err)
 	}
 	opHandler, store := newOPBackend(t, "https://re0auth.test", clients, manager)
+	interact := opts.Authorization
+	if interact == nil {
+		interact = opHandler
+	}
+	devices := opts.DeviceStore
+	if devices == nil {
+		devices = store
+	}
 	api, err := New(Config{
 		Issuer:            "https://re0auth.test",
 		OIDC:              opHandler,
 		TokenIntrospector: opHandler,
 		GrantStore:        store,
-		DeviceStore:       store,
-		Authorization:     opHandler,
+		DeviceStore:       devices,
+		Authorization:     interact,
 		Sessions:          manager,
 		Accounts:          accounts,
 		Auth:              authHandler,
 		Federation:        opts.Federation,
+		AuditLog:          opts.AuditLog,
 	})
 	if err != nil {
 		t.Fatal(err)

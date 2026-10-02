@@ -9,6 +9,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/idp"
+	"github.com/Re0Auth/r0semi/safeurl"
 	"github.com/Re0Auth/r0semi/vault"
 )
 
@@ -114,10 +115,13 @@ func (l *SocialLogin) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	l.states[state] = socialState{
-		provider:  provider,
-		verifier:  verifier,
-		nonce:     nonce,
-		returnTo:  r.URL.Query().Get("return_to"),
+		provider: provider,
+		verifier: verifier,
+		nonce:    nonce,
+		// return_to arrives on an unauthenticated GET and is echoed back in the
+		// callback JSON, so it is held to the same same-origin rule as every other
+		// request-supplied redirect parameter (the guard lives in safeurl).
+		returnTo:  safeurl.RelativePath(r.URL.Query().Get("return_to")),
 		expiresAt: l.now().Add(l.stateTTL),
 	}
 	l.mu.Unlock()
@@ -198,7 +202,7 @@ func (l *SocialLogin) handleCallback(w http.ResponseWriter, r *http.Request, est
 		Outcome:  audit.OutcomeOK,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"state": "confirmed", "subject": subject, "return_to": st.returnTo,
+		"state": "confirmed", "subject": subject, "return_to": safeurl.RelativePath(st.returnTo),
 	})
 }
 

@@ -92,6 +92,23 @@
 （[dependencies.md](./dependencies.md) §4 的"假时钟不能和真实时钟混用"）：宁可用真实短窗口，
 也不要两套时钟。
 
+## 数据面刻意不重试（旋转型单次凭据）
+
+本决策给 `httpclient` **提供**了重试策略，但不等于每个出站客户端都装它。**Re0Auth 数据面刻意不装重试层**：
+
+- 装它的是 `cmd/referencesource` 里的 TapTap 客户端（`httpclient.Retry(...)`）。数据面在
+  `cmd/re0auth/main.go` 里建的出站客户端只有连接池、`Bulkhead`、`CircuitBreaker` 与地址闸门，
+  **没有** `Retry`（`NewOutboundClient` 不隐式加）。
+- 理由是**旋转型单次凭据**：绑定的刷新是一次性的，同一个 refresh 值重放只会输掉 CAS、加剧 churn，
+  而不会让它成功；对这类请求「重试」在语义上就是错的。
+- 这是一条**被机器钉住的**裁定：`internal/zzprobe/federation/httpclient_test.go:342` 在
+  `cmd/re0auth/main.go` 出现 `httpclient.Retry(` 时直接失败——否则哪天有人顺手加回去，会得到
+  「看起来更韧、实际在重放单次凭据」的组合。
+- 对数据源的说法必须与此一致：[source-onboarding.md](./source-onboarding.md) 曾承诺
+  「指数退避重试」，那**是文档写错**（FO-05），已改为如实描述（连接池 + 并发上限 + 熔断，
+  无重试）。本决策第 2 条里「POST 不隐式重放」的幂等白名单是**policy 归属**的说明，
+  不是「数据面在重试 GET」的承诺：数据面今天一个重试都没有。
+
 ## 后果
 
 - **`httpclient` 的对外形状基本不变**：`Retry` / `Bulkhead` / `CircuitBreaker` / `NewOutboundClient`

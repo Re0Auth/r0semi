@@ -122,7 +122,7 @@ func TestDirectDeviceApprovalAuditRecordsTheRequestedScopes(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id", "phigros.score.read"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "SCPE-0002", "usr_1", nil); err != nil {
+	if err := store.approveDevice(ctx, "SCPE-0002", "usr_1", nil); err != nil {
 		t.Fatal(err)
 	}
 	event := deviceApprovalEvent(t, logger)

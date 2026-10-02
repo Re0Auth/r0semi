@@ -61,6 +61,59 @@ test('an unknown route still gets the app’s own 404 copy', async ({ page }) =>
 	await expect(page.getByText('404')).toBeVisible();
 });
 
+// S12-10, the browser half. The boundary check has to be visible where a person
+// is: a 200 carrying a shape the page cannot use must produce the page's own
+// failure sentence, not an uncaught render error that the error boundary reports
+// in JavaScript. Interception is how the audit's trigger — a captive portal or a
+// half-migrated backend answering 200 with the wrong body — is reproduced without
+// a test path inside the app.
+test('a wrong-shaped 200 becomes the page’s own failure, not a render error', async ({ page }) => {
+	await page.route('**/v1/sessions/current', (route) =>
+		route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({})
+		})
+	);
+
+	await page.goto('/app/');
+
+	// The account page's failure line, assembled from the malformed_response
+	// ApiError — proof the failure happened before a render had to cope with it.
+	await expect(
+		page.getByText('session response is missing or has an invalid user_id')
+	).toBeVisible();
+	// And the error boundary's own copy is not what a visitor is shown.
+	await expect(page.getByText('页面没有加载成功。')).toHaveCount(0);
+});
+
+// S12-10, the 5xx half. The fixed-copy branch is what stands between an uncaught
+// render failure and a JavaScript message becoming the page's headline, and it
+// had no executable probe. Rather than add a route that throws to the shipped
+// app, this makes the home page's own code chunk fail with a 5xx — the shape a
+// proxy or a half-deployed edge produces — and asserts the deployment's sentence
+// is shown for the 500 that results. The failing import's own message
+// ("Failed to fetch dynamically imported module…") is a JavaScript string, which
+// is exactly the class of message the branch exists to replace.
+test('a 5xx while loading a route shows the fixed copy, not the internal message', async ({
+	page
+}) => {
+	await page.route('**/nodes/*.js', async (route) => {
+		const res = await route.fetch();
+		const body = await res.text();
+		// Only the page module for `/` becomes the failure; the error page's own
+		// module must keep loading, or there would be nothing left to render.
+		if (!body.includes('你的 Re0Auth 账号')) {
+			return route.fulfill({ response: res, body });
+		}
+		return route.fulfill({ status: 500, contentType: 'text/plain', body: 'proxy failure' });
+	});
+
+	await page.goto('/app/');
+	await expect(page.getByText('页面没有加载成功。')).toBeVisible();
+	await expect(page.getByText('500')).toBeVisible();
+});
+
 // S12-5, the reliability half. The object URL was revoked in the same task as the
 // click that starts the download, which can cancel it before the browser has read
 // the blob. The anchor is instrumented so the ordering is observable rather than

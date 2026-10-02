@@ -138,6 +138,12 @@ type Config struct {
 	// legitimately not offer self-service erasure, and then the endpoint is absent
 	// from both the router and the spec rather than answering 501.
 	Deleter AccountDeleter
+	// AccountReauthWindow is how recently the account must have authenticated for
+	// its own erasure to be accepted. Zero disables the check. Deletion is
+	// irreversible and session-scoped, so a stolen or long-idle cookie should not
+	// be enough to destroy the account without signing in again (Z07-9). It is
+	// the account-plane counterpart of AdminReauthWindow.
+	AccountReauthWindow time.Duration
 
 	// Audit, when set, enables the operator-plane audit read and verify endpoints.
 	// It requires Sessions and a non-empty Admins allowlist, because reading the
@@ -214,6 +220,11 @@ type Server struct {
 	trustedProxies []netip.Prefix
 	// clientAddrHeader is Config.ClientAddrHeader: which header names the client.
 	clientAddrHeader ClientAddrHeader
+	// warnedUntrustedProxy makes the "declared a header but the peer is not a
+	// trusted proxy" warning fire once per server rather than once per request:
+	// the condition is a deployment misconfiguration, not a per-request event, and
+	// a per-request log line would be a self-inflicted flood (S15-5).
+	warnedUntrustedProxy atomic.Bool
 	// oidc is the protocol plane; introspector, grants and devices are the
 	// OP-backed business-plane seams.
 	oidc         http.Handler
@@ -229,6 +240,9 @@ type Server struct {
 	adminReauth time.Duration
 	// deleter erases the signed-in account; nil when self-service erasure is off.
 	deleter AccountDeleter
+	// accountReauth is how recent the session's authentication must be for the
+	// account to erase itself. Zero disables the check.
+	accountReauth time.Duration
 	// auditReader reads the audit log for the operator plane; nil when that plane
 	// is not configured.
 	auditReader AuditReader
@@ -341,16 +355,17 @@ func New(cfg Config) (*Server, error) {
 		// Wrapped once, here, so every protocol-plane mount is covered by the same
 		// recoverer: a panic in the provider must answer as an OAuth error, not as a
 		// closed connection.
-		oidc:         recoverProtocol(cfg.OIDC),
-		introspector: cfg.TokenIntrospector,
-		grants:       cfg.GrantStore,
-		devices:      cfg.DeviceStore,
-		adminSvc:     cfg.Admin,
-		adminAllowed: adminAllowed,
-		adminReauth:  cfg.AdminReauthWindow,
-		deleter:      cfg.Deleter,
-		auditReader:  cfg.Audit,
-		auditLog:     cfg.AuditLog,
+		oidc:          recoverProtocol(cfg.OIDC),
+		introspector:  cfg.TokenIntrospector,
+		grants:        cfg.GrantStore,
+		devices:       cfg.DeviceStore,
+		adminSvc:      cfg.Admin,
+		adminAllowed:  adminAllowed,
+		adminReauth:   cfg.AdminReauthWindow,
+		deleter:       cfg.Deleter,
+		accountReauth: cfg.AccountReauthWindow,
+		auditReader:   cfg.Audit,
+		auditLog:      cfg.AuditLog,
 	}
 	compressor, err := compress.New(compress.Config{
 		Encodings: compress.Default(),

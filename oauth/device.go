@@ -35,6 +35,20 @@ const (
 // authorization. The caller maps it to a 404 or to expired_token.
 var ErrDeviceNotFound = errors.New("oauth: device authorization not found")
 
+// ErrUserCodeConflict reports a device-authorization write refused because the
+// canonical user code already names another live request.
+//
+// S04-5: uniqueness is the store's canonical unique constraint's job, not a
+// check-then-insert in oauth. A DeviceStore's SaveDevice MUST return an error
+// wrapping this sentinel when the write violates the canonical user-code
+// uniqueness — the dash-stripped uppercase form GetDeviceByUserCode looks up —
+// and MUST NOT wrap any other failure as a conflict. oauth treats
+// exactly this as a collision (redraw the user code) and every other error as
+// fatal, so an infrastructure fault can no longer masquerade as an exhausted code
+// space and a genuine collision can no longer be lost to a race between the
+// pre-flight read and the insert.
+var ErrUserCodeConflict = errors.New("oauth: user code already in use")
+
 // DeviceStatus is the lifecycle of a device authorization.
 type DeviceStatus string
 
@@ -127,6 +141,12 @@ type DeviceDecision struct {
 // that read before the decision write its stale copy back afterwards, erasing the
 // decision. That is the bug these method shapes exist to make unrepresentable.
 type DeviceStore interface {
+	// SaveDevice persists a new request. It is the authoritative uniqueness gate:
+	// when the canonical user code already names a live record it MUST return an
+	// error wrapping ErrUserCodeConflict, and any other failure MUST be returned
+	// as itself. The GET-then-INSERT that used to live in oauth left a window
+	// between the lookup and this write; the canonical unique constraint does not
+	// (S04-5).
 	SaveDevice(ctx context.Context, deviceCode string, d DeviceAuthorizationRecord) error
 	GetDevice(ctx context.Context, deviceCode string) (DeviceAuthorizationRecord, error)
 	GetDeviceByUserCode(ctx context.Context, userCode string) (DeviceAuthorizationRecord, error)
@@ -166,14 +186,24 @@ func NewMemoryDeviceStore() *MemoryDeviceStore {
 	}
 }
 
-// SaveDevice implements DeviceStore.
+// SaveDevice implements DeviceStore. It mirrors the canonical unique constraint
+// the PG store carries (0033): a normalized user code that already names a live
+// record is ErrUserCodeConflict, a duplicate device-code hash is refused rather
+// than silently overwriting the earlier authorization.
 func (s *MemoryDeviceStore) SaveDevice(_ context.Context, deviceCode string, d DeviceAuthorizationRecord) error {
 	d.DeviceCodeHash = TokenHash(deviceCode)
+	canonical := NormalizeUserCode(d.UserCode)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.byDev[d.DeviceCodeHash]; exists {
+		return fmt.Errorf("oauth: device code already stored")
+	}
+	if _, taken := s.byUser[canonical]; taken {
+		return fmt.Errorf("%w: %s", ErrUserCodeConflict, canonical)
+	}
 	s.byDev[d.DeviceCodeHash] = d
-	s.byUser[NormalizeUserCode(d.UserCode)] = d.DeviceCodeHash
+	s.byUser[canonical] = d.DeviceCodeHash
 	return nil
 }
 
@@ -312,18 +342,17 @@ func (s *service) BeginDeviceAuthorization(ctx context.Context, req DeviceAuthor
 	if err != nil {
 		return DeviceAuthorizationResponse{}, err
 	}
-	userCode, err := s.freeUserCode(ctx)
-	if err != nil {
-		return DeviceAuthorizationResponse{}, err
-	}
-
-	if err := s.devices.SaveDevice(ctx, deviceCode, DeviceAuthorizationRecord{
-		UserCode:  userCode,
+	// The candidate user code and the save are retried together on a conflict:
+	// uniqueness is the store's canonical unique constraint's decision, and only
+	// that conflict means "redraw". Any other save failure is the request's answer
+	// (S04-5).
+	userCode, err := s.saveDeviceAuthorization(ctx, deviceCode, DeviceAuthorizationRecord{
 		ClientID:  client.ID,
 		Scopes:    append([]Scope(nil), req.Scopes...),
 		Status:    DevicePending,
 		ExpiresAt: s.now().Add(s.deviceTTL),
-	}); err != nil {
+	})
+	if err != nil {
 		return DeviceAuthorizationResponse{}, err
 	}
 
@@ -544,6 +573,38 @@ func (s *service) resolveScopes(client Client, scopes []Scope) (Client, []Descri
 	return client, descriptors, nil
 }
 
+// saveDeviceAuthorization draws a user code and persists the request, retrying
+// only while the store reports the canonical user code is taken.
+//
+// This is where uniqueness is decided (S04-5). The pre-flight read in freeUserCode
+// is an optimisation; the authoritative answer is the store's canonical unique
+// constraint, surfaced as ErrUserCodeConflict. A non-conflict save error is
+// returned as itself: retrying it cannot help, and reporting it as "could not
+// allocate a unique user code" would drop the cause an operator needs.
+func (s *service) saveDeviceAuthorization(ctx context.Context, deviceCode string, base DeviceAuthorizationRecord) (string, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		userCode, err := s.freeUserCode(ctx)
+		if err != nil {
+			return "", err
+		}
+		base.UserCode = userCode
+		switch err := s.devices.SaveDevice(ctx, deviceCode, base); {
+		case err == nil:
+			return userCode, nil
+		case errors.Is(err, ErrUserCodeConflict):
+			continue // canonical unique constraint says taken, redraw
+		default:
+			return "", err
+		}
+	}
+	return "", errors.New("oauth: could not allocate a unique user code")
+}
+
+// freeUserCode draws a user code that the store does not already hold. It is a
+// pre-flight read, not the uniqueness gate: only a store error that is not
+// ErrDeviceNotFound and not an ErrUserCodeConflict is fatal, and the read and the
+// later SaveDevice are still an unavoidable race that the canonical unique
+// constraint closes (S04-5).
 func (s *service) freeUserCode(ctx context.Context) (string, error) {
 	for attempt := 0; attempt < 8; attempt++ {
 		code, err := newUserCode()
@@ -553,9 +614,11 @@ func (s *service) freeUserCode(ctx context.Context) (string, error) {
 		// Only "not found" means the code is free. Every other error is a store
 		// failure: retrying cannot fix it, and folding it into the loop turned an
 		// infrastructure fault into "could not allocate a unique user code" with
-		// the cause dropped (S04-5).
+		// the cause dropped (S04-5). A conflict reported by the read counts as a
+		// collision, so a store that surfaces the constraint on lookup is handled
+		// the same way as one that returns the record.
 		switch _, err := s.devices.GetDeviceByUserCode(ctx, code); {
-		case err == nil:
+		case err == nil, errors.Is(err, ErrUserCodeConflict):
 			continue // taken, redraw
 		case errors.Is(err, ErrDeviceNotFound):
 			return code, nil

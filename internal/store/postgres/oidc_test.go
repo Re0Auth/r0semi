@@ -291,8 +291,22 @@ func TestDeviceFlowAcceptsStandardOIDCScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("describing an OIDC device request failed: %v", err)
 	}
-	if len(auth.Scopes) != 2 {
-		t.Fatalf("described scopes = %v, want only the two catalogue scopes", auth.Scopes)
+	// The page must cover what an approval grants: protocol scopes are shown as
+	// system-required placeholders rather than dropped (A-FE-3 / A-FE-V1).
+	if len(auth.Scopes) != len(requested) {
+		t.Fatalf("described scopes = %v, want one descriptor per requested scope %v", auth.Scopes, requested)
+	}
+	for _, d := range auth.Scopes {
+		switch d.Scope {
+		case "openid", "profile", "email":
+			if d.Title != "系统必需" {
+				t.Fatalf("protocol scope %q rendered as %q, want the system-required placeholder", d.Scope, d.Title)
+			}
+		default:
+			if d.Title == "系统必需" {
+				t.Fatalf("catalogue scope %q lost its descriptor", d.Scope)
+			}
+		}
 	}
 
 	if err := store.DecideDeviceAuthorization(ctx, "WXYZ-1234", "usr_1", true,
@@ -336,7 +350,7 @@ func TestDeviceCodeIsSingleUse(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "ONCE-1234", "usr_1", nil); err != nil {
+	if err := store.approveDevice(ctx, "ONCE-1234", "usr_1", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -368,7 +382,7 @@ func TestRevokingAGrantDeletesItsDeviceAuthorization(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "REVK-1234", "usr_1", nil); err != nil {
+	if err := store.approveDevice(ctx, "REVK-1234", "usr_1", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -669,7 +683,7 @@ func TestOIDCDeviceFlow(t *testing.T) {
 	}
 
 	// Approval narrows the scopes.
-	if err := store.ApproveDevice(ctx, "bcdf-ghjk", "usr_1", []string{"account.id"}); err != nil {
+	if err := store.approveDevice(ctx, "bcdf-ghjk", "usr_1", []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
 	st, err = store.GetDeviceAuthorizatonState(ctx, "oidc-device", "dev-code-1")
@@ -787,14 +801,14 @@ func TestDeviceDecisionsNameTheClientInTheAuditRow(t *testing.T) {
 		[]string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "G17A-0001", "usr_g17", nil); err != nil {
+	if err := store.approveDevice(ctx, "G17A-0001", "usr_g17", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "g17-deny-code", "G17D-0002", expires,
 		[]string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DenyDevice(ctx, "G17D-0002"); err != nil {
+	if err := store.DenyDevice(ctx, "G17D-0002", "usr_g17"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -830,10 +844,10 @@ func TestDeviceDecisionIsRefusedOnceTheCodeIsDecided(t *testing.T) {
 
 	t.Run("a second approval is refused", func(t *testing.T) {
 		newCode(t, "SPNT-0001", 5*time.Minute)
-		if err := store.ApproveDevice(ctx, "SPNT-0001", "usr_1", nil); err != nil {
+		if err := store.approveDevice(ctx, "SPNT-0001", "usr_1", nil); err != nil {
 			t.Fatalf("first approval: %v", err)
 		}
-		if err := store.ApproveDevice(ctx, "SPNT-0001", "usr_2", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+		if err := store.approveDevice(ctx, "SPNT-0001", "usr_2", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
 			t.Fatalf("second approval = %v, want ErrDeviceNotFound", err)
 		}
 		st, err := store.DeviceByUserCode(ctx, "SPNT-0001")
@@ -847,37 +861,37 @@ func TestDeviceDecisionIsRefusedOnceTheCodeIsDecided(t *testing.T) {
 
 	t.Run("approving a denied code is refused", func(t *testing.T) {
 		newCode(t, "DENY-0001", 5*time.Minute)
-		if err := store.DenyDevice(ctx, "DENY-0001"); err != nil {
+		if err := store.DenyDevice(ctx, "DENY-0001", "usr_1"); err != nil {
 			t.Fatalf("deny: %v", err)
 		}
-		if err := store.ApproveDevice(ctx, "DENY-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+		if err := store.approveDevice(ctx, "DENY-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
 			t.Fatalf("approving a denied code = %v, want ErrDeviceNotFound", err)
 		}
 	})
 
 	t.Run("approving an expired code is refused", func(t *testing.T) {
 		newCode(t, "EXPR-0001", -time.Minute)
-		if err := store.ApproveDevice(ctx, "EXPR-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
+		if err := store.approveDevice(ctx, "EXPR-0001", "usr_1", nil); !errors.Is(err, oauth.ErrDeviceNotFound) {
 			t.Fatalf("approving an expired code = %v, want ErrDeviceNotFound", err)
 		}
 	})
 
 	t.Run("a second denial is refused", func(t *testing.T) {
 		newCode(t, "TWIC-0001", 5*time.Minute)
-		if err := store.DenyDevice(ctx, "TWIC-0001"); err != nil {
+		if err := store.DenyDevice(ctx, "TWIC-0001", "usr_1"); err != nil {
 			t.Fatalf("first denial: %v", err)
 		}
-		if err := store.DenyDevice(ctx, "TWIC-0001"); !errors.Is(err, oauth.ErrDeviceNotFound) {
+		if err := store.DenyDevice(ctx, "TWIC-0001", "usr_1"); !errors.Is(err, oauth.ErrDeviceNotFound) {
 			t.Fatalf("second denial = %v, want ErrDeviceNotFound", err)
 		}
 	})
 
 	t.Run("a denial still overrides an approval", func(t *testing.T) {
 		newCode(t, "OVER-0001", 5*time.Minute)
-		if err := store.ApproveDevice(ctx, "OVER-0001", "usr_1", nil); err != nil {
+		if err := store.approveDevice(ctx, "OVER-0001", "usr_1", nil); err != nil {
 			t.Fatalf("approve: %v", err)
 		}
-		if err := store.DenyDevice(ctx, "OVER-0001"); err != nil {
+		if err := store.DenyDevice(ctx, "OVER-0001", "usr_2"); err != nil {
 			t.Fatalf("deny after approve: %v", err)
 		}
 		st, err := store.DeviceByUserCode(ctx, "OVER-0001")

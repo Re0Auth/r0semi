@@ -110,13 +110,21 @@ func TestDeviceFlowAcceptsStandardOIDCScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("describing an OIDC device request failed: %v", err)
 	}
-	// Only catalogue scopes are shown as permissions.
-	if len(auth.Scopes) != 2 {
-		t.Fatalf("described scopes = %v, want only the two catalogue scopes", auth.Scopes)
+	// The page must cover what an approval grants: protocol scopes are shown as
+	// system-required placeholders rather than dropped (A-FE-3 / A-FE-V1).
+	if len(auth.Scopes) != len(requested) {
+		t.Fatalf("described scopes = %v, want one descriptor per requested scope %v", auth.Scopes, requested)
 	}
 	for _, d := range auth.Scopes {
-		if d.Scope == "openid" || d.Scope == "profile" || d.Scope == "email" {
-			t.Fatalf("protocol scope %q was rendered as a permission", d.Scope)
+		switch d.Scope {
+		case "openid", "profile", "email":
+			if d.Title != "系统必需" {
+				t.Fatalf("protocol scope %q rendered as %q, want the system-required placeholder", d.Scope, d.Title)
+			}
+		default:
+			if d.Title == "系统必需" {
+				t.Fatalf("catalogue scope %q lost its descriptor", d.Scope)
+			}
 		}
 	}
 

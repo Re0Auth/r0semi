@@ -62,7 +62,10 @@ node docs/issues/_fragments/_merge.mjs            # 全部片段 -> P0..P3/fixed
 - `_merge.mjs` 按「轮次越晚越权威」合并，同 ID 只保留一条；`ALIAS` 表落实同机制合并；
   结束时会打印并向 `_counts.json` 写入**在册 / OPEN** 数量。
 - 额外的手工片段：[`_fragments/conformance.md`](_fragments/conformance.md)（OIDF 一致性套件门禁的
-  4 条已知缺口，来自 `docs/conformance.md`）。
+  4 条已知缺口，来自 `docs/conformance.md`）与
+  [`_fragments/round10.md`](_fragments/round10.md)（第 10 轮寄存器裁定标注：把 `not-doing.md`
+  已有裁定回写为 `DECIDED-NONGOAL`，并更正一条被 Z20-2 取代的 raw scope 裁定。它在 `_merge.mjs`
+  里的 `prio` 是 `-3`，因此其 `S11-1` 行覆盖第 9 轮抽取结果里仍标 `OPEN` 的那一行）。
 - **生成文件**：`P0-blockers.md`、`P1-high.md`、`P2-medium.md`、`P3-low.md`、`fixed.md`、
   `not-doing.md` 的生成区、`_counts.json`。`P2-triage.md` 与本文是**手写**的。
 

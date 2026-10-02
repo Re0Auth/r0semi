@@ -148,7 +148,7 @@ func TestDeviceDeadlinesAreJudgedByTheClockThatWroteThem(t *testing.T) {
 
 	// --- the approval: expires_at judged by the writer's clock, auth_time
 	// stamped with it ---
-	if err := oidc.ApproveDevice(ctx, "CLCK-2345", "usr_1", []string{"account.id"}); err != nil {
+	if err := oidc.approveDevice(ctx, "CLCK-2345", "usr_1", []string{"account.id"}); err != nil {
 		t.Fatalf("approving a code its writer still considers live was refused: %v", err)
 	}
 	st, err = oidc.DeviceByUserCode(ctx, "CLCK-2345")
@@ -158,7 +158,7 @@ func TestDeviceDeadlinesAreJudgedByTheClockThatWroteThem(t *testing.T) {
 	if !st.Done {
 		t.Fatal("the approval did not land")
 	}
-	// The stamp is taken from the store clock inside ApproveDevice, so it lands
+	// The stamp is taken from the store clock inside approveDevice, so it lands
 	// within a second of this read on either side. Testing `!AuthTime.Before(want)`
 	// against a clock read AFTER the call would reject every correct stamp (it is
 	// always a few microseconds older than the read); only the two-clock failure,

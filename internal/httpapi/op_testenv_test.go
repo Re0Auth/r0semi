@@ -35,6 +35,20 @@ import (
 // could drift from it.
 func newOPBackend(t testing.TB, issuer string, clients oauth.ClientRegistry, sessions *auth.Manager, metrics ...*observability.Metrics) (*oidchttp.Handler, *memory.OIDCStore) {
 	t.Helper()
+	return newOPBackendRegistry(t, issuer, clients, sessions, oauth.DefaultRegistry(), metrics...)
+}
+
+// newOPBackendRegistry is newOPBackend with an explicit scope catalogue.
+//
+// It exists so a test can exercise a scope the built-in catalogue does not carry
+// — today `<game>.raw.read` (Z20-2) — through the real OP, because the OP's scope
+// gate consults the same registry the business plane renders from and a scope
+// missing here cannot be granted at all.
+func newOPBackendRegistry(t testing.TB, issuer string, clients oauth.ClientRegistry, sessions *auth.Manager, registry *oauth.Registry, metrics ...*observability.Metrics) (*oidchttp.Handler, *memory.OIDCStore) {
+	t.Helper()
+	if registry == nil {
+		registry = oauth.DefaultRegistry()
+	}
 	var m *observability.Metrics
 	if len(metrics) > 0 {
 		m = metrics[0]
@@ -58,7 +72,7 @@ func newOPBackend(t testing.TB, issuer string, clients oauth.ClientRegistry, ses
 	}
 	store, err := memory.NewOIDCStore(memory.OIDCOptions{
 		Clients:  clients,
-		Registry: oauth.DefaultRegistry(),
+		Registry: registry,
 		Signer:   oidcstore.NewSigner("test", key),
 		Login:    login,
 	})
@@ -72,7 +86,7 @@ func newOPBackend(t testing.TB, issuer string, clients oauth.ClientRegistry, ses
 		CryptoKeyID:   "test",
 		AllowInsecure: true,
 		Clients:       clients,
-		Registry:      oauth.DefaultRegistry(),
+		Registry:      registry,
 		Consent:       store,
 		Metrics:       m,
 	})

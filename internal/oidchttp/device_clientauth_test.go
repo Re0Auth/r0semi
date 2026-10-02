@@ -82,7 +82,11 @@ func pollDeviceGrant(t testing.TB, f fixture, form url.Values, basicID, secret s
 func approvedDeviceCode(t testing.TB, f fixture, clientID, basicID, secret string) string {
 	t.Helper()
 	deviceCode, userCode := startDeviceAuthz(t, f, clientID, basicID, secret, []string{"account.id"})
-	if err := f.store.ApproveDevice(context.Background(), userCode, "usr_1", nil); err != nil {
+	// The store's only exported device-decision entrance is
+	// DecideDeviceAuthorization (ApproveDevice was de-exported, Z20V-2=B). A nil
+	// scope set approves everything requested; explicit is nil because none of
+	// this fixture's scopes require individual consent.
+	if err := f.store.DecideDeviceAuthorization(context.Background(), userCode, "usr_1", true, nil, nil); err != nil {
 		t.Fatalf("approve device: %v", err)
 	}
 	return deviceCode

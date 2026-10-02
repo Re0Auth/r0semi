@@ -108,22 +108,20 @@ func (l *AuditLogger) loadKey(ctx context.Context, subject string) ([]byte, erro
 	}
 	return key, nil
 }`
-	if cacheHitPrecedesTheQuery(syntheticLoad) {
+	if tombstoneGatedCachePrecedesTheQuery(syntheticLoad) {
 		t.Fatalf("control 1 did not detect a loadKey that queries before answering from cache")
 	}
 
-	// 2. A Destroy that evicts more than its own map must keep the cross-process
-	// primitives visible to the structural scan.
-	syntheticDestroy := `
-func (l *AuditLogger) Destroy(ctx context.Context, subject string) error {
-	destroyed.Store(subject, struct{}{})
-	delete(l.cache, subject)
-	notifyPeers(subject)
-	return nil
+	// 2. The pre-fix cachedAnswer consulted the local cache with no tombstone
+	// gate, which is exactly what let another replica keep pseudonymising an
+	// erased subject.
+	syntheticCachedAnswer := `
+func (l *AuditLogger) cachedAnswer(ctx context.Context, subject string) ([]byte, bool, error) {
+	key, ok := l.cached(subject)
+	return key, ok, nil
 }`
-	scrD := scrubLiterals(t, "synthetic", syntheticDestroy)
-	if !strings.Contains(scrD, "notifyPeers") || !strings.Contains(scrD, "destroyed.Store") {
-		t.Fatalf("control 2 did not keep the cross-process primitives visible; the check would miss a fix")
+	if tombstoneCheckedBeforeTheCache(syntheticCachedAnswer) {
+		t.Fatalf("control 2 did not detect a cachedAnswer with no tombstone gate; the Z10-1 guard would be vacuous")
 	}
 
 	// 3. The pre-fix admin.client.* record: the id is the (pseudonymised) subject

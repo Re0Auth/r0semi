@@ -376,15 +376,15 @@ func TestZZAdmProviderAuditFailureIsNeitherReturnedNorLogged(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(old)
 
-	err = store.ApproveDevice(ctx, "WXYZ-1234", "usr_victim", []string{"account.id"})
+	err = store.DecideDeviceAuthorization(ctx, "WXYZ-1234", "usr_victim", true, nil, nil)
 	logged := buf.String()
 
 	if err != nil {
-		t.Logf("ApproveDevice surfaced the audit failure: %v", err)
+		t.Logf("DecideDeviceAuthorization surfaced the audit failure: %v", err)
 	}
 	if err == nil && !strings.Contains(strings.ToLower(logged), "audit") {
 		t.Errorf("a device approval (a whole access grant) was performed against a dead audit "+
-			"sink: ApproveDevice returned nil and nothing was logged (captured log %q). "+
+			"sink: DecideDeviceAuthorization returned nil and nothing was logged (captured log %q). "+
 			"The action proceeds, the record is lost, and no operator signal exists - neither "+
 			"the fail-closed direction (vault.Use, lifecycle) nor the log-and-proceed one "+
 			"(admin, auth) was taken", logged)

@@ -25,7 +25,7 @@ import (
 	"github.com/Re0Auth/r0semi/idp"
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/observability"
-	"github.com/Re0Auth/r0semi/internal/safeurl"
+	"github.com/Re0Auth/r0semi/safeurl"
 )
 
 // Session keys. Flow state is stored server-side, so mode and return_to cannot
@@ -582,9 +582,13 @@ var loginCodes = map[string]string{
 // The rest (an unknown provider, a forged state, a provider mismatch) end at a 400
 // page with no redirect, so the frontend has no sentence for them and needs none —
 // the distinction is what keeps the two lists comparable rather than merely equal.
+//
+// codeIdentityTaken is deliberately absent: it is a server-side audit detail now,
+// never a redirect, so that the link callback cannot confirm who owns an external
+// identity (Z07-8).
 var redirectCodes = []string{
 	codeAccessDenied, codeProviderUnavailable, codeInvalidRequest, codeExchangeFailed,
-	codeIdentityFailed, codeNotSignedIn, codeIdentityTaken, codeLinkFailed,
+	codeIdentityFailed, codeNotSignedIn, codeLinkFailed,
 	codeSignupFailed, codeLookupFailed, codeSessionFailed,
 }
 
@@ -800,11 +804,21 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := h.accounts.LinkIdentity(ctx, user, ident); err != nil {
+			// An identity already owned by another account (I-3, ErrIdentityTaken)
+			// and any other link failure leave the browser with the same answer.
+			// Telling them apart in the return URL let any signed-in person who
+			// can authenticate as some external subject ask whether that subject
+			// already has an account here — an existence oracle the login flow
+			// deliberately does not offer (Z07-8). The distinction is kept, but
+			// server-side: it is the code on the audit record below, never the
+			// redirect.
+			detail := codeLinkFailed
 			if errors.Is(err, account.ErrIdentityTaken) {
-				h.failLogin(w, r, provider, returnTo, codeIdentityTaken)
-				return
+				detail = codeIdentityTaken
 			}
-			h.failLogin(w, r, provider, returnTo, codeLinkFailed)
+			h.observeLogin(string(provider), codeLinkFailed)
+			h.recordAuth(ctx, "auth.login", provider, "", outcomeFor(detail), detail)
+			redirectError(w, r, returnTo, codeLinkFailed)
 			return
 		}
 		h.observeLogin(string(provider), observability.LoginSuccess)

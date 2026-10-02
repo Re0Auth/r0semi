@@ -151,8 +151,8 @@ func TestV02ApprovedDeviceCodePastExpiryStillMintsTokens(t *testing.T) {
 		[]string{"openid", "account.id"}); err != nil {
 		t.Fatalf("StoreDeviceAuthorization: %v", err)
 	}
-	if err := e.store.ApproveDevice(ctx, "BCDF-GHJK", "usr_vfy", nil); err != nil {
-		t.Fatalf("ApproveDevice: %v", err)
+	if err := e.store.DecideDeviceAuthorization(ctx, "BCDF-GHJK", "usr_vfy", true, nil, nil); err != nil {
+		t.Fatalf("DecideDeviceAuthorization: %v", err)
 	}
 
 	// Step past the advertised lifetime.
@@ -279,7 +279,7 @@ func TestV04DevicePollRejectsClientSecretPostWhileCodeAndRefreshAcceptIt(t *test
 		clock.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.store.ApproveDevice(ctx, "BCDF-GHJM", "usr_vfy", nil); err != nil {
+	if err := e.store.DecideDeviceAuthorization(ctx, "BCDF-GHJM", "usr_vfy", true, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	resp, raw = e.devicePoll(t, "vfy-dev-post", e.webID, e.webSec, true)

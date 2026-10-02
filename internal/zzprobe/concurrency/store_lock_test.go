@@ -62,7 +62,7 @@ func TestApproveDeviceHoldsTheStoreLockAcrossTheAuditWrite(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	op := func() error { return st.ApproveDevice(ctx, "AAAA-BBBB", "usr_1", nil) }
+	op := func() error { return st.DecideDeviceAuthorization(ctx, "AAAA-BBBB", "usr_1", true, nil, nil) }
 	if held := lockHeldDuring(t, st, log, op); held {
 		t.Error("ApproveDevice held the store lock while the audit write was in flight: S13-4 regressed, " +
 			"so every other call on this store waits behind a (possibly remote) audit append")
@@ -77,7 +77,7 @@ func TestDenyDeviceHoldsTheStoreLockAcrossTheAuditWrite(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	op := func() error { return st.DenyDevice(ctx, "CCCC-DDDD") }
+	op := func() error { return st.DenyDevice(ctx, "CCCC-DDDD", "usr_1") }
 	if held := lockHeldDuring(t, st, log, op); held {
 		t.Error("DenyDevice held the store lock while the audit write was in flight: S13-4 regressed")
 	}
@@ -130,7 +130,7 @@ func TestAnAuditSinkThatReadsTheStoreDeadlocksUnderTheLock(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := audited.ApproveDevice(ctx, "EEEE-FFFF", "usr_1", nil); err != nil {
+	if err := audited.DecideDeviceAuthorization(ctx, "EEEE-FFFF", "usr_1", true, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !<-g.answered {
@@ -181,12 +181,12 @@ func TestEveryAuditPathForwardsTheRequestContext(t *testing.T) {
 		time.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ApproveDevice(ctx, "GGGG-HHHH", "usr_1", nil); err != nil {
+	if err := st.DecideDeviceAuthorization(ctx, "GGGG-HHHH", "usr_1", true, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	assertForwarded(t, "ApproveDevice")
+	assertForwarded(t, "DecideDeviceAuthorization")
 
-	if err := st.DenyDevice(ctx, "GGGG-HHHH"); err != nil {
+	if err := st.DenyDevice(ctx, "GGGG-HHHH", "usr_1"); err != nil {
 		t.Fatal(err)
 	}
 	assertForwarded(t, "DenyDevice")

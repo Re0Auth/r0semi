@@ -41,7 +41,7 @@ func TestPurgeSubjectRemovesRequestsCodesAndDevices(t *testing.T) {
 		time.Now().Add(time.Hour), []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApproveDevice(ctx, "ABCD-EFGH", subject, []string{"account.id"}); err != nil {
+	if err := store.approveDevice(ctx, "ABCD-EFGH", subject, []string{"account.id"}); err != nil {
 		t.Fatal(err)
 	}
 

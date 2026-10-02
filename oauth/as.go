@@ -86,6 +86,17 @@ func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg C
 	if ms, ok := tokens.(*MemoryStore); ok {
 		ms.now = cfg.Now
 	}
+	// The in-memory pair. A client registry that keeps no tokens cannot revoke
+	// them on its own, and this is the one place both halves are in hand: publish
+	// the token engine to the registry so ClientAdmin.Delete removes the client's
+	// tokens with its registration (KIT-10). A registry or store that does not
+	// implement the two interfaces — a durable one that owns its tokens, a test
+	// double — is left exactly as it was.
+	if setter, ok := clients.(TokenRevokerSetter); ok {
+		if revoker, ok := tokens.(TokenAdmin); ok {
+			setter.SetTokenRevoker(revoker)
+		}
+	}
 	return &service{
 		clients:      clients,
 		tokens:       tokens,
@@ -339,6 +350,9 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 	case err != nil:
 		return TokenResponse{}, err
 	}
+	// The store hands back a retained row even if its deadline has passed
+	// (S09-4): the caller, with its injected clock, is the only place expiry is
+	// judged, so the claim above cannot be treated as proof the value was live.
 	if !s.now().Before(rt.ExpiresAt) {
 		return TokenResponse{}, protocolError("invalid_grant", "refresh token has expired")
 	}
@@ -519,10 +533,12 @@ func (s *service) issue(ctx context.Context, clientID, subject string, scopes []
 	}, nil
 }
 
-// dummyClientSecretHash is the fixed digest the unknown-client branch compares
+// dummyClientSecretHash is the verifier the unknown-client branch recomputes
 // against. It is not a credential: it exists so the refusal spends the same
-// constant-time comparison a real secret check does, instead of returning after a
+// salted slow-hash work a real secret check does, instead of returning after a
 // single map miss and letting an attacker time client-id enumeration (S01-5).
+// Recomparing a stored verifier (not hashing the presented secret afresh) is what
+// keeps this branch the same shape as Authenticate's.
 var dummyClientSecretHash = NewSecretHash("oauth:no-such-client")
 
 // client resolves a client and, when auth is set, authenticates a confidential
@@ -539,7 +555,7 @@ func (s *service) client(ctx context.Context, id, secret string, auth bool) (Cli
 	c, err := s.clients.Get(ctx, id)
 	if errors.Is(err, ErrClientNotFound) {
 		if auth {
-			subtle.ConstantTimeCompare(dummyClientSecretHash, NewSecretHash(secret))
+			verifySecretHash(dummyClientSecretHash, secret)
 		}
 		return Client{}, protocolError("invalid_client", "invalid client credentials")
 	}

@@ -66,7 +66,7 @@ func TestAdversarialDeviceCodeIsSingleUse(t *testing.T) {
 	env := deviceEnv(t)
 	ctx := context.Background()
 	dc, uc := startDevice(t, env, "account.id")
-	if err := env.store.ApproveDevice(ctx, uc, "usr_1", nil); err != nil {
+	if err := env.store.DecideDeviceAuthorization(ctx, uc, "usr_1", true, nil, nil); err != nil {
 		t.Fatal("approve was refused")
 	}
 
@@ -92,7 +92,7 @@ func TestAdversarialDeviceCodeIsRevokedByBulkRevocation(t *testing.T) {
 	env := deviceEnv(t)
 	ctx := context.Background()
 	dc, uc := startDevice(t, env, "account.id")
-	if err := env.store.ApproveDevice(ctx, uc, "usr_1", nil); err != nil {
+	if err := env.store.DecideDeviceAuthorization(ctx, uc, "usr_1", true, nil, nil); err != nil {
 		t.Fatal("approve was refused")
 	}
 	status1, first := pollDevice(t, env, dc)
@@ -196,15 +196,17 @@ func TestAdversarialDeviceDenyWinsWhicheverWriteOrder(t *testing.T) {
 			ctx := context.Background()
 			dc, uc := startDevice(t, env, "account.id")
 			if order == orders[0] {
-				if err := env.store.DenyDevice(ctx, uc); err != nil {
+				// The denying account travels with the call (Z20V-1): the audit
+				// event has to be able to name who refused.
+				if err := env.store.DenyDevice(ctx, uc, "usr_1"); err != nil {
 					t.Fatal("deny was refused")
 				}
-				_ = env.store.ApproveDevice(ctx, uc, "usr_1", nil)
+				_ = env.store.DecideDeviceAuthorization(ctx, uc, "usr_1", true, nil, nil)
 			} else {
-				if err := env.store.ApproveDevice(ctx, uc, "usr_1", nil); err != nil {
+				if err := env.store.DecideDeviceAuthorization(ctx, uc, "usr_1", true, nil, nil); err != nil {
 					t.Fatal("approve was refused")
 				}
-				if err := env.store.DenyDevice(ctx, uc); err != nil {
+				if err := env.store.DenyDevice(ctx, uc, "usr_1"); err != nil {
 					t.Fatal("deny was refused")
 				}
 			}
@@ -223,10 +225,10 @@ func TestAdversarialDeviceTokenSubjectIsAlwaysAnApprover(t *testing.T) {
 	env := deviceEnv(t)
 	ctx := context.Background()
 	dc, uc := startDevice(t, env, "account.id")
-	if err := env.store.ApproveDevice(ctx, uc, "usr_1", nil); err != nil {
+	if err := env.store.DecideDeviceAuthorization(ctx, uc, "usr_1", true, nil, nil); err != nil {
 		t.Fatal("first approve was refused")
 	}
-	_ = env.store.ApproveDevice(ctx, uc, "usr_2", nil)
+	_ = env.store.DecideDeviceAuthorization(ctx, uc, "usr_2", true, nil, nil)
 
 	status, doc := pollDevice(t, env, dc)
 	if status != http.StatusOK {

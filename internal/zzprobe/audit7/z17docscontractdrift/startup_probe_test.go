@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -238,13 +239,19 @@ func TestZ17ReadmeQuickstartCannotStartWithTheShippedExample(t *testing.T) {
 		"[idp.google] client secrets the quickstart never sets:\n%s", firstLines(out, 3))
 }
 
-// TestZ17ReadmeMemorySnippetCannotStart is Z17-2.
+// TestZ17ReadmeMemorySnippetCannotStart is the flipped form of Z17-2; the name is
+// kept so the coverage matrix still maps here.
 //
-// README.md:36-40 shows the environment-only, in-memory startup with just
-// RE0AUTH_ISSUER and RE0AUTH_KEK. That invocation cannot reach a listener: the
-// https issuer needs cookie_secure, and the two OP keys are required in memory
-// mode too (README.md:31-32 says so two paragraphs earlier). The probe requires
-// the snippet, as written, to serve /healthz, and FAILS when it does not.
+// The finding was: README.md's environment-only, in-memory snippet showed only
+// RE0AUTH_ISSUER and RE0AUTH_KEK, while the https issuer needs cookie_secure and
+// the two OP keys are required in memory mode too — so the documented invocation
+// could not reach a listener. The document has since been fixed (README.md's
+// snippet now carries cookie_secure and both OP keys).
+//
+// The guard now reads the snippet from README itself and requires it to serve
+// /healthz, and names the five variables the surrounding text calls mandatory. The
+// anti-vacuity control runs the PRE-FIX shape (ISSUER + KEK only) and requires it
+// to FAIL, so a snippet that dropped a key again cannot pass unnoticed.
 func TestZ17ReadmeMemorySnippetCannotStart(t *testing.T) {
 	dir := t.TempDir()
 	empty := filepath.Join(dir, "empty.toml")
@@ -254,46 +261,79 @@ func TestZ17ReadmeMemorySnippetCannotStart(t *testing.T) {
 	k := makeKeys(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", z17Port)
 
-	// Positive control: the same environment plus cookie_secure and the two OP
-	// keys serves /healthz, so those are the whole difference.
-	control := map[string]string{
-		"RE0AUTH_ISSUER":           "https://re0auth.example",
-		"RE0AUTH_KEK":              k.kek,
-		"RE0AUTH_COOKIE_SECURE":    "true",
-		"RE0AUTH_OIDC_TOKEN_KEY":   k.token,
-		"RE0AUTH_OIDC_SIGNING_KEY": k.signing,
-		"RE0AUTH_ADDR":             addr,
-	}
-	if served, log := tryServe(t, control, empty, addr); !served {
-		t.Fatalf("positive control never served %s/healthz; the probe proves nothing:\n%s", addr, firstLines(log, 6))
+	// The documented snippet, read from README rather than hard-coded: the probe's
+	// contract is "what the README shows", so it must follow the document.
+	readme := readFile(t, filepath.Join(repoRoot(t), "README.md"))
+	names := readmeMemorySnippetNames(t, readme)
+	for _, want := range []string{
+		"RE0AUTH_ISSUER", "RE0AUTH_KEK", "RE0AUTH_COOKIE_SECURE",
+		"RE0AUTH_OIDC_TOKEN_KEY", "RE0AUTH_OIDC_SIGNING_KEY",
+	} {
+		if !names[want] {
+			t.Errorf("README.md's memory-mode snippet no longer sets %s, which the surrounding text "+
+				"calls mandatory in this mode; the documented invocation cannot start", want)
+		}
 	}
 
-	// The snippet verbatim. RE0AUTH_ADDR is a harness accommodation so the probe
-	// cannot collide with another listener; it changes only where it would bind.
-	snippet := map[string]string{
+	// RE0AUTH_ADDR is a harness accommodation so the probe cannot collide with
+	// another listener; it changes only where it would bind.
+	env := map[string]string{"RE0AUTH_ADDR": addr}
+	for name := range names {
+		switch name {
+		case "RE0AUTH_ISSUER":
+			env[name] = "https://re0auth.example"
+		case "RE0AUTH_KEK":
+			env[name] = k.kek
+		case "RE0AUTH_COOKIE_SECURE":
+			env[name] = "true"
+		case "RE0AUTH_OIDC_TOKEN_KEY":
+			env[name] = k.token
+		case "RE0AUTH_OIDC_SIGNING_KEY":
+			env[name] = k.signing
+		default:
+			t.Fatalf("the README snippet now documents %s, which this probe cannot generate a value for; "+
+				"re-derive Z17-2", name)
+		}
+	}
+	if served, log := tryServe(t, env, empty, addr); !served {
+		t.Errorf("README.md's memory-mode snippet does not start as written: it is refused during "+
+			"configuration or never serves /healthz. Observed:\n%s", firstLines(log, 4))
+	}
+
+	// Anti-vacuity: the pre-fix snippet (ISSUER + KEK only) must still fail. If it
+	// served, this probe could not tell a complete snippet from an incomplete one.
+	preFix := map[string]string{
 		"RE0AUTH_ISSUER": "https://re0auth.example",
 		"RE0AUTH_KEK":    k.kek,
 		"RE0AUTH_ADDR":   addr,
 	}
-	if served, log := tryServe(t, snippet, empty, addr); !served {
-		t.Errorf("README.md:36-40's environment-only snippet does not start as written: it is "+
-			"refused during configuration. Observed:\n%s", firstLines(log, 3))
+	if served, _ := tryServe(t, preFix, empty, addr); served {
+		t.Fatal("control: ISSUER + KEK alone served /healthz, so this guard cannot detect a snippet that " +
+			"drops the mandatory keys; it is vacuous")
 	}
+}
 
-	// The second, independent blocker: with the cookie flag the snippet still
-	// omits, the two OP keys README.md:31-32 calls mandatory in both storage
-	// modes are the next refusal.
-	snippet2 := map[string]string{
-		"RE0AUTH_ISSUER":        "https://re0auth.example",
-		"RE0AUTH_KEK":           k.kek,
-		"RE0AUTH_COOKIE_SECURE": "true",
-		"RE0AUTH_ADDR":          addr,
+// readmeMemorySnippetNames returns the RE0AUTH_* names README's environment-only
+// startup block sets. That block is the `sh` fence whose command is `./re0auth`
+// without `-config` (the config-file quickstart carries `-config`).
+func readmeMemorySnippetNames(t *testing.T, readme string) map[string]bool {
+	t.Helper()
+	blocks := regexp.MustCompile("(?s)```sh\\n(.*?)```").FindAllStringSubmatch(readme, -1)
+	var block string
+	for _, m := range blocks {
+		if strings.Contains(m[1], "./re0auth") && !strings.Contains(m[1], "-config") {
+			block = m[1]
+			break
+		}
 	}
-	if served, log := tryServe(t, snippet2, empty, addr); !served {
-		t.Errorf("README.md:36-40's snippet plus the cookie flag still does not start — the two OP "+
-			"keys its own text calls mandatory in memory mode are not in the snippet. Observed:\n%s",
-			firstLines(log, 3))
+	if block == "" {
+		t.Fatalf("README.md no longer has an environment-only ./re0auth snippet; re-derive Z17-2")
 	}
+	names := map[string]bool{}
+	for _, name := range regexp.MustCompile(`RE0AUTH_[A-Z0-9_]+`).FindAllString(block, -1) {
+		names[name] = true
+	}
+	return names
 }
 
 // tryServe starts the binary and reports whether /healthz answered 200 within

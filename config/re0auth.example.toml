@@ -24,6 +24,24 @@
 # A value that is present but unrecognised refuses startup rather than falling
 # back silently, so a level that looks applied is applied.
 
+# Shutdown budget: three numbers in three files. None is a setting here, but a
+# deployment must keep them in step.
+#
+#   dataPlaneTimeout              = 45s  cmd/re0auth/main.go — one data-plane
+#                                        request end to end (below writeTimeout
+#                                        60s, so the refusal is written)
+#   shutdownTimeout               = 45s  cmd/re0auth/main.go — the graceful drain
+#                                        after SIGTERM; >= dataPlaneTimeout, so a
+#                                        request the data plane admitted finishes
+#   terminationGracePeriodSeconds = 60s  deploy/k8s/base/deployment.yaml —
+#                                        endpointRemovalWait 5s + shutdownTimeout
+#                                        45s + auditDrainTimeout 10s = 60s
+#
+# A drain shorter than dataPlaneTimeout cuts off exactly the slow read the data
+# plane's deadline exists to answer with a readable 504; a grace period shorter
+# than the stack gets the pod SIGKILLed before the audit drain can refuse what is
+# left.
+
 [server]
 # Public base URL. Must be absolute; it is the OAuth issuer and appears in every
 # discovery document. Redirect URIs registered with your identity providers and
@@ -288,6 +306,13 @@ name = "First-party client"
 # confidential one.
 # secret_env = "RE0AUTH_CLIENT_SECRET"
 redirect_uris = ["https://app.example/callback"]
+# The scopes this client may request. A client can only ask for scopes listed
+# here, and only for scopes the server's catalogue describes.
+#
+# The raw passthrough is gated by its own explicit `<game>.raw.read` scope (for
+# example "phigros.raw.read"), NOT by the game's resource scopes: the raw proxy
+# hands a source's entire native API through, which no resource-scoped grant
+# covers. Grant it here only to clients that really need the native dialect.
 scopes        = ["account.id", "phigros.profile.read"]
 # Exempt this one client from the mandatory-PKCE rule, for a client that cannot
 # send a code_challenge (a certification suite, a legacy RP). Confidential clients
@@ -332,6 +357,14 @@ subjects = []
 # Kill Switch). There is no second factor to prompt for, so re-login is the
 # step-up. "0" disables the check.
 # Environment override: RE0AUTH_ADMIN_REAUTH_WINDOW="15m"
+reauth_window = "15m"
+
+[account]
+# How recent the account's own sign-in must be for DELETE /v1/account (self
+# erasure) to be accepted. Erasure cannot be undone, so it uses the same
+# step-up-by-re-login as the operator plane above and defaults to the same
+# magnitude. "0" disables the check.
+# Environment override: RE0AUTH_ACCOUNT_REAUTH_WINDOW="15m"
 reauth_window = "15m"
 
 [upstream]
@@ -426,6 +459,11 @@ reauth_window = "15m"
 # # active | degraded | retired
 # status       = "active"
 # raw_base     = "https://api.next-phi.example/v1"
+# # Declaring raw_base makes this game's raw passthrough available AND registers
+# # its `<game>.raw.read` scope (here "phigros.raw.read") in the scope catalogue.
+# # A client must list that scope in its own `scopes` to be allowed to request
+# # it; a token without it is refused with 403 on
+# # GET /v1/games/<game>/sources/<source>/raw/….
 # # Set this ONLY if the source's discovery document advertises
 # # cascade_revocation_endpoint. Declaring it makes Re0Auth offer "sign out
 # # everywhere" for the source; declaring it wrongly makes that a button that

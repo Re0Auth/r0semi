@@ -32,10 +32,22 @@ type AuditLogger struct {
 	// stopped by Close.
 	batch *auditBatcher
 	// mu guards cache, which maps a subject to its per-subject key AND to the
-	// answer "this subject has no key". It is a cache, not a source of truth:
-	// losing it costs one query.
+	// answer "this subject has no key", and tombstones, the local mirror of
+	// audit_subject_tombstones. Neither is a source of truth: losing them costs
+	// one query.
 	mu    sync.Mutex
 	cache map[string]cachedSubjectKey
+	// tombstones mirrors the shared erasure facts another replica wrote. It is
+	// consulted before the cache answers, and refreshed from the database on a
+	// short interval so the check itself does not become a query per audit event
+	// (see syncTombstones, Z10-1).
+	tombstones map[string]struct{}
+	// tombstoneSeq is the highest tombstones.seq this process has loaded, and
+	// tombstoneSyncedAt is when it last tried. Together they make the refresh
+	// incremental and rate-limited.
+	tombstoneSeq          int64
+	tombstoneSyncedAt     time.Time
+	tombstoneSyncInterval time.Duration
 	// now is the clock the cache's entries are aged with. It is the handle's clock
 	// (see DB.now) so the TTL obeys the same single-clock policy as every other
 	// deadline this package writes; set by DB.Audit, never nil.

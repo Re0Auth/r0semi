@@ -249,6 +249,7 @@ func newZAStack(t *testing.T, opts zAOpts) *zAStack {
 	if clientScopes == nil {
 		clientScopes = []oauth.Scope{
 			oauth.ScopeAccountID, oauth.ScopePhigrosProfile, oauth.ScopePhigrosScore,
+			oauth.Scope(oauth.RawScope(zGame)),
 		}
 	}
 	clients := oauth.NewMemoryClientRegistry()
@@ -318,7 +319,7 @@ func newZAStack(t *testing.T, opts zAOpts) *zAStack {
 
 	scopeRegistry := opts.Registry
 	if scopeRegistry == nil {
-		scopeRegistry = oauth.DefaultRegistry()
+		scopeRegistry = zRegistryWithRaw(t)
 	}
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -400,6 +401,27 @@ func (s *zAStack) serve(admins []account.UserID) *zAEnv {
 func newZAEnv(t *testing.T, opts zAOpts) *zAEnv {
 	t.Helper()
 	return newZAStack(t, opts).serve(nil)
+}
+
+// zRegistryWithRaw is the default catalogue plus the raw-passthrough scope this
+// fixture's sources advertise.
+//
+// The composition root registers one `<game>.raw.read` per configured game with a
+// raw_base (cmd/re0auth/main.go rawScopeDescriptors), and every source here has
+// one, so a cross-check that mints a raw token needs the same descriptor. Without
+// it the OP refuses the scope at authorize time and the probe could never express
+// "raw is allowed" (Z20-2).
+func zRegistryWithRaw(t *testing.T) *oauth.Registry {
+	t.Helper()
+	reg, err := oauth.NewRegistry(append(oauth.DefaultDescriptors(), oauth.Descriptor{
+		Scope: oauth.Scope(oauth.RawScope(zGame)), Title: "读取 " + zGame + " 原生接口",
+		Description: "probe descriptor: the explicit scope the raw passthrough requires",
+		Risk:        oauth.RiskHigh,
+	})...)
+	if err != nil {
+		t.Fatalf("oauth.NewRegistry: %v", err)
+	}
+	return reg
 }
 
 // zBrowser returns a client with a cookie jar that does NOT follow redirects, so

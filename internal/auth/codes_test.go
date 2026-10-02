@@ -48,7 +48,7 @@ func TestEveryLoginCodeHasAnOutcome(t *testing.T) {
 			t.Errorf("redirect code %q has no audit outcome", code)
 		}
 	}
-	for _, code := range []string{codeUnknownProvider, codeInvalidState, codeProviderMismatch} {
+	for _, code := range []string{codeUnknownProvider, codeInvalidState, codeProviderMismatch, codeIdentityTaken} {
 		if _, ok := loginCodes[code]; !ok {
 			t.Errorf("audit-only code %q has no audit outcome", code)
 		}

@@ -266,6 +266,20 @@ export interface AdminRegistration {
 	client_secret?: string;
 }
 
+/**
+ * One page of the operator's client inventory.
+ *
+ * The listing is cursor-paged: `data` is the page (ordered by `client_id`), and
+ * `next_cursor` — absent on the last page — is echoed back as `cursor` to fetch
+ * the one after it. It is not an offset, so a client registered between two
+ * requests cannot make the next page repeat or skip a row.
+ */
+export interface AdminClientPage {
+	data: AdminClient[];
+	csrf_token: string;
+	next_cursor?: string;
+}
+
 export interface KillSwitchReport {
 	tokens_revoked: number;
 	sessions_revoked: number;
@@ -294,22 +308,60 @@ function looksLikeProblem(value: unknown): value is Problem {
 	);
 }
 
+/** Field predicates for `requireData`, small enough to read at the call site. */
+const isString = (v: unknown): boolean => typeof v === 'string';
+const isNumber = (v: unknown): boolean => typeof v === 'number';
+const isArray = (v: unknown): boolean => Array.isArray(v);
+const isObject = (v: unknown): v is Record<string, unknown> =>
+	typeof v === 'object' && v !== null;
+const isOneOf =
+	(...allowed: string[]) =>
+	(v: unknown): boolean =>
+		typeof v === 'string' && allowed.includes(v);
+const hasStrings = (v: unknown, ...keys: string[]): boolean =>
+	isObject(v) && keys.every((key) => isString(v[key]));
+
 /**
- * A list endpoint answers with `{ data: [...] }`.
+ * The one shape check every 2xx JSON body goes through.
  *
- * The type parameter only asserts that shape; JSON is not typed, and a response
- * whose `data` is missing (or is an object where the page iterates) throws inside
+ * The type parameter only asserts a shape; JSON is not typed, and a response
+ * whose field is missing (or is an object where the page iterates) throws inside
  * a render, where the only handler left is SvelteKit's error boundary — which
  * shows the JavaScript message instead of something a person can act on. Checking
  * at the boundary turns the same response into an ApiError every caller already
  * knows how to display.
+ *
+ * `shape` names each field a caller will read and the predicate it must satisfy.
+ * It deliberately stays top-level: a body that is the wrong envelope entirely is
+ * the failure this guards against, and validating every nested field would turn
+ * one rule into a second schema that has to be kept in step with the server.
+ */
+function requireData<T>(
+	value: unknown,
+	what: string,
+	shape: Record<string, (field: unknown) => boolean>
+): T {
+	if (!isObject(value)) {
+		throw new ApiError(0, local('malformed_response', `${what} response is not a JSON object`));
+	}
+	for (const [field, valid] of Object.entries(shape)) {
+		if (!valid(value[field])) {
+			throw new ApiError(
+				0,
+				local('malformed_response', `${what} response is missing or has an invalid ${field}`)
+			);
+		}
+	}
+	return value as T;
+}
+
+/**
+ * A list endpoint answers with `{ data: [...] }`, which is just the `data`
+ * envelope every list shares; it is expressed through `requireData` so there is
+ * one place that decides what a malformed body means.
  */
 function requireDataList<T>(value: unknown, what: string): { data: T[] } {
-	const data = (value as { data?: unknown } | null | undefined)?.data;
-	if (!Array.isArray(data)) {
-		throw new ApiError(0, local('malformed_response', `${what} response is missing its data array`));
-	}
-	return value as { data: T[] };
+	return requireData<{ data: T[] }>(value, what, { data: isArray });
 }
 
 interface CallOptions {
@@ -434,13 +486,12 @@ export const api = {
 	// would turn every later write into an unexplainable 403.
 	currentSession: async () => {
 		const session = await call<Session>('GET', '/v1/sessions/current');
-		if (typeof session?.user_id !== 'string' || typeof session?.csrf_token !== 'string') {
-			throw new ApiError(
-				0,
-				local('malformed_response', 'session response is missing user_id or csrf_token')
-			);
-		}
-		return session;
+		return requireData<Session>(session, 'session', {
+			user_id: isString,
+			primary_identity_id: isString,
+			csrf_token: isString,
+			identities: isArray
+		});
 	},
 
 	signOut: (csrf: string) => call<void>('POST', '/v1/sessions/sign_out', { csrf }),
@@ -450,29 +501,63 @@ export const api = {
 			'GET',
 			`/v1/authorization_requests/${encodeURIComponent(id)}`
 		);
-		if (typeof request?.id !== 'string' || !Array.isArray(request?.scopes)) {
-			throw new ApiError(
-				0,
-				local('malformed_response', 'authorization request is missing id or scopes')
-			);
-		}
-		return request;
+		return requireData<AuthorizationRequest>(request, 'authorization request', {
+			id: isString,
+			scopes: isArray,
+			client: (v) => hasStrings(v, 'id', 'name'),
+			// Used as the CSRF token of the decision; absent, the approval is a 403
+			// with no explanation.
+			csrf_token: isString
+		});
 	},
 
-	decideAuthorizationRequest: (id: string, csrf: string, decision: AuthorizationDecision) =>
-		call<RedirectResult>('POST', `/v1/authorization_requests/${encodeURIComponent(id)}/decision`, {
-			body: decision,
-			csrf
-		}),
+	decideAuthorizationRequest: async (id: string, csrf: string, decision: AuthorizationDecision) => {
+		const result = await call<RedirectResult>(
+			'POST',
+			`/v1/authorization_requests/${encodeURIComponent(id)}/decision`,
+			{ body: decision, csrf }
+		);
+		// This string is handed to window.location.assign verbatim. A missing one
+		// would navigate to the literal "undefined"; refusing it keeps the page on
+		// its own error message.
+		return requireData<RedirectResult>(result, 'authorization decision', { redirect_to: isString });
+	},
 
-	getDeviceVerification: (userCode: string) =>
-		call<DeviceVerification>(
+	getDeviceVerification: async (userCode: string) => {
+		const res = await call<DeviceVerification>(
 			'GET',
 			userCode ? `/v1/device/verification?user_code=${encodeURIComponent(userCode)}` : '/v1/device/verification'
-		),
+		);
+		// The state is the branch the page switches on; anything else is a body it
+		// cannot act on. A pending body is read field by field, so all of it is
+		// checked here rather than throwing from the render.
+		if (!isObject(res) || (res.state !== 'awaiting_code' && res.state !== 'pending')) {
+			throw new ApiError(
+				0,
+				local('malformed_response', 'device verification response has an unknown state')
+			);
+		}
+		if (res.state === 'pending') {
+			return requireData<DevicePending>(res, 'device verification', {
+				user_code: isString,
+				client: (v) => hasStrings(v, 'id', 'name'),
+				scopes: isArray,
+				expires_at: isString,
+				csrf_token: isString
+			});
+		}
+		return res as DeviceAwaitingCode;
+	},
 
-	decideDevice: (csrf: string, decision: DeviceDecision) =>
-		call<DeviceDecisionResult>('POST', '/v1/device/decision', { body: decision, csrf }),
+	decideDevice: async (csrf: string, decision: DeviceDecision) => {
+		const result = await call<DeviceDecisionResult>('POST', '/v1/device/decision', {
+			body: decision,
+			csrf
+		});
+		return requireData<DeviceDecisionResult>(result, 'device decision', {
+			state: isOneOf('approved', 'denied')
+		});
+	},
 
 	listGrants: async () => requireDataList<Grant>(await call('GET', '/v1/grants'), 'grants'),
 
@@ -506,35 +591,62 @@ export const api = {
 		// The filename of the download is built from profile.user_id, so an export
 		// that does not carry one must fail where the caller can catch it rather
 		// than as a TypeError deep inside the download.
-		if (typeof data?.profile?.user_id !== 'string' || data.profile.user_id === '') {
-			throw new ApiError(
-				0,
-				local('malformed_response', 'account export is missing profile.user_id')
-			);
-		}
-		return data;
+		return requireData<AccountExport>(data, 'account export', {
+			profile: (v) => isObject(v) && isString(v.user_id) && v.user_id !== ''
+		});
 	},
 
 	// Erasure is idempotent server-side; the acknowledgement is required by the
 	// server so the act cannot happen without naming what it does.
-	deleteAccount: (csrf: string) =>
-		call<AccountDeletion>('DELETE', '/v1/account', {
+	deleteAccount: async (csrf: string) => {
+		const result = await call<AccountDeletion>('DELETE', '/v1/account', {
 			body: { acknowledge: 'deletes_my_account' },
 			csrf
-		}),
+		});
+		return requireData<AccountDeletion>(result, 'account deletion', { result: isObject });
+	},
 
 	// Operator plane. Every write here needs a fresh authentication; a
 	// `reauth_required` code means the operator must sign in again.
-	listAdminClients: async () => {
-		const res = await call<{ data: AdminClient[]; csrf_token: string }>('GET', '/v1/admin/clients');
-		requireDataList<AdminClient>(res, 'admin clients');
-		return res;
+	//
+	// The inventory is paged: pass the previous page's `next_cursor` back as
+	// `cursor`. The server refuses a cursor it did not issue (400) rather than
+	// restarting from the first page, so a caller must treat `next_cursor` as an
+	// opaque value.
+	listAdminClients: async (page?: { limit?: number; cursor?: string }) => {
+		const params = new URLSearchParams();
+		if (page?.limit !== undefined) params.set('limit', String(page.limit));
+		if (page?.cursor) params.set('cursor', page.cursor);
+		const query = params.toString();
+		const res = await call<AdminClientPage>(
+			'GET',
+			`/v1/admin/clients${query ? `?${query}` : ''}`
+		);
+		const body = requireData<AdminClientPage>(res, 'admin clients', {
+			data: isArray,
+			csrf_token: isString
+		});
+		// The field is optional, so `requireData` does not check it; a value that
+		// is present but not a string would otherwise be handed straight back to
+		// the server as a cursor the caller never received.
+		if (body.next_cursor !== undefined && !isString(body.next_cursor)) {
+			throw new ApiError(
+				0,
+				local('malformed_response', 'admin clients response has an invalid next_cursor')
+			);
+		}
+		return body;
 	},
 
-	registerAdminClient: (
+	registerAdminClient: async (
 		csrf: string,
 		body: { name: string; type: string; redirect_uris: string[]; scopes: string[] }
-	) => call<AdminRegistration>('POST', '/v1/admin/clients', { body, csrf }),
+	) => {
+		const result = await call<AdminRegistration>('POST', '/v1/admin/clients', { body, csrf });
+		return requireData<AdminRegistration>(result, 'admin registration', {
+			client: (v) => hasStrings(v, 'client_id', 'name')
+		});
+	},
 
 	suspendAdminClient: (clientId: string, csrf: string) =>
 		call<void>('POST', `/v1/admin/clients/${encodeURIComponent(clientId)}/suspend`, { csrf }),
@@ -545,28 +657,46 @@ export const api = {
 	deleteAdminClient: (clientId: string, csrf: string) =>
 		call<void>('DELETE', `/v1/admin/clients/${encodeURIComponent(clientId)}`, { csrf }),
 
-	killSwitch: (
+	killSwitch: async (
 		csrf: string,
 		target: { target: 'all' | 'client' | 'subject' | 'bindings'; client_id?: string; subject?: string }
-	) => call<KillSwitchReport>('POST', '/v1/admin/kill_switch', { body: target, csrf }),
+	) => {
+		const report = await call<KillSwitchReport>('POST', '/v1/admin/kill_switch', {
+			body: target,
+			csrf
+		});
+		return requireData<KillSwitchReport>(report, 'kill switch report', {
+			tokens_revoked: isNumber,
+			sessions_revoked: isNumber,
+			clients_suspended: isNumber
+		});
+	},
 
 	// 200 with a body, not 204: whether the source was actually told is part of
 	// the answer, and a bare success would overstate what happened.
-	unbindSource: (game: string, source: string, csrf: string) =>
-		call<UnbindResult>(
+	unbindSource: async (game: string, source: string, csrf: string) => {
+		const result = await call<UnbindResult>(
 			'DELETE',
 			`/v1/bindings/${encodeURIComponent(game)}/${encodeURIComponent(source)}`,
 			{ csrf }
-		),
+		);
+		return requireData<UnbindResult>(result, 'unbind result', {
+			upstream: isOneOf('done', 'unsupported', 'unavailable', 'nothing')
+		});
+	},
 
 	// The acknowledgement is required by the server, not by this client: ending
 	// somebody's sessions on every device should not be reachable without writing
 	// down that it means that. Sending it from here is the UI agreeing, not the UI
 	// deciding.
-	cascadeRevoke: (game: string, source: string, csrf: string) =>
-		call<UnbindResult>(
+	cascadeRevoke: async (game: string, source: string, csrf: string) => {
+		const result = await call<UnbindResult>(
 			'POST',
 			`/v1/bindings/${encodeURIComponent(game)}/${encodeURIComponent(source)}/cascade_revocation`,
 			{ body: { acknowledge: 'signs_out_all_devices' }, csrf }
-		)
+		);
+		return requireData<UnbindResult>(result, 'cascade revocation result', {
+			upstream: isOneOf('done', 'unsupported', 'unavailable', 'nothing')
+		});
+	}
 };

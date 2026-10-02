@@ -20,12 +20,14 @@ spec:
       serviceAccountName: re0auth
       # Longer than the server's own shutdown stack, which runs in series: it
       # flips /readyz to 503 and waits out the endpoint removal (5s), then drains
-      # in-flight requests (30s), then drains the audit batcher's queued rows
-      # (10s, auditDrainTimeout) — 5 + 30 + 10 = 45s total. 45s means the pod
-      # outlives the audit drain's own budget instead of being SIGKILLed before
-      # it can refuse what is left. The endpoint-removal wait is in the process,
-      # not a preStop hook: the scratch image has no /bin/sleep to run one with.
-      terminationGracePeriodSeconds: 45
+      # in-flight requests (shutdownTimeout, 45s — itself >= the data plane's 45s
+      # deadline, so a request the data plane admitted is answered rather than cut
+      # off), then drains the audit batcher's queued rows (10s, auditDrainTimeout)
+      # — 5 + 45 + 10 = 60s total. 60s means the pod outlives the audit drain's own
+      # budget instead of being SIGKILLed before it can refuse what is left. The
+      # endpoint-removal wait is in the process, not a preStop hook: the scratch
+      # image has no /bin/sleep to run one with.
+      terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

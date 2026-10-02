@@ -81,7 +81,7 @@ SPIKE_ARTIFACTS=$PWD/conformance-artifacts \
 
 | input | meaning |
 |---|---|
-| `plan_json` | repo-relative path to a plan payload (our wrapper around the suite's `POST /api/plan`; see [`scripts/conformance/plans/README.md`](../scripts/conformance/plans/README.md)). **Leave empty on the first run**: the spike then prints the suite's plan catalogue under "Available plans" in the run summary. |
+| `plan_json` | repo-relative path to a plan payload (our wrapper around the suite's `POST /api/plan`; see [`scripts/conformance/plans/README.md`](../scripts/conformance/plans/README.md)). **Leave empty on the first run**: the spike then prints the suite's plan catalogue under "Available plans" in the run summary. A non-empty value must name a plan on the allowlist (`CONFORMANCE_ALLOWED_PLANS`) or the job fails before the spike starts — see the *Which plan* gap. |
 | `redirect_uri` | the redirect URI seeded into the OP's `[client]`. It must equal the one the suite generates for the test; read it from the suite and pass it back here so both sides match. Blank keeps the script default. |
 | `require_plan` | when true, the script exits non-zero unless the plan reaches `FINISHED` with `SUCCESS`/`WARNING`/`REVIEW`/`SKIPPED`. Use this once the nightly is green — it is the same switch as dropping `continue-on-error`. |
 
@@ -127,6 +127,11 @@ Environment equivalents for a direct script run: `CONFORMANCE_PLAN_JSON`,
 `[client] allow_missing_pkce = true` itself once a plan is requested, and also seeds
 the plan's second client as a `[[clients]]` entry (see the known gap below).
 
+> The plan allowlist (CONF-2) is enforced by a workflow step, **not** by
+> `spike.sh` — a direct script run bypasses it. That is deliberate (the workflow is
+> the gate; the script is the mechanism), but it means "run it locally with any
+> `plan_json`" is not the same as "the gate would run it".
+
 ## The first real finding: mandatory PKCE vs the Basic OP profile
 
 The first plan run produced one substantive result, and it was a policy collision
@@ -159,22 +164,61 @@ exemption — check `op.log` for the startup WARN and for
 
 ## Known gaps (the reason this is still a spike)
 
-- **JVM trust store.** Addressed by milestone 4b: the script builds a derived image
-  `FROM registry.gitlab.com/openid/conformance-suite:latest` (the base is
-  `eclipse-temurin:21`, so the JDK is at `/opt/java/openjdk`) that runs
-  `keytool -importcert` against its `cacerts` with Caddy's local CA — root, plus the
-  intermediate when the layout has one, because the chain is root → intermediate →
-  leaf and some builds serve only the leaf. This has not been observed on a runner
-  yet — if the base image's JDK path differs, the build fails and the script falls
-  back to the upstream image (the connectivity milestones still report). A publicly
-  trusted certificate removes the need entirely.
+- **JVM trust store — PENDING VERIFICATION, never observed on a runner (CONF-3).**
+  The mechanism exists (milestone 4b): the script builds a derived image
+  `FROM registry.gitlab.com/openid/conformance-suite:latest` (`eclipse-temurin:21`)
+  that runs `keytool -importcert` against the JVM's `cacerts` with Caddy's local CA —
+  root, plus the intermediate when the layout has one, because the chain is
+  root → intermediate → leaf and some builds serve only the leaf.
+  **What is not established is that the build succeeds on a runner.** The JDK path
+  (`${JAVA_HOME:-/opt/java/openjdk}`) is an assumption read off the upstream base,
+  not an observation; if it is wrong the build fails and the script silently falls
+  back to the upstream image — the connectivity milestones still report, but the
+  suite keeps only the public CAs, so a plan run against the self-signed issuer fails
+  at TLS. Milestone 4b prints `PASS` or `WARN` in the run summary; do not write
+  "addressed" until a run shows `PASS`.
+  How to observe it on the runner (the same check can be run locally under WSL2):
+  ```sh
+  # 1. the JDK path the Dockerfile's RUN resolves to must exist
+  docker run --rm re0auth-conformance-spike:local \
+    sh -c 'echo JAVA_HOME=${JAVA_HOME:-unset}; ls -d "${JAVA_HOME:-/opt/java/openjdk}/lib/security/cacerts"'
+  # 2. both spike aliases must be in the trust store (intermediate only when Caddy has one)
+  docker run --rm re0auth-conformance-spike:local \
+    sh -c 'keytool -list -keystore "${JAVA_HOME:-/opt/java/openjdk}/lib/security/cacerts" \
+             -storepass changeit | grep -E "re0auth-spike-(root|intermediate)"'
+  ```
+  Command 1 must print an existing path, command 2 at least `re0auth-spike-root`; the
+  spike's `suite-build.log` (in the artifact) and its milestone-4b summary line are
+  the durable record. **Exit criteria to close CONF-3:** one CI run with milestone 4b
+  `PASS`, plus at least one plan module that exercises the suite→issuer TLS path green
+  with the derived image. Only then decide whether to keep the fallback as
+  warning-only safety or delete it. A publicly trusted certificate removes the need
+  entirely.
 - **Client registration.** The redirect URI the suite generates must be the one
   seeded into `[client]` (`CONFORMANCE_REDIRECT_URI`). Until it is observed, the
   value in the script is a placeholder.
-- **Which plan.** Certification plans are named per OP profile; this OP implements
-  authorization code + PKCE + refresh + device, and not dynamic registration or
-  PAR. The plan allowlist must name what is supported and record the rest as
-  intentionally out of scope, never silently skipped.
+- **Which plan — an explicit allowlist, and an unknown plan is an error (CONF-2).**
+  This OP implements authorization code + PKCE + refresh + device authorization; it
+  deliberately does **not** implement dynamic client registration (DCR) or pushed
+  authorization requests (PAR). The gate therefore names what it will run and refuses
+  everything else instead of silently skipping it:
+  - **Allowed** — `CONFORMANCE_ALLOWED_PLANS` in `.github/workflows/conformance.yml`
+    (job-level environment, comma-separated). It must contain only names copied from
+    the suite's own `plan-catalogue.json`; a name is never guessed. What is observed
+    so far is the authorization-code + PKCE Basic OP plan
+    `oidcc-basic-certification-test-plan` (the shipped
+    `scripts/conformance/plans/oidcc-basic.json`).
+  - **Intentionally unsupported** — plans that require DCR (the
+    `client_registration: dynamic_client` variant) or PAR. Recorded here and in
+    [oidc-decision.md](./oidc-decision.md) O-9 as out of scope by decision, not
+    skipped by accident. Device-grant and refresh plans are in scope and may be
+    added once their names are read off the catalogue.
+  - **Unknown / unlisted plan → the workflow fails before the spike starts**, naming
+    the value and the allowlist (the "Enforce the plan allowlist" step). A typo in
+    `plan_json` previously looked like a successful connectivity-only run.
+  - **Adding a plan is two edits**: prove it against `plan-catalogue.json` (its exact
+    `planName`, its variants, its configuration fields), then add the exact spelling
+    to `CONFORMANCE_ALLOWED_PLANS`.
 - **`oidcc-server`'s `client_id` warning is known behaviour, not a defect.** The
   engine's `NewIDTokenClaims` always writes a non-standard `client_id` claim into the
   `id_token` and offers no override point. The value is the RP's own `client_id` — no
@@ -215,15 +259,86 @@ exemption — check `op.log` for the startup WARN and for
   This is only for the suite's own run: it proves protocol behaviour, and it is not a
   certification result — the OIDF certification plans still expect a real client and
   user at the OP.
-- **Pinned images.** `caddy:2`, `curlimages/curl:latest`,
+- **Pinned images — not pinned yet, and no digest may be invented (CONF-1).**
+  `caddy:2`, `curlimages/curl:latest`,
   `registry.gitlab.com/openid/conformance-suite:latest` and `mongo:6.0.13` are
-  floating tags. Once the job is a gate they must be pinned by digest, like the
-  `Dockerfile` base images. (Docker Hub's `openid/conformance-suite` no longer
-  exists — the first CI run found that out; the project publishes to its own GitLab
-  registry.)
+  floating tags (`scripts/conformance/spike.sh`). The project's rule is that a gate
+  pins every image by digest, exactly as the `Dockerfile` base images do
+  (`node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1`,
+  `golang:1.27-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414`),
+  the CI/release Postgres service does
+  (`postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54`,
+  the same digest `deploy/k8s/backup/cronjob.yaml` uses; S15-2) and the release
+  scanner does (`aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7`).
+  **None of the four conformance images has an audited digest in this repository
+  yet**, so there is nothing to reuse: pinning them starts by observing each digest
+  once. Dependency row: [dependencies.md](./dependencies.md) §6.
+  Observe them once (the `conformance.yml` step "Record the image digests to pin"
+  already writes this table to the run summary; the same works on any Docker host):
+  ```sh
+  for ref in caddy:2 curlimages/curl:latest \
+             registry.gitlab.com/openid/conformance-suite:latest mongo:6.0.13; do
+    printf '%s %s\n' "$ref" \
+      "$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}')"
+  done
+  ```
+  Then replace each tag in `scripts/conformance/spike.sh` (the `SUITE_IMAGE` /
+  `MONGO_IMAGE` variables and the `caddy` / `curlimages/curl` `docker run` commands)
+  with `<tag>@<digest>`, using only a digest that was observed resolving to the tag
+  that was tested — a digest copied from a blog or a registry page is not an
+  observation. Docker Hub's `openid/conformance-suite` no longer exists — the first
+  CI run found that out; the project publishes to its own GitLab registry.
 
-## Turning it into a gate
+## Turning it into a gate (upgrade path + blocking conditions)
 
-1. A nightly run with all chosen plans green.
-2. Drop `continue-on-error` from the spike step and pin every image by digest.
-3. Call the job from `release.yml` so a `v*` tag cannot publish without it.
+This is still a spike and `continue-on-error` is still **on purpose**: no plan has
+been observed green, so removing it today would turn an unproven signal into a
+blocking job — the failure mode that ends with a gate being deleted rather than
+fixed. What can be done without pretending is already done: the conformance
+auto-login is build-tagged and runtime-gated, the plan allowlist is enforced (CONF-2),
+the four images' digests are recorded by the run itself (CONF-1), `conformance.yml`
+already declares `workflow_call` (the mechanical prerequisite for step 4), and the
+`require_plan` dispatch input already fails a single dispatch hard. The remaining
+steps are gated on evidence and are run in order.
+
+**Blocking conditions — every one must hold before the next step:**
+
+1. **Nightly, chosen plans, all green.**
+   - Gate: a scheduled run, or a dispatch with `require_plan: true`, finishes with
+     every module in `SUCCESS`/`WARNING`/`REVIEW`/`SKIPPED`, and every `WARNING` is a
+     known one tied to a decision (the `oidcc-server` `client_id` warning is O-10 in
+     [oidc-decision.md](./oidc-decision.md)).
+   - Evidence to attach: the run's step summary, `plan-run.json` from the
+     `conformance-spike` artifact, and `op.log` with no unexpected `WARN`.
+2. **Drop `continue-on-error`** (CONF-4).
+   - Precondition: step 1 holds, the derived suite image is observed green (CONF-3),
+     and the allowlist contains exactly the plans that are green.
+   - Edit: remove `continue-on-error: true` from the spike step in
+     `.github/workflows/conformance.yml`, and keep the nightly's
+     `CONFORMANCE_REQUIRE_PLAN=1`.
+   - Rollback: if the *suite* turns out to be the flaky part, note the flake and fix
+     it; do not leave a permanently red gate.
+3. **Pin every image by digest** (CONF-1).
+   - Precondition: the four digests were observed resolving to the tested tags.
+   - Edit: `scripts/conformance/spike.sh` (and any `docker run` in the workflow).
+   - Why it is ordered here: a pinned digest makes a later red run attributable to
+     the OP or the plan, not to whatever `latest` became overnight.
+4. **Call it from `release.yml` before a tag can publish.**
+   - Precondition: steps 1–3 done. Calling a report-only workflow from the release
+     graph is worse than not calling it — it reads as a gate without being one.
+   - Edit: one job in `release.yml`, then add it to the `needs:` of `image` and
+     `release`:
+
+     ```yaml
+     conformance:
+       needs: ci
+       uses: ./.github/workflows/conformance.yml
+       with:
+         plan_json: scripts/conformance/plans/oidcc-basic.json
+         require_plan: true
+       permissions:
+         contents: read
+     ```
+
+     `image` becomes `needs: [ci, conformance]`, `release` becomes
+     `needs: [ci, conformance, image]`.

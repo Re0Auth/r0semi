@@ -106,7 +106,7 @@ audit ────────────────────> oauth
 > 已迁出 Re0Auth：它们现在属于**参考数据源**（`referencesource`），并作为公开库
 > （`vault` / `tapsign` / `taptapoauth`）供任何数据源复用。**Re0Auth 自身不再持有任何凭据。**
 
-> **包分层（v1 公开化）**：`audit`、`httpclient`、`idp`、`oauth`、`upstreamkit`(+`conformance`)、`vault`、`tapsign`、`taptapoauth`、`referencesource`
+> **包分层（v1 公开化）**：`audit`、`httpclient`、`idp`、`oauth`、`safeurl`、`upstreamkit`(+`conformance`)、`vault`、`tapsign`、`taptapoauth`、`referencesource`
 > 是**公开库**，不依赖 `internal/`，可被**进程外的独立服务**（数据源）导入。Re0Auth 自己的库（`oauth`）
 > 不自带能力键——key 与 `core.Component` 装配统一声明在 `internal/wiring`，因为**库不该耦合 DI 容器**。
 >
@@ -304,6 +304,10 @@ RFC 8628 的 `verification_uri` 指向**人类页面** `/app/device`（`oauth.Co
 **出站韧性**（`httpclient`，基于 `failsafe-go`）：重试（指数退避 + 抖动，认 `Retry-After`）、按上游 host 的
 熔断器、出站 bulkhead 三件套。**策略在本仓库、机制在库里**：**默认只重试幂等方法**（POST 不隐式重放），
 429/502/503/504 可重试而 500 不可，这些规则仍在 `httpclient`；循环、退避调度与熔断状态机来自库。
+**注意这是 `httpclient` 提供的能力，不是每个出站客户端都装它**：数据面的组合根
+（`cmd/re0auth`）只装熔断 / bulkhead / 地址闸门，**不装** `Retry`；装 `Retry` 的是
+`cmd/referencesource` 的 TapTap 客户端，且有一条守卫测试阻止数据面把它加回来——
+理由见 [resilience-decision.md](./resilience-decision.md)「数据面刻意不重试（旋转型单次凭据）」（FO-05）。
 bulkhead 的许可覆盖整段响应体（直到 body 关闭），不是只覆盖到响应头。选型、被否的方案与三处语义变化见
 [resilience-decision.md](./resilience-decision.md)（ADR-0009），依赖表见 [dependencies.md](./dependencies.md)。
 
@@ -465,7 +469,10 @@ re0auth 的数据面：把下游对某个游戏资源的请求，映射到一个
 - **HTTP**：`GET /v1/games/{game}/sources`（公开发现，含状态与 raw 支持）、
   `GET /v1/games/{game}/{resource}`（AT + scope）。响应带 `Re0Auth-Source`，降级时附 `Re0Auth-Degraded`。
 
-> 已知粗粒度处：raw 的 scope 门禁用的是“该源任一资源 scope”，专用 `<game>.raw.read` 为后续工作。
+> raw 的 scope 门禁是显式的 `<game>.raw.read`（Z20-2，见 [upstream-protocol.md](./upstream-protocol.md) §9.1）：
+> 「持该源任一资源 scope 即可 raw」的旧规则已移除，同意页取消勾选的权限不能从 raw 绕过。
+> 该 scope 由组合根按配置的游戏生成并登记（`cmd/re0auth` 的 `rawScopeDescriptors` /
+> `registerRawScopes`，`Risk = high`），客户端仍须在自己的 `scopes` 里显式放行。
 
 ### 4.12 参考数据源（切片 1–4 已实现：`referencesource` + `cmd/referencesource`）
 
@@ -658,8 +665,17 @@ pseudonym = HMAC(key, "…pseudonym/1" ‖ subject)              -- 写进 audit
   `lifecycle` 里有测试钉住这个顺序（`TestDeleteAccountDestroysThePseudonymKeyLast`）。
 - **销毁之后**同一 subject 若再来事件（例如某个陈旧会话），会拿到**新的** key、**不同的**假名，
   因此与旧行失去关联——这正是想要的。
-- **跨进程缓存不破坏擦除**：每个进程缓存 subject→key 以避免每次写审计都查库，
-  但假名是确定性的，缓存命中也只是继续产出同一个假名；不可关联性来自**密钥行不存在**，与缓存无关。
+- **跨进程擦除靠墓碑，不靠「缓存无害」**（Z10-1：当初这一节写的「不可关联性来自密钥行不存在、
+  与缓存无关」是错的）。每个进程缓存 subject→key 以避免每次写审计都查库，问题恰恰在这个缓存——
+  **别的副本**抹除之后，本副本的 warm cache 仍然合法地算着**旧**假名，于是被抹除账号的新事件
+  继续与已抹除的历史关联，而且只要缓存还在命中，它就不是一个窗口。
+  现在 `Destroy` 在**同一事务**里删 `audit_subject_keys` 行并写一条 `audit_subject_tombstones`
+  （迁移 `0034`）；每个副本按 `seq` 增量同步墓碑（间隔 1s），`loadKey` **先查墓碑再信缓存**，
+  命中墓碑就丢弃本地缓存条目并回库重读——行已不在，于是这一条新事件铸一把**新** key、得到**新**
+  假名，与旧行失去关联（这正是上面「销毁之后」那条要的结果）。`pseudoCacheTTL`（30s）退化为
+  「够不到墓碑表时的兜底」，缓存满时按 `pseudoCacheMax`（4096）**部分淘汰**（S09-9）。
+  诚实的边界（Z10-1 的残余）：跨副本可见性最多滞后一个同步间隔（1s）；墓碑表读不到时这条路径
+  **fail-closed 报错**，而不是回答「未抹除」——它坐在 vault 的 fail-closed 审计路径上。
 - **诚实的边界**：
   - **迁移前的行保留原样**（原样就是当时的 `usr_…` 或空）。没有回填——回填要么使 0013 写在旧值上的哈希失效，
     要么需要一个启动期的 Go 数据迁移。这是一次性的边界，写在这里而不是假装没有。
@@ -712,7 +728,9 @@ critical scope 强制显式同意、refresh 轮换、撤销幂等、令牌过期
 `/v1/me` 的 Bearer + scope 校验、自省 / 撤销、以及三个平面错误格式互不泄漏。
 
 `internal/auth` 用假 IdP + Cookie jar 跑完整登录/绑定往返：start 生成 PKCE、callback 兑换并落地会话、
-`identity_taken` 拒绝、`return_to` 防开放重定向、CSRF 令牌校验。
+`link_failed` 回跳拒绝、`return_to` 防开放重定向、CSRF 令牌校验。（绑定回调**不再**用
+`identity_taken` 区分「外部身份已被他人占用」：占用与其它链接失败同样回 `?error=link_failed`，
+占用事实只写进服务端审计的 `Detail["code"]`，否则回跳码就是一个账号存在性预言机——Z07-8。）
 
 `internal/httpapi` 的 `TestAuthorizationInteractionEndToEnd` 用一套假 IdP 跑通**全栈**：
 登录 → `/oauth/authorize` → 同意页数据 → 决策 → 换码 → `/v1/me`。

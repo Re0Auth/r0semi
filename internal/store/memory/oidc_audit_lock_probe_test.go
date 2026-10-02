@@ -100,7 +100,7 @@ func TestApproveDeviceAuditsOutsideTheStoreLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertLockFreeDuringAudit(t, store, log, func() error {
-		return store.ApproveDevice(ctx, "LOCK-0001", "usr_1", nil)
+		return store.approveDevice(ctx, "LOCK-0001", "usr_1", nil)
 	})
 }
 
@@ -113,6 +113,6 @@ func TestDenyDeviceAuditsOutsideTheStoreLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertLockFreeDuringAudit(t, store, log, func() error {
-		return store.DenyDevice(ctx, "LOCK-0002")
+		return store.DenyDevice(ctx, "LOCK-0002", "usr_1")
 	})
 }

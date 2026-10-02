@@ -1059,20 +1059,44 @@ paths:
     get:
       operationId: adminListClients
       tags: [admin]
-      summary: Every registered downstream client, suspended ones included.
+      summary: One page of registered downstream clients, suspended ones included.
       description: |
         The operator's inventory. Unlike `GET /v1/grants`, this is not scoped to
         the caller: it is a deployment-wide view for reviewing what applications
         exist and what they may request.
+
+        The listing is paged: ordered by `client_id` ascending, bounded by
+        `limit`, and resumed with the opaque `next_cursor` a previous page
+        returned. The cursor names the last client id of the page rather than an
+        offset, so a client registered between two requests cannot make the next
+        page repeat or skip a row.
 
         Requires an account whose `usr_…` id is on the deployment's admin
         allowlist. A signed-in non-admin is answered `404`, not `403`: the
         operator plane is not advertised to accounts that cannot use it.
       security:
         - sessionCookie: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Page size, between 1 and 100. Absent means 100. A value outside the
+            range — `0`, a negative number, or anything above the ceiling — is a
+            `400`, never a silent clamp: a caller that asked for 1000 and got 100
+            would read the short page as the end of the list.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            `next_cursor` from the previous page. Opaque; a value the server did
+            not issue is a `400` rather than a restart from the first page, so a
+            paging loop cannot repeat itself forever.
+          schema: { type: string }
       responses:
         '200':
-          description: All clients, ordered by client id.
+          description: A page of clients, ordered by client id.
           content:
             application/json:
               schema:
@@ -1083,6 +1107,16 @@ paths:
                     type: array
                     items: { $ref: '#/components/schemas/AdminClient' }
                   csrf_token: { type: string }
+                  next_cursor:
+                    type: string
+                    description: |
+                      Pass as `cursor` to fetch the next page. Absent on the last
+                      page.
+        '400':
+          description: A malformed `limit`, or a `cursor` this endpoint did not issue.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404':
           description: The caller is not an administrator.
@@ -1278,9 +1312,13 @@ paths:
       tags: [admin]
       summary: Delete a client registration and revoke its tokens.
       description: |
-        Removes the registration and deletes every token the client holds. The
-        token purge runs whether or not the registration existed, so a retry after
-        a dropped response still cuts live access. Idempotent.
+        Removes the registration and revokes every credential the client holds:
+        its access and refresh tokens, any unspent authorization code, and any
+        pending authorization or device authorization. That revocation is part of
+        the delete, not a follow-up — a deleted client must not keep acting
+        through a token it already obtained, and an unredeemed code could mint a
+        fresh pair. The token purge runs whether or not the registration existed,
+        so a retry after a dropped response still cuts live access. Idempotent.
       security:
         - sessionCookie: []
       parameters:
@@ -1834,12 +1872,16 @@ components:
           type: string
           description: |
             `revocable` or `long_lived`, as the source declared it. `long_lived`
-            is why disconnecting may leave a live login at the source.
-          enum: [revocable, long_lived]
+            is why disconnecting may leave a live login at the source. The empty
+            string is emitted when the source has left this deployment's
+            configuration (`configured: false`), so the closed enum admits it.
+          enum: [revocable, long_lived, ""]
         status:
           type: string
-          description: The source's lifecycle state.
-          enum: [active, degraded, retired]
+          description: |
+            The source's lifecycle state. The empty string is emitted when the
+            source has left this deployment's configuration (`configured: false`).
+          enum: [active, degraded, retired, ""]
         has_refresh:
           type: boolean
           description: Whether the token can be renewed without asking the user again.

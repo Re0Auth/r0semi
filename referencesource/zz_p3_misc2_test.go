@@ -12,6 +12,7 @@ import (
 
 	"github.com/Re0Auth/r0semi/referencesource"
 )
+
 // newProbeBrowser is a client with its own cookie jar: the identity of one
 // browser, which is what the probes below are about.
 func newProbeBrowser(t *testing.T) *http.Client {
@@ -151,7 +152,7 @@ func TestZ14_6TapTapBindingIsSecretAndChecked(t *testing.T) {
 		t.Fatal("the challenge set no TapTap binding cookie")
 	}
 	if strings.Contains(raw, bind) {
-		t.Errorf("the challenge body contains the binding cookie value: the value exists to be "+
+		t.Errorf("the challenge body contains the binding cookie value: the value exists to be " +
 			"withheld from the page that started the challenge, which is the attacker's own page")
 	}
 

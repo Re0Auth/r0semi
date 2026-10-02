@@ -156,7 +156,7 @@ func TestProbeUnparsableBodyDefeatsTheDeviceScopeGate(t *testing.T) {
 	// The scope the gate was supposed to stop does not stop at the authorization:
 	// the human approves (the consent page renders the catalogue, not the client's
 	// registration), and the token carries it.
-	if err := e.store.ApproveDevice(t.Context(), userCode, "usr_probe", nil); err != nil {
+	if err := e.store.DecideDeviceAuthorization(t.Context(), userCode, "usr_probe", true, nil, nil); err != nil {
 		t.Fatalf("approval: %v", err)
 	}
 	pollResp, pollRaw := e.postForm(t, "/oauth/token", url.Values{

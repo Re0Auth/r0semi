@@ -115,6 +115,15 @@ Passkey 的 OP 即可；Re0Auth 仍不持有也不验证任何密码/密钥。pr
 - 登录**无法发起**（如自定义 OIDC provider 的 discovery 不可达）时，**不返回裸 502**，而是 303 回
   `return_to?error=provider_unavailable`，由前端给出可读提示。provider 拒绝（`error=access_denied`）
   同样回 `return_to?error=…`；因此 `return_to` 为空时需要 `/` → `/app/` 的跳转**带上 query**，否则原因会丢。
+- **回跳码的完整契约**以 `internal/auth/auth.go` 的 `redirectCodes` 为准（前端每个码必须有文案，
+  由 `TestLoginFailureCodesAreExplainedByTheFrontend` 反向钉住）：
+  `access_denied`、`provider_unavailable`、`invalid_request`、`exchange_failed`、`identity_failed`、
+  `not_signed_in`、`link_failed`、`signup_failed`、`lookup_failed`、`session_failed`。
+  另有几类失败（未知 provider、伪造的 `state`、provider 不匹配）**不重定向**，直接 400，
+  所以它们不在码表里。
+- **`identity_taken` 不是回跳码**（Z07-8）：绑定回调里「该外部身份已被他人占用」与其它链接失败
+  一律回 `?error=link_failed`，占用事实只写进服务端审计的 `Detail["code"]`。否则调用方可以用
+  回跳码确认某个外部身份是否已有 Re0Auth 账号（存在性预言机）。
 - IdP 采用 Authorization Code + PKCE；`state` 单次使用、短时效。
 - provider 具体细节（scope、QQ unionid、微软 tenant）属实现，不改变本节契约。
 

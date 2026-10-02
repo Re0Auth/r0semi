@@ -135,16 +135,28 @@ func killSwitchRecordsThroughKillDetail(killBody string) bool {
 	return strings.Contains(killBody, "s.recordKill(") && !strings.Contains(killBody, "map[string]string{")
 }
 
-// TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer is Z10-5, kept as
-// it was: the finding is still open, and the source shape it reads is unchanged.
-// It re-derives Z10-5 from both ends: admin.KillSwitch returns (report, err) with
-// the counts it already cut, and the HTTP handler writes only a problem body on
-// the error branch.
+// TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer is the flipped form
+// of Z10-5; the name is kept so the coverage matrix still maps here.
+//
+// The finding was: a partially applied sweep kept its 500, but the HTTP layer's
+// error branch discarded the report, so a caller of a failed `all` sweep could not
+// tell what had already been cut — and those cuts are irreversible. The fix wraps
+// the failure with the report (admin.PartialError) and renders every completed
+// count as an RFC 9457 extension member on the 500 (httpapi.withKillSwitchPartial).
+//
+// The guard pins both ends: every failing path returns `partial(step, rep, err)`,
+// and the handler's error branch calls withKillSwitchPartial and enumerates the
+// counts. The anti-vacuity control feeds the pre-fix handler (which discarded the
+// report) to the same predicate, so a revert turns this red.
 func TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer(t *testing.T) {
-	// Service end: every error return hands back `rep` alongside the error.
+	// Service end: every failure hands the report back wrapped with the step.
 	kill := funcBody(t, "internal/admin/admin.go", "KillSwitch")
-	if n := strings.Count(kill, "return rep, err"); n < 3 {
-		t.Fatalf("admin.KillSwitch returns (rep, err) on only %d paths; the promise Z10-5 tests is gone", n)
+	if n := strings.Count(kill, "return rep, partial("); n < 4 {
+		t.Fatalf("admin.KillSwitch wraps the report on only %d failure paths; the Z10-5 contract "+
+			"(the report travels with the error) is gone", n)
+	}
+	if !killSwitchPartialFailuresCarryTheReport(kill) {
+		t.Errorf("KillSwitch no longer returns its partial report on a failure; Z10-5's fix is reverted")
 	}
 	for _, frag := range []string{"return rep, ErrInvalidTarget", "return rep, ErrBindingsUnavailable"} {
 		if !strings.Contains(kill, frag) {
@@ -158,22 +170,52 @@ func TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer(t *testing.T) {
 		t.Errorf("the report no longer carries sessions_revoked; Z10-5's premise changed")
 	}
 
-	// HTTP end: the error branch discards the report.
+	// HTTP end: the error branch now RENDERS the report as problem extensions.
 	const routes = "internal/httpapi/admin_routes.go"
 	handler := funcBody(t, routes, "handleAdminKillSwitch")
 	if !strings.Contains(handler, "report, err := s.adminSvc.KillSwitch(") {
 		t.Fatalf("the handler no longer receives the report; re-derive Z10-5")
 	}
-	errBranch := regexp.MustCompile(`(?s)case err != nil:(.*?)writeProblem`).FindStringSubmatch(handler)
-	if errBranch == nil {
-		t.Fatalf("the handler's generic error branch changed shape; re-derive Z10-5")
+	if !handlerRendersThePartialReport(handler) {
+		t.Errorf("the handler's error branch no longer renders the completed counts as problem " +
+			"extensions; Z10-5's fix has been reverted and a failed sweep is opaque again")
 	}
-	if strings.Contains(errBranch[1], "report") {
-		t.Errorf("the handler's error branch now uses the report — Z10-5 may be fixed and its verdict must change")
+	if !strings.Contains(handler, "http.StatusInternalServerError") {
+		t.Errorf("a partial sweep no longer keeps its 500; Z10-5's premise (a failure stays a failure) changed")
+	}
+	partial := funcBodyRaw(t, routes, "withKillSwitchPartial")
+	for _, field := range []string{"TokensRevoked", "SessionsRevoked", "ClientsSuspended", "FlowsPurged"} {
+		if !strings.Contains(partial, "p."+field+" = &rep."+field) {
+			t.Errorf("withKillSwitchPartial no longer carries %s as an explicit extension member; a "+
+				"completed count is missing from the failed sweep's answer again", field)
+		}
 	}
 	if !strings.Contains(handler, "writeJSON(w, http.StatusOK, report)") {
-		t.Errorf("the success branch no longer writes the report; the asymmetry Z10-5 rests on is gone")
+		t.Errorf("the success branch no longer writes the report; the asymmetry Z10-5 rested on is gone")
 	}
+
+	// Anti-vacuity: the pre-fix error branch discarded the report. The predicate
+	// must reject it.
+	preFix := `case err != nil:
+		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "the kill switch could not complete")`
+	if handlerRendersThePartialReport(preFix) {
+		t.Fatal("the predicate accepts the pre-fix handler that discards the partial report; this guard " +
+			"would not fail on a revert and is vacuous")
+	}
+}
+
+// killSwitchPartialFailuresCarryTheReport reports whether every failure exit
+// wraps the report with the step that stopped the sweep.
+func killSwitchPartialFailuresCarryTheReport(killBody string) bool {
+	return strings.Count(killBody, "return rep, partial(") >= 4 &&
+		!strings.Contains(killBody, "return rep, err\n")
+}
+
+// handlerRendersThePartialReport reports whether the handler's generic error
+// branch unwraps the partial error and renders it as problem extensions.
+func handlerRendersThePartialReport(handler string) bool {
+	return strings.Contains(handler, "errors.As(err, &pe)") &&
+		strings.Contains(handler, "withKillSwitchPartial(pe)")
 }
 
 // TestZ10VerifyShutdownStackFitsThePodGracePeriod is the flipped form of Z10-3
@@ -210,13 +252,13 @@ func TestZ10VerifyShutdownStackFitsThePodGracePeriod(t *testing.T) {
 
 	// The documentation moved with the code, and this half is not optional: the
 	// old comment's "35s total" was what made G-12 keep getting re-reported.
-	if !strings.Contains(deploy, "5 + 30 + 10 = 45s") {
-		t.Errorf("the manifest comment no longer counts the whole stack (5 + 30 + 10 = 45s); the budget it " +
+	if !strings.Contains(deploy, "5 + 45 + 10 = 60s") {
+		t.Errorf("the manifest comment no longer counts the whole stack (5 + 45 + 10 = 60s); the budget it " +
 			"documents and the budget the process spends have drifted apart again")
 	}
 	cl := repoFile(t, "CHANGELOG.md")
-	if !strings.Contains(cl, "terminationGracePeriodSeconds ≥ 45s") {
-		t.Errorf("the CHANGELOG no longer advises terminationGracePeriodSeconds ≥ 45s; the documented budget " +
+	if !strings.Contains(cl, "terminationGracePeriodSeconds ≥ 60s") {
+		t.Errorf("the CHANGELOG no longer advises terminationGracePeriodSeconds ≥ 60s; the documented budget " +
 			"no longer covers the whole stack")
 	}
 }

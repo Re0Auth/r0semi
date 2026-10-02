@@ -2,13 +2,17 @@ package oauth
 
 import (
 	"context"
+	"crypto/pbkdf2"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,7 +48,8 @@ const (
 )
 
 // A Client is a registered downstream application. The secret is stored only as
-// a SHA-256 hash.
+// a salted PBKDF2-HMAC-SHA256 verifier (see NewSecretHash); the plaintext is
+// never persisted.
 type Client struct {
 	ID            string
 	Name          string
@@ -114,21 +119,149 @@ func NewClient(id, name string, typ ClientType, secret string, redirects []strin
 	return c, nil
 }
 
+// Verifier parameters for client secrets.
+//
+// S01-10: the digest used to be a bare unsalted SHA-256 of the secret. That is a
+// fast hash with no per-secret salt, so a dumped registry could be tested against
+// a wordlist (and two clients sharing a secret were visibly identical) at GPU
+// speed. The verifier is now a salted, deliberately slow PBKDF2-HMAC-SHA256 with
+// its algorithm and parameters carried in the stored string, so the format itself
+// is part of the contract and the work factor can be raised later without a new
+// column.
+//
+// Argon2id (golang.org/x/crypto/argon2) was the first choice, but x/crypto is not
+// a dependency of this module (go.mod has no require for it) and the task's write
+// scope excludes go.mod/go.sum. crypto/pbkdf2 is standard library as of Go 1.24,
+// needs no new module, and the parameters below are tuned for a generated,
+// high-entropy client secret rather than a human password.
+const (
+	// secretHashAlgorithm is the scheme name stored as the second field.
+	secretHashAlgorithm = "pbkdf2-sha256"
+	// secretHashIterations is the PBKDF2 iteration count written into every new
+	// verifier. A verifier stores its own count, so raising this does not
+	// invalidate already-stored secrets.
+	secretHashIterations = 210_000
+	// secretHashMaxIterations bounds what a stored verifier may ask a reader to
+	// compute, so a corrupted or hostile row cannot turn one authentication into
+	// an unbounded amount of work.
+	secretHashMaxIterations = 4_000_000
+	// secretHashSaltBytes is the per-secret random salt.
+	secretHashSaltBytes = 16
+	// secretHashKeyBytes is the derived verifier length.
+	secretHashKeyBytes = 32
+)
+
 // NewSecretHash returns the stored digest of a client secret. Registration and
 // rotation use it to turn a freshly generated secret into the form a registry
 // persists; Authenticate is its counterpart.
+//
+// The returned bytes are a PHC-like ASCII string
+// "$pbkdf2-sha256$i=<iterations>$<salt>$<dk>", where salt and dk are unpadded
+// standard base64. Every call draws a fresh salt, so two hashes of the same
+// secret are different bytes; equality of two stored digests is therefore NOT a
+// statement about the secrets. Callers that need to compare a configured secret
+// against a stored one must call Authenticate.
+//
+// It panics only when the system CSPRNG fails. That is not a condition under
+// which a process may keep registering credentials, and a fallback would be a
+// silent downgrade of exactly the property this function exists to provide.
 func NewSecretHash(secret string) []byte {
-	sum := sha256.Sum256([]byte(secret))
-	return sum[:]
+	encoded, err := hashSecret(secret)
+	if err != nil {
+		panic("oauth: NewSecretHash: " + err.Error())
+	}
+	return encoded
+}
+
+// hashSecret is NewSecretHash with the entropy failure returned rather than
+// panicked, for the one caller that can still refuse.
+func hashSecret(secret string) ([]byte, error) {
+	salt := make([]byte, secretHashSaltBytes)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, fmt.Errorf("client secret salt: %w", err)
+	}
+	dk, err := pbkdf2.Key(sha256.New, secret, salt, secretHashIterations, secretHashKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("client secret hash: %w", err)
+	}
+	return []byte("$" + secretHashAlgorithm + "$i=" + strconv.Itoa(secretHashIterations) + "$" +
+		base64.RawStdEncoding.EncodeToString(salt) + "$" +
+		base64.RawStdEncoding.EncodeToString(dk)), nil
+}
+
+// splitSecretHash parses a stored verifier, returning its salt, derived key and
+// work factor. It is the only reader of the encoding, so RestoreClient's
+// admission and Authenticate's verification cannot disagree about what a
+// well-formed digest is. An unparseable value reports ok=false; the old bare
+// SHA-256 digest is unparseable here on purpose (S01-10: no legacy verify path).
+func splitSecretHash(encoded []byte) (salt, dk []byte, iterations int, ok bool) {
+	parts := strings.Split(string(encoded), "$")
+	if len(parts) != 5 || parts[0] != "" || parts[1] != secretHashAlgorithm {
+		return nil, nil, 0, false
+	}
+	rawIter, found := strings.CutPrefix(parts[2], "i=")
+	if !found {
+		return nil, nil, 0, false
+	}
+	iterations, err := strconv.Atoi(rawIter)
+	if err != nil || iterations < 1 || iterations > secretHashMaxIterations {
+		return nil, nil, 0, false
+	}
+	salt, err = base64.RawStdEncoding.DecodeString(parts[3])
+	if err != nil || len(salt) < 8 {
+		return nil, nil, 0, false
+	}
+	dk, err = base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil || len(dk) != secretHashKeyBytes {
+		return nil, nil, 0, false
+	}
+	return salt, dk, iterations, true
+}
+
+// validSecretHash reports whether encoded is a verifier this package produced, so
+// a registry cannot persist a digest that no later process can authenticate
+// against.
+func validSecretHash(encoded []byte) bool {
+	_, _, _, ok := splitSecretHash(encoded)
+	return ok
+}
+
+// ValidSecretHash reports whether encoded is a client-secret verifier this
+// package's NewSecretHash produced — the shape both RestoreClientWithStatus and
+// RotateSecret admit. It is exported for a ClientAdmin registry that stores the
+// digest outside oauth: an invalid or legacy digest must be refused at rotation,
+// not accepted and then turned into an unknown client at the next RestoreClient.
+//
+// It is a shape check only; it does not authenticate. Use Client.Authenticate to
+// compare a plaintext secret against a stored verifier.
+func ValidSecretHash(encoded []byte) bool {
+	return validSecretHash(encoded)
+}
+
+// verifySecretHash recomputes the verifier for secret and compares it in constant
+// time. The iterations come from the stored encoding, so an older verifier keeps
+// working after the current work factor is raised.
+func verifySecretHash(encoded []byte, secret string) bool {
+	salt, want, iterations, ok := splitSecretHash(encoded)
+	if !ok {
+		return false
+	}
+	got, err := pbkdf2.Key(sha256.New, secret, salt, iterations, len(want))
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(want, got) == 1
 }
 
 // Authenticate checks a client secret in constant time.
+//
+// It is the only correct way to compare a configured plaintext secret with a
+// Client, because the stored digest is salted and differs on every construction.
 func (c Client) Authenticate(secret string) bool {
 	if len(c.secretHash) == 0 {
 		return false
 	}
-	sum := sha256.Sum256([]byte(secret))
-	return subtle.ConstantTimeCompare(c.secretHash, sum[:]) == 1
+	return verifySecretHash(c.secretHash, secret)
 }
 
 // SecretHash returns the stored digest of the client secret, for persistence.
@@ -158,7 +291,7 @@ func RestoreClientWithStatus(id, name string, typ ClientType, status ClientStatu
 		return Client{}, errors.New("oauth: client id is required")
 	case typ != ClientPublic && typ != ClientConfidential:
 		return Client{}, fmt.Errorf("oauth: invalid client type %q", typ)
-	case typ == ClientConfidential && len(secretHash) != sha256.Size:
+	case typ == ClientConfidential && !validSecretHash(secretHash):
 		return Client{}, errors.New("oauth: confidential client requires a secret hash")
 	case typ == ClientPublic && len(secretHash) != 0:
 		return Client{}, errors.New("oauth: public client must not have a secret hash")
@@ -358,36 +491,181 @@ func LookupClientNames(ctx context.Context, reg ClientRegistry, ids []string) ma
 	return out
 }
 
+// Client-page bounds. Every ListClients implementation resolves a caller's
+// limit with ResolveClientPageLimit, so the default and the ceiling cannot drift
+// between the in-memory and Postgres registries, and a caller that passes a bad
+// limit is refused (ErrInvalidClientLimit) rather than silently clamped.
+//
+// The default is the ceiling on purpose: an operator inventory is small, so a
+// request that names no limit gets the largest page this endpoint will serve.
+const (
+	DefaultClientPageSize = 100
+	MaxClientPageSize     = 100
+)
+
+// ErrInvalidClientLimit reports a limit outside [1, MaxClientPageSize].
+var ErrInvalidClientLimit = errors.New("oauth: invalid client page limit")
+
+// ErrInvalidClientCursor reports a cursor this package did not issue: a cursor
+// that fails to decode, or whose payload is not one of ours. It is a typed error
+// so the HTTP layer can answer 400 instead of treating an unreadable cursor as a
+// store fault — or, worse, quietly starting over from the first page, which would
+// make a caller's paging loop repeat data forever.
+var ErrInvalidClientCursor = errors.New("oauth: invalid client cursor")
+
+// clientCursorPrefix versions the decoded cursor payload. The prefix is checked
+// on decode, so a value that decodes to bytes this package did not write — a
+// cursor from another endpoint, or a forged one — is refused rather than
+// interpreted as a client id.
+const clientCursorPrefix = "cl1:"
+
+// EncodeClientCursor turns the last row's sort key (the client id) into the
+// opaque cursor a caller passes back as `cursor`. base64url without padding
+// keeps it safe in a query string, and the version prefix keeps it from being
+// confused with any other endpoint's cursor.
+//
+// The key is not encrypted: it names a client id that the same caller can
+// already read from the page. It is opaque only in the sense that its shape is
+// not part of the API — clients must treat it as a value to echo, and a value
+// the server did not produce is rejected.
+func EncodeClientCursor(id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(clientCursorPrefix + id))
+}
+
+// DecodeClientCursor reverses EncodeClientCursor. An empty cursor means "the
+// first page" and is not an error; anything else must decode to a non-empty
+// payload with this package's prefix.
+func DecodeClientCursor(cursor string) (string, error) {
+	if cursor == "" {
+		return "", nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return "", fmt.Errorf("%w: it is not base64url", ErrInvalidClientCursor)
+	}
+	after, found := strings.CutPrefix(string(raw), clientCursorPrefix)
+	if !found || after == "" {
+		return "", fmt.Errorf("%w: it does not carry a client key", ErrInvalidClientCursor)
+	}
+	return after, nil
+}
+
+// ResolveClientPageLimit applies the page-size contract: zero means "the
+// caller did not ask", which becomes DefaultClientPageSize; anything outside
+// [1, MaxClientPageSize] is refused with ErrInvalidClientLimit.
+//
+// A limit above the ceiling is an error rather than a clamp because a caller
+// that asked for 10,000 rows and silently received 100 would page wrong — it
+// would take the short page as the end of the list.
+func ResolveClientPageLimit(limit int) (int, error) {
+	if limit == 0 {
+		return DefaultClientPageSize, nil
+	}
+	if limit < 1 || limit > MaxClientPageSize {
+		return 0, fmt.Errorf("%w: it must be between 1 and %d", ErrInvalidClientLimit, MaxClientPageSize)
+	}
+	return limit, nil
+}
+
 // ClientAdmin is the management side of a registry: the operations an operator
 // uses to review and revoke clients. It is separate from ClientRegistry so the
 // protocol plane depends only on what it needs to serve requests, and so a
 // read-only or third-party registry remains a valid ClientRegistry.
 type ClientAdmin interface {
-	// List returns every client, suspended ones included, ordered by id.
-	List(ctx context.Context) ([]Client, error)
+	// ListClients returns one page of clients ordered by id ascending, suspended
+	// ones included, plus the cursor that fetches the next page.
+	//
+	// Ordering is deterministic and total because the id is the sort key and is
+	// unique: a page boundary is a client id, not an offset, so a row inserted
+	// between two pages cannot duplicate or skip one the way an OFFSET would.
+	//
+	// limit is resolved with ResolveClientPageLimit (0 means the default; an
+	// out-of-range value is ErrInvalidClientLimit). cursor is a value a previous
+	// call returned as nextCursor; empty starts at the first page, and a value
+	// this package did not issue is ErrInvalidClientCursor. The returned cursor is
+	// empty exactly when the page is the last one.
+	ListClients(ctx context.Context, limit int, cursor string) ([]Client, string, error)
 	// SetStatus changes the lifecycle. An unknown id is ErrClientNotFound.
 	SetStatus(ctx context.Context, id string, status ClientStatus) error
 	// RotateSecret replaces a confidential client's secret digest. An unknown id
 	// is ErrClientNotFound; a public client is ErrNoSecretToRotate, because it has
 	// no secret and giving it one would break RestoreClient's validation. The
-	// digest must be exactly sha256.Size bytes — what NewSecretHash produces and
-	// what RestoreClient demands — so a wrong-length rotation is refused instead
-	// of being stored and silently locking the client out on the next restart.
+	// digest must be one NewSecretHash produced — the one encoding RestoreClient
+	// admits: "$pbkdf2-sha256$i=<iterations>$<salt>$<dk>" — so a wrong or legacy
+	// digest is refused instead of being stored and silently locking the client
+	// out on the next restart.
 	RotateSecret(ctx context.Context, id string, secretHash []byte) error
-	// Delete removes the registration. Deleting an absent client is not an
-	// error, which keeps an operator's retry idempotent.
+	// Delete removes the registration AND revokes every credential the client
+	// holds: access and refresh tokens, unspent authorization codes,
+	// spent-refresh tombstones, pending authorization requests and device
+	// authorizations.
+	//
+	// Revoking is part of the operation, not a follow-up. A deleted client must
+	// not keep acting through a token it already obtained: the protocol plane
+	// reports a deleted client as unknown, but a token that is still a live row
+	// remains a capability until it expires, and an unredeemed code can mint a
+	// fresh pair. Either one would make "the client was deleted" a claim the
+	// deployment cannot back.
+	//
+	// A registry that keeps client rows and token rows in separate engines cannot
+	// satisfy this by itself; the engine that mints the tokens publishes itself
+	// through TokenRevokerSetter, and Delete then fans the revocation out. A
+	// registry wired with no revoker has no tokens to revoke.
+	//
+	// Deleting an absent client is not an error, which keeps an operator's retry
+	// idempotent; revoking is idempotent for the same reason.
 	Delete(ctx context.Context, id string) error
+}
+
+// TokenRevokerSetter is implemented by a ClientAdmin whose clients' tokens live
+// in a separate engine. The engine that mints the tokens calls SetTokenRevoker
+// with itself, so Delete can honour the ClientAdmin.Delete contract.
+//
+// It is an optional extension rather than part of ClientAdmin: a registry that
+// owns its tokens does not implement it and does not need it, and the assertion
+// is what keeps the wiring out of the interface every registry must satisfy.
+type TokenRevokerSetter interface {
+	// SetTokenRevoker records the token engine Delete must revoke through. It is
+	// called once, at composition, before any request is served.
+	SetTokenRevoker(rev TokenAdmin)
 }
 
 // MemoryClientRegistry is a non-durable ClientRegistry for development and tests.
 type MemoryClientRegistry struct {
 	mu   sync.RWMutex
 	byID map[string]Client
+	// tokens, when set, is the token engine the clients of this registry were
+	// issued tokens by. Delete revokes through it to honour the
+	// ClientAdmin.Delete contract; a registry that was never wired (used on its
+	// own, with no token store) has nothing to revoke and leaves the field nil.
+	//
+	// It is written once at composition — by NewService for the hand-rolled
+	// engine, by memory.NewOIDCStore for the OpenID Provider — through
+	// SetTokenRevoker, and read under mu from then on.
+	tokens TokenAdmin
 }
 
 // NewMemoryClientRegistry returns an empty registry.
 func NewMemoryClientRegistry() *MemoryClientRegistry {
 	return &MemoryClientRegistry{byID: make(map[string]Client)}
+}
+
+// SetTokenRevoker implements TokenRevokerSetter: it names the engine Delete
+// revokes through.
+func (r *MemoryClientRegistry) SetTokenRevoker(rev TokenAdmin) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tokens = rev
+}
+
+// tokenRevoker reads the wired revoker. The lock is released before the caller
+// uses it: RevokeTokens takes the token store's own lock, and holding this
+// registry's while calling out would order the two locks the wrong way round
+// against anything that reads a client while holding the token store.
+func (r *MemoryClientRegistry) tokenRevoker() TokenAdmin {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.tokens
 }
 
 // Create implements ClientRegistry.
@@ -432,16 +710,38 @@ func (r *MemoryClientRegistry) ClientNames(_ context.Context, ids []string) (map
 	return out, nil
 }
 
-// List implements ClientAdmin.
-func (r *MemoryClientRegistry) List(_ context.Context) ([]Client, error) {
+// ListClients implements ClientAdmin. Ids sort bytewise (Go's string order),
+// which is the collation the Postgres implementation orders by for the ASCII
+// client ids NewClient and the admin plane generate.
+func (r *MemoryClientRegistry) ListClients(_ context.Context, limit int, cursor string) ([]Client, string, error) {
+	limit, err := ResolveClientPageLimit(limit)
+	if err != nil {
+		return nil, "", err
+	}
+	after, err := DecodeClientCursor(cursor)
+	if err != nil {
+		return nil, "", err
+	}
+
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	out := make([]Client, 0, len(r.byID))
 	for _, c := range r.byID {
 		out = append(out, c)
 	}
+	r.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
+
+	// The cursor names a row, not an offset: the page starts at the first id
+	// strictly greater than the one the cursor carried, so a client added between
+	// two requests lands on a later page instead of shifting this one.
+	if after != "" {
+		out = out[sort.Search(len(out), func(i int) bool { return out[i].ID > after }):]
+	}
+	if len(out) > limit {
+		out = out[:limit]
+		return out, EncodeClientCursor(out[len(out)-1].ID), nil
+	}
+	return out, "", nil
 }
 
 // SetStatus implements ClientAdmin.
@@ -462,11 +762,12 @@ func (r *MemoryClientRegistry) SetStatus(_ context.Context, id string, status Cl
 
 // RotateSecret implements ClientAdmin.
 func (r *MemoryClientRegistry) RotateSecret(_ context.Context, id string, secretHash []byte) error {
-	// The shape RestoreClient enforces. A shorter (or longer) digest used to be
-	// stored as-is, so the client authenticated fine until the process restarted,
-	// when RestoreClient refused the row and the client became unknown.
-	if len(secretHash) != sha256.Size {
-		return fmt.Errorf("oauth: a rotation needs a %d-byte secret hash, got %d", sha256.Size, len(secretHash))
+	// The shape RestoreClient enforces. A value it would refuse used to be stored
+	// as-is, so the client authenticated fine until the process restarted, when
+	// RestoreClient refused the row and the client became unknown.
+	if !validSecretHash(secretHash) {
+		return fmt.Errorf("oauth: a rotation needs a %s secret hash, got %d bytes",
+			secretHashAlgorithm, len(secretHash))
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -482,8 +783,18 @@ func (r *MemoryClientRegistry) RotateSecret(_ context.Context, id string, secret
 	return nil
 }
 
-// Delete implements ClientAdmin.
-func (r *MemoryClientRegistry) Delete(_ context.Context, id string) error {
+// Delete implements ClientAdmin. The tokens go first: if the revocation fails
+// the registration survives, so a retry still has the client to act on and the
+// deployment never reports a client as gone while its credentials live.
+//
+// A registry that was never wired with a token engine (see SetTokenRevoker) has
+// nothing to revoke and removes only the registration.
+func (r *MemoryClientRegistry) Delete(ctx context.Context, id string) error {
+	if rev := r.tokenRevoker(); rev != nil {
+		if _, err := rev.RevokeTokens(ctx, TokenFilter{ClientID: id}); err != nil {
+			return err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.byID, id)

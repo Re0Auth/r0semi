@@ -3,6 +3,8 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/Re0Auth/r0semi/internal/admin"
 )
 
 // problem is an RFC 9457 Problem Details object. Business plane only.
@@ -18,6 +20,19 @@ type problem struct {
 	Game          string `json:"game,omitempty"`
 	Source        string `json:"source,omitempty"`
 	BindURL       string `json:"bind_url,omitempty"`
+
+	// Kill Switch extension members (Z10-5). A partially applied sweep is still a
+	// failure — the status stays 500 — but the counts it had already completed are
+	// the thing an incident responder needs, and a retry is not guaranteed. The
+	// pointers distinguish "zero" from "this step never ran".
+	TokensRevoked    *int                  `json:"tokens_revoked,omitempty"`
+	SessionsRevoked  *int64                `json:"sessions_revoked,omitempty"`
+	ClientsSuspended *int                  `json:"clients_suspended,omitempty"`
+	FlowsPurged      *int                  `json:"flows_purged,omitempty"`
+	Bindings         *admin.BindingOutcome `json:"bindings,omitempty"`
+	// BindingsError is set when the binding sweep is the step that failed;
+	// `bindings` is then absent, and the two together say which dimension broke.
+	BindingsError string `json:"bindings_error,omitempty"`
 }
 
 // problemTitles is the closed catalogue of codes this API can produce. Every key

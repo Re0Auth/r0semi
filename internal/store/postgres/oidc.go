@@ -18,6 +18,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"github.com/Re0Auth/r0semi/audit"
+	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/internal/oidcstore"
 	"github.com/Re0Auth/r0semi/oauth"
 )
@@ -360,6 +361,14 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 	return &a, nil
 }
 
+// scanAuthRequest runs the by-ID read AuthRequestByID issues and classifies its
+// failure. The query carries the deadline predicate, so "no row" means exactly one
+// thing: this store does not hold a pending request under this id — never issued,
+// already decided, or expired. That is the consent screen's caller-situation, so it
+// carries authorization.ErrRequestExpired and the HTTP layer answers 4xx (S04-7).
+// Every other error — a pool that could not answer, a row that failed to decode —
+// keeps its cause and stays a 5xx with an audit row, because reporting an outage as
+// an expired link is a refusal the operator never sees.
 func (s *OIDCStore) scanAuthRequest(ctx context.Context, query string, args ...any) (op.AuthRequest, error) {
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -367,6 +376,9 @@ func (s *OIDCStore) scanAuthRequest(ctx context.Context, query string, args ...a
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestRow])
 	if err != nil {
+		if noRows(err) {
+			return nil, fmt.Errorf("postgres: auth request is unknown or expired: %w", authorization.ErrRequestExpired)
+		}
 		return nil, fmt.Errorf("postgres: auth request: %w", err)
 	}
 	a := row.request()
@@ -1043,19 +1055,30 @@ type introspectionRow struct {
 }
 
 // SetIntrospectionFromToken implements op.Storage.
+//
+// The failure classes are deliberately distinct (S02-8): an unknown token and an
+// expired one both answer oauth.ErrTokenNotFound, which the introspection handler
+// turns into Active:false, while a query or scan failure keeps its cause and is
+// answered as a 500. The earlier shape collapsed the connection/pool failure into
+// the not-found class, so a broken store reported a live token as inactive.
 func (s *OIDCStore) SetIntrospectionFromToken(ctx context.Context, introspection *oidc.IntrospectionResponse, tokenID, subject, _ string) error {
 	rows, err := s.pool.Query(ctx, `
 		SELECT client_id, scopes, expires_at FROM oidc_access_tokens WHERE id_hash = $1`,
 		hashValue(tokenID))
 	if err != nil {
-		return errors.New("postgres: token not found")
+		return fmt.Errorf("postgres: introspect token: %w", err)
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[introspectionRow])
 	if err != nil {
-		return errors.New("postgres: token not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return oauth.ErrTokenNotFound
+		}
+		// A scan or collect failure is not "not found": it is a store fault and
+		// must stay one (S02-8).
+		return fmt.Errorf("postgres: introspect token: %w", err)
 	}
 	if !row.ExpiresAt.After(s.now()) {
-		return errors.New("postgres: token expired")
+		return oauth.ErrTokenNotFound
 	}
 	introspection.Active = true
 	introspection.Subject = subject
@@ -1327,8 +1350,13 @@ func (s *OIDCStore) DeviceByUserCode(ctx context.Context, userCode string) (*op.
 	return s.deviceState(ctx, `upper(replace(user_code, '-', '')) = upper(replace($1, '-', ''))`, userCode)
 }
 
-// ApproveDevice marks a device authorization approved. A nil scopes slice keeps
+// approveDevice marks a device authorization approved. A nil scopes slice keeps
 // the requested scopes; an explicit slice narrows them.
+//
+// It is deliberately unexported (Z20V-2): it does NOT run the ExplicitConsent
+// gate, which lives in DecideDeviceAuthorization. Exporting a rewrite that skipped
+// that gate left a direct caller able to approve a critical scope with no
+// individual tick, so approval has exactly one exported entrance.
 //
 // The write carries the conditions the read does — still pending, still
 // unexpired, not denied — so approving is a state transition rather than an
@@ -1337,7 +1365,7 @@ func (s *OIDCStore) DeviceByUserCode(ctx context.Context, userCode string) (*op.
 // unconditional, with two racing deciders both succeeding. The race was shown to
 // have no payoff, and it is closed here anyway, because a decision that lands on
 // a code somebody else already decided should be refused where it lands.
-func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string, scopes []string) error {
+func (s *OIDCStore) approveDevice(ctx context.Context, userCode, subject string, scopes []string) error {
 	// The store clock decides the deadline and stamps the auth time: both are
 	// process-side facts this store wrote (the deadline by the caller of
 	// StoreDeviceAuthorization, the auth time here), and judging either with the
@@ -1373,13 +1401,16 @@ func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string,
 	return nil
 }
 
-// DenyDevice marks a device authorization denied.
+// DenyDevice marks a device authorization denied. subject is the account that
+// refused: the interactive route already holds it, so recording it is what makes
+// `oidc.device.deny` able to answer who refused, not just which client was
+// involved (Z20V-1).
 //
-// Its condition is deliberately not the same as ApproveDevice's: `done = false` is
+// Its condition is deliberately not the same as approveDevice's: `done = false` is
 // absent, so a denial still outranks an approval whichever write lands second.
 // That invariant is round 3's C3-3 conclusion and the tests pin it; what this
 // adds is that a second denial is refused rather than recorded twice.
-func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
+func (s *OIDCStore) DenyDevice(ctx context.Context, userCode, subject string) error {
 	var clientID string
 	err := s.pool.QueryRow(ctx, `
 		UPDATE oidc_devices SET denied = true
@@ -1392,9 +1423,9 @@ func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
 	case err != nil:
 		return fmt.Errorf("postgres: deny device: %w", err)
 	}
-	// client_id rides out of the write (G-17); the subject is not on this path —
-	// the denying account is the caller's, and recording it is Z20V-1's job.
-	s.record(ctx, "oidc.device.deny", "", clientID, audit.OutcomeDenied)
+	// client_id rides out of the write (G-17); the subject comes from the caller
+	// that authenticated the denying account (Z20V-1).
+	s.record(ctx, "oidc.device.deny", subject, clientID, audit.OutcomeDenied)
 	return nil
 }
 
@@ -1663,11 +1694,12 @@ func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode st
 	if err != nil {
 		return oauth.DeviceAuthorization{}, oauth.ErrDeviceNotFound
 	}
-	// Only catalogue scopes are described; `openid`/`profile`/... are protocol
-	// flags the catalogue deliberately does not know, and resolving the full
-	// request made a standard OIDC device request fail.
-	described, _ := oidcstore.SplitProtocolScopes(st.Scopes)
-	descriptors, err := s.registry.Resolve(oidcstore.Scopes(described), st.ClientID)
+	// The page displays every scope an approval can grant, not only the catalogue
+	// ones: `openid`/`profile`/... are protocol flags the catalogue deliberately
+	// does not describe, and DecideDeviceAuthorization re-attaches them to the
+	// grant. Dropping them here made the screen show less than the token carried
+	// (A-FE-3 / A-FE-V1); they render as an explicit system-required placeholder.
+	descriptors, err := deviceDisplayDescriptors(s.registry, st.Scopes, st.ClientID)
 	if err != nil {
 		return oauth.DeviceAuthorization{}, err
 	}
@@ -1682,6 +1714,48 @@ func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode st
 		Scopes:    descriptors,
 		ExpiresAt: st.Expires,
 	}, nil
+}
+
+// deviceDisplayDescriptors returns one descriptor per requested scope, in request
+// order, so the verification page's displayed set covers everything an approval
+// can grant (A-FE-3 / A-FE-V1).
+//
+// Catalogue scopes resolve through the registry, which still rejects an unknown
+// or client-restricted data scope. A scope the catalogue does not describe — the
+// standard OIDC claim scopes, which DecideDeviceAuthorization re-attaches to the
+// grant — is rendered as an explicit system-required placeholder instead of being
+// silently dropped. The placeholder text matches the httpapi consent view's, so
+// the two screens describe one scope the same way.
+func deviceDisplayDescriptors(registry *oauth.Registry, scopes []string, clientID string) ([]oauth.Descriptor, error) {
+	described, _ := oidcstore.SplitProtocolScopes(scopes)
+	resolved, err := registry.Resolve(oidcstore.Scopes(described), clientID)
+	if err != nil {
+		return nil, err
+	}
+	byScope := make(map[oauth.Scope]oauth.Descriptor, len(resolved))
+	for _, d := range resolved {
+		byScope[d.Scope] = d
+	}
+	out := make([]oauth.Descriptor, 0, len(scopes))
+	seen := make(map[oauth.Scope]struct{}, len(scopes))
+	for _, sc := range scopes {
+		s := oauth.Scope(sc)
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		if d, ok := byScope[s]; ok {
+			out = append(out, d)
+			continue
+		}
+		out = append(out, oauth.Descriptor{
+			Scope:       s,
+			Title:       "系统必需",
+			Description: "此项由授权服务器要求，权限目录中未单独描述。",
+			Risk:        oauth.RiskLow,
+		})
+	}
+	return out, nil
 }
 
 // DecideDeviceAuthorization records the user's approval or denial, narrowing
@@ -1700,7 +1774,7 @@ func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, sub
 		return oauth.ErrDeviceNotFound
 	}
 	if !approve {
-		return s.DenyDevice(ctx, userCode)
+		return s.DenyDevice(ctx, userCode, subject)
 	}
 
 	granted, err := oidcstore.NarrowScopes(st.Scopes, scopes)
@@ -1727,7 +1801,7 @@ func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, sub
 	// ADR-0001 O-6 (revised): a device authorization always yields a refresh
 	// token, so offline_access is granted implicitly.
 	granted = oidcstore.WithOfflineAccess(granted)
-	return s.ApproveDevice(ctx, userCode, subject, granted)
+	return s.approveDevice(ctx, userCode, subject, granted)
 }
 
 func appendScopeUnique(dst []oauth.Scope, s oauth.Scope) []oauth.Scope {

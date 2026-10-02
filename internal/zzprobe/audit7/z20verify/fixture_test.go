@@ -170,12 +170,13 @@ func newVEnv(t *testing.T, opts vOptions) *vEnv {
 
 	scopeRegistry := opts.Registry
 	if scopeRegistry == nil {
-		scopeRegistry = oauth.DefaultRegistry()
+		scopeRegistry = vRegistryWithRaw(t)
 	}
 	clientScopes := opts.ClientScopes
 	if clientScopes == nil {
 		clientScopes = []oauth.Scope{
 			oauth.ScopeAccountID, oauth.ScopePhigrosProfile, oauth.ScopePhigrosScore,
+			oauth.Scope(oauth.RawScope(vGame)),
 		}
 	}
 	clients := oauth.NewMemoryClientRegistry()
@@ -398,6 +399,23 @@ func vRegistryWith(t *testing.T, extra ...oauth.Descriptor) *oauth.Registry {
 		t.Fatalf("oauth.NewRegistry: %v", err)
 	}
 	return reg
+}
+
+// vRegistryWithRaw is the shipped catalogue plus the raw-passthrough scope the
+// default fixture source advertises.
+//
+// The composition root registers `<game>.raw.read` for every game with a raw_base
+// (cmd/re0auth/main.go rawScopeDescriptors), and the default source here has one,
+// so a probe that mints a raw token needs the same descriptor — otherwise the OP
+// refuses the scope at authorize time and no probe could express "raw is allowed"
+// (Z20-2).
+func vRegistryWithRaw(t *testing.T) *oauth.Registry {
+	t.Helper()
+	return vRegistryWith(t, oauth.Descriptor{
+		Scope: oauth.Scope(oauth.RawScope(vGame)), Title: "读取 " + vGame + " 原生接口",
+		Description: "probe descriptor: the explicit scope the raw passthrough requires",
+		Risk:        oauth.RiskHigh,
+	})
 }
 
 // vTwoSources is two sources of one game both serving `scores`, each with its

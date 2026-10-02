@@ -110,12 +110,12 @@ func TestReEnrollKeepsTheOriginalCreatedAt(t *testing.T) {
 	}
 }
 
-// --- S07-11: bindingAAD's uint32 length prefix must not be reachable
+// --- S07-11: identity fields stay inside the store's bound
 
-// TestOverLongIdentityFieldsAreRefused pins that an identity whose field cannot be
-// length-prefixed by bindingAAD's uint32 is refused at the door. An accepted 4 GiB
-// + subject wraps to a small uint32, so two different identities can produce the
-// same AAD (envelope.go:148, envelope.go:150).
+// TestOverLongIdentityFieldsAreRefused pins that an identity whose field is far
+// outside any stored identity shape is refused at the door. The bound predates
+// the AAD's uvarint prefix (which cannot truncate a Go-length field), so this now
+// guards the store-side hygiene bound rather than a prefix collision.
 func TestOverLongIdentityFieldsAreRefused(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
 	ctx := context.Background()
@@ -126,13 +126,13 @@ func TestOverLongIdentityFieldsAreRefused(t *testing.T) {
 		t.Fatalf("control: a 20-byte subject was refused: %v", err)
 	}
 
-	// 1 MiB is far inside uint32 but far outside any stored identity shape, so a
-	// builder that truncates has no excuse for accepting it.
+	// 1 MiB is far inside uint64 but far outside any stored identity shape, so a
+	// builder with no bound at all has no excuse for accepting it.
 	over := Identity{Subject: strings.Repeat("s", 1<<20), Provider: "taptap"}
 	err := svc.Enroll(ctx, over, []byte("x"), nil)
 	if !errors.Is(err, ErrInvalidIdentity) {
-		t.Fatalf("Enroll accepted a %d-byte subject (err = %v); bindingAAD length-prefixes it with "+
-			"a uint32, which truncates at 2^32 (vault/envelope.go:148)", 1<<20, err)
+		t.Fatalf("Enroll accepted a %d-byte subject (err = %v); maxIdentityFieldLen bounds "+
+			"identity fields (vault/repo.go)", 1<<20, err)
 	}
 }
 

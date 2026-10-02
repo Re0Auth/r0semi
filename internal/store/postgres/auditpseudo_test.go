@@ -13,9 +13,10 @@ import (
 
 func keyWith(fill byte) *AuditLogger {
 	return &AuditLogger{
-		key:   bytes.Repeat([]byte{fill}, 32),
-		now:   time.Now,
-		cache: map[string]cachedSubjectKey{},
+		key:        bytes.Repeat([]byte{fill}, 32),
+		now:        time.Now,
+		cache:      map[string]cachedSubjectKey{},
+		tombstones: map[string]struct{}{},
 	}
 }
 

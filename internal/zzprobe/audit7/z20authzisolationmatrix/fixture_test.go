@@ -143,6 +143,27 @@ func zRegistryWithCritical(t *testing.T) *oauth.Registry {
 	return reg
 }
 
+// zRegistryWithRaw is the default catalogue plus the raw-passthrough scope this
+// fixture's source advertises.
+//
+// The composition root builds that entry per configured game with a raw_base
+// (cmd/re0auth/main.go rawScopeDescriptors → registerRawScopes), and the fixture
+// source always has one, so a probe that mints a raw token must register the same
+// descriptor. Without it the OP refuses `phigros.raw.read` at authorize time with
+// invalid_scope — the scope the gate now checks could never be granted (Z20-2).
+func zRegistryWithRaw(t *testing.T) *oauth.Registry {
+	t.Helper()
+	reg, err := oauth.NewRegistry(append(oauth.DefaultDescriptors(), oauth.Descriptor{
+		Scope: oauth.Scope(oauth.RawScope(zGame)), Title: "读取 " + zGame + " 原生接口",
+		Description: "probe descriptor: the explicit scope the raw passthrough requires",
+		Risk:        oauth.RiskHigh,
+	})...)
+	if err != nil {
+		t.Fatalf("oauth.NewRegistry: %v", err)
+	}
+	return reg
+}
+
 func newZEnv(t *testing.T, opts zOptions) *zEnv {
 	t.Helper()
 	ctx := context.Background()
@@ -213,12 +234,13 @@ func newZEnv(t *testing.T, opts zOptions) *zEnv {
 
 	scopeRegistry := opts.Registry
 	if scopeRegistry == nil {
-		scopeRegistry = oauth.DefaultRegistry()
+		scopeRegistry = zRegistryWithRaw(t)
 	}
 	clientScopes := opts.ClientScopes
 	if clientScopes == nil {
 		clientScopes = []oauth.Scope{
 			oauth.ScopeAccountID, oauth.ScopePhigrosProfile, oauth.ScopePhigrosScore,
+			oauth.Scope(oauth.RawScope(zGame)),
 		}
 	}
 	typ, secret := oauth.ClientPublic, ""

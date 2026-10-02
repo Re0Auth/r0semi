@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/Re0Auth/r0semi/internal/federation"
+	"github.com/Re0Auth/r0semi/oauth"
 )
 
 // probeUpstream is a real upstream that records what it was asked and answers a
@@ -122,7 +123,7 @@ func TestZ09RawResponseDoesNotLeakTheSourcesHeaders(t *testing.T) {
 	srv, mint := zzHarness(t, reg, []zzBind{
 		{User: "usr_v", Game: zzGame, Source: "src", Access: "tok"},
 	}, nil)
-	at := mint("usr_v", zzProfileScope)
+	at := mint("usr_v", oauth.RawScope(zzGame))
 
 	code, hdr, body := zzGet(t, srv.Client(), srv.URL+"/v1/games/"+zzGame+"/sources/src/raw/data", at)
 	t.Logf("raw => %d content-type=%q cache-control=%q body=%q",
@@ -159,7 +160,7 @@ func TestZ09RawPathCannotEscapeTheSourcesBase(t *testing.T) {
 	srv, mint := zzHarness(t, reg, []zzBind{
 		{User: "usr_v", Game: zzGame, Source: "src", Access: "tok"},
 	}, nil)
-	at := mint("usr_v", zzProfileScope)
+	at := mint("usr_v", oauth.RawScope(zzGame))
 
 	cases := []struct {
 		payload string
@@ -200,27 +201,41 @@ func TestZ09RawPathCannotEscapeTheSourcesBase(t *testing.T) {
 	}
 }
 
-// Source names are operator input that reaches a response header verbatim
-// (`w.Header().Set("Re0Auth-Source", result.Source)`), and NewRegistry does not
-// validate them (FO-04). A CRLF in one must not become a header of its own.
+// TestZ09ASourceNameCannotInjectAResponseHeader is the flipped form of FO-04; the
+// name is kept so the coverage matrix still maps here.
+//
+// The finding was: federation.NewRegistry accepted a source name carrying CRLF,
+// and that name reached `Re0Auth-Source` verbatim, so the CRLF could become a
+// header of its own. The registry now validates game, source and resource names
+// (internal/federation/federation.go validateSourceName, which cites FO-04), so
+// the shape is refused at construction. The guard pins that, and keeps the
+// end-to-end header check as the second line of defence for names that do pass.
 func TestZ09ASourceNameCannotInjectAResponseHeader(t *testing.T) {
 	up := newProbeUpstream(t, http.StatusOK, "application/json", `{"ok":true}`, nil)
-	reg, err := federation.NewRegistry(federation.Source{
+
+	// The finding's shape must now be refused at construction.
+	if _, err := federation.NewRegistry(federation.Source{
 		Game: zzGame, Name: "src\r\nX-Injected: 1", DisplayName: "Src", Issuer: up.URL,
 		Resources: []federation.Resource{
 			{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: zzProfileScope},
 		},
-	})
-	if err != nil {
-		t.Fatalf("NewRegistry refused the name: %v", err)
+	}); err == nil {
+		t.Errorf("NewRegistry accepted a source name carrying CRLF; it reaches the Re0Auth-Source " +
+			"response header and could become a header of its own (FO-04)")
+	} else {
+		t.Logf("CRLF source name refused: %v", err)
 	}
+
+	// Anti-vacuity + end-to-end: a clean name is accepted and no injected header
+	// appears on the response.
+	reg := zzRegistryFor(t, up.URL, false)
 	srv, mint := zzHarness(t, reg, []zzBind{
-		{User: "usr_v", Game: zzGame, Source: "src\r\nX-Injected: 1", Access: "tok"},
+		{User: "usr_v", Game: zzGame, Source: "src", Access: "tok"},
 	}, nil)
 	at := mint("usr_v", zzProfileScope)
 
 	code, hdr, _ := zzGet(t, srv.Client(), srv.URL+"/v1/games/"+zzGame+"/profile", at)
-	t.Logf("source name with CRLF => %d Re0Auth-Source=%q X-Injected=%q",
+	t.Logf("clean source name => %d Re0Auth-Source=%q X-Injected=%q",
 		code, hdr.Get("Re0Auth-Source"), hdr.Get("X-Injected"))
 	if hdr.Get("X-Injected") != "" {
 		t.Errorf("the source name injected a response header: X-Injected=%q", hdr.Get("X-Injected"))

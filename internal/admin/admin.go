@@ -42,6 +42,37 @@ var ErrBindingsUnavailable = errors.New("admin: this deployment cannot revoke da
 // internal error.
 var ErrInvalidRegistration = errors.New("admin: invalid registration")
 
+// PartialError wraps a Kill Switch failure with the counts the sweep had already
+// completed when it stopped, and the step that stopped it.
+//
+// A partial failure is still a failure — the endpoint keeps answering 500 — but
+// the caller must be able to see what was already cut, because those effects are
+// irreversible and an incident responder cannot wait for a retry to learn them
+// (Z10-5). The wrapped error is unchanged, so errors.Is still finds the sentinels.
+type PartialError struct {
+	Report Report
+	// Step names the dimension whose sweep failed: "clients", "tokens",
+	// "sessions", "bindings" or "flows".
+	Step string
+	Err  error
+}
+
+func (e *PartialError) Error() string {
+	return "admin: kill switch partially applied at " + e.Step + ": " + e.Err.Error()
+}
+
+// Unwrap exposes the underlying failure so errors.Is/As keep working.
+func (e *PartialError) Unwrap() error { return e.Err }
+
+// partial reports err wrapped with the report as it stands and the step that
+// stopped the sweep.
+func partial(step string, rep Report, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PartialError{Report: rep, Step: step, Err: err}
+}
+
 // Clients is the registration store the operator plane manages: the request-path
 // methods plus the administrative ones.
 type Clients interface {
@@ -108,7 +139,12 @@ type Revoker interface {
 
 // Service is the operator capability.
 type Service interface {
-	ListClients(ctx context.Context) ([]oauth.Client, error)
+	// ListClients returns one page of clients ordered by id, plus the cursor that
+	// fetches the next page — the registry's own ClientAdmin.ListClients contract,
+	// passed through unchanged. limit is resolved by the registry
+	// (oauth.ResolveClientPageLimit), and an invalid limit or cursor comes back as
+	// the registry's typed error.
+	ListClients(ctx context.Context, limit int, cursor string) ([]oauth.Client, string, error)
 	Register(ctx context.Context, actor string, req RegisterRequest) (Registration, error)
 	// RotateClientSecret issues a new secret for a confidential client and returns
 	// it once. The old secret stops working immediately; the client id and its
@@ -222,9 +258,10 @@ func New(cfg Config) (Service, error) {
 	}, nil
 }
 
-// ListClients implements Service.
-func (s *service) ListClients(ctx context.Context) ([]oauth.Client, error) {
-	return s.clients.List(ctx)
+// ListClients implements Service: it forwards the page request to the registry,
+// which owns the ordering and the cursor encoding.
+func (s *service) ListClients(ctx context.Context, limit int, cursor string) ([]oauth.Client, string, error) {
+	return s.clients.ListClients(ctx, limit, cursor)
 }
 
 // Register implements Service. The new client is active immediately: only
@@ -304,6 +341,12 @@ func (s *service) ActivateClient(ctx context.Context, actor, clientID string) er
 
 // DeleteClient implements Service. The registration goes first; the tokens are
 // purged regardless of whether it existed, so a retry still cuts live access.
+//
+// The registry's own Delete also revokes (see oauth.ClientAdmin.Delete), so on
+// the shipped registries this second sweep finds nothing. It is kept: the
+// operator plane talks to a ClientAdmin port that may be some other
+// implementation, and "the client is gone but its tokens are not" is not an
+// outcome this endpoint is willing to leave to that implementation's goodwill.
 func (s *service) DeleteClient(ctx context.Context, actor, clientID string) error {
 	deleteErr := s.clients.Delete(ctx, clientID)
 	removed, revokeErr := s.tokens.RevokeTokens(ctx, oauth.TokenFilter{ClientID: clientID})
@@ -348,7 +391,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 	if target.ClientID != "" {
 		if err := s.clients.SetStatus(ctx, target.ClientID, oauth.ClientSuspended); err != nil {
 			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
-			return rep, err
+			return rep, partial("clients", rep, err)
 		}
 		rep.ClientsSuspended = 1
 	}
@@ -363,7 +406,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 		rep.TokensRevoked = removed
 		if err != nil {
 			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
-			return rep, err
+			return rep, partial("tokens", rep, err)
 		}
 	}
 
@@ -382,7 +425,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 		}
 		if err != nil {
 			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
-			return rep, err
+			return rep, partial("sessions", rep, err)
 		}
 		rep.SessionsRevoked = n
 	} else if target.All || target.Subject != "" {
@@ -413,7 +456,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 		}
 		if err != nil {
 			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
-			return rep, err
+			return rep, partial("bindings", rep, err)
 		}
 		rep.Bindings = &outcome
 	} else if target.All || target.Bindings || target.Subject != "" {
@@ -430,7 +473,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 		purged, err := s.flows.PurgeUserFlows(ctx, target.Subject)
 		if err != nil {
 			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
-			return rep, err
+			return rep, partial("flows", rep, err)
 		}
 		rep.FlowsPurged = purged
 	} else if target.All || target.Subject != "" {

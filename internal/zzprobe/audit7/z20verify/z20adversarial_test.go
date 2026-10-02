@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/Re0Auth/r0semi/oauth"
 )
 
 // z20advNewUserCode creates a device authorization through the real protocol
@@ -87,17 +89,19 @@ func TestZ20AdvDeviceDenialAuditDropsTheSubject(t *testing.T) {
 // refusal and proves no dial happened.
 func TestZ20AdvRawEscapeIsRefusedWith400AndNoUpstreamCall(t *testing.T) {
 	e := newVEnv(t, vOptions{})
-	score := e.mintToken(vSubject, "phigros.score.read")
+	// The explicit raw scope: the control must reach the proxy's path handling, and
+	// since Z20-2 the resource scope would be refused by the scope gate first.
+	raw := e.mintToken(vSubject, oauth.RawScope(vGame))
 
 	// Control: the same token is served on a path inside the base, so the probe
 	// reaches the proxy rather than a gate that rejects everything.
-	st, _, body := e.vGet("/v1/games/"+vGame+"/sources/fake/raw/resources/scores", score)
+	st, _, body := e.vGet("/v1/games/"+vGame+"/sources/fake/raw/resources/scores", raw)
 	if st != http.StatusOK {
 		t.Fatalf("control: an in-base raw read = %d: %s", st, body)
 	}
 	before := len(e.upstream.snapshot())
 
-	st, _, body = e.vGet("/v1/games/"+vGame+"/sources/fake/raw/..%2f..%2fetc", score)
+	st, _, body = e.vGet("/v1/games/"+vGame+"/sources/fake/raw/..%2f..%2fetc", raw)
 	t.Logf("escaping raw path -> %d %s", st, body)
 	if st != http.StatusBadRequest {
 		t.Errorf("an escaping raw path answered %d, want 400: %s", st, body)

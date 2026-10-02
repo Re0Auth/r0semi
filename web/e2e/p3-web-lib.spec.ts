@@ -100,6 +100,132 @@ test('a well-formed list envelope still passes validation', async () => {
 	);
 });
 
+// S12-10, the extension half. The list endpoints were the visible offenders, but
+// every other JSON endpoint trusted its `as T` just the same: a 200 with the
+// wrong shape reached the renderer and threw there. Each of them must now fail as
+// an ApiError at the boundary, where the page's own error handling can show it.
+test('the remaining JSON endpoints reject a wrong-shaped 200', async () => {
+	// The body is deliberately one the stated interface does not allow — an empty
+	// object wherever the page reads a field, and a nonsense enum where it branches.
+	const cases: Array<[string, unknown, () => Promise<unknown>]> = [
+		['session', {}, () => api.currentSession()],
+		['authorization request', {}, () => api.getAuthorizationRequest('req')],
+		[
+			'authorization decision',
+			{},
+			() => api.decideAuthorizationRequest('req', 'csrf', { decision: 'approve' })
+		],
+		['device verification', { state: 'not-a-state' }, () => api.getDeviceVerification('CODE')],
+		['pending device verification', { state: 'pending' }, () => api.getDeviceVerification('CODE')],
+		['device decision', {}, () => api.decideDevice('csrf', { user_code: 'C', decision: 'approve' })],
+		['account deletion', {}, () => api.deleteAccount('csrf')],
+		['admin clients', { data: [] }, () => api.listAdminClients()],
+		[
+			'admin registration',
+			{},
+			() =>
+				api.registerAdminClient('csrf', {
+					name: 'n',
+					type: 'public',
+					redirect_uris: ['https://client.example/cb'],
+					scopes: ['account.id']
+				})
+		],
+		['kill switch report', {}, () => api.killSwitch('csrf', { target: 'all' })],
+		['unbind result', { upstream: 'not-an-outcome' }, () => api.unbindSource('g', 's', 'csrf')],
+		['cascade result', {}, () => api.cascadeRevoke('g', 's', 'csrf')]
+	];
+
+	for (const [what, body, call] of cases) {
+		await withFetch(
+			async () => json(200, body),
+			async () => {
+				const err = await call().then(
+					() => null,
+					(e) => e as unknown
+				);
+				expect(err, `${what} accepted a wrong-shaped body`).toBeInstanceOf(ApiError);
+				expect((err as ApiError).code, what).toBe('malformed_response');
+			}
+		);
+	}
+});
+
+// The negative control for the extension: the same endpoints must still accept
+// the shapes the server actually sends. Without this, a shape rule that rejected
+// everything would pass the test above and break the app.
+test('well-formed bodies for the remaining endpoints still resolve', async () => {
+	await withFetch(
+		async () =>
+			json(200, { user_id: 'u', primary_identity_id: 'i', csrf_token: 'c', identities: [] }),
+		async () => {
+			expect((await api.currentSession()).csrf_token).toBe('c');
+		}
+	);
+
+	await withFetch(
+		async () =>
+			json(200, {
+				state: 'pending',
+				user_code: 'CODE',
+				client: { id: 'cli', name: 'Phi CLI' },
+				scopes: [],
+				expires_at: '2026-01-01T00:00:00Z',
+				csrf_token: 'c'
+			}),
+		async () => {
+			const res = await api.getDeviceVerification('CODE');
+			expect(res.state).toBe('pending');
+		}
+	);
+
+	await withFetch(
+		async () => json(200, { state: 'approved' }),
+		async () => {
+			expect((await api.decideDevice('c', { user_code: 'CODE', decision: 'approve' })).state).toBe(
+				'approved'
+			);
+		}
+	);
+
+	await withFetch(
+		async () => json(200, { redirect_to: 'https://client.example/cb?code=x' }),
+		async () => {
+			expect(
+				(await api.decideAuthorizationRequest('req', 'c', { decision: 'approve' })).redirect_to
+			).toBe('https://client.example/cb?code=x');
+		}
+	);
+
+	await withFetch(
+		async () => json(200, { data: [], csrf_token: 'c' }),
+		async () => {
+			expect((await api.listAdminClients()).csrf_token).toBe('c');
+		}
+	);
+
+	await withFetch(
+		async () => json(200, { result: { sessions: 1 } }),
+		async () => {
+			expect((await api.deleteAccount('c')).result).toEqual({ sessions: 1 });
+		}
+	);
+
+	await withFetch(
+		async () => json(200, { tokens_revoked: 1, sessions_revoked: 2, clients_suspended: 3 }),
+		async () => {
+			expect((await api.killSwitch('c', { target: 'all' })).tokens_revoked).toBe(1);
+		}
+	);
+
+	await withFetch(
+		async () => json(200, { upstream: 'nothing' }),
+		async () => {
+			expect((await api.unbindSource('g', 's', 'c')).upstream).toBe('nothing');
+		}
+	);
+});
+
 // S12-5, the validation half: the download filename is built from
 // profile.user_id, so an export that does not carry one must be refused at the
 // boundary rather than throwing inside the download.

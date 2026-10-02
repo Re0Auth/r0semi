@@ -7,7 +7,7 @@ metadata:
     # TLS terminates here; the issuer is https and the app is configured with
     # cookie_secure = true for the same reason.
     nginx.ingress.kubernetes.io/proxy-body-size: "1m"
-    # The server drains for up to 30s; the proxy must wait for it, not cut it off.
+    # The server drains for up to 45s; the proxy must wait for it, not cut it off.
     nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
 spec:
   ingressClassName: nginx

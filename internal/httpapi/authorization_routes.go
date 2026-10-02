@@ -3,10 +3,14 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"time"
 
+	"github.com/Re0Auth/r0semi/audit"
 	"github.com/Re0Auth/r0semi/internal/account"
+	"github.com/Re0Auth/r0semi/internal/authorization"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -94,7 +98,7 @@ func (s *Server) handleGetAuthorizationRequest(w http.ResponseWriter, r *http.Re
 	}
 	view, err := s.authInteract.DescribeAuthorization(r.Context(), id)
 	if err != nil {
-		s.writeProblem(w, r, http.StatusNotFound, "not_found", "authorization request expired")
+		s.writeAuthorizationError(w, r, user, "describe", err)
 		return
 	}
 
@@ -149,7 +153,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 	case "deny":
 		redirect, err := s.authInteract.DenyAuthorization(r.Context(), id)
 		if err != nil {
-			s.writeProblem(w, r, http.StatusNotFound, "not_found", "authorization request expired")
+			s.writeAuthorizationError(w, r, user, "deny", err)
 			return
 		}
 		s.sessions.Unbind(r.Context(), authzBindKind, id)
@@ -158,7 +162,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 	case "approve":
 		redirect, err := s.authInteract.ApproveAuthorization(r.Context(), id, string(user), toScopes(body.Scopes), toScopes(body.Explicit))
 		if err != nil {
-			s.writeDecisionError(w, r, err)
+			s.writeDecisionError(w, r, user, err)
 			return
 		}
 		s.sessions.Unbind(r.Context(), authzBindKind, id)
@@ -169,23 +173,84 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-func (s *Server) writeDecisionError(w http.ResponseWriter, r *http.Request, err error) {
+func (s *Server) writeDecisionError(w http.ResponseWriter, r *http.Request, user account.UserID, err error) {
 	var oe *oauth.Error
 	switch {
+	case errors.Is(err, authorization.ErrRequestExpired):
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request",
+			"the authorization request is unknown or expired")
 	case errors.As(err, &oe) && oe.Code == "access_denied":
 		s.writeProblem(w, r, http.StatusForbidden, "explicit_consent_required", oe.Description)
 	case errors.As(err, &oe):
 		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", oe.Description)
 	default:
-		s.writeProblem(w, r, http.StatusNotFound, "not_found", "authorization request expired")
+		s.recordAuthorizationFault(w, r, user, "decision", err)
 	}
 }
 
+// writeAuthorizationError classifies a failure from the interaction seam's read
+// paths (DescribeAuthorization, DenyAuthorization).
+//
+// The two answers a browser can receive are deliberately far apart (S04-7):
+//
+//   - the engine no longer holds the request (ErrRequestExpired) is the caller's
+//     situation, answered as invalid_request — the same code the protocol plane
+//     uses for a request that cannot be served;
+//   - anything else is an engine fault. It is answered 500 with a generic detail
+//     (the error text stays in the log and the audit row, never on the wire) and
+//     recorded, because a consent screen that is broken for everyone has to be
+//     visible to an operator, not disguised as "your link expired".
+func (s *Server) writeAuthorizationError(w http.ResponseWriter, r *http.Request, user account.UserID, op string, err error) {
+	if errors.Is(err, authorization.ErrRequestExpired) {
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request",
+			"the authorization request is unknown or expired")
+		return
+	}
+	s.recordAuthorizationFault(w, r, user, op, err)
+}
+
+// recordAuthorizationFault logs an interaction-seam failure and writes the 500.
+// The audit row names the operation and the account, never the error text: the
+// subject is the account this consent screen was serving, and the detail is a
+// closed set of step names.
+func (s *Server) recordAuthorizationFault(w http.ResponseWriter, r *http.Request, user account.UserID, op string, err error) {
+	slog.ErrorContext(r.Context(), "authorization interaction failed",
+		"request_id", requestID(r), "operation", op, "err", err)
+	if s.auditLog != nil {
+		if rerr := s.auditLog.Record(r.Context(), audit.Event{
+			Time:    time.Now().UTC(),
+			Action:  "auth.authorization.fault",
+			Subject: string(user),
+			Outcome: audit.OutcomeError,
+			Detail:  map[string]string{"operation": op},
+		}); rerr != nil {
+			slog.Error("audit record failed", "action", "auth.authorization.fault", "err", rerr)
+		}
+	}
+	s.writeProblem(w, r, http.StatusInternalServerError, "internal_error",
+		"the authorization request could not be served")
+}
+
+// scopeViews renders the scopes a consent screen displays.
+//
+// The displayed set must be a SUPERSET of the set the decision will grant
+// (A-FE-3). A scope the catalogue does not describe used to be skipped, which
+// silently removed it from the screen while the server still carried it through
+// to the grant — the screen showed less than it granted. Every granted scope is
+// rendered now; the ones with no descriptor get an explicit system-required
+// placeholder rather than being dropped or silently granted.
 func (s *Server) scopeViews(scopes []oauth.Scope) []map[string]any {
 	out := make([]map[string]any, 0, len(scopes))
 	for _, sc := range scopes {
 		d, ok := s.scopes.Get(sc)
 		if !ok {
+			out = append(out, map[string]any{
+				"scope":            sc.String(),
+				"title":            "系统必需",
+				"description":      "此项由授权服务器要求，权限目录中未单独描述。",
+				"risk":             oauth.RiskLow.String(),
+				"explicit_consent": false,
+			})
 			continue
 		}
 		out = append(out, map[string]any{
