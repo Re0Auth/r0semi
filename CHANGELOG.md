@@ -61,7 +61,13 @@
   绑定，启动即拒绝）、纳入启动漂移检查（文件与已注册行不一致即拒绝启动），启用时与每次实际使用时
   都有日志。见 ADR-0005 §7b 与 [docs/conformance.md](docs/conformance.md)。
 - 其余修复：OIDC discovery/JWKS 响应体 1 MiB 上限（S06-1）、压缩协商失败不再绕过限流与并发上限
-  （S13-1）、绑定完成与解绑改为按绑定串行（S14-2）。
+  （S13-1）、绑定完成与解绑改为按绑定串行（S14-2）、配置了 `HTTP(S)_PROXY` 时私网闸门改按目标地址
+  判定（S06-2）、凭据型出站请求不再受注入 Doer 的跳转策略左右（S07-1）。
+- **备份在任何失败下都不留明文（S15-1 / S15-3）**：`scripts/backup.sh` 现在在 `umask`/`mkdir`
+  之后、首次写入之前安装 EXIT trap，任何非零退出都会删掉明文 dump 与半成品 sidecar
+  （此前 `set -e` 会在 `age` 失败处直接退出，后面的 `shred`/`rm` 永不执行）；备份 CronJob 的
+  `jobTemplate` 增加 `activeDeadlineSeconds: 600`，`pg_dump` 包在 `timeout 540` 里——在
+  `concurrencyPolicy: Forbid` 下，一次挂死的 dump 此前会让之后所有调度被静默跳过。
 
 ### 新增能力
 

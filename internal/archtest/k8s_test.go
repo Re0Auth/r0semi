@@ -347,6 +347,20 @@ func TestBackupWorkloadIsSafeToLeaveRunning(t *testing.T) {
 		t.Fatalf("concurrencyPolicy = %q, want Forbid: overlapping dumps compete for the service's connection budget",
 			policy)
 	}
+	// S15-3: Forbid is also why a job that never finishes is worse than a failed
+	// one — the next runs are skipped, silently and indefinitely. The deadline
+	// bounds one run's lifetime; the in-container `timeout` makes its failure
+	// pg_dump's own exit code instead of the deadline's SIGKILL.
+	jobTemplate := nestedMap(t, cron, "spec", "jobTemplate", "spec")
+	deadline, ok := jobTemplate["activeDeadlineSeconds"].(int)
+	if !ok || deadline <= 0 {
+		t.Fatalf("the backup job has no activeDeadlineSeconds (%v): a hung pg_dump stops every later "+
+			"backup silently", jobTemplate["activeDeadlineSeconds"])
+	}
+	if deadline >= 900 {
+		t.Errorf("activeDeadlineSeconds = %d is not inside the 15-minute schedule (%s): two runs can "+
+			"still overlap", deadline, jobSpec["schedule"])
+	}
 
 	podSpec := nestedMap(t, cron, "spec", "jobTemplate", "spec", "template", "spec")
 	// The DSN-bearing container does not mount a token it never reads.
@@ -407,6 +421,7 @@ func TestBackupWorkloadIsSafeToLeaveRunning(t *testing.T) {
 		{"pg_dump", "the workload must dump the database"},
 		{"sha256sum", "each dump needs its checksum beside it"},
 		{"-mtime", "an unbounded dump directory fills the volume and stops the backups"},
+		{"timeout ", "a dump that hangs must fail on its own terms inside the job's deadline (S15-3)"},
 	} {
 		if !strings.Contains(script, want.needle) {
 			t.Fatalf("the backup script does not contain %q: %s", want.needle, want.why)

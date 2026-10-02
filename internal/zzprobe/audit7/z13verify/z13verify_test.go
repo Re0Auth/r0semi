@@ -638,3 +638,45 @@ func tailLines(s string, n int) string {
 	}
 	return strings.Join(lines, " | ")
 }
+
+// S15-1, executed: with `age` PRESENT but failing (a bad recipient, a full disk),
+// the plaintext dump must not survive the run. `set -e` exits at the failing
+// command, so the shred/rm on the next line never runs unless the script removes
+// the plaintext from an EXIT trap.
+func TestZ13VAFailingAgeDoesNotLeaveThePlaintextDump(t *testing.T) {
+	root := repoRoot(t)
+	bin := bashPath(t)
+	work := t.TempDir()
+	stubDir := filepath.Join(work, "bin")
+	// The last argument of `pg_dump ... --file "$out"` is the output path.
+	writeStub(t, filepath.Join(stubDir, "pg_dump"),
+		"#!/bin/sh\nfor last; do :; done\nprintf dump > \"$last\"\n")
+	// Present (so the pre-flight tool check passes) and failing.
+	writeStub(t, filepath.Join(stubDir, "age"),
+		"#!/bin/sh\necho 'age: bad recipient' >&2\nexit 1\n")
+
+	body := `
+set -u
+export PATH="$STUBDIR:/usr/bin:/bin"
+cd "$ROOT" || exit 9
+d=$(mktemp -d)
+DATABASE_URL=postgres://x BACKUP_AGE_RECIPIENT=age1test \
+  bash scripts/backup.sh "$d" >/tmp/s151.log 2>&1; echo "EXIT=$?"
+echo "FILES=$(ls -1 "$d" | tr '\n' ',')"
+`
+	out, errb, code := runBashScript(t, bin, body, []string{
+		"ROOT=" + bashPathOf(root),
+		"STUBDIR=" + bashPathOf(stubDir),
+	})
+	if code != 0 {
+		t.Fatalf("the harness itself failed (exit %d):\n%s\n%s", code, out, errb)
+	}
+	got := kv(out)
+	if got["EXIT"] != "1" {
+		t.Fatalf("control: the failing age did not fail the script: %v", got)
+	}
+	if files := got["FILES"]; strings.Contains(files, ".dump") {
+		t.Errorf("a failing age left files behind: %s — the operator reads the non-zero exit and "+
+			"believes the directory holds ciphertext only (S15-1)", files)
+	}
+}

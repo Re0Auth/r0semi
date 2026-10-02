@@ -1,7 +1,7 @@
 # P2 · 中（MEDIUM）
 
 > 前提较高，或影响有界但确定。
-> **条目数：72** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-02，HEAD `5940afe`）。
+> **条目数：72** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-02，HEAD `71f56fa`）。
 > 严重度取**对抗性复核后的裁定**；同一机制多编号者已合并，别名写在 ID 列。
 
 
@@ -15,11 +15,11 @@
 | S02-3 | P2 | 设备授权端点拒绝合规的 Basic secret：client_id 做了 form-unescape，secret 没有 | internal/oidchttp/oidchttp.go:1114; internal/oidchttp/oidchttp.go:1152; internal/oidchttp/oidchttp.go:1175 | OPEN | `basicSecret` 原样比对存储的 SHA-256，而 RFC 6749 §2.3.1 要求 client 对两者都做 form-urlencode。；id 与 secret 成对解码后再认证。 |
 | S02-4 | P2 | ValidateSigner 的 2048 位下限只作用于当前键，不覆盖 JWKS 里公布的 retired key | internal/oidcstore/oidcstore.go:62; internal/oidcstore/oidcstore.go:69; internal/oidcstore/oidcstore.go:73 | OPEN | retired key 的 Public 与当前键一起进 KeySet 并用于 id_token hint / access token 验证，弱键可继续验签。；对 KeySet 中全部签名键统一执行位数下限。 |
 | S05-1 | P2 | 刷新拒绝把任何 400/401/403 都判为"授权已死"并加密销毁绑定 | internal/federation/refresh.go:170; internal/federation/refresh.go:179; internal/federation/refresh.go:142 | OPEN | 不看 OAuth error code 与响应体；`refreshRejected` 直接 `vault.Revoke` + `bindings.Delete`，连可重试的配置错误也一并 shred。；按 error code 分类（invalid_grant 才判死），可重试错误保留绑定并标冷却。 |
-| S06-2 | P2 | 配置了 HTTP(S)_PROXY 时，SSRF 私网拦截作用在代理地址而非目标地址 | httpclient/outbound.go:92; httpclient/outbound.go:95; httpclient/outbound.go:42 | OPEN | `http.ProxyFromEnvironment` 让 DialContext（以及 Control 钩子）拿到代理地址，目标主机从未被解析或检查。；在拨号前解析并校验目标地址，或对配置了代理的部署禁用私网直连。 |
+| S06-2 | P2 | 配置了 HTTP(S)_PROXY 时，SSRF 私网拦截作用在代理地址而非目标地址 | httpclient/outbound.go:92; httpclient/outbound.go:95; httpclient/outbound.go:42 | FIXED（5940afe） | 已落地：拨号前按目标地址做私网闸门判定（代理场景不再让守卫作用在代理地址上）。 |
 | S06-3 | P2 | oidcProvider 持 providerMu 跨一次网络 discovery，失败又不缓存 ⇒ 一个死 issuer 串行化所有并发登录 | idp/idp.go:705; idp/idp.go:711; idp/idp.go:713 | OPEN | 锁覆盖整个 `oidc.NewProvider`（10s 超时），失败不推进 `discoveredAt`，每次请求重试。；发现移出锁（double-checked）或 singleflight + 短超时 + 负缓存。 |
 | S06-4 | P2 | SocialLogin.states 无界 map，且每次未认证 start 都在锁下 O(n) 清扫 | referencesource/social.go:102; referencesource/social.go:104; referencesource/social.go:193 | OPEN | 无上限、无周期清扫，过期只靠每次新 start 的全表扫描执行。；给在途授权设上限 + 周期清扫（不随请求数线性）。 |
 | S06-5 | P2 | TapTapLogin.attempts 同样无界、每 challenge 一次 O(n) 清扫，未认证可达 | referencesource/taptap.go:124; referencesource/taptap.go:126; referencesource/taptap.go:258 | OPEN | 每条 entry 还持有 DeviceAuth（含验证 URL/码），单条内存不小。；同 S06-4。 |
-| S07-1 | P2 | 凭据型出站请求完全依赖注入 Doer 的跳转策略；net/http 会把自定义认证头复制到跨主机跳转目标 | tapsign/client.go:114; tapsign/client.go:115; tapsign/client.go:125; taptapoauth/client.go:195 | OPEN | X-LC-Session / X-LC-Key / 上游 MAC Authorization 在 CheckRedirect 为 nil（stdlib 默认）时会跟随跳转并携带。；客户端强制禁止跨主机跳转或在跳转时剥离认证头。 |
+| S07-1 | P2 | 凭据型出站请求完全依赖注入 Doer 的跳转策略；net/http 会把自定义认证头复制到跨主机跳转目标 | tapsign/client.go:114; tapsign/client.go:115; tapsign/client.go:125; taptapoauth/client.go:195 | FIXED（12d104b） | 已落地：凭据型出站请求不再受注入 Doer 的跳转策略左右（跨主机跳转时认证头不再跟随）。 |
 | S07-2 | P2 | vault.Enroll 先持久化凭据、后写审计事件 ⇒ 审计失败时对一次已发生的写入报错，留下未审计（federation 里还是孤儿）的秘密 | vault/service.go:245; vault/service.go:259 | OPEN | 与 `Use` 的 fail-closed（先审计后交明文）相反。；先审计后写入，或写入失败时回滚并在错误里 Join 审计错误。 |
 | S08-1 | P2 | Vault KEK 解析硬编码 RE0AUTH_KEK 优先于 vault.kek_env，重命名的键被静默忽略 | cmd/re0auth/config.go:729-743; cmd/re0auth/config.go:471; scripts/backup-keys.sh:74-77 | OPEN | 其他设置都遵循 env > 文件约定或专用 RE0AUTH_ 覆盖，KEK 却先读死名字。；`kek_env` 存在时只读它；与 `RE0AUTH_KEK` 不一致时拒绝启动并点名。 |
 | S08-4 | P2 | DeleteAccount 在本地移除 Failed>0 时仍报成功并写 outcome=ok | internal/lifecycle/lifecycle.go:200-206; internal/lifecycle/lifecycle.go:313-315; internal/federation/killswitch.go:140-146; internal/federation/killswitch.go:180-183 | OPEN | `RevokeUserBindings` 只在无法枚举时返错；单条绑定的本地移除失败被折叠进结果。；把 Failed>0 反映到 outcome 与错误，别写 ok。 |
@@ -31,8 +31,8 @@
 | S13-2 | P2 | StoreDeviceAuthorization 每次公开请求都持 store 全局锁 O(n) 扫描（§5 合并：S13-3、S14-1、S14-6、S14-7） | internal/store/memory/oidc.go:1050; internal/store/memory/oidc.go:1053; internal/store/memory/oidc.go:1124 | OPEN | 唯一 mutex 同时守所有令牌操作，设备授权端点公开可达。；为设备记录建索引/分桶，避免持全局锁扫描。 |
 | S14-3 | P2 | 内存 store 分页器每页重排全表：vault Rotate 与 federation Kill Switch 变成 O(N²logN) | vault/repo.go:229; vault/repo.go:233; vault/rotate.go:45; internal/federation/binding.go:255; internal/federation/binding.go:262; internal/federation/killswitch.go:58 | OPEN | 每页都物化全部行、排序、再用游标过滤，游标不减少工作量。；让游标真正参与分页（持久有序索引或快照）。 |
 | S14-5 | P2 | refresh 家族撤销与轮换非原子，并发重放可留下新世代 token | oauth/as.go:264; oauth/as.go:276; oauth/as.go:308; oauth/as.go:418; oauth/as.go:421; oauth/tokens.go:434 | OPEN | `ConsumeRefresh` 原子，但 `ConsumeRefresh → RevokeRefreshFamily` 与 `ConsumeRefresh → issue` 不是。；把"消费+撤销/签发"做成一个原子步骤（或家族级锁）。 |
-| S15-1 | P2 | age 加密失败时 scripts/backup.sh 把明文转储留在磁盘 | scripts/backup.sh:44-48; scripts/backup.sh:10 | OPEN | 脚本 `set -euo pipefail`，`age` 非零即退出，后面的 shred/rm 永不执行。；trap 清理 + 先写临时目录，失败也删明文。 |
-| S15-3 | P2 | 备份 CronJob 无 activeDeadlineSeconds：一次 pg_dump 挂死会静默停掉之后所有备份 | deploy/k8s/backup/cronjob.yaml:11-22; deploy/k8s/backup/cronjob.yaml:59-70 | OPEN | `concurrencyPolicy: Forbid` 会跳过新调度，jobTemplate 只有 backoffLimit。；加 activeDeadlineSeconds 与 pg_dump 侧 timeout。 |
+| S15-1 | P2 | age 加密失败时 scripts/backup.sh 把明文转储留在磁盘 | scripts/backup.sh:22-40 | FIXED（71f56fa） | 已落地：`umask`/`mkdir` 之后、首次写入之前装 EXIT trap，任何非零退出都 `rm -f` 掉 `plain/.age/.sha256` 中间产物；成功路径不受影响。守卫：`internal/archtest/backup_scripts_test.go`（静态顺序）＋ `audit7/z13verify` 的 `TestZ13VAFailingAgeDoesNotLeaveThePlaintextDump`（真 bash + 失败的 age 桩，反向已验证会红）。 |
+| S15-3 | P2 | 备份 CronJob 无 activeDeadlineSeconds：一次 pg_dump 挂死会静默停掉之后所有备份 | deploy/k8s/backup/cronjob.yaml:20-31 | FIXED（71f56fa） | 已落地：`jobTemplate.spec.activeDeadlineSeconds: 600`（< 15 分钟调度间隔）＋ 容器内 `timeout 540 pg_dump`。守卫：`internal/archtest` 的备份 CronJob 测试（deadline 存在且小于调度间隔、脚本含 `timeout`）。 |
 | Z07-1 | P2 | pending 同意句柄的 TTL 在两个后端的 by-ID 读/决策路径上都不裁决，只靠 15 分钟一轮 sweep 执行（sweep 停摆则永不过期） | `internal/store/memory/oidc.go:402-410` | FIXED（b17c76f） | `AuthRequestByID` 内存版补过期判据、PG 版加 `AND expires_at > $2`，并补「过期 auth request 的 by-ID 读被拒」测试；依据 `Z07-VERIFIED.md:45`、`00-MAIN-VERIFICATION.md` 无对应节 |
 | Z07-3 | P2 | 设备验证页把调用方可控的 user_code 原样绑进浏览器会话：实测 32 次导航把单会话堆到 1 807 500 B（≈1.72 MiB；产品自设上限为 64 KiB，非原报告的 1 MiB） | `internal/httpapi/device_routes.go:69` | FIXED（4dff4a3） | 绑定/回显都用 `oauth.NormalizeUserCode(userCode)` 的规范值，并给 `Bind` 的 id 加字节上限；依据 `Z07-VERIFIED.md:47`、`Z07-VERIFIED.md:81-94` |
 | Z09-1 | P2 | `sources[].status` 无词汇表闸门：任何拼写变体（`Retired`/`retired `/`disabled`）被静默当作可服务源继续读取，并继续决定**另一个源**的 scope 闸门 | `internal/federation/federation.go:162-176` | FIXED（本轮） | `NewRegistry` 照 `token_class` 同形加显式 switch：空值→`active`，词表外值按名拒绝启动（拒绝而非归一化，与 token_class 的既有裁定一致）；恒红探针 `audit7/z09federationdataplane/status_test.go` 改写为守卫（拒词表外值 / 收四个合法值 / `retired` 仍不被服务） |
