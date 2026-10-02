@@ -306,6 +306,18 @@ func validateRawBase(raw string) error {
 	return nil
 }
 
+// maxSourceNameBytes bounds a game, source or resource name.
+//
+// The name is path-safe under validateSourceName's charset rule, but path-safe is
+// not the same as bounded: the value is joined into the bind callback path, the
+// vault provider identity and the registry's own key, echoed in the /v1/sources
+// listing and stored per binding. Nothing legitimate approaches this length, and
+// 128 bytes is the cap the rest of the tree already uses for operator- and
+// caller-chosen identifiers — maxBoundHandleBytes (internal/auth) and
+// maxRequestIDBytes (internal/httpapi) — so an over-long name is refused at
+// startup rather than carried verbatim (22-2: a 4096-byte name was accepted).
+const maxSourceNameBytes = 128
+
 // validateSourceName checks a game or source name before it is joined into a URL
 // path, a vault identity or the registry's key.
 //
@@ -326,7 +338,15 @@ func validateRawBase(raw string) error {
 // halves is what keeps the join injective. This is deliberately stricter than
 // FO-04's suggested "[a-z0-9][a-z0-9._-]*": that charset would leave the collision
 // open.
+//
+// The charset says what a name may contain; maxSourceNameBytes says how long it
+// may be. Both are refused here, at startup, for the same reason.
 func validateSourceName(field, value string) error {
+	if len(value) > maxSourceNameBytes {
+		return fmt.Errorf(
+			"%s is %d bytes, over the %d-byte limit: the name is joined into a URL path, a vault identity and the registry key, so it is bounded rather than carried",
+			field, len(value), maxSourceNameBytes)
+	}
 	for i, r := range value {
 		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
 		if i == 0 && (r == '-' || r == '_') {

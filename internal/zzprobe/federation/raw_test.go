@@ -172,12 +172,39 @@ func TestProbeRawPathCannotChangeTheHost(t *testing.T) {
 
 // The guard's own documented blind spot, driven explicitly: a segment that
 // becomes ".." only after a decoding the guard does not perform.
+//
+// It used to only print what each form did, so the decode-depth property its name
+// claims had no guard at all: a regression that stopped decoding once, twice or
+// three times would still PASS. The two halves are asserted now — the forms the
+// guard's round cap decodes to ".." must be refused with nothing sent upstream,
+// and the forms it does not decode may pass through but must never leave the
+// configured base or host.
 func TestProbeRawPathEncodedTraversalDepth(t *testing.T) {
+	// Decoded to ".." within maxRawPathDecodeRounds (4): each must be refused.
 	for _, p := range []string{
-		"%2e%2e/x",             // one decode: guard sees ".." -> refuse
-		"%252e%252e/x",         // two decodes
-		"%25252e%25252e/x",     // three
-		"%2525252e%2525252ex",  // four+ (hits the round cap)
+		"%2e%2e/x",            // one decode: guard sees ".." -> refuse
+		"%252e%252e/x",        // two decodes
+		"%25252e%25252e/x",    // three
+		"%2525252e%2525252ex", // four+ (hits the round cap)
+	} {
+		svc, rig := rawService(t, "RIG/v1", "upstream-token")
+		_, err := svc.Raw(context.Background(), federation.RawRequest{
+			User: "usr_1", Game: "phigros", Source: "src", Path: p,
+		})
+		if !errors.Is(err, federation.ErrRawPathEscapes) {
+			t.Errorf("path %q decodes to %q within the round cap but erred with %v, want ErrRawPathEscapes: "+
+				"the decode depth the guard relies on regressed", p, "..", err)
+		}
+		if seen := rig.seen(); len(seen) != 0 {
+			t.Errorf("path %q was refused but the source was still asked: %v", p, seen)
+		}
+	}
+
+	// Not decoded to ".." by the guard: overlong UTF-8, fullwidth full stop,
+	// IIS-style %u. The guard may let these through, but the invariant holds
+	// regardless — the request never leaves the configured base, and it is never
+	// an absolute-form or scheme-relative target.
+	for _, p := range []string{
 		"%c0%ae%c0%ae/x",       // overlong UTF-8 for ".."
 		"%ef%bc%8e%ef%bc%8e/x", // fullwidth full stop
 		"%u002e%u002e/x",       // IIS-style %u
@@ -186,6 +213,17 @@ func TestProbeRawPathEncodedTraversalDepth(t *testing.T) {
 		_, err := svc.Raw(context.Background(), federation.RawRequest{
 			User: "usr_1", Game: "phigros", Source: "src", Path: p,
 		})
+		for _, got := range rig.seen() {
+			if !strings.HasPrefix(got, "GET /v1") {
+				t.Errorf("path %q produced %q, which is not under the configured /v1 base", p, got)
+			}
+			if strings.HasPrefix(got, "GET http://") || strings.HasPrefix(got, "GET https://") {
+				t.Errorf("path %q produced an absolute-form request line: %q", p, got)
+			}
+			if strings.Contains(got, "//evil.example") {
+				t.Errorf("path %q produced a scheme-relative target: %q", p, got)
+			}
+		}
 		t.Logf("path %-24q err=%v upstream=%v", p, err, rig.seen())
 	}
 }
@@ -194,7 +232,10 @@ func TestProbeRawPathEncodedTraversalDepth(t *testing.T) {
 func TestProbeRawResponseSizeAndStreaming(t *testing.T) {
 	const gib = int64(1) << 30
 
-	// 1. Declared Content-Length far past the cap.
+	// 1. Declared Content-Length far past the cap, with only a few bytes actually
+	// sent. The read must not report the truncated stream as a complete 200: it
+	// used to only log the error, so a read path that swallowed the EOF and
+	// returned its five bytes as success would still PASS.
 	t.Run("huge Content-Length", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", "1000000000000000000")
@@ -204,8 +245,16 @@ func TestProbeRawResponseSizeAndStreaming(t *testing.T) {
 		defer srv.Close()
 		svc := rawServiceAt(t, srv.URL)
 		start := time.Now()
-		_, err := svc.Raw(context.Background(), federation.RawRequest{User: "usr_1", Game: "phigros", Source: "src", Path: "x"})
-		t.Logf("Content-Length: 1e18 => err=%v after %v", err, time.Since(start))
+		res, err := svc.Raw(context.Background(), federation.RawRequest{User: "usr_1", Game: "phigros", Source: "src", Path: "x"})
+		elapsed := time.Since(start)
+		t.Logf("Content-Length: 1e18 => err=%v res=%q after %v", err, res.Body, elapsed)
+		if err == nil {
+			t.Errorf("a body that declared 1e18 bytes and sent %d was reported as a complete read (res=%q): "+
+				"a truncated body must not be served as a 200", len(res.Body), res.Body)
+		}
+		if elapsed > 30*time.Second {
+			t.Errorf("a huge declared Content-Length held the call for %v", elapsed)
+		}
 	})
 
 	// 2. A body that never ends. The attempt is bounded only by the client's own
@@ -335,14 +384,27 @@ func TestProbeRegistryAcceptsPathEscapingNames(t *testing.T) {
 		t.Errorf("the accepted source is not retrievable under its own key")
 	}
 
-	// Residual (STILL-OPEN, deliberately not asserted): there is no length cap.
-	// A 4096-character name is path-safe but still lands verbatim in the redirect
-	// URL and source key; logged so this guard is not read as covering it.
+	// The length half of 22-2: path-safe is not bounded. The charset rule alone
+	// accepted a name of any length, and a 4096-byte one landed verbatim in the
+	// redirect URL and the registry key. It is asserted now, and the cap is
+	// checked from both sides — a name exactly at internal/federation's
+	// maxSourceNameBytes (128) is accepted, one byte past it is not — so a
+	// registry that refused everything could not satisfy this.
+	const cap = 128
 	if _, err := federation.NewRegistry(federation.Source{
-		Game: "phigros", Name: strings.Repeat("a", 4096), Issuer: "https://api.example",
+		Game: "phigros", Name: strings.Repeat("a", cap), Issuer: "https://api.example",
 		Resources: []federation.Resource{{Name: "profile", Scope: "phigros.profile.read"}},
-	}); err == nil {
-		t.Logf("RESIDUAL (STILL-OPEN): a %d-character source name is accepted; the registry has no length cap", 4096)
+	}); err != nil {
+		t.Errorf("NewRegistry refused a path-safe name exactly at the %d-byte cap: %v", cap, err)
+	}
+	for _, n := range []int{cap + 1, 4096} {
+		if _, err := federation.NewRegistry(federation.Source{
+			Game: "phigros", Name: strings.Repeat("a", n), Issuer: "https://api.example",
+			Resources: []federation.Resource{{Name: "profile", Scope: "phigros.profile.read"}},
+		}); err == nil {
+			t.Errorf("NewRegistry accepted a %d-byte source name: a path-safe name is still a URL path "+
+				"segment, a vault identity and a registry key, so an unbounded one must be refused at startup (22-2)", n)
+		}
 	}
 }
 
