@@ -218,6 +218,40 @@ func (s *MemoryDeviceStore) RecordDecision(_ context.Context, deviceCodeHash str
 	return true, nil
 }
 
+// SweepExpired drops every device record whose deadline has passed and reports
+// how many. It is the device store's counterpart to MemoryStore.SweepExpired.
+//
+// Expiry is already enforced on read, so this is not what makes an expired
+// request unusable — it is what keeps the two maps from holding every request
+// the process ever started, which is a leak with no other bound in a store that
+// has no database behind it.
+//
+// The byUser index is keyed by normalized user code, and a user code can be
+// reused once its old record is gone, so the index entry is dropped only when it
+// still points at the record being removed; otherwise a sweep would delete the
+// mapping of a newer request that happens to carry the same user code.
+//
+// Nothing calls it on a timer from inside this package: a deployment that runs
+// this store either calls it from its own loop or accepts the growth, and saying
+// so here is better than starting a goroutine a caller cannot stop.
+func (s *MemoryDeviceStore) SweepExpired(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for devHash, rec := range s.byDev {
+		if now.Before(rec.ExpiresAt) {
+			continue
+		}
+		if key := NormalizeUserCode(rec.UserCode); s.byUser[key] == devHash {
+			delete(s.byUser, key)
+		}
+		delete(s.byDev, devHash)
+		removed++
+	}
+	return removed
+}
+
 // BeginDeviceAuthorization starts a device authorization. The scopes are
 // validated here, exactly as the interactive flow validates them, so an
 // unregistered client or scope fails before any user is bothered.
