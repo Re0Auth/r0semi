@@ -319,18 +319,12 @@ func TestV_RealProcessReadyzIsPublicAndLimiterExempt(t *testing.T) {
 // loopback address it picks, which is the opposite direction from the audit
 // report's claim.
 func TestV_RealProcessTwoListenersOnOnePortAndWhoAnswers(t *testing.T) {
-	dir := t.TempDir()
-	port := freePort(t)
-	cfg := fmt.Sprintf("[server]\nissuer = \"http://localhost:%d\"\naddr = \"0.0.0.0:%d\"\n"+
-		"cookie_secure = false\ninternal_addr = \"localhost:%d\"\n", port, port, port)
-	logPath := writeConfig(t, dir, cfg)
-	p := startServer(t, dir, baseEnv(), "-config", logPath)
+	p, port := startTwoListenerProcess(t)
 
 	// 127.0.0.1 is the literal address `internal_addr` names here, and it is
 	// where the operational handler answers: the public listener is the
 	// wildcard, so this is also proof that the two really coexisted.
 	opsBase := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitForOps(t, p, opsBase)
 
 	log := p.log()
 	for _, want := range []string{"listening", "internal surface listening"} {
@@ -366,17 +360,89 @@ func TestV_RealProcessTwoListenersOnOnePortAndWhoAnswers(t *testing.T) {
 	}
 }
 
-// waitForOps waits until the operational listener answers /metrics.
-func waitForOps(t *testing.T, p *proc, opsBase string) {
+// opsReadyTimeout bounds ONE attempt's wait for the operational listener. The
+// real process binds within tens of milliseconds, so this is generous for a
+// single port; the budget for environment noise lives in the retry, not here.
+const opsReadyTimeout = 10 * time.Second
+
+// opsReadyClient polls on a fresh connection every time, which is what makes the
+// readiness measure sound on Windows. main.go binds and listens the public
+// wildcard (cfg.Addr resolved to [::]:P) BEFORE the internal listener
+// (localhost resolved to 127.0.0.1:P), so a poll that connects inside that
+// window is answered 404 by the public handler. Over the pooled
+// http.DefaultTransport that get() uses, the 404 connection is then kept alive
+// and reused for every later poll, so /metrics never reaches the operational
+// handler and the probe reports a timeout even though both listeners came up.
+// Closing each poll's connection means a startup-window 404 cannot pin the
+// probe: the next poll dials again and reaches the operational listener.
+func opsReadyClient() *http.Client {
+	return &http.Client{
+		Timeout:   time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+}
+
+// waitForOps reports whether the operational listener answered /metrics before
+// the process exited or the budget expired. It does NOT fail the test: the
+// caller retries on a fresh port and only a run of complete failures is fatal,
+// so the environment can be absorbed without weakening the 200 assertion.
+func waitForOps(t *testing.T, p *proc, opsBase string) bool {
 	t.Helper()
-	deadline := time.Now().Add(25 * time.Second)
+	client := opsReadyClient()
+	defer client.CloseIdleConnections()
+	deadline := time.Now().Add(opsReadyTimeout)
 	for time.Now().Before(deadline) {
-		if c, _ := get(t, opsBase+"/metrics"); c == http.StatusOK {
-			return
+		select {
+		case err := <-p.waitErr:
+			p.waitErr <- err // leave it for stop() to collect
+			return false
+		default:
+		}
+		resp, err := client.Get(opsBase + "/metrics") //nolint:gosec // loopback, test-only
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return true
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("the operational listener never answered %s/metrics:\n%s", opsBase, p.log())
+	return false
+}
+
+// startTwoListenerProcess runs the whole environment-sensitive sequence —
+// choose a port, start the real process with addr=0.0.0.0:P and
+// internal_addr=localhost:P, wait for the operational listener on 127.0.0.1:P —
+// and retries it on a fresh port when an attempt does not become ready (a port
+// lost to another process, or the Windows wildcard-vs-loopback delivery detail
+// opsReadyClient exists to survive). Each failed attempt's process is stopped
+// and released before the next one, and its log is carried into the failure.
+// Only when every attempt fails does the probe turn red, which is what keeps
+// "the two listeners did not come up" from being swallowed as noise.
+func startTwoListenerProcess(t *testing.T) (*proc, int) {
+	t.Helper()
+	const attempts = 4
+	var logs []string
+	for attempt := 1; attempt <= attempts; attempt++ {
+		dir := t.TempDir()
+		port := freePort(t)
+		cfg := fmt.Sprintf("[server]\nissuer = \"http://localhost:%d\"\naddr = \"0.0.0.0:%d\"\n"+
+			"cookie_secure = false\ninternal_addr = \"localhost:%d\"\n", port, port, port)
+		p := startServer(t, dir, baseEnv(), "-config", writeConfig(t, dir, cfg))
+		opsBase := fmt.Sprintf("http://127.0.0.1:%d", port)
+		if waitForOps(t, p, opsBase) {
+			return p, port
+		}
+		logs = append(logs, fmt.Sprintf("attempt %d/%d on port %d:\n%s", attempt, attempts, port, p.log()))
+		t.Logf("attempt %d/%d on port %d did not become ready; retrying on a fresh port",
+			attempt, attempts, port)
+		p.stop() // release this process and port before the next attempt
+	}
+	t.Fatalf("the operational listener on 127.0.0.1 never answered /metrics on %d fresh ports, "+
+		"so the two-listener setup did not come up in any of them:\n%s",
+		attempts, strings.Join(logs, "\n"))
+	return nil, 0
 }
 
 func mustCode(t *testing.T, url string) int {
