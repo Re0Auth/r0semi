@@ -574,7 +574,7 @@ func (s *Server) Handler() http.Handler {
 	// present (ADR-0001 P4b).
 	root.Handle("GET /.well-known/oauth-authorization-server", s.oidc)
 	root.Handle("GET /.well-known/openid-configuration", s.oidc)
-	root.Handle("/oauth/", s.oidc)
+	root.Handle("/oauth/", withAuthorizeNoStore(s.oidc))
 	// Same method policy as the two documents the OP owns (above), and for the
 	// same reason: an unlisted verb on a URL this server serves is 405 with
 	// Allow, not the catch-all's 404 (G-24).
@@ -756,7 +756,16 @@ func (s *Server) businessPlane() http.Handler {
 		}
 		sort.Strings(allow)
 		allowHeader := strings.Join(allow, ", ")
+		// The operator plane hides itself from a signed-in account that is not on
+		// the allowlist, and it has to do so before this dispatch, not inside a
+		// handler: the dispatch is what turned an undeclared verb into 405 + Allow
+		// and advertised the plane to exactly the account the design hides it from
+		// (AUD-4). An allowlisted operator still gets the dispatch's 405.
+		hidesAdmin := strings.HasPrefix(pattern, "/v1/admin/")
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			if hidesAdmin && s.hideAdminPlaneFrom(w, r) {
+				return
+			}
 			// net/http serves a HEAD request from a GET handler; do the same, so the
 			// dispatch does not turn a legal HEAD into a 405.
 			method := r.Method
@@ -793,6 +802,32 @@ func (s *Server) businessPlane() http.Handler {
 func withNoStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withAuthorizeNoStore marks the OP's two authorization endpoints uncacheable.
+//
+// Both of the 302s they write carry a single-use secret in the query: the login
+// redirect carries the authorization request handle and the authorization
+// response carries the code. The protocol plane's cache policy (oidchttp)
+// covered introspection, userinfo, the keys document and the token endpoint but
+// not these, while the token endpoint is the same kind of response and the
+// business plane is `no-store` in its entirety (`withNoStore`); this is the
+// same rule applied where it was missing (HE-2).
+//
+// A 302 is not in RFC 9110 section 15.1's heuristically cacheable set, so this
+// closes a consistency gap rather than a live cache-poisoning hole, and it does
+// not keep the code out of the browser's own history. The predicate names the
+// two authorize paths on purpose: the metadata documents mounted beside them are
+// deliberately cacheable (`public, max-age=300`) and a plane-wide no-store here
+// would take that back.
+func withAuthorizeNoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/authorize", "/oauth/authorize/callback":
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

@@ -839,8 +839,9 @@ func TestZZProbeAuthorizationRedirectCarriesNoCacheDirective(t *testing.T) {
 	loc := rec.Header().Get("Location")
 	t.Logf("login redirect: %d Location=%q Cache-Control=%q Pragma=%q",
 		rec.Code, loc, rec.Header().Get("Cache-Control"), rec.Header().Get("Pragma"))
-	if strings.Contains(loc, "authRequestID=") && rec.Header().Get("Cache-Control") == "" {
-		t.Errorf("the redirect carrying authRequestID (%q) has no Cache-Control", loc)
+	if strings.Contains(loc, "authRequestID=") && rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("the redirect carrying authRequestID (%q) has Cache-Control=%q, want no-store",
+			loc, rec.Header().Get("Cache-Control"))
 	}
 
 	// Now the authorization response itself, which carries the code.
@@ -859,8 +860,9 @@ func TestZZProbeAuthorizationRedirectCarriesNoCacheDirective(t *testing.T) {
 	loc = rec.Header().Get("Location")
 	t.Logf("authorization response: %d Location=%q Cache-Control=%q Pragma=%q",
 		rec.Code, loc, rec.Header().Get("Cache-Control"), rec.Header().Get("Pragma"))
-	if strings.Contains(loc, "code=") && rec.Header().Get("Cache-Control") == "" {
-		t.Errorf("the authorization response carrying a code (%q) has no Cache-Control", loc)
+	if strings.Contains(loc, "code=") && rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("the authorization response carrying a code (%q) has Cache-Control=%q, want no-store",
+			loc, rec.Header().Get("Cache-Control"))
 	}
 }
 

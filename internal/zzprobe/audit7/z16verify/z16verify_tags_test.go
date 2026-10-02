@@ -82,59 +82,132 @@ func gitQuiet(t *testing.T, dir string, args ...string) {
 }
 
 // TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile runs the repository's own
-// "a tagged test file must be reachable from CI" guard against a tree where a
-// tracked, tagged test file cannot compile. The guard lists it by name — reachable
-// is exactly what it did not check — while the tagged build rejects it, because
-// reachability is asserted over file names and build comments and never over the
-// toolchain.
+// "a tagged test file must be reachable from CI" guard against a tree whose
+// tracked, tagged test file cannot compile, holding the broken body fixed and
+// moving only its build comment. Reachability is asserted over file names and
+// build comments and never over the toolchain, so the guard is blind to whether
+// a file it accepts actually compiles.
+//
+// N-04 landed: ci.yml:400 now vets with `-tags audit5,audit6,audit7,conformance,
+// audit,protocolaudit`, so the guard's orphan list is empty and every
+// workflow-satisfiable constraint is compiled by that one step. The guard itself
+// still compiles nothing, and the two runs below separate the two facts:
+//
+//   - tagged `audit6` — a tag the workflows set, hence "reachable" — the guard is
+//     silent: it reports the corpus, accepts the file's constraint as reachable
+//     and never names it, while the tagged toolchain rejects it (control above).
+//   - tagged `z16orphanprobe` — a tag no workflow sets — the guard names the very
+//     same file. Corpus membership is therefore proved by run 2, and the only
+//     difference between the runs is satisfiability, not the compile error.
+//
+// Compilation of these files is covered exclusively by the CI vet step's -tags
+// list, so a file whose tag is absent from it can still decay in silence.
 func TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile(t *testing.T) {
+	// The broken body, used verbatim in the isolated control and in the fixture
+	// the guard reads. Only the build comment changes between the two guard runs.
+	const body = "package z05memstore\n\nimport \"testing\"\n\n" +
+		"func TestZ16VerifyBrokenProbe(t *testing.T) { _ = noSuchFunctionAnywhere() }\n"
+
+	// Isolated control: the exact body behind the exact tag is excluded from the
+	// default build (`go vet ./...` never looks inside it) and rejected once the
+	// tag is set. Deterministic on purpose: it does not depend on a copy of the
+	// whole repository, which a concurrent writer can leave torn mid-file.
+	ctrl := t.TempDir()
+	for _, f := range []struct{ name, text string }{
+		{"go.mod", "module probe.example/z16verify\n\ngo 1.27\n"},
+		{"unrelated.go", "package z05memstore\n\nfunc real() {}\n"},
+		{"fixture_test.go", "//go:build audit6\n\n" + body},
+	} {
+		if err := os.WriteFile(filepath.Join(ctrl, f.name), []byte(f.text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code, out := run(t, ctrl, nil, "go", "vet", "./..."); code != 0 {
+		t.Fatalf("control: the default gates must exclude the tagged fixture (that is what makes it "+
+			"invisible to `go test ./...` and `go vet ./...`); got exit %d:\n%s", code, out)
+	}
+	code, out := run(t, ctrl, nil, "go", "vet", "-tags", "audit6", "./...")
+	if code == 0 {
+		t.Fatalf("the fixture body compiles under the tag, so this probe would prove nothing")
+	}
+	if !strings.Contains(out, "noSuchFunctionAnywhere") {
+		t.Fatalf("the tagged vet failed for a reason other than the fixture's undefined callee:\n%s", out)
+	}
+	t.Logf("isolated control: `go vet ./...` accepts the fixture, `go vet -tags audit6 ./...` rejects "+
+		"it with %s", strings.TrimSpace(firstLine(out)))
+
 	src := repoRoot(t)
 	tmp := t.TempDir()
 	copyRepo(t, src, tmp)
 
-	// A tracked, audit-tagged file in the repository's own corpus is overwritten
-	// with a body that calls a function which does not exist. It is still tagged,
-	// still tracked, and no workflow sets that tag (N-04 added audit5/audit6/
-	// audit7, so `audit` is the tag that stays orphaned).
+	// The fixture: a tracked file in the repository's own corpus is overwritten
+	// with that same body. The guard enumerates it through `git ls-files`.
 	broken := filepath.Join(tmp, "internal", "zzprobe", "audit6", "z05memstore", "alias_residual_test.go")
-	if err := os.WriteFile(broken, []byte("//go:build audit\n\npackage z05memstore\n\n"+
-		"import \"testing\"\n\nfunc TestZ16VerifyBrokenProbe(t *testing.T) { _ = noSuchFunctionAnywhere() }\n"), 0o644); err != nil {
-		t.Fatal(err)
+	writeFixture := func(tag string) {
+		t.Helper()
+		if err := os.WriteFile(broken, []byte("//go:build "+tag+"\n\n"+body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
+	writeFixture("audit6")
 
 	gitQuiet(t, tmp, "init", "--quiet")
 	gitQuiet(t, tmp, "add", "-A")
 	gitQuiet(t, tmp, "commit", "--quiet", "-m", "verify fixture")
 
-	// The premise: the file really does not compile once the tag it carries is
-	// set. (This is the tagged vet of the whole package; the package's other
-	// files are intact, so a failure here is the fixture's undefined callee.)
-	code, out := run(t, tmp, nil, "go", "vet", "-tags", "audit", "./internal/zzprobe/audit6/z05memstore/...")
+	// Corroboration in the copied tree: the fixture's own package must not vet
+	// clean under its tag. Whether the compiler names our callee is only logged —
+	// a copy taken while another process writes the repository can carry a torn
+	// unrelated file, and the package is then skipped as a broken dependency. The
+	// isolated control above is the normative proof of the fixture's breakage.
+	code, out = run(t, tmp, nil, "go", "vet", "-tags", "audit6", "./internal/zzprobe/audit6/z05memstore/...")
 	if code == 0 {
-		t.Fatalf("the fixture does not even look broken; the tagged vet accepted it")
+		t.Fatalf("the fixture's own package vets clean under -tags audit6, so the fixture is not the " +
+			"broken sample this probe needs")
 	}
-	if !strings.Contains(out, "noSuchFunctionAnywhere") {
-		t.Logf("tagged vet output (kept for diagnosis):\n%s", out)
-		t.Fatalf("the tagged vet failed for a reason other than the fixture's undefined callee")
-	}
-	t.Logf("tagged vet on the fixture's package: exit %d (%s)", code, strings.TrimSpace(firstLine(out)))
+	t.Logf("copied tree: `go vet -tags audit6 ./internal/zzprobe/audit6/z05memstore/...` exits %d (%s)",
+		code, strings.TrimSpace(firstLine(out)))
 
-	// The fixture really is in the corpus the guard reads, and the guard really
-	// runs — it reports the corpus size. Whether it names the fixture is not the
-	// point here (the fixture's tag is a tag no workflow sets, so naming it is
-	// what the guard is for); the blindness is that the report is purely textual:
-	// it never asks whether a single file in it compiles.
-	code, out = run(t, tmp, nil, "go", "test", "-tags", "audit7", "-count=1", "-v",
-		"-run", "^TestEveryTaggedTestFileIsReachableFromCI$",
-		"./internal/zzprobe/audit7/z16guardtestquality/")
-	if !strings.Contains(out, "tracked test files") {
-		t.Fatalf("the guard did not report a corpus at all, so it is not reading the tree:\n%s", out)
+	guardRun := func() string {
+		t.Helper()
+		_, out := run(t, tmp, nil, "go", "test", "-tags", "audit7", "-count=1", "-v",
+			"-run", "^TestEveryTaggedTestFileIsReachableFromCI$",
+			"./internal/zzprobe/audit7/z16guardtestquality/")
+		if !strings.Contains(out, "tracked test files are behind a constraint no workflow can satisfy") {
+			t.Fatalf("the guard did not report a corpus at all, so it is not reading the tree:\n%s", out)
+		}
+		return out
 	}
-	if !strings.Contains(out, "alias_residual_test.go") {
-		t.Fatalf("the fixture is not in the corpus the guard read, so this probe proves nothing:\n%s", out)
+
+	// Run 1 (reachable form): the fixture's tag is in ci.yml:400's list, and the
+	// guard says nothing about the file. It is accepted as reachable without ever
+	// being compiled — even though the isolated control shows it cannot compile.
+	out = guardRun()
+	if !strings.Contains(out, "audit6") {
+		t.Fatalf("the guard no longer reports the fixture's tag among the workflow tags, so the "+
+			"reachability half of this probe is void:\n%s", out)
 	}
-	t.Logf("the guard's report (exit %d) lists the fixture by name while the fixture cannot compile "+
-		"(control above); the report contains no compilation step for any file it lists", code)
+	if strings.Contains(out, "alias_residual_test.go") {
+		t.Fatalf("the guard named a file whose tag the workflows set; that is a different guard "+
+			"than the one under test:\n%s", out)
+	}
+
+	// Run 2 (orphan form): same tracked file, same broken body, a tag no workflow
+	// sets. The guard must now name it — proving the file IS in the corpus it
+	// enumerates, so run 1's silence was a satisfiability verdict and not a skip.
+	writeFixture("z16orphanprobe")
+	out = guardRun()
+	const label = "alias_residual_test.go (//go:build z16orphanprobe)"
+	if !strings.Contains(out, label) {
+		t.Fatalf("the guard did not name the same broken file under an unsatisfiable tag, so the "+
+			"file is not in the corpus it reads and run 1 proved nothing:\n%s", out)
+	}
+	// The guard named it without compiling it. The isolated control already proved
+	// the same body cannot compile in either tag form, and the guard's report
+	// contains no compilation step for anything it lists.
+	t.Logf("the guard: names the fixture when its constraint is orphaned (run 2), accepts the same " +
+		"broken file silently when ci.yml:400's tags satisfy it (run 1); the report itself compiles " +
+		"nothing it lists")
 }
 
 func firstLine(s string) string {

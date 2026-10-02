@@ -44,6 +44,15 @@ import (
 // answers not_found / "unknown resource", while a handler that was reached
 // answers its own detail.
 func zzAdmProblemDetail(t *testing.T, resp *http.Response) string {
+	_, detail := zzAdmProblemFrom(t, resp)
+	return detail
+}
+
+// zzAdmProblemFrom decodes both the machine-readable `code` and the `detail` of
+// a problem+json body in one pass. A body that is not problem+json decodes to
+// two empty strings rather than failing the test: not every route in the walk
+// answers a problem.
+func zzAdmProblemFrom(t *testing.T, resp *http.Response) (code, detail string) {
 	t.Helper()
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
@@ -52,9 +61,9 @@ func zzAdmProblemDetail(t *testing.T, resp *http.Response) string {
 	}
 	var p problem
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return ""
+		return "", ""
 	}
-	return p.Detail
+	return p.Code, p.Detail
 }
 
 // zzAdmAdminPatterns returns every declared route under /v1/admin, grouped by
@@ -154,6 +163,22 @@ func TestZZAdmWrongVerbAdvertisesTheOperatorPlaneToANonAdmin(t *testing.T) {
 		}
 	}
 	t.Logf("wrong-verb leak on %d undeclared-verb probes", leaked)
+
+	// The other half of the fix, and its anti-vacuous control: hoisting the gate
+	// in front of the dispatch must not swallow the dispatch for the account the
+	// plane exists for. An allowlisted operator's undeclared verb is still the
+	// method dispatch's 405 + Allow.
+	op := newAdminEnv(t, true) // signed in, on the allowlist
+	opBrowser := newBrowser(t)
+	signIn(t, opBrowser, op.base)
+	resp := zzAdmSend(t, opBrowser, op.base, http.MethodPut, "/v1/admin/clients", "")
+	allow := resp.Header.Get("Allow")
+	status := resp.StatusCode
+	zzAdmProblemDetail(t, resp)
+	if status != http.StatusMethodNotAllowed || allow == "" {
+		t.Errorf("operator PUT /v1/admin/clients = %d Allow=%q, want the dispatch's 405 with "+
+			"Allow: hiding the plane from a non-admin must not hide it from an operator", status, allow)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -397,16 +422,28 @@ type zzAdmFailingLogger struct{ err error }
 func (f zzAdmFailingLogger) Record(context.Context, audit.Event) error { return f.err }
 
 // ---------------------------------------------------------------------------
-// P5. Erasing an operator's account does not end the operator capability its
-// other sessions hold.
+// P5. Erasing an operator's account ends the operator capability its other
+// sessions hold (AUD-10, S03-6).
 //
-// The composition root states the session half itself ("sessions for a deleted
-// account are only dropped on expiry", cmd/re0auth/main.go). What it does not
-// state is the consequence for the allowlist: the gate is keyed on the session's
-// usr_ value, never on the account row, so a deleted account keeps full operator
-// power until its cookie expires.
+// The probe this replaces was written against a tree where the finding was real:
+// requireAdmin keyed on the session's usr_ value and never re-read the account
+// row, so a deleted account kept full operator power until its cookie expired
+// and the probe measured 200. The re-read is now in requireAdmin, ahead of the
+// allowlist check, so the second session is answered by writeAccountError - 401
+// `unauthenticated` plus EndSession teardown, the documented shape for a session
+// whose account row is gone (S03-5, Z07-7; the same shape the stale-session
+// guard in zz_p3_probes_test.go pins). 404 "unknown resource" is the shape for an
+// existing account that is not on the allowlist (docs/admin.md section 0), a
+// different condition; answering it here would also skip the teardown. The probe
+// therefore asserted the wrong status and could never go green.
+//
+// What this guard pins is the property that matters: the erased operator's
+// second session must never reach the plane again, and it must be torn down
+// rather than answered once and left live. The pre-erasure 200 from the same
+// cookie is the anti-vacuous control: the usr_ is still on the allowlist, so if
+// the account-existence re-read is ever removed this goes back to 200.
 // ---------------------------------------------------------------------------
-func TestZZAdmErasedOperatorKeepsThePlaneThroughAnotherSession(t *testing.T) {
+func TestZZAdmErasedOperatorLosesThePlaneThroughAnotherSession(t *testing.T) {
 	env := newAdminEnv(t, true)
 
 	// Memory-mode wiring: no session revoker, no flow purger, no pseudonym store.
@@ -446,13 +483,26 @@ func TestZZAdmErasedOperatorKeepsThePlaneThroughAnotherSession(t *testing.T) {
 	resp.Body.Close()
 
 	resp = zzAdmSend(t, second, base, http.MethodGet, "/v1/admin/clients", "")
-	detail := zzAdmProblemDetail(t, resp)
+	code, detail := zzAdmProblemFrom(t, resp)
 	if resp.StatusCode == http.StatusOK {
-		t.Errorf("an erased account's second session still calls the operator plane " +
-			"(GET /v1/admin/clients = 200): erasure removed the account, not the operator " +
-			"capability the allowlist keys on")
-	} else if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("second session after erasure = %d %q, want 404", resp.StatusCode, detail)
+		t.Fatalf("an erased account's second session still calls the operator plane "+
+			"(GET /v1/admin/clients = 200): erasure removed the account, not the operator "+
+			"capability the allowlist keys on (AUD-10 regressed)")
+	}
+	if resp.StatusCode != http.StatusUnauthorized || code != "unauthenticated" {
+		t.Fatalf("second session after erasure = %d %q (code %q); a session whose account row is "+
+			"gone is answered by writeAccountError: 401 unauthenticated plus teardown (S03-5, Z07-7)",
+			resp.StatusCode, detail, code)
+	}
+
+	// The teardown, not just the one refusal: the erasure revoked no sessions in
+	// this wiring, so a second request is refused only because writeAccountError's
+	// EndSession ran. It must not be a fresh 401 from the same still-live cookie.
+	resp = zzAdmSend(t, second, base, http.MethodGet, "/v1/admin/clients", "")
+	zzAdmProblemFrom(t, resp)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("the erased account's second session is %d on a second request, want 401: "+
+			"the stale session was not torn down", resp.StatusCode)
 	}
 }
 

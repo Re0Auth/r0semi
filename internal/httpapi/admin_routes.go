@@ -86,6 +86,49 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// hideAdminPlaneFrom answers the operator plane's 404 for a caller the plane
+// hides itself from, *before* businessPlane's method dispatch can answer
+// 405 + Allow. It reports whether it wrote the response.
+//
+// requireAdmin alone cannot keep the promise in docs/admin.md section 0 ("a
+// signed-in account that is not on the list sees /v1/admin/* exactly as it sees
+// a path that does not exist"): the dispatch runs ahead of every handler, so an
+// undeclared verb was answered by the dispatch itself and told a non-admin both
+// that this deployment runs an operator plane and which methods each route
+// declares (AUD-4; the same promise is in docs/openapi.yaml under the admin
+// tag). Moving the decision in front of the dispatch is what closes it.
+//
+// An anonymous caller is deliberately left to the handlers. They answer 401,
+// which is the shape every declared verb already gives it, and the dispatch in
+// front of them preserves the method table the business plane publishes for the
+// routes it serves (plane_test.go). The promise AUD-4 breaks is about the
+// account that is signed in and not on the allowlist.
+func (s *Server) hideAdminPlaneFrom(w http.ResponseWriter, r *http.Request) bool {
+	if s.sessions == nil {
+		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown resource")
+		return true
+	}
+	user, ok := s.sessions.User(r.Context())
+	if !ok {
+		return false
+	}
+	// Same account-existence re-read as requireAdmin: operator authority follows
+	// the account row, not a cookie (S03-6). An erased account whose session has
+	// not been revoked is answered by writeAccountError (401 + teardown, S03-5),
+	// never the plane.
+	if s.accounts != nil {
+		if _, err := s.accounts.GetUser(r.Context(), user); err != nil {
+			s.writeAccountError(w, r, err, "account lookup failed")
+			return true
+		}
+	}
+	if !s.adminAllowed[user] {
+		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown resource")
+		return true
+	}
+	return false
+}
+
 // requireAdminWrite is requireAdmin plus the checks every mutating admin endpoint
 // needs: a valid CSRF token and a recent enough authentication. Both conditions
 // produce a documented problem code.
