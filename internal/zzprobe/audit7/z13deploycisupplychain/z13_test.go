@@ -159,7 +159,10 @@ func indentBlock(s string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Z13-2: the release tag is pushed to GHCR before the Trivy gate runs.
+// Z13-2 (S15-6): the release tag used to be pushed to GHCR before the Trivy
+// gate ran. The fix builds with push-by-digest and creates the release tag only
+// after the scan and the signature; this is now the regression guard for that
+// ordering.
 // ---------------------------------------------------------------------------
 
 // step is one `- uses:`/`- name:` entry of a workflow job, reduced to the fields
@@ -241,67 +244,100 @@ func jobSteps(t *testing.T, workflow, job string) []step {
 
 func unquote(s string) string { return strings.Trim(s, `"'`) }
 
+// TestZ13ReleasePushesTheReleaseTagBeforeTheScan started as Z13-2/S15-6: the
+// build-push step attached the release tag (`push: true`, tags from
+// `steps.meta.outputs.tags`) before the Trivy gate ran, so a build that failed
+// the scan was already pullable as the tag the deployment pins. The fix built
+// with push-by-digest and no tag, then created the release tag from the scanned
+// digest after the gate and the signature. The guard pins that order, and the
+// name is kept for the round-9 coverage matrix.
 func TestZ13ReleasePushesTheReleaseTagBeforeTheScan(t *testing.T) {
 	root := repoRoot(t)
 	release := readFile(t, root, ".github", "workflows", "release.yml")
 	steps := jobSteps(t, release, "image")
-	if len(steps) < 6 {
+	if len(steps) < 8 {
 		t.Fatalf("parsed only %d steps from the image job; the probe is stale", len(steps))
 	}
 
-	pushAt, scanAt, promoteAt, signAt := -1, -1, -1, -1
+	buildAt, scanAt, signAt, tagAt, promoteAt := -1, -1, -1, -1, -1
 	var metaWith, pushWith string
 	for i, s := range steps {
 		switch {
 		case strings.Contains(s.Uses, "docker/metadata-action"):
 			metaWith = s.With
 		case strings.Contains(s.Uses, "docker/build-push-action"):
-			pushAt, pushWith = i, s.With
+			buildAt, pushWith = i, s.With
 		case strings.Contains(s.Name, "scan the image"):
 			scanAt = i
-		case strings.Contains(s.Name, "promote to latest"):
-			promoteAt = i
 		case strings.Contains(s.Name, "sign the image digest"):
 			signAt = i
+		case strings.Contains(s.Name, "tag the release"):
+			tagAt = i
+		case strings.Contains(s.Name, "promote to latest"):
+			promoteAt = i
 		}
 	}
 	// Controls: every step the ordering claim depends on must have been found,
-	// and the Trivy gate must really be a gate.
-	if pushAt < 0 || scanAt < 0 || promoteAt < 0 || signAt < 0 {
-		t.Fatalf("could not locate all four steps (push=%d scan=%d promote=%d sign=%d)", pushAt, scanAt, promoteAt, signAt)
+	// the scan must really be a blocking gate, and the build must really publish
+	// something — otherwise "the tag is created after the scan" is vacuous.
+	if buildAt < 0 || scanAt < 0 || signAt < 0 || tagAt < 0 || promoteAt < 0 {
+		t.Fatalf("could not locate all five steps (build=%d scan=%d sign=%d tag=%d promote=%d)",
+			buildAt, scanAt, signAt, tagAt, promoteAt)
 	}
 	if !strings.Contains(steps[scanAt].Run, "--exit-code 1") || !strings.Contains(steps[scanAt].Run, "HIGH,CRITICAL") {
 		t.Fatalf("the scan step is no longer a blocking HIGH/CRITICAL gate: %q", steps[scanAt].Run)
 	}
-	if !strings.Contains(pushWith, "push: true") {
-		t.Fatalf("the build-push step no longer pushes: %q", pushWith)
+	if !strings.Contains(pushWith, "push=true") {
+		t.Fatalf("the build-push step no longer pushes anything: %q", pushWith)
 	}
-	// The round-5 fix must still be in place, or this probe is measuring the old bug.
-	if strings.Contains(metaWith, "type=raw,value=latest") || strings.Contains(metaWith, "latest") {
-		t.Errorf("metadata-action now produces a `latest` tag before the scan: the P2-12 fix has regressed")
+
+	// The fix: pushed by digest, with no registry tag attached to the build.
+	if !strings.Contains(pushWith, "push-by-digest=true") {
+		t.Errorf("the build no longer pushes by digest; the release tag can be attached before the scan again: %q", pushWith)
 	}
-	if promoteAt < scanAt {
-		t.Errorf("`latest` is promoted before the scan; the P2-12 fix has regressed")
+	if buildAttachesTheReleaseTag(pushWith) {
+		t.Errorf("the build-push step attaches a registry tag again (S15-6/Z13-2 regressed): the image is "+
+			"pullable under that tag while the Trivy gate is still to run: %q", pushWith)
 	}
 	if !strings.Contains(metaWith, "type=ref,event=tag") {
 		t.Fatalf("metadata-action no longer tags from the git ref: %q", metaWith)
 	}
-	if !strings.Contains(pushWith, "steps.meta.outputs.tags") {
-		t.Fatalf("build-push-action no longer uses the metadata tags: %q", pushWith)
+	if strings.Contains(metaWith, "latest") {
+		t.Errorf("metadata-action now produces a `latest` tag before the scan: the P2-12 fix has regressed")
 	}
 
-	// The residual: the RELEASE tag itself is pushed by the step above the scan.
-	if pushAt < scanAt {
-		t.Errorf("the image is pushed to GHCR (push: true, tags from type=ref,event=tag) at step %d "+
-			"while the Trivy gate is step %d: when the scan fails, `ghcr.io/<repo>:<tag>` already "+
-			"exists and is indistinguishable from a scanned one. Only `latest` and the GitHub release "+
-			"are gated. Gate the push (build with load: true, scan, then push) or scan before the push",
-			pushAt, scanAt)
+	// The order the finding was about: build → scan → sign → tag the release →
+	// promote to latest. The release tag no longer exists while the gate runs.
+	if !(buildAt < scanAt && scanAt < signAt && signAt < tagAt && tagAt < promoteAt) {
+		t.Errorf("the image job's order changed: build(%d) scan(%d) sign(%d) tag-release(%d) promote-latest(%d); "+
+			"want build < scan < sign < tag-release < promote-latest so no tag points at an unscanned or "+
+			"unsigned image", buildAt, scanAt, signAt, tagAt, promoteAt)
 	}
-	if signAt < promoteAt {
-		t.Errorf("the image digest is signed (step %d) after `latest` is promoted (step %d): a signing "+
-			"failure leaves the floating tag pointing at an unsigned image", signAt, promoteAt)
+
+	// The release tag is moved onto the scanned digest rather than rebuilt, so the
+	// bytes that passed the gate are what the tag resolves to.
+	tagRun := steps[tagAt].Run
+	if !strings.Contains(tagRun, "imagetools create") || !strings.Contains(tagRun, "steps.build.outputs.digest") {
+		t.Errorf("`tag the release` no longer retags the scanned digest (run: %q); a rebuild here would put "+
+			"bytes that never passed the gate behind the release tag", tagRun)
 	}
+	if !strings.Contains(steps[promoteAt].Run, "steps.build.outputs.digest") {
+		t.Errorf("`promote to latest` no longer points at the scanned digest: %q", steps[promoteAt].Run)
+	}
+
+	// Anti-vacuity: the pre-fix build step attached the tag directly. The
+	// predicate must call that "attaches a registry tag".
+	preFix := "push: true\ntags: ${{ steps.meta.outputs.tags }}"
+	if !buildAttachesTheReleaseTag(preFix) {
+		t.Fatal("the predicate accepts the pre-fix build step; this guard would not fail on a revert and is vacuous")
+	}
+}
+
+// buildAttachesTheReleaseTag reports whether a build-push `with:` block attaches
+// a registry tag to the built image — the pre-fix shape that made the release
+// tag pullable before the scan.
+func buildAttachesTheReleaseTag(buildWith string) bool {
+	return strings.Contains(buildWith, "steps.meta.outputs.tags") || strings.Contains(buildWith, "push: true")
 }
 
 // ---------------------------------------------------------------------------

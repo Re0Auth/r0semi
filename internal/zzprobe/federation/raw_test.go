@@ -281,12 +281,17 @@ func rawServiceAt(t *testing.T, issuer string) federation.Service {
 // concatenated into?
 // ---------------------------------------------------------------------------
 
+// TestProbeRegistryAcceptsPathEscapingNames started as the FO-04/G-18 finding:
+// NewRegistry accepted game/source names containing "/", ".", "?", "#",
+// whitespace or control bytes, and every one of those is concatenated into a
+// bind redirect URL, an OAuth scope or the raw proxy route — so an
+// operator-supplied name could move the path it was placed in. The "." case is
+// worse: BindingIdentity joins the two halves with ".", so ("a.b","c") and
+// ("a","b.c") are two registry entries sharing one vault credential row. The
+// registry now validates both halves against a path-safe alphabet; this is the
+// regression guard for that fix.
 func TestProbeRegistryAcceptsPathEscapingNames(t *testing.T) {
-	// These are all values an operator (or, in the future, a discovery document)
-	// could supply. Where do they end up? Scopes, the bind redirect URL, and the
-	// raw proxy route.
-	cases := []struct{ game, name string }{
-		{"phigros", "src"},
+	dangerous := []struct{ game, name string }{
 		{"phigros", "../evil"},
 		{"../..", "src"},
 		{"phigros", "src/../other"},
@@ -295,24 +300,49 @@ func TestProbeRegistryAcceptsPathEscapingNames(t *testing.T) {
 		{"phigros", "src%2F..%2Fother"},
 		{"phigros", "src\x00null"},
 		{"phigros", "src\nnewline"},
-		{"phigros", strings.Repeat("a", 4096)},
 		{"phigros", "src with space"},
+		{"phigros", ".."},
+		{"phigros", "src.other"},
+		{"phigros", `src\other`},
+		{"phigros", "UPPER"},
+		{"phigros", "-leading"},
+		{"phigros", "_leading"},
+	}
+	for _, c := range dangerous {
+		_, err := federation.NewRegistry(federation.Source{
+			Game: c.game, Name: c.name, Issuer: "https://api.example",
+			Resources: []federation.Resource{{Name: "profile", Scope: "phigros.profile.read"}},
+		})
+		if err == nil {
+			t.Errorf("NewRegistry accepted game=%q name=%q: both halves are concatenated into bind redirect "+
+				"paths, OAuth scopes and the raw route, so a name that escapes its path changes where the "+
+				"request goes — and '.' makes two entries share one vault credential row (FO-04/G-18)",
+				c.game, c.name)
+		}
 	}
 
-	for _, c := range cases {
-		reg, err := federation.NewRegistry(federation.Source{
-			Game: c.game, Name: c.name, Issuer: "https://api.example",
-			Resources: []federation.Resource{{Name: "profile", Scope: c.game + ".profile.read"}},
-		})
-		if err != nil {
-			t.Logf("game=%q name=%q => registry REFUSED: %v", c.game, c.name, err)
-			continue
-		}
-		src, _ := reg.Get(c.game, c.name)
-		t.Logf("game=%q name=%q => ACCEPTED; sourceKey=%q redirect-derived=%q scope=%q",
-			c.game, c.name, c.game+"/"+c.name,
-			"https://re0auth.example/auth/upstream/"+src.Game+"/"+src.Name+"/callback",
-			src.Resources[0].Scope)
+	// Positive control: a well-formed source is still accepted and retrievable,
+	// so the refusals above are about the characters and not a registry that
+	// refuses everything.
+	reg, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "src-1", Issuer: "https://api.example",
+		Resources: []federation.Resource{{Name: "profile", Scope: "phigros.profile.read"}},
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry refused a well-formed source: %v", err)
+	}
+	if _, ok := reg.Get("phigros", "src-1"); !ok {
+		t.Errorf("the accepted source is not retrievable under its own key")
+	}
+
+	// Residual (STILL-OPEN, deliberately not asserted): there is no length cap.
+	// A 4096-character name is path-safe but still lands verbatim in the redirect
+	// URL and source key; logged so this guard is not read as covering it.
+	if _, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: strings.Repeat("a", 4096), Issuer: "https://api.example",
+		Resources: []federation.Resource{{Name: "profile", Scope: "phigros.profile.read"}},
+	}); err == nil {
+		t.Logf("RESIDUAL (STILL-OPEN): a %d-character source name is accepted; the registry has no length cap", 4096)
 	}
 }
 

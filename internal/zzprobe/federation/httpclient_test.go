@@ -317,17 +317,76 @@ func TestProbeBulkheadSlotReturnsOnClose(t *testing.T) {
 // idempotent), but the data plane does not wrap its doer in Retry at all. This
 // records where Retry is actually installed, because the documented promise to
 // sources ("鎸囨暟閫€閬块噸璇?, source-onboarding.md 搂4) is about the data plane.
+// TestProbeRetryIsNotInstalledOnTheDataPlane pins the wiring the finding was
+// about rather than describing it: the data plane's federation client is built
+// by NewOutboundClient, whose decorator stack (transport, bulkhead, breaker,
+// address guard) has no Retry layer, and cmd/re0auth/main.go constructs no
+// httpclient.Retry. The only production call site is the TapTap client in
+// cmd/referencesource. If either changes, the data plane starts spending a
+// retry budget per user read, which docs/source-onboarding.md never told sources
+// about.
 func TestProbeRetryIsNotInstalledOnTheDataPlane(t *testing.T) {
-	// There is no way to assert absence by running, so this states what the
-	// static search found and would fail if the wiring grew a Retry wrapper whose
-	// retry budget the data plane then spends per user read.
-	t.Log("static: httpclient.Retry is constructed in exactly one place in the " +
-		"repository 鈥?cmd/referencesource/main.go:143 (the TapTap client). " +
-		"cmd/re0auth/main.go's federationClient uses NewOutboundClient only " +
-		"(bundled decorators: Transport, Bulkhead, CircuitBreaker) 鈥?no Retry layer.")
-	t.Log("consequence: the data plane has no automatic retry, so " +
-		"docs/source-onboarding.md 搂4's '鍑虹珯杩炴帴姹?+ 骞跺彂涓婇檺锛坆ulkhead锛? 鎸囨暟閫€閬块噸璇? " +
-		"overstates what a source will see from Re0Auth")
+	re0auth := probeRepoFile(t, "cmd/re0auth/main.go")
+	refsource := probeRepoFile(t, "cmd/referencesource/main.go")
+	outbound := probeRepoFile(t, "httpclient/outbound.go")
+
+	// Controls: both ends of the claim are really present, so the assertions
+	// below are statements about the wiring and not about a bad file read.
+	if !strings.Contains(refsource, "httpclient.Retry(") {
+		t.Fatalf("cmd/referencesource no longer installs httpclient.Retry; the probe is reading the wrong tree")
+	}
+	if !strings.Contains(re0auth, "federationClient := httpclient.NewOutboundClient(") {
+		t.Fatalf("cmd/re0auth no longer builds federationClient with NewOutboundClient; re-derive the finding")
+	}
+
+	if strings.Contains(re0auth, "httpclient.Retry(") {
+		t.Errorf("cmd/re0auth/main.go now installs httpclient.Retry: the data plane's per-user reads would " +
+			"spend a retry budget that the documented promise to sources does not mention")
+	}
+
+	// The federation service must be wired to that exact client, on both the
+	// Doer and the HTTPClient side.
+	svcAt := strings.Index(re0auth, "federation.NewService(federation.Config{")
+	if svcAt < 0 {
+		t.Fatalf("cmd/re0auth no longer constructs federation.NewService(federation.Config{...}); re-derive")
+	}
+	end := strings.Index(re0auth[svcAt:], "\n\t})")
+	if end < 0 {
+		t.Fatalf("the federation.Config literal no longer closes where this probe expects; re-derive")
+	}
+	cfgBlock := re0auth[svcAt : svcAt+end]
+	for _, field := range []string{"Doer:", "HTTPClient:"} {
+		line := ""
+		for _, l := range strings.Split(cfgBlock, "\n") {
+			if strings.Contains(l, field) {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Errorf("the federation.Config literal on the data plane has no %s field; re-derive the finding", field)
+			continue
+		}
+		if !strings.Contains(line, "federationClient") {
+			t.Errorf("federation.Config.%s is wired to %q, not the NewOutboundClient-backed federationClient: "+
+				"the data plane may have grown a retrying client", field, strings.TrimSpace(line))
+		}
+	}
+
+	// And the builder itself bundles no Retry layer, so no data-plane caller can
+	// acquire one through NewOutboundClient.
+	start := strings.Index(outbound, "func NewOutboundClient(")
+	if start < 0 {
+		t.Fatalf("httpclient/outbound.go no longer declares NewOutboundClient; re-derive")
+	}
+	region := outbound[start:]
+	if i := strings.Index(region, "\n}\n"); i >= 0 {
+		region = region[:i+2]
+	}
+	if strings.Contains(region, "Retry") {
+		t.Errorf("NewOutboundClient's decorator stack now mentions Retry: the data plane would gain automatic "+
+			"retries through it. Body: %s", strings.Join(strings.Fields(region), " "))
+	}
 }
 
 func newFlakyServer(t *testing.T, h http.HandlerFunc) *httptestServer {

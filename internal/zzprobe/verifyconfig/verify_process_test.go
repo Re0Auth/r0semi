@@ -563,8 +563,19 @@ func TestV_ShippedExampleConfigRefusesToStartWithoutDatabaseURL(t *testing.T) {
 	if code == 0 {
 		t.Logf("the example config started without DATABASE_URL")
 	}
-	if !strings.Contains(out, "DATABASE_URL") {
-		t.Errorf("the refusal does not name DATABASE_URL:\n%s", out)
+	if code == 0 {
+		t.Errorf("the shipped example config started with no DATABASE_URL: [storage] in the example names one, " +
+			"so it must refuse")
+	}
+	// Z19-1: the refusal names the configuration field (storage.dsn_env), not the
+	// environment variable that is missing, so a log line cannot double as a list
+	// of the deployment's secret names.
+	if strings.Contains(out, "DATABASE_URL") {
+		t.Errorf("the refusal echoes the DSN's environment-variable name; Z19-1's redaction has regressed:\n%s", out)
+	}
+	if !strings.Contains(out, "storage.dsn_env") || !strings.Contains(out, "stage=config") {
+		t.Errorf("the refusal no longer identifies the missing configuration field (storage.dsn_env, stage=config): "+
+			"it must stay diagnosable without echoing the variable name:\n%s", out)
 	}
 
 	// Same config, DATABASE_URL set to something unreachable: now the driver is
@@ -578,7 +589,7 @@ func TestV_ShippedExampleConfigRefusesToStartWithoutDatabaseURL(t *testing.T) {
 	for k, v := range secrets {
 		env2[k] = v
 	}
-	env2["DATABASE_URL"] = "postgres://user:pass@db.internal:5432/re0auth?sslmode=disable"
+	env2["DATABASE_URL"] = "postgres://user:hunter2-probe-secret@db.internal:5432/re0auth?sslmode=disable"
 	env2["RE0AUTH_AUDIT_KEY"] = probeKEK
 	code2, out2 := runToExit(t, dir2, env2, "-config", filepath.Join(dir2, "re0auth.toml"))
 	t.Logf("the same file WITH DATABASE_URL -> exit %d: %s",
@@ -588,6 +599,11 @@ func TestV_ShippedExampleConfigRefusesToStartWithoutDatabaseURL(t *testing.T) {
 	}
 	if strings.Contains(out2, "storage is in-memory") {
 		t.Errorf("the example config stayed in memory with DATABASE_URL set:\n%s", out2)
+	}
+	// Z19-1, second half: the connection failure is reported without echoing the
+	// DSN or its password, so the log stays usable as an incident artifact.
+	if strings.Contains(out2, "hunter2-probe-secret") || strings.Contains(out2, "sslmode=disable") {
+		t.Errorf("the connection-failure log echoes the DSN or its credentials:\n%s", out2)
 	}
 }
 

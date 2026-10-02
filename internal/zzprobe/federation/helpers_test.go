@@ -7,6 +7,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Re0Auth/r0semi/audit"
@@ -49,4 +51,29 @@ func httptestClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // httptest only
 	}
+}
+
+// probeRepoFile reads one repository file, found by walking up to the module
+// root, so a source-reading probe does not depend on the test's directory depth.
+func probeRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("no go.mod above %s", dir)
+		}
+		dir = parent
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return string(raw)
 }

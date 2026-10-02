@@ -215,10 +215,20 @@ func (f *frozenStore) PutIfVersion(ctx context.Context, b federation.Binding, v 
 	return f.BindingStore.PutIfVersion(ctx, b, v)
 }
 
-// After a refresh wins the CAS but the binding row is deleted before the vault
-// write, the vault keeps a secret for a binding that no longer exists. That is
-// the ordering trade refresh.go names ("the one case the ordering trade buys") —
-// this probe asks whether the residue is really only the case named there.
+// TestProbeRefreshVaultResidueAfterRowDisappears records — without failing — the
+// vault residue left when the binding row disappears around a refresh.
+//
+// This was audit-5's red probe. docs/audit-7/findings/22-audit5-red-reconciliation.md
+// (table #2, §二.5) rules it DECIDED-NONGOAL under FO-02: "known, not a finding;
+// the evidence does not hold". The ruling also records a mechanism error here:
+// onPut deletes the row BEFORE PutIfVersion runs, so the CAS necessarily LOSES
+// (refresh.go's !won branch returns bindings.Get → ErrNotBound) and the secret
+// left in the vault is the one Enroll wrote at setup, not one the refresh wrote.
+// The real FO-02 window — CAS wins, then the row is deleted before
+// storeBindingSecret — is not constructed by this fixture, and
+// docs/audit-7/BRIEF.md §5 lists the cross-instance refresh residue as
+// deliberately out of scope. The probe therefore records the state instead of
+// re-reporting a decided non-goal.
 func TestProbeRefreshVaultResidueAfterRowDisappears(t *testing.T) {
 	log := &reqLog{}
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -286,14 +296,22 @@ func TestProbeRefreshVaultResidueAfterRowDisappears(t *testing.T) {
 	_, gerr := store.Get(ctx, "usr_1", "phigros", "src")
 	exists, _ := v.Exists(ctx, federation.BindingIdentity(b))
 	t.Logf("row present: %v; vault secret present: %v", gerr == nil, exists)
-	if gerr != nil && exists {
-		t.Errorf("the vault holds a secret whose binding row is gone: no endpoint reaches it, "+
-			"ListAll cannot see it, and the Kill Switch cannot ask its source (err=%v)", gerr)
+
+	// Harness premise, not the finding: the fixture's point is that the deletion
+	// hook ran before the CAS, so the row is gone and the loser path was taken.
+	// If that stops holding, the probe is measuring a different interleaving.
+	if gerr == nil {
+		t.Fatalf("the binding row survived the refresh (gerr=nil): the fixture did not construct the " +
+			"lost-CAS interleaving this probe is about, so it measured nothing")
 	}
-	if gerr == nil && exists {
-		var out map[string]string
-		_ = v.Use(ctx, federation.BindingIdentity(b), func(p []byte) error { return json.Unmarshal(p, &out) })
-		t.Logf("row and secret both present; secret=%v", out)
+	switch {
+	case exists:
+		t.Logf("STATE (DECIDED-NONGOAL, FO-02): row gone, vault secret present. The secret is the setup " +
+			"Enroll's — the CAS lost before any vault write — and no endpoint, ListAll row or Kill Switch " +
+			"can reach it. Ruling: docs/audit-7/findings/22-audit5-red-reconciliation.md #2 and " +
+			"docs/audit-7/BRIEF.md §5; recorded, not failed here.")
+	default:
+		t.Logf("STATE: row and vault secret both gone; no residue this run")
 	}
 }
 

@@ -9,8 +9,16 @@
 //	endpointRemovalWait (sleep) + shutdownTimeout (HTTP drain) + auditDrainTimeout
 //
 // The round-5 fix for "the shutdown drain budget can outlast the pod grace"
-// (P2-31) bounded the third term but did not add the first two back in, and the
-// deployment's own comment still counts only the first two ("35s total").
+// (P2-31) bounded the third term but did not add the first two back in. That was
+// G-12/Z10-3: `5 + 30 + 30 = 65s` against a 45s grace. It has since been fixed —
+// auditDrainTimeout is 10s, the manifest comment counts all three terms
+// (`5 + 30 + 10 = 45s`) and the CHANGELOG advises `terminationGracePeriodSeconds
+// ≥ 45s` — and this test now guards the fixed arithmetic, failing if the total
+// exceeds the grace again.
+//
+// The operational listener is not part of this series: it is marked noDrain and
+// closed outright rather than sharing the drain context with the public listener
+// (Z10V-2; the guard for that half lives in z10verify).
 package z10adminauditprivacy
 
 import (

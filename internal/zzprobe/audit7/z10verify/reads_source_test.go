@@ -5,7 +5,6 @@
 package z10verify
 
 import (
-	"regexp"
 	"strings"
 	"testing"
 )
@@ -90,9 +89,10 @@ func TestZ10VerifyTheAuditReadGuardIsNotRequiredToHaveASink(t *testing.T) {
 // ---- negative controls ---------------------------------------------------------
 
 // TestZ10VerifySourceChecksCanFail proves the source-reading assertions are not
-// vacuous: each fabricated snippet is one the real check must reject. If any of
-// these controls stops failing, the corresponding finding above may have been
-// "verified" by a check that cannot see the bug.
+// vacuous: each fabricated snippet is the pre-fix shape the rewritten guards in
+// killswitch_source_test.go / pseudo_source_test.go must reject. If any of these
+// controls stops failing, the corresponding guard may have been "verified" by a
+// check that cannot see a revert.
 func TestZ10VerifySourceChecksCanFail(t *testing.T) {
 	// 1. A loadKey whose cache check comes after the query.
 	syntheticLoad := `
@@ -102,24 +102,18 @@ func (l *AuditLogger) loadKey(ctx context.Context, subject string) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	l.mu.Lock()
-	cached, ok := l.cache[subject]
-	l.mu.Unlock()
+	cached, ok := l.cached(subject)
 	if ok {
 		return cached, nil
 	}
 	return key, nil
 }`
-	scr := scrubLiterals(t, "synthetic", syntheticLoad)
-	guard := strings.Index(scr, "if ok {")
-	dbQuery := strings.Index(scr, "l.pool.QueryRow(")
-	cacheReturn := strings.Index(scr, "return cached")
-	if !(dbQuery < cacheReturn && guard < cacheReturn) {
-		t.Fatalf("control 1 did not detect a loadKey that queries before answering from cache (query %d, guard %d, cache return %d)",
-			dbQuery, guard, cacheReturn)
+	if cacheHitPrecedesTheQuery(syntheticLoad) {
+		t.Fatalf("control 1 did not detect a loadKey that queries before answering from cache")
 	}
 
-	// 2. A Destroy that evicts more than its own map.
+	// 2. A Destroy that evicts more than its own map must keep the cross-process
+	// primitives visible to the structural scan.
 	syntheticDestroy := `
 func (l *AuditLogger) Destroy(ctx context.Context, subject string) error {
 	destroyed.Store(subject, struct{}{})
@@ -132,26 +126,39 @@ func (l *AuditLogger) Destroy(ctx context.Context, subject string) error {
 		t.Fatalf("control 2 did not keep the cross-process primitives visible; the check would miss a fix")
 	}
 
-	// 3. An admin.client.* record that does carry client_id in Detail.
-	syntheticRecord := `s.record(ctx, actor, "admin.client.suspend", clientID, audit.OutcomeOK, map[string]string{
-		"tokens_revoked": strconv.Itoa(removed),
-		"client_id":      clientID,
-	})`
-	kk := regexp.MustCompile(`s\.record\(ctx, actor, "admin\.client\.[a-z_]+", [^,]+, [^,]+, map\[string\]string\{[^}]*\}`)
-	call := kk.FindString(syntheticRecord)
-	if call == "" || !strings.Contains(call, "client_id") {
-		t.Fatalf("control 3 did not detect a client_id-carrying admin record (matched %q)", call)
+	// 3. The pre-fix admin.client.* record: the id is the (pseudonymised) subject
+	// and there is no compensating client_id in Detail.
+	syntheticRecord := `s.record(ctx, actor, "admin.client.register", id, audit.OutcomeOK, map[string]string{"type": "confidential"})`
+	if _, subject := clientRecordCall(t, syntheticRecord, "admin.client.register"); subject != "id" {
+		t.Fatalf("control 3 did not read the pre-fix subject (got %q)", subject)
+	}
+	if clientRecordCarriesClientID(syntheticRecord) {
+		t.Fatalf("control 3 did not detect a client_id-less admin record; the Z10-8 guard would be vacuous")
 	}
 
-	// 4. A kill-switch failure detail that does carry sessions_revoked, and one
-	//    that carries neither count, must both be distinguishable.
-	syntheticKill := `s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, map[string]string{
-		"tokens_revoked":   strconv.Itoa(rep.TokensRevoked),
-		"sessions_revoked": strconv.FormatInt(rep.SessionsRevoked, 10),
-	})`
-	re := regexp.MustCompile(`(?s)map\[string\]string\{([^}]*)\}\)`)
-	m := re.FindStringSubmatch(syntheticKill)
-	if m == nil || !strings.Contains(m[1], "sessions_revoked") {
-		t.Fatalf("control 4 did not detect a sessions_revoked in a failure detail (match %v)", m)
+	// 4. The pre-fix kill-switch failure detail: inline, tokens only.
+	syntheticKill := `s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, ` +
+		`map[string]string{"tokens_revoked": strconv.Itoa(rep.TokensRevoked)})`
+	if killSwitchRecordsThroughKillDetail(syntheticKill) {
+		t.Fatalf("control 4 did not detect an inline partial kill-switch Detail; the Z10V-1 guard would be vacuous")
+	}
+
+	// 5. The pre-fix Report, with no sessions-unavailable marker.
+	syntheticReport := `type Report struct {
+	BindingsUnavailable bool ` + "`json:\"bindings_unavailable,omitempty\"`" + `
+}`
+	if sessionUnavailableMarkerPresent(syntheticReport) {
+		t.Fatalf("control 5 did not detect a Report without the sessions marker; the Z10-4 guard would be vacuous")
+	}
+
+	// 6. The pre-fix shutdown loop: every endpoint drained from the shared budget.
+	syntheticServe := `
+	for _, ep := range endpoints {
+		if e := ep.server.Shutdown(drainCtx); e != nil {
+			_ = ep.server.Close()
+		}
+	}`
+	if operationalListenerBypassesTheSharedDrain(syntheticServe) {
+		t.Fatalf("control 6 did not detect the shared drain; the Z10V-2 guard would be vacuous")
 	}
 }

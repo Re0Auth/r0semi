@@ -1,7 +1,13 @@
 //go:build audit7
 
-// Re-check of Z10-4, Z10-5 and the audit-detail gap this round found: every claim
-// here is read out of the source text, so a wrong claim fails a test.
+// Regression guards for Z10-4, Z10-5, Z10V-1, Z10-3/G-12 and Z10V-2.
+//
+// These probes were written while the findings were open and asserted the
+// pre-fix shape. The fixes have since landed, so each guard now asserts the
+// fixed behaviour: reverting the fix turns it red. Every guard carries a
+// negative control that feeds the pre-fix source shape to the same predicate —
+// "the fixed text is present" is only worth something if the predicate can also
+// say "the old shape is absent".
 package z10verify
 
 import (
@@ -11,59 +17,132 @@ import (
 	"testing"
 )
 
-// TestZ10VerifyKillSwitchReportHasNoSessionUnavailableMarker confirms Z10-4's
-// mechanism and its asymmetry: bindings carry an "unavailable" marker, sessions
-// do not.
-func TestZ10VerifyKillSwitchReportHasNoSessionUnavailableMarker(t *testing.T) {
+// TestZ10VerifyKillSwitchReportCarriesTheSessionUnavailableMarker is the flipped
+// form of Z10-4. The pre-fix asymmetry was: bindings carried an "unavailable"
+// marker, sessions did not, so `sessions_revoked: 0` could not be told apart
+// from "this deployment cannot sign anyone out". The guard pins the fixed
+// symmetry.
+func TestZ10VerifyKillSwitchReportCarriesTheSessionUnavailableMarker(t *testing.T) {
 	const file = "internal/admin/admin.go"
 	raw := repoFile(t, file)
 
+	if !sessionUnavailableMarkerPresent(raw) {
+		t.Fatalf("admin no longer carries both the SessionsUnavailable field and the sessions_unavailable " +
+			"wire key: Z10-4's fix has been reverted")
+	}
+	if !regexp.MustCompile(`(?m)\bSessionsUnavailable\s+bool`).MatchString(raw) {
+		t.Errorf("admin.Report no longer declares SessionsUnavailable bool; the marker Z10-4 added is gone")
+	}
+	if !strings.Contains(raw, `json:"sessions_unavailable,omitempty"`) {
+		t.Errorf("SessionsUnavailable no longer serialises as sessions_unavailable; the responder-visible " +
+			"marker Z10-4 added is gone")
+	}
 	if !regexp.MustCompile(`(?m)\bBindingsUnavailable\s+bool`).MatchString(raw) {
-		t.Fatalf("admin.Report no longer declares BindingsUnavailable; the asymmetry Z10-4 rests on is gone")
-	}
-	if regexp.MustCompile(`\bSessionsUnavailable\b`).MatchString(raw) {
-		t.Errorf("admin.Report now has a SessionsUnavailable marker: Z10-4 is fixed and its verdict must change")
-	}
-	if strings.Contains(raw, "sessions_unavailable") {
-		t.Errorf("the kill switch now emits sessions_unavailable: Z10-4 is fixed")
+		t.Errorf("admin.Report no longer declares BindingsUnavailable bool; the control the symmetry rests on is gone")
 	}
 
-	// The sessions half is skipped entirely when the port is absent, with no
-	// else-branch that records the absence.
-	kill := scrubLiterals(t, file, funcBody(t, file, "KillSwitch"))
+	// The marker is set when the target has a session dimension and there is no
+	// revoker, and only then: a wired deployment must still report the number.
+	kill := funcBody(t, file, "KillSwitch")
+	if !strings.Contains(kill, "rep.SessionsUnavailable = true") {
+		t.Errorf("KillSwitch no longer sets rep.SessionsUnavailable on the no-revoker branch; Z10-4's fix is gone")
+	}
 	if !strings.Contains(kill, "s.sessions != nil &&") {
-		t.Fatalf("KillSwitch no longer guards the session sweep on a non-nil port; Z10-4's premise changed")
+		t.Fatalf("KillSwitch no longer guards the session sweep on a non-nil port; the probe reads the wrong branch")
 	}
 	if !strings.Contains(kill, "rep.SessionsRevoked = n") {
-		t.Errorf("KillSwitch no longer assigns rep.SessionsRevoked; the marker question changed")
+		t.Errorf("KillSwitch no longer assigns rep.SessionsRevoked on the wired branch; the marker's control is gone")
 	}
-	if strings.Contains(kill, "SessionsUnavailable = true") {
-		t.Errorf("KillSwitch now sets a sessions-unavailable marker: Z10-4 is fixed")
-	}
-
-	// The bindings half says so explicitly, in the same function, which is the
-	// control: the report format can express the distinction.
-	if !strings.Contains(kill, "rep.BindingsUnavailable = true") {
-		t.Errorf("KillSwitch no longer marks bindings as unavailable; the control for Z10-4's asymmetry is gone")
-	}
-
-	// And killDetail does not carry the marker either.
-	detailRaw := funcBodyRaw(t, file, "killDetail")
-	if !strings.Contains(detailRaw, `"sessions_revoked"`) {
+	// And the durable row says so too, next to the count.
+	detail := funcBodyRaw(t, file, "killDetail")
+	if !strings.Contains(detail, `"sessions_revoked"`) {
 		t.Errorf("killDetail no longer records sessions_revoked; re-derive Z10-4")
 	}
-	if strings.Contains(detailRaw, "sessions_unavailable") {
-		t.Errorf("killDetail now records sessions_unavailable: Z10-4 is fixed")
+	if !strings.Contains(detail, `"sessions_unavailable"`) {
+		t.Errorf("killDetail no longer records sessions_unavailable; the audit row is silent again about a " +
+			"deployment that cannot cut sessions")
+	}
+
+	// Anti-vacuity: the predicate above must reject the pre-fix Report, or a
+	// revert would leave this test green.
+	preFix := `type Report struct {
+	BindingsUnavailable bool ` + "`json:\"bindings_unavailable,omitempty\"`" + `
+}`
+	if sessionUnavailableMarkerPresent(preFix) {
+		t.Fatal("the predicate cannot see the pre-fix shape (no SessionsUnavailable / sessions_unavailable); " +
+			"this guard would not fail on a revert and is vacuous")
 	}
 }
 
-// TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer re-derives Z10-5
-// from both ends: admin.KillSwitch returns (report, err) with the counts it
-// already cut, and the HTTP handler writes only a problem body on the error
-// branch.
+func sessionUnavailableMarkerPresent(src string) bool {
+	return strings.Contains(src, "SessionsUnavailable") && strings.Contains(src, "sessions_unavailable")
+}
+
+// TestZ10VerifyKillSwitchAuditDetailCarriesEveryCountOnEveryPath is the flipped
+// form of Z10V-1. The finding was that the failure rows carried only
+// `tokens_revoked` in an inline Detail map while the success row went through
+// killDetail, which carries `sessions_revoked` as well — so a failed sweep that
+// had already cut sessions left a durable row that did not say so.
+//
+// The fix routes every path through recordKill → killDetail. The guard pins
+// that: no inline Detail map in KillSwitch, and one shared Detail builder that
+// carries every count and every "unavailable" marker.
+func TestZ10VerifyKillSwitchAuditDetailCarriesEveryCountOnEveryPath(t *testing.T) {
+	const file = "internal/admin/admin.go"
+
+	kill := funcBody(t, file, "KillSwitch")
+	if !killSwitchRecordsThroughKillDetail(kill) {
+		t.Fatalf("KillSwitch no longer routes its audit rows through recordKill/killDetail: the partial-detail " +
+			"failure Z10V-1 fixed can be reintroduced")
+	}
+	if n := strings.Count(kill, "s.recordKill("); n < 5 {
+		t.Errorf("KillSwitch records through recordKill on only %d paths; want the success path and at least "+
+			"four exit paths", n)
+	}
+
+	recordKill := funcBody(t, file, "recordKill")
+	if !strings.Contains(recordKill, "killDetail(rep, target)") {
+		t.Fatalf("recordKill no longer derives the Detail from killDetail; re-derive Z10V-1")
+	}
+
+	detail := funcBodyRaw(t, file, "killDetail")
+	for _, key := range []string{
+		`"tokens_revoked"`,
+		`"sessions_revoked"`,
+		`"client_id"`,
+		`"bindings_unavailable"`,
+		`"sessions_unavailable"`,
+	} {
+		if !strings.Contains(detail, key) {
+			t.Errorf("killDetail no longer records %s; a durable kill-switch row is missing that fact again", key)
+		}
+	}
+
+	// Anti-vacuity: the pre-fix KillSwitch built its failure Detail inline with
+	// only tokens_revoked. The predicate must call that "not routed through
+	// killDetail".
+	preFix := `s.record(ctx, actor, "admin.kill_switch", "all", audit.OutcomeError,
+		map[string]string{"tokens_revoked": strconv.Itoa(rep.TokensRevoked)})`
+	if killSwitchRecordsThroughKillDetail(preFix) {
+		t.Fatal("the predicate accepts an inline partial Detail map as if it went through killDetail; " +
+			"this guard would not fail on a revert and is vacuous")
+	}
+}
+
+// killSwitchRecordsThroughKillDetail reports whether a KillSwitch body derives
+// its audit Detail from killDetail rather than building a partial map inline.
+func killSwitchRecordsThroughKillDetail(killBody string) bool {
+	return strings.Contains(killBody, "s.recordKill(") && !strings.Contains(killBody, "map[string]string{")
+}
+
+// TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer is Z10-5, kept as
+// it was: the finding is still open, and the source shape it reads is unchanged.
+// It re-derives Z10-5 from both ends: admin.KillSwitch returns (report, err) with
+// the counts it already cut, and the HTTP handler writes only a problem body on
+// the error branch.
 func TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer(t *testing.T) {
 	// Service end: every error return hands back `rep` alongside the error.
-	kill := scrubLiterals(t, "internal/admin/admin.go", funcBody(t, "internal/admin/admin.go", "KillSwitch"))
+	kill := funcBody(t, "internal/admin/admin.go", "KillSwitch")
 	if n := strings.Count(kill, "return rep, err"); n < 3 {
 		t.Fatalf("admin.KillSwitch returns (rep, err) on only %d paths; the promise Z10-5 tests is gone", n)
 	}
@@ -81,7 +160,7 @@ func TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer(t *testing.T) {
 
 	// HTTP end: the error branch discards the report.
 	const routes = "internal/httpapi/admin_routes.go"
-	handler := scrubLiterals(t, routes, funcBody(t, routes, "handleAdminKillSwitch"))
+	handler := funcBody(t, routes, "handleAdminKillSwitch")
 	if !strings.Contains(handler, "report, err := s.adminSvc.KillSwitch(") {
 		t.Fatalf("the handler no longer receives the report; re-derive Z10-5")
 	}
@@ -97,63 +176,13 @@ func TestZ10VerifyKillSwitchDropsThePartialSummaryInTheHTTPLayer(t *testing.T) {
 	}
 }
 
-// TestZ10VerifyKillSwitchAuditDetailCarriesNoSessionsCount is the new finding of
-// this re-check, stated as a probe that goes red if it is ever fixed: no
-// kill-switch failure path records how many sessions were already cut, while the
-// success path's killDetail does. The zone-10 report asserts the opposite — that
-// the audit row carries `sessions_revoked` — and its own probe only ever
-// asserted `tokens_revoked`.
-func TestZ10VerifyKillSwitchAuditDetailCarriesNoSessionsCount(t *testing.T) {
-	const file = "internal/admin/admin.go"
-	raw := repoFile(t, file)
-
-	re := regexp.MustCompile(`(?s)map\[string\]string\{([^}]*)\}\)`)
-	var calls [][2]string
-	for _, m := range re.FindAllStringSubmatchIndex(raw, -1) {
-		before := raw[:m[0]]
-		idx := strings.LastIndex(before, "s.record(")
-		if idx < 0 {
-			continue
-		}
-		callHead := before[idx:]
-		if !strings.Contains(callHead, `"admin.`+"kill_switch"+`"`) {
-			continue
-		}
-		calls = append(calls, [2]string{callHead, raw[m[2]:m[3]]})
-	}
-	if len(calls) != 3 {
-		t.Fatalf("found %d kill-switch record call sites with an inline Detail literal, want 3 "+
-			"(the failure paths of KillSwitch): the probe is reading the wrong source", len(calls))
-	}
-
-	// The success path goes through killDetail, which does carry it.
-	detailRaw := funcBodyRaw(t, file, "killDetail")
-	if !strings.Contains(detailRaw, `"sessions_revoked"`) {
-		t.Fatalf("killDetail no longer carries sessions_revoked; the asymmetry this finding rests on is gone")
-	}
-
-	// None of the inline Detail literals on the failure paths carry it.
-	for _, c := range calls {
-		head, body := c[0], c[1]
-		if strings.Contains(head, "killDetail") {
-			continue // the success path, already checked
-		}
-		if strings.Contains(body, "sessions_revoked") {
-			t.Errorf("a kill-switch failure path now records sessions_revoked in Detail: the finding is fixed. Detail: %s",
-				strings.Join(strings.Fields(body), " "))
-		}
-		if !strings.Contains(body, "tokens_revoked") {
-			t.Errorf("a kill-switch failure path no longer records tokens_revoked at all; re-derive the finding. Detail: %s",
-				strings.Join(strings.Fields(body), " "))
-		}
-	}
-}
-
-// TestZ10VerifyShutdownStackStillExceedsThePodGracePeriod independently parses
-// the four real numbers and agrees with the zone-10 report's arithmetic — while
-// also showing that round 6's finding G-12 named exactly this stack, so the
-// report's "rebuttal of a fix" framing is wrong.
-func TestZ10VerifyShutdownStackStillExceedsThePodGracePeriod(t *testing.T) {
+// TestZ10VerifyShutdownStackFitsThePodGracePeriod is the flipped form of Z10-3
+// (a re-report of round 6's G-12). The stack was `5 + 30 + 30 = 65s` against a
+// 45s grace period, with the manifest and the CHANGELOG counting only the first
+// two terms. The fix cut auditDrainTimeout to 10s and taught the documentation
+// the whole stack; the guard pins arithmetic and documentation together, so a
+// partial revert fails here.
+func TestZ10VerifyShutdownStackFitsThePodGracePeriod(t *testing.T) {
 	removal := secondsNamed(t, "cmd/re0auth/main.go", "endpointRemovalWait")
 	shutdown := secondsNamed(t, "cmd/re0auth/main.go", "shutdownTimeout")
 	drain := secondsNamed(t, "internal/store/postgres/auditbatch.go", "auditDrainTimeout")
@@ -167,27 +196,85 @@ func TestZ10VerifyShutdownStackStillExceedsThePodGracePeriod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if removal == 0 || shutdown == 0 || drain == 0 || grace == 0 {
+		t.Fatalf("a parsed value is zero (%d/%d/%d/%d): the probe is not reading what it thinks",
+			removal, shutdown, drain, grace)
+	}
 	total := removal + shutdown + drain
 	t.Logf("independently parsed: %d + %d + %d = %d vs grace %d", removal, shutdown, drain, total, grace)
-	if total <= grace {
-		t.Errorf("the stack now fits (%ds <= %ds): the finding is fixed and its verdict must change", total, grace)
+
+	if total > grace {
+		t.Errorf("the shutdown stack needs %ds but the pod is SIGKILLed after %ds: the audit drain runs only "+
+			"after the HTTP drain and is killed with rows still queued", total, grace)
 	}
 
-	// The manifest comment still counts only the first two terms, and the
-	// CHANGELOG still advises a grace that only covers them.
-	if !strings.Contains(deploy, "35s") {
-		t.Errorf("the manifest no longer claims a 35s budget; the comment half of the finding changed")
+	// The documentation moved with the code, and this half is not optional: the
+	// old comment's "35s total" was what made G-12 keep getting re-reported.
+	if !strings.Contains(deploy, "5 + 30 + 10 = 45s") {
+		t.Errorf("the manifest comment no longer counts the whole stack (5 + 30 + 10 = 45s); the budget it " +
+			"documents and the budget the process spends have drifted apart again")
 	}
 	cl := repoFile(t, "CHANGELOG.md")
-	if !strings.Contains(cl, "terminationGracePeriodSeconds ≥ 35s") {
-		t.Errorf("the CHANGELOG no longer advises a 35s grace; the doc half of the finding changed")
+	if !strings.Contains(cl, "terminationGracePeriodSeconds ≥ 45s") {
+		t.Errorf("the CHANGELOG no longer advises terminationGracePeriodSeconds ≥ 45s; the documented budget " +
+			"no longer covers the whole stack")
+	}
+}
+
+// TestZ10VerifyTheOperationalListenerIsClosedNotDrained is the flipped form of
+// Z10V-2. The finding was that every endpoint shared one 30s drainCtx, so
+// whichever listener went first could spend the whole budget and leave the
+// other with an already-expired context. The fix marks the operational listener
+// noDrain and closes it outright. The guard pins that the bypass exists, that it
+// is the internal surface that gets it, and that it happens before Shutdown.
+func TestZ10VerifyTheOperationalListenerIsClosedNotDrained(t *testing.T) {
+	const file = "cmd/re0auth/main.go"
+	raw := repoFile(t, file)
+
+	if !regexp.MustCompile(`(?m)\bnoDrain\s+bool`).MatchString(raw) {
+		t.Fatalf("the endpoint type no longer has a noDrain field; Z10V-2's fix has been reverted")
+	}
+	serve := funcBody(t, file, "serveUntilSignal")
+	if !operationalListenerBypassesTheSharedDrain(serve) {
+		t.Fatalf("serveUntilSignal no longer closes the noDrain endpoint instead of draining it from the " +
+			"shared budget: Z10V-2's fix has been reverted")
 	}
 
-	// G-12 of round 6 recorded the same numbers, so this is a re-report.
-	round6 := repoFile(t, "scratchpad/audit6/findings/00-LAUNCH-READINESS-CONSOLIDATED.md")
-	if !strings.Contains(round6, "5s + 30s + 30s = 65s") || !strings.Contains(round6, "G-12") {
-		t.Errorf("round 6 does not contain the G-12 entry this probe found; the re-report judgement must be re-checked")
+	// The endpoint that gets the bypass is the operational surface.
+	internalAt := strings.Index(raw, "metrics.InternalHandler()")
+	noDrainAt := strings.Index(raw, "noDrain: true")
+	if internalAt < 0 || noDrainAt < 0 {
+		t.Fatalf("the internal listener or its noDrain mark is gone (InternalHandler %d, noDrain %d); re-derive Z10V-2",
+			internalAt, noDrainAt)
 	}
+	if noDrainAt < internalAt || noDrainAt > internalAt+400 {
+		t.Errorf("noDrain is no longer set on the internal-listener endpoint (found at %d, InternalHandler at %d); "+
+			"some other listener may now be closed without draining", noDrainAt, internalAt)
+	}
+
+	// Anti-vacuity: the pre-fix loop drained every endpoint from the shared
+	// context. The predicate must reject it.
+	preFix := `for _, ep := range endpoints {
+		if e := ep.server.Shutdown(drainCtx); e != nil {
+			_ = ep.server.Close()
+		}
+	}`
+	if operationalListenerBypassesTheSharedDrain(preFix) {
+		t.Fatal("the predicate accepts the pre-fix shared drain as if it bypassed it; this guard would not " +
+			"fail on a revert and is vacuous")
+	}
+}
+
+// operationalListenerBypassesTheSharedDrain reports whether a serveUntilSignal
+// body closes the noDrain endpoint instead of handing it the shared deadline,
+// and does so before the first Shutdown call.
+func operationalListenerBypassesTheSharedDrain(serveBody string) bool {
+	bypass := strings.Index(serveBody, "if ep.noDrain {")
+	if bypass < 0 || !strings.Contains(serveBody[bypass:], "ep.server.Close()") {
+		return false
+	}
+	shutdown := strings.Index(serveBody, "ep.server.Shutdown(drainCtx)")
+	return shutdown < 0 || bypass < shutdown
 }
 
 // secondsNamed extracts `name = <N> * time.Second` from a repository file.
