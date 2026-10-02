@@ -1081,19 +1081,40 @@ func normalizeUserCode(code string) string {
 }
 
 // StoreDeviceAuthorization implements op.Storage.
+//
+// No full-table purge runs here. This method is reachable from the public
+// POST /oauth/device_authorization, so an unconditional
+// purgeExpiredDevicesLocked scanned every pending device under the store's single
+// lock on each such request: N requests inside the ten-minute window cost O(N²)
+// locked work, stalling every other store call behind them (S13-2). Reclaiming
+// expired records by deadline is the janitor's job — SweepExpired runs it on a
+// ticker, off the request path.
+//
+// The one expired record this path does reclaim is the one that would otherwise
+// answer the request: a user_code collision. The old unconditional purge made an
+// expired user_code reusable as a side effect; that property is preserved by
+// deleting just the colliding expired device below, so nothing observable changes
+// except the dropped scan.
 func (s *OIDCStore) StoreDeviceAuthorization(_ context.Context, clientID, deviceCode, userCode string, expires time.Time, scopes []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.purgeExpiredDevicesLocked(s.now())
-	if _, exists := s.userCodes[normalizeUserCode(userCode)]; exists {
-		return op.ErrDuplicateUserCode
+	key := normalizeUserCode(userCode)
+	if h, exists := s.userCodes[key]; exists {
+		rec, found := s.devices[h]
+		if !found || s.now().Before(rec.expiresAt) {
+			return op.ErrDuplicateUserCode
+		}
+		// The colliding record is past its deadline: drop it (and its user_code
+		// index entry) and fall through to claim the code.
+		delete(s.devices, h)
+		delete(s.userCodes, key)
 	}
 	h := oauth.TokenHash(deviceCode)
 	s.devices[h] = deviceRecord{
 		deviceCodeHash: h, userCode: userCode, clientID: clientID,
 		scopes: append([]string(nil), scopes...), expiresAt: expires,
 	}
-	s.userCodes[normalizeUserCode(userCode)] = h
+	s.userCodes[key] = h
 	return nil
 }
 
