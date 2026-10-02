@@ -463,16 +463,29 @@ func (s *Tokens) TokenOwner(ctx context.Context, value string) (string, error) {
 // they are residue no client can use, and inflating a Kill Switch report with
 // them would tell an operator it revoked credentials it did not. Leaving them
 // would keep each revoked family's replay signal armed after the switch.
+//
+// All of it runs in one transaction and the count is zero when any step fails,
+// matching OIDCStore.RevokeTokens: a bulk revocation that applied half of itself
+// and reported a count would be indistinguishable, to the retry, from success.
 func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, error) {
-	total, err := revokeMatching(ctx, s.pool, []string{"oauth_access_tokens", "oauth_refresh_tokens"}, f)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return total, err
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	total, err := revokeMatching(ctx, tx, []string{"oauth_access_tokens", "oauth_refresh_tokens"}, f)
+	if err != nil {
+		return 0, err
 	}
 	clause, args := revokePredicate(f)
 	for _, table := range []string{"oauth_codes", "oauth_refresh_tombstones"} {
-		if _, err := s.pool.Exec(ctx, `DELETE FROM `+table+clause, args...); err != nil {
-			return total, err
+		if _, err := tx.Exec(ctx, `DELETE FROM `+table+clause, args...); err != nil {
+			return 0, err
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
 	}
 	return total, nil
 }

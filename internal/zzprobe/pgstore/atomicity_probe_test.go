@@ -115,7 +115,7 @@ func TestMultiStatementMutationsRunInATransaction(t *testing.T) {
 	// these loses its Begin, the probe fails.
 	protected := map[string][]string{
 		"sessions.go":   {}, // asserted empty below: see the note
-		"oauth.go":      {"DeleteBySubjectClient"},
+		"oauth.go":      {"DeleteBySubjectClient", "RevokeTokens"},
 		"oidc.go":       {"RevokeGrant", "TerminateSession", "PurgeSubject", "RevokeTokens", "revokeInOneTx", "DeleteAuthRequest"},
 		"account.go":    {"CreateWithIdentity", "LinkIdentity", "UnlinkIdentity"},
 		"sweep.go":      {"SweepExpired"},
@@ -140,7 +140,7 @@ func TestMultiStatementMutationsRunInATransaction(t *testing.T) {
 	// no transaction; the report states the interleaving that breaks for each.
 	unprotected := map[string][]string{
 		"sessions.go": {"RevokeAllSessions", "RevokeSubjectSessions", "SweepExpired"},
-		"oauth.go":    {"RevokeTokens", "PurgeLegacySubject"},
+		"oauth.go":    {"PurgeLegacySubject"},
 	}
 	for file, methods := range unprotected {
 		src, err := os.ReadFile(filepath.Join(adapterDir, file))
