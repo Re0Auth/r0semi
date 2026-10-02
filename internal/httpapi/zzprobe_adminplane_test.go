@@ -485,8 +485,8 @@ func TestZZAdmErasedOperatorLosesThePlaneThroughAnotherSession(t *testing.T) {
 	resp = zzAdmSend(t, second, base, http.MethodGet, "/v1/admin/clients", "")
 	code, detail := zzAdmProblemFrom(t, resp)
 	if resp.StatusCode == http.StatusOK {
-		t.Fatalf("an erased account's second session still calls the operator plane "+
-			"(GET /v1/admin/clients = 200): erasure removed the account, not the operator "+
+		t.Fatalf("an erased account's second session still calls the operator plane " +
+			"(GET /v1/admin/clients = 200): erasure removed the account, not the operator " +
 			"capability the allowlist keys on (AUD-10 regressed)")
 	}
 	if resp.StatusCode != http.StatusUnauthorized || code != "unauthenticated" {

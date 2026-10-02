@@ -738,4 +738,3 @@ func TestAuthenticateClientRejectsPublicClient(t *testing.T) {
 		t.Fatalf("unknown-client code = %q, want invalid_client", got)
 	}
 }
-
