@@ -1189,56 +1189,97 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 	}
 
 	// RFC 8628 §3.5: a client polling faster than the advertised interval is told
-	// to slow down. The library maps context.DeadlineExceeded to that error. The
-	// UPDATE is the claim on this poll: a concurrent second poll blocks, then sees
-	// the new last_poll and updates nothing. One store-clock value both writes
-	// the deadline and judges it — the single-clock policy; the database's now()
-	// would make the interval a race between two clocks.
+	// to slow down. The library maps context.DeadlineExceeded to that error.
 	//
-	// The interval is subtracted in Go, and the resulting instant is bound as a
-	// plain timestamptz: SQL interval arithmetic here (`$4 - make_interval(secs
-	// => $3)`) left the parameter untyped enough that PostgreSQL resolved the
-	// subtraction as `interval - interval` and then refused the comparison
-	// ("operator does not exist: timestamp with time zone <= interval"), which
-	// CI's TestDevicePollingIsThrottled caught. staleBefore is the last instant a
-	// previous poll may carry for this one to be admitted; `last_poll IS NULL`
-	// admits the first.
+	// G-15 (Direction A): the interval is anchored at the client's last ATTEMPT,
+	// not at its last admitted poll — the anchor the memory engine has always
+	// used (internal/store/memory/oidc.go, pinned there by
+	// TestDeviceThrottleAnchorsOnTheLastAttempt). This claim therefore moves
+	// last_poll on every pending poll and judges the OLD value it found: a
+	// premature poll advances the anchor and still answers slow_down, so a
+	// client polling every 3s against a 5s interval is throttled on both engines
+	// until it goes quiet for a full interval. The previous form put
+	// `last_poll <= $4` in the UPDATE's WHERE, so a premature attempt wrote
+	// nothing and the window ran from the last admitted poll; that is the
+	// cross-engine divergence the register adjudicated.
+	//
+	// The read of the old anchor and the write of the new one are one
+	// transaction with the row locked: `SELECT … FOR UPDATE` is the claim on
+	// this poll. A concurrent second poll blocks on that lock and, once the
+	// first commits, re-reads the anchor the first wrote — so the two cannot
+	// both judge themselves against the same pre-winner last_poll. This is why
+	// the decision is made in Go from the locked value and applied in the same
+	// transaction: a bare `UPDATE … RETURNING last_poll` cannot express it,
+	// because RETURNING reports the NEW row, not the one it replaced.
+	//
+	// One store-clock value both writes the deadline and judges it — the
+	// single-clock policy; the database's now() would make the interval a race
+	// between two clocks. The interval is subtracted in Go, and the resulting
+	// instant is bound as a plain timestamptz: SQL interval arithmetic here
+	// (`$4 - make_interval(secs => $3)`) left the parameter untyped enough that
+	// PostgreSQL resolved the subtraction as `interval - interval` and then
+	// refused the comparison ("operator does not exist: timestamp with time zone
+	// <= interval"), which CI's TestDevicePollingIsThrottled caught. staleBefore
+	// is the last instant a previous poll may carry for this one to be admitted;
+	// a NULL last_poll (the first poll) admits.
 	staleBefore := now.Add(-oidcstore.DefaultDevicePollInterval)
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE oidc_devices
-		   SET last_poll = $3
-		 WHERE device_code_hash = $1 AND client_id = $2 AND done = false AND denied = false
-		   AND (last_poll IS NULL OR last_poll <= $4)`,
-		hashValue(deviceCode), clientID, now, staleBefore)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: record device poll: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		st, err := s.deviceState(ctx, `device_code_hash = $1 AND client_id = $2`, hashValue(deviceCode), clientID)
-		if err != nil {
-			return nil, err
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var previous *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT last_poll FROM oidc_devices
+		 WHERE device_code_hash = $1 AND client_id = $2 AND done = false AND denied = false
+		 FOR UPDATE`,
+		hashValue(deviceCode), clientID).Scan(&previous)
+	if err != nil && !noRows(err) {
+		return nil, fmt.Errorf("postgres: record device poll: %w", err)
+	}
+	if err == nil {
+		// Every pending poll moves the anchor, admitted or not (G-15). The write
+		// is unconditional on purpose: the window is what judges the poll, not
+		// the other way round.
+		if _, err := tx.Exec(ctx, `
+			UPDATE oidc_devices
+			   SET last_poll = $3
+			 WHERE device_code_hash = $1 AND client_id = $2 AND done = false AND denied = false`,
+			hashValue(deviceCode), clientID, now); err != nil {
+			return nil, fmt.Errorf("postgres: record device poll: %w", err)
 		}
-		// The expiry predicate above is why this row reached the fall-through:
-		// it is approved but past its deadline, so it missed the DELETE and the
-		// throttle UPDATE. Consume it here too, and clear Done so the library's
-		// Done-before-Expires order answers expired_token rather than minting
-		// (G-7). deviceState itself stays unfiltered: it is shared with
-		// DeviceByUserCode, where a missing row would surface as access_denied.
-		if st.Done && !st.Denied && !now.Before(st.Expires) {
-			if _, err := s.pool.Exec(ctx,
-				`DELETE FROM oidc_devices WHERE device_code_hash = $1 AND client_id = $2`,
-				hashValue(deviceCode), clientID); err != nil {
-				return nil, fmt.Errorf("postgres: expire device authorization: %w", err)
-			}
-			st.Done = false
-			return st, nil
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("postgres: record device poll: %w", err)
 		}
-		if !st.Done && !st.Denied {
+		if previous != nil && previous.After(staleBefore) {
 			return nil, context.DeadlineExceeded
 		}
+		return s.deviceState(ctx, `device_code_hash = $1 AND client_id = $2`, hashValue(deviceCode), clientID)
+	}
+	_ = tx.Rollback(ctx)
+
+	// No pending row: it is approved, denied or already gone — so it is not a
+	// throttled poll, and the read below is the library's answer. An approved
+	// record past its deadline is consumed here too, because the DELETE at the
+	// top of this method carries the expires_at predicate (G-7). Done is cleared
+	// so the library's Done-before-Expires order answers expired_token rather
+	// than minting. deviceState itself stays unfiltered: it is shared with
+	// DeviceByUserCode, where a missing row would surface as access_denied.
+	st, err := s.deviceState(ctx, `device_code_hash = $1 AND client_id = $2`, hashValue(deviceCode), clientID)
+	if err != nil {
+		return nil, err
+	}
+	if st.Done && !st.Denied && !now.Before(st.Expires) {
+		if _, err := s.pool.Exec(ctx,
+			`DELETE FROM oidc_devices WHERE device_code_hash = $1 AND client_id = $2`,
+			hashValue(deviceCode), clientID); err != nil {
+			return nil, fmt.Errorf("postgres: expire device authorization: %w", err)
+		}
+		st.Done = false
 		return st, nil
 	}
-	return s.deviceState(ctx, `device_code_hash = $1 AND client_id = $2`, hashValue(deviceCode), clientID)
+	return st, nil
 }
 
 // deviceState reads one oidc_devices row. A missing row is oauth.ErrDeviceNotFound
