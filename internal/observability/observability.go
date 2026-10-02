@@ -307,7 +307,7 @@ func (m *Metrics) Middleware(classify func(*http.Request) string, next http.Hand
 		next.ServeHTTP(rec, r)
 
 		method := normalizeMethod(r.Method)
-		m.requests.WithLabelValues(plane, method, strconv.Itoa(rec.status)).Inc()
+		m.requests.WithLabelValues(plane, method, normalizeStatus(rec.status)).Inc()
 		m.duration.WithLabelValues(plane, method).Observe(time.Since(start).Seconds())
 	})
 }
@@ -595,27 +595,90 @@ func normalizeMethod(method string) string {
 	}
 }
 
+// normalizeStatus keeps the status label inside HTTP's own code space. The value
+// is not always this service's own answer: the raw-proxy federation route writes a
+// source's status verbatim (internal/httpapi/federation_routes.go:320) and net/http
+// accepts any code up to 999, so a source answering 900+n minted one series per n.
+// Codes outside 100..599 collapse into one bounded bucket, exactly as an unknown
+// method or grant_type does. The codes inside it keep their own value because the
+// alerting rules match the class (`status=~"5.."`).
+func normalizeStatus(code int) string {
+	if code < 100 || code > 599 {
+		return "other"
+	}
+	return strconv.Itoa(code)
+}
+
 // InternalHandler builds the internal listener's handler: the metrics endpoint
 // and the runtime profiling endpoints. It is deliberately not mounted on the
 // public mux; serve it on an address only your operator plane can reach.
 func (m *Metrics) InternalHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", m.Handler())
-	registerPprof(mux)
+	registerPprof(mux, newProfileGate())
 	return mux
+}
+
+// The two windows the expensive profiling endpoints may run for, and the reason
+// they are bounded at all: "on the internal listener" is not the same as "trusted
+// to spend unbounded CPU". A CPU profile's size is proportional to its window, so
+// clamping `seconds` bounds both the CPU a caller can spend and the bytes the
+// endpoint can produce (S13-8).
+const (
+	// maxProfileSeconds is Go's own default CPU-profile window.
+	maxProfileSeconds = 30
+	// maxTraceSeconds is shorter because an execution trace is far larger per
+	// second than a CPU profile, and it cannot be sampled down.
+	maxTraceSeconds = 10
+)
+
+// profileGate bounds the expensive profiling endpoints: one profiling request at a
+// time, with a clamped time window. Without it any caller could start a profile per
+// connection — each one racing for the single process-wide CPU profiler and
+// allocating its own buffers — or ask for a window measured in hours.
+type profileGate struct {
+	slot chan struct{}
+}
+
+func newProfileGate() *profileGate { return &profileGate{slot: make(chan struct{}, 1)} }
+
+// guard admits one profiling request at a time and clamps its `seconds` query
+// parameter to maxSeconds. A refused request is answered 503 rather than queued: a
+// profile is a deliberate act, and making the caller wait behind someone else's
+// 30-second window would turn the bound into a way to hold connections open.
+func (g *profileGate) guard(maxSeconds int, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case g.slot <- struct{}{}:
+			defer func() { <-g.slot }()
+		default:
+			http.Error(w, "profiling endpoint busy", http.StatusServiceUnavailable)
+			return
+		}
+		if raw := r.URL.Query().Get("seconds"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > maxSeconds {
+				q := r.URL.Query()
+				q.Set("seconds", strconv.Itoa(maxSeconds))
+				r.URL.RawQuery = q.Encode()
+			}
+		}
+		next(w, r)
+	}
 }
 
 // registerPprof mounts net/http/pprof explicitly rather than importing it for
 // its side effect, which would publish these handlers on http.DefaultServeMux —
-// the one mux a later dependency might also serve from.
-func registerPprof(mux *http.ServeMux) {
+// the one mux a later dependency might also serve from. The two endpoints that
+// burn CPU for a caller-chosen window go through gate; the rest are cheap enough
+// that an operator must still be able to reach them while a profile is running.
+func registerPprof(mux *http.ServeMux, gate *profileGate) {
 	// Index serves /debug/pprof/ and every named profile under it (heap,
 	// goroutine, allocs, block, mutex, threadcreate), resolved at request time.
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/profile", gate.guard(maxProfileSeconds, pprof.Profile))
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.HandleFunc("/debug/pprof/trace", gate.guard(maxTraceSeconds, pprof.Trace))
 }
 
 // statusRecorder captures the response status for the counter while forwarding
@@ -627,6 +690,15 @@ type statusRecorder struct {
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
+	// An informational response is not the response (RFC 9110 §15.2): net/http
+	// forwards it and still expects the real status, so it must not be latched here
+	// either. Latching it made a 103 Early Hints the status this metric reported for
+	// a response that answered 204. 101 Switching Protocols ends the exchange and is
+	// recorded as the final status (S13-7).
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		r.ResponseWriter.WriteHeader(code)
+		return
+	}
 	if !r.wrote {
 		r.status = code
 		r.wrote = true
