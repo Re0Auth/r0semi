@@ -26,7 +26,10 @@ func (s *audit9BlockingPutStore) arm() {
 	s.mu.Unlock()
 }
 
-func (s *audit9BlockingPutStore) Put(ctx context.Context, b Binding) error {
+// block parks the next row write. CompleteBind claims the row with
+// PutIfVersion when the flow began against a live binding, so every write
+// primitive has to be parked or the test's window never opens.
+func (s *audit9BlockingPutStore) block() {
 	s.mu.Lock()
 	block := s.armed
 	s.armed = false
@@ -35,7 +38,21 @@ func (s *audit9BlockingPutStore) Put(ctx context.Context, b Binding) error {
 		close(s.inPut)
 		<-s.release
 	}
+}
+
+func (s *audit9BlockingPutStore) Put(ctx context.Context, b Binding) error {
+	s.block()
 	return s.MemoryBindingStore.Put(ctx, b)
+}
+
+func (s *audit9BlockingPutStore) PutIfVersion(ctx context.Context, b Binding, expectedVersion uint64) (bool, error) {
+	s.block()
+	return s.MemoryBindingStore.PutIfVersion(ctx, b, expectedVersion)
+}
+
+func (s *audit9BlockingPutStore) Create(ctx context.Context, b Binding) (bool, error) {
+	s.block()
+	return s.MemoryBindingStore.Create(ctx, b)
 }
 
 // AUDIT9 / S14-2 (fixed) — CompleteBind holds the per-binding keyed lock, so a

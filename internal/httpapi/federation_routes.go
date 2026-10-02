@@ -426,7 +426,14 @@ func (s *Server) handleBindCallback(w http.ResponseWriter, r *http.Request) {
 	_, flow, err := s.federate.CompleteBind(r.Context(), user, state, code)
 	returnTo := safeurl.RelativePath(flow.ReturnTo)
 	if err != nil {
-		redirectWithError(w, r, returnTo, "bind_failed")
+		code := "bind_failed"
+		if errors.Is(err, federation.ErrBindSuperseded) {
+			// Truthful copy: the source was disconnected while this bind was in
+			// flight, so the browser is told the bind was superseded rather than
+			// that something failed.
+			code = "bind_superseded"
+		}
+		redirectWithError(w, r, returnTo, code)
 		return
 	}
 	// returnTo went through safeurl.RelativePath, so it is a same-origin path.

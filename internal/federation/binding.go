@@ -133,6 +133,12 @@ type BindingStore interface {
 	// different processes: both may read version N, but only one may write N+1.
 	// The loser must re-read and use the winner's token rather than overwrite it.
 	PutIfVersion(ctx context.Context, b Binding, expectedVersion uint64) (bool, error)
+	// Create stores b only if no binding exists for (user, game, source), and
+	// reports whether it did. It is the compare-and-swap a FIRST bind needs:
+	// there is no version to expect, so "still absent" is the precondition. One
+	// insert-if-absent statement, so a bind that lost its flow to a removal in
+	// another process cannot recreate the row.
+	Create(ctx context.Context, b Binding) (bool, error)
 	Delete(ctx context.Context, user account.UserID, game, source string) error
 	// List returns every binding a user holds, so the account page can show what
 	// is connected and offer to disconnect it.
@@ -201,7 +207,19 @@ func (s *MemoryBindingStore) PutIfVersion(_ context.Context, b Binding, expected
 	return true, nil
 }
 
-// Delete implements BindingStore. Deleting an absent binding is not an error.
+// Create implements BindingStore: insert only if the key is absent, under one
+// lock so the check and the write cannot be separated.
+func (s *MemoryBindingStore) Create(_ context.Context, b Binding) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := bindingKey(b.User, b.Game, b.Source)
+	if _, ok := s.m[key]; ok {
+		return false, nil
+	}
+	s.m[key] = b
+	return true, nil
+}
+
 // Delete implements BindingStore. Deleting an absent binding is not an error,
 // which keeps unbinding idempotent.
 func (s *MemoryBindingStore) Delete(_ context.Context, user account.UserID, game, source string) error {

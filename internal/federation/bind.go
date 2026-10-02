@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +22,11 @@ var (
 	ErrBindUser = errors.New("federation: bind request belongs to another user")
 	// ErrBindUnavailable reports a source that cannot be bound.
 	ErrBindUnavailable = errors.New("federation: source cannot be bound")
+	// ErrBindSuperseded reports a bind whose binding was removed or replaced
+	// after the flow began: an Unbind, a CascadeRevoke, a Kill Switch shred or an
+	// account erasure completed first, or another writer claimed the row. The
+	// bind is refused rather than allowed to re-create the credential.
+	ErrBindSuperseded = errors.New("federation: the binding was removed or changed while this bind was in progress")
 )
 
 // BindFlow is a pending source binding.
@@ -35,6 +39,16 @@ type BindFlow struct {
 	State     string
 	ReturnTo  string
 	ExpiresAt time.Time
+
+	// Bound reports whether a binding existed when this flow began, and
+	// BoundVersion is its Version at that moment (meaningful only when Bound).
+	// CompleteBind re-checks them with PutIfVersion / Create, so a flow begun
+	// against a live binding cannot re-create one that a completed Unbind,
+	// CascadeRevoke, Kill Switch shred or account erasure removed (S14-2). Those
+	// are single store operations, unlike the process-local keyedMutex, so the
+	// check also holds across Postgres replicas.
+	Bound        bool
+	BoundVersion uint64
 }
 
 // BindChallenge is what the browser needs to start binding.
@@ -143,6 +157,16 @@ func (s *service) BeginBind(ctx context.Context, user account.UserID, game, sour
 		Verifier: verifier, State: id, ReturnTo: returnTo,
 		ExpiresAt: s.now().Add(s.bindTTL),
 	}
+	// Record what the account was bound to when this flow began. The read is
+	// deliberately taken without the lock: it is a precondition to re-check under
+	// the lock in CompleteBind, not a lock itself, and a stale read only makes the
+	// later claim fail closed.
+	if current, gerr := s.bindings.Get(ctx, user, game, source); gerr == nil {
+		flow.Bound = true
+		flow.BoundVersion = current.Version
+	} else if !errors.Is(gerr, ErrNotBound) {
+		return BindChallenge{}, gerr
+	}
 	if err := s.flows.Put(ctx, flow); err != nil {
 		return BindChallenge{}, err
 	}
@@ -170,11 +194,10 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 
 	// The per-binding keyed lock, held for the whole exchange-and-store sequence,
 	// exactly like every other writer of one binding's credential (Unbind,
-	// refreshBinding, CascadeRevoke, shredBinding). Without it a bind callback that
-	// landed inside an Unbind / Kill Switch / account-erasure window stored the
-	// vault secret and wrote the row back after the removal had reported success,
-	// so a source the user (or an operator) was told was disconnected existed again
-	// (S14-2). The two operations are now ordered: each sees the other's result.
+	// refreshBinding, CascadeRevoke, shredBinding). It orders a bind against a
+	// CONCURRENT removal within this process. A removal that already finished is
+	// caught by the claim below, not by the lock: the flow remembers the Version
+	// the account was bound to, and a row that moved or vanished loses the CAS.
 	unlock := s.locks.lock(bindingKey(user, flow.Game, flow.Source))
 	defer unlock()
 
@@ -198,30 +221,34 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 		HasRefresh: token.RefreshToken != "",
 		Version:    generation,
 	}
-	// The token goes into the vault; the binding store keeps only metadata.
+	// Claim the row BEFORE the vault write, the order refreshBinding uses
+	// (refresh.go) and for the same reason: a writer that loses the claim must not
+	// have touched the vault. The claim is also where the BeginBind precondition
+	// is enforced — PutIfVersion refuses a row that moved or vanished, Create
+	// refuses one that appeared — so a removal that completed before this flow
+	// reached the lock still cannot be undone, in this process or another replica.
+	var won bool
+	if flow.Bound {
+		won, err = s.bindings.PutIfVersion(ctx, binding, flow.BoundVersion)
+	} else {
+		won, err = s.bindings.Create(ctx, binding)
+	}
+	if err != nil {
+		return Binding{}, flow, err
+	}
+	if !won {
+		// Fail closed, and do not touch the vault: there is no secret to roll back
+		// because the vault write has not happened yet.
+		return Binding{}, flow, ErrBindSuperseded
+	}
+	// The token goes into the vault; the binding store keeps only metadata. The
+	// row is already claimed, so a vault failure cannot strand a decryptable
+	// secret with no row pointing at it; it leaves the row for the next call or an
+	// Unbind, the same trade refreshBinding documents.
 	if err := s.storeBindingSecret(ctx, binding, bindingSecret{
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,
 	}); err != nil {
-		return Binding{}, flow, err
-	}
-	if err := s.bindings.Put(ctx, binding); err != nil {
-		// Do not leave an orphaned secret behind. A rollback that fails is reported
-		// alongside the original error rather than swallowed: the residue is a
-		// decryptable upstream token with no row pointing at it, which no endpoint
-		// can reach and only an account erasure would clear.
-		if rerr := s.vault.Revoke(ctx, BindingIdentity(binding)); rerr != nil {
-			// Logged as well as returned. No endpoint can reach the residue and only
-			// an account erasure clears it, so the caller seeing this error is not
-			// enough on its own: an operator has to learn that a decryptable upstream
-			// token is stranded. The subject is deliberately not named — a raw usr_…
-			// here would outlive the erasure's pseudonym key (G-23); game and source
-			// locate the binding, and the audit sink carries the account.
-			slog.ErrorContext(ctx, "could not roll back a bind's vault secret; a secret is left with no binding",
-				"game", binding.Game, "source", binding.Source, "err", rerr)
-			return Binding{}, flow, errors.Join(err,
-				fmt.Errorf("federation: a secret is left in the vault with no binding: %w", rerr))
-		}
 		return Binding{}, flow, err
 	}
 	return binding, flow, nil

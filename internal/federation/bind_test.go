@@ -1,17 +1,14 @@
 package federation
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
@@ -66,22 +63,37 @@ func bindService(t *testing.T, issuer string) (Service, *MemoryBindingStore, vau
 	return svc, bindings, v
 }
 
-// putFailsStore is the row write failing while the vault is fine: the case the
-// bind path rolls back.
-type putFailsStore struct {
+// claimFailsStore fails the row claim while the vault is fine. With the claim
+// ordered before the vault write, a failed claim must leave no secret behind.
+type claimFailsStore struct {
 	BindingStore
 	err error
 }
 
-func (p putFailsStore) Put(context.Context, Binding) error { return p.err }
+func (p claimFailsStore) Create(context.Context, Binding) (bool, error) {
+	return false, p.err
+}
 
-// A bind writes the upstream token to the vault BEFORE it records the binding row,
-// so a failing row write is rolled back. When the rollback fails too, the residue is
-// a decryptable upstream token with no row pointing at it: no endpoint can reach it
-// and only an account erasure clears it. That failure used to be dropped with `_ =`,
-// which made the residue invisible to the caller and to the operator. Both learn
-// about it now — the error is joined, and the log says what is stranded.
-func TestCompleteBindReportsARollbackThatFailed(t *testing.T) {
+func (p claimFailsStore) PutIfVersion(context.Context, Binding, uint64) (bool, error) {
+	return false, p.err
+}
+
+// enrollFailsVault fails the vault write while leaving reads working.
+type enrollFailsVault struct {
+	vault.Service
+	err error
+}
+
+func (v enrollFailsVault) Enroll(context.Context, vault.Identity, []byte, map[string]string) error {
+	return v.err
+}
+
+// A bind claims the binding row BEFORE it writes the upstream token to the vault,
+// so a failed claim leaves no residue: no decryptable credential with no row
+// pointing at it. The old order (secret first, roll back on a failed row write)
+// could strand one when the rollback also failed; claiming first removes the
+// window instead of reporting it.
+func TestCompleteBindClaimsTheRowBeforeItWritesTheSecret(t *testing.T) {
 	up, challenge := fakeTokenServer(t, "up-token")
 	reg, err := NewRegistry(Source{
 		Game: game, Name: sourceName, DisplayName: "Fake", Issuer: up.URL,
@@ -91,24 +103,18 @@ func TestCompleteBindReportsARollbackThatFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	putErr := errors.New("binding store is down")
-	revokeErr := errors.New("vault is sealed")
+	claimErr := errors.New("binding store is down")
+	v := newVault(t)
 	svc, err := NewService(Config{
 		Registry: reg,
-		Bindings: putFailsStore{err: putErr},
-		Vault:    revokeBrokenVault{Service: newVault(t), err: revokeErr},
+		Bindings: claimFailsStore{BindingStore: NewMemoryBindingStore(), err: claimErr},
+		Vault:    v,
 		Doer:     http.DefaultClient, HTTPClient: http.DefaultClient,
 		BaseURL: "https://re0auth.test",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Capture the log, so "an operator can see it" is a fact rather than a claim.
-	var logged bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	ctx := context.Background()
 	ch, err := svc.BeginBind(ctx, "usr_1", game, sourceName, "/dashboard")
@@ -122,19 +128,59 @@ func TestCompleteBindReportsARollbackThatFailed(t *testing.T) {
 	*challenge = u.Query().Get("code_challenge")
 
 	_, _, err = svc.CompleteBind(ctx, "usr_1", ch.ID, "code-1")
-
-	switch {
-	case err == nil:
-		t.Fatal("a bind that could not be recorded was reported as a success")
-	case !errors.Is(err, putErr):
+	if !errors.Is(err, claimErr) {
 		t.Fatalf("err = %v, want the store failure", err)
-	case !errors.Is(err, revokeErr):
-		t.Fatalf("err = %v, want the rollback failure joined in", err)
-	case !strings.Contains(err.Error(), "no binding"):
-		t.Fatalf("err = %v, want it to name the residue", err)
 	}
-	if !strings.Contains(logged.String(), "no binding") {
-		t.Fatalf("the stranded secret was not logged: %q", logged.String())
+	// The claim came first, so no secret was written and there is nothing stranded.
+	ok, xerr := v.Exists(ctx, BindingIdentity(Binding{User: "usr_1", Game: game, Source: sourceName}))
+	if xerr != nil || ok {
+		t.Fatalf("a failed row claim left a vault secret: exists=%v err=%v", ok, xerr)
+	}
+}
+
+// The other half of the ordering: when the claim wins and the vault write then
+// fails, the error is reported and the claimed row is left for the next call or
+// an Unbind. There is no secret, so the failure cannot advertise a usable binding.
+func TestCompleteBindReportsASecretWriteFailureAfterTheClaim(t *testing.T) {
+	up, challenge := fakeTokenServer(t, "up-token")
+	reg, err := NewRegistry(Source{
+		Game: game, Name: sourceName, DisplayName: "Fake", Issuer: up.URL,
+		ClientID: "cid", ClientSecret: "sec", TokenClass: "revocable",
+		Resources: []Resource{{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: profileScope}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enrollErr := errors.New("vault is sealed")
+	store := NewMemoryBindingStore()
+	svc, err := NewService(Config{
+		Registry: reg,
+		Bindings: store,
+		Vault:    enrollFailsVault{Service: newVault(t), err: enrollErr},
+		Doer:     http.DefaultClient, HTTPClient: http.DefaultClient,
+		BaseURL: "https://re0auth.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	ch, err := svc.BeginBind(ctx, "usr_1", game, sourceName, "/dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(ch.AuthorizeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*challenge = u.Query().Get("code_challenge")
+
+	_, _, err = svc.CompleteBind(ctx, "usr_1", ch.ID, "code-1")
+	if !errors.Is(err, enrollErr) {
+		t.Fatalf("err = %v, want the vault failure", err)
+	}
+	if _, gerr := store.Get(ctx, "usr_1", game, sourceName); gerr != nil {
+		t.Fatalf("the claimed row is gone after a vault failure: %v", gerr)
 	}
 }
 

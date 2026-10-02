@@ -865,6 +865,36 @@ func TestBindingPutIfVersionIsAtomic(t *testing.T) {
 	}
 }
 
+// Create is the compare-and-swap a first bind uses: it inserts only when the row
+// is still absent, so a bind that lost its flow to a removal in another process
+// cannot recreate one.
+func TestBindingCreateIsInsertOnly(t *testing.T) {
+	db := openTestDB(t)
+	bindings := db.Bindings()
+	ctx := context.Background()
+
+	won, err := bindings.Create(ctx, federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 7})
+	if err != nil || !won {
+		t.Fatalf("create on an absent row: won=%v err=%v, want true", won, err)
+	}
+	// A second create loses and must not overwrite the winner.
+	won, err = bindings.Create(ctx, federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 8})
+	if err != nil || won {
+		t.Fatalf("create on a present row: won=%v err=%v, want false", won, err)
+	}
+	if got, _ := bindings.Get(ctx, "usr_1", "phigros", "fake"); got.Version != 7 {
+		t.Fatalf("version = %d after a losing create, want 7", got.Version)
+	}
+	// After a delete (an Unbind) an absent row can be created again.
+	if err := bindings.Delete(ctx, "usr_1", "phigros", "fake"); err != nil {
+		t.Fatal(err)
+	}
+	won, err = bindings.Create(ctx, federation.Binding{User: "usr_1", Game: "phigros", Source: "fake", Version: 9})
+	if err != nil || !won {
+		t.Fatalf("create after delete: won=%v err=%v, want true", won, err)
+	}
+}
+
 // A bind flow is single-use: two concurrent callbacks must not both succeed.
 func TestBindFlowsConsumeIsSingleUse(t *testing.T) {
 	db := openTestDB(t)
@@ -875,6 +905,9 @@ func TestBindFlowsConsumeIsSingleUse(t *testing.T) {
 		ID: "bnd_1", State: "st-1", User: "usr_1",
 		Game: "phigros", Source: "fake", Verifier: "verifier-1",
 		ReturnTo: "/dashboard", ExpiresAt: time.Now().Add(10 * time.Minute).UTC().Truncate(time.Microsecond),
+		// A generation whose high bit is set pins the signed-column round trip:
+		// the version must come back bit-exact, not clamped or sign-mangled.
+		Bound: true, BoundVersion: 1<<63 + 7,
 	}
 	if err := flows.Put(ctx, flow); err != nil {
 		t.Fatal(err)
@@ -887,6 +920,10 @@ func TestBindFlowsConsumeIsSingleUse(t *testing.T) {
 	if got.ID != flow.ID || got.User != flow.User || got.Game != flow.Game ||
 		got.Source != flow.Source || got.Verifier != flow.Verifier || got.ReturnTo != flow.ReturnTo {
 		t.Fatalf("flow = %+v", got)
+	}
+	if !got.Bound || got.BoundVersion != flow.BoundVersion {
+		t.Fatalf("bound precondition = (%v, %d), want (%v, %d)",
+			got.Bound, got.BoundVersion, flow.Bound, flow.BoundVersion)
 	}
 	if _, err := flows.Consume(ctx, "st-1"); !errors.Is(err, federation.ErrUnknownBind) {
 		t.Fatalf("second consume = %v, want ErrUnknownBind", err)

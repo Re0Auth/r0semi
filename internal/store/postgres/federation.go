@@ -102,6 +102,21 @@ func (s *Bindings) PutIfVersion(ctx context.Context, b federation.Binding, expec
 	return tag.RowsAffected() == 1, nil
 }
 
+// Create implements federation.BindingStore. ON CONFLICT DO NOTHING makes
+// "insert only if absent" one atomic statement, so two first binds in different
+// processes cannot both win.
+func (s *Bindings) Create(ctx context.Context, b federation.Binding) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO federation_bindings (user_id, game, source, token_type, expiry, has_refresh, version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (user_id, game, source) DO NOTHING`,
+		string(b.User), b.Game, b.Source, b.TokenType, nullTime(b.Expiry), b.HasRefresh, int64(b.Version)) //nolint:gosec // G115: bit-exact round trip of the random version
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // Delete implements federation.BindingStore. Deleting an absent binding is not
 // an error, so unbinding stays idempotent.
 func (s *Bindings) Delete(ctx context.Context, user account.UserID, game, source string) error {
@@ -199,8 +214,8 @@ type BindFlows struct{ pool *pgxpool.Pool }
 func (s *BindFlows) Put(ctx context.Context, f federation.BindFlow) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO federation_bind_flows
-			(state, id, user_id, game, source, pkce_verifier, return_to, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(state, id, user_id, game, source, pkce_verifier, return_to, expires_at, bound, bound_version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (state) DO UPDATE SET
 			id            = EXCLUDED.id,
 			user_id       = EXCLUDED.user_id,
@@ -208,8 +223,11 @@ func (s *BindFlows) Put(ctx context.Context, f federation.BindFlow) error {
 			source        = EXCLUDED.source,
 			pkce_verifier = EXCLUDED.pkce_verifier,
 			return_to     = EXCLUDED.return_to,
-			expires_at    = EXCLUDED.expires_at`,
-		f.State, f.ID, string(f.User), f.Game, f.Source, f.Verifier, f.ReturnTo, f.ExpiresAt)
+			expires_at    = EXCLUDED.expires_at,
+			bound         = EXCLUDED.bound,
+			bound_version = EXCLUDED.bound_version`,
+		f.State, f.ID, string(f.User), f.Game, f.Source, f.Verifier, f.ReturnTo, f.ExpiresAt,
+		f.Bound, int64(f.BoundVersion)) //nolint:gosec // G115: bit-exact round trip of the random binding version
 	return err
 }
 
@@ -222,6 +240,9 @@ type bindFlowRow struct {
 	PKCEVerifier string    `db:"pkce_verifier"`
 	ReturnTo     string    `db:"return_to"`
 	ExpiresAt    time.Time `db:"expires_at"`
+	Bound        bool      `db:"bound"`
+	// Bit-exact round trip of the random binding version; see bindingRow.Version.
+	BoundVersion int64 `db:"bound_version"`
 }
 
 // Consume implements federation.BindFlowStore.
@@ -229,7 +250,7 @@ func (s *BindFlows) Consume(ctx context.Context, state string) (federation.BindF
 	rows, err := s.pool.Query(ctx, `
 		DELETE FROM federation_bind_flows
 		 WHERE state = $1
-		RETURNING id, user_id, game, source, pkce_verifier, return_to, expires_at`, state)
+		RETURNING id, user_id, game, source, pkce_verifier, return_to, expires_at, bound, bound_version`, state)
 	if err != nil {
 		return federation.BindFlow{}, err
 	}
@@ -241,14 +262,16 @@ func (s *BindFlows) Consume(ctx context.Context, state string) (federation.BindF
 		return federation.BindFlow{}, err
 	}
 	return federation.BindFlow{
-		ID:        row.ID,
-		User:      account.UserID(row.UserID),
-		Game:      row.Game,
-		Source:    row.Source,
-		Verifier:  row.PKCEVerifier,
-		State:     state,
-		ReturnTo:  row.ReturnTo,
-		ExpiresAt: row.ExpiresAt,
+		ID:           row.ID,
+		User:         account.UserID(row.UserID),
+		Game:         row.Game,
+		Source:       row.Source,
+		Verifier:     row.PKCEVerifier,
+		State:        state,
+		ReturnTo:     row.ReturnTo,
+		ExpiresAt:    row.ExpiresAt,
+		Bound:        row.Bound,
+		BoundVersion: uint64(row.BoundVersion), //nolint:gosec // G115: bit-exact round trip
 	}, nil
 }
 
