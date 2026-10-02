@@ -1371,13 +1371,14 @@ func (s *OIDCStore) DeviceByUserCode(_ context.Context, userCode string) (*op.De
 // docs/security-audit-3.md).
 func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string, scopes []string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	h, ok := s.userCodes[normalizeUserCode(userCode)]
 	if !ok {
+		s.mu.Unlock()
 		return oauth.ErrDeviceNotFound
 	}
 	d := s.devices[h]
 	if d.done || d.denied || !s.now().Before(d.expiresAt) {
+		s.mu.Unlock()
 		return oauth.ErrDeviceNotFound
 	}
 	d.done = true
@@ -1387,7 +1388,14 @@ func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string,
 		d.scopes = append([]string(nil), scopes...)
 	}
 	s.devices[h] = d
-	s.record(ctx, "oidc.device.approve", subject, d.clientID, audit.OutcomeOK)
+	clientID := d.clientID
+	s.mu.Unlock()
+	// The audit write is a synchronous, potentially remote append, and the store
+	// has exactly one lock: holding it here made every other call — every
+	// authorize, exchange, introspection and sweep — wait behind the sink
+	// (S13-4). The record describes a state change that has already happened, so
+	// it is written after the lock is released, as the other auditing methods do.
+	s.record(ctx, "oidc.device.approve", subject, clientID, audit.OutcomeOK)
 	return nil
 }
 
@@ -1397,18 +1405,22 @@ func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string,
 // consulted, so denying still outranks an approval whichever write lands second.
 func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	h, ok := s.userCodes[normalizeUserCode(userCode)]
 	if !ok {
+		s.mu.Unlock()
 		return oauth.ErrDeviceNotFound
 	}
 	d := s.devices[h]
 	if d.denied {
+		s.mu.Unlock()
 		return oauth.ErrDeviceNotFound
 	}
 	d.denied = true
 	s.devices[h] = d
-	s.record(ctx, "oidc.device.deny", "", d.clientID, audit.OutcomeDenied)
+	clientID := d.clientID
+	s.mu.Unlock()
+	// Out of the critical section for the same reason as ApproveDevice (S13-4).
+	s.record(ctx, "oidc.device.deny", "", clientID, audit.OutcomeDenied)
 	return nil
 }
 
