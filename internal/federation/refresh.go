@@ -139,15 +139,30 @@ func (s *service) refreshBinding(ctx context.Context, src Source, current Bindin
 // version that moved past the one we spent means somebody else won, and their
 // token is the live one. Only a version that did not move means the grant is
 // genuinely gone and the user must bind again.
+//
+// The re-read's failure is not a "did not move" (Z09V-2). Only ErrNotBound —
+// the row is already gone — shares the destructive branch's meaning. Any other
+// read error is a store fault, and treating it as evidence that the version was
+// unchanged means ONE failed read deletes the binding row and crypto-shreds a
+// vault key that may still belong to a perfectly valid binding. It is returned
+// upward instead: the caller retries, and nothing destructive happens on a read
+// that told us nothing.
 func (s *service) refreshRejected(ctx context.Context, spent Binding) (Binding, error) {
-	if latest, err := s.bindings.Get(ctx, spent.User, spent.Game, spent.Source); err == nil && latest.Version != spent.Version {
-		return latest, nil
+	latest, err := s.bindings.Get(ctx, spent.User, spent.Game, spent.Source)
+	switch {
+	case err == nil:
+		if latest.Version != spent.Version {
+			return latest, nil
+		}
+	case !errors.Is(err, ErrNotBound):
+		return Binding{}, err
 	}
-	// The grant is genuinely gone. Remove the secret before the row, mirroring
-	// shredBinding: the secret is the part that could still be used, and a secret
-	// that outlives its row is a decryptable upstream token no endpoint can reach.
-	// This path already holds the per-binding lock a refresh took, so it cannot
-	// call shredBinding itself — that would re-enter the same lock.
+	// The grant is genuinely gone (or the row already is). Remove the secret
+	// before the row, mirroring shredBinding: the secret is the part that could
+	// still be used, and a secret that outlives its row is a decryptable upstream
+	// token no endpoint can reach. This path already holds the per-binding lock a
+	// refresh took, so it cannot call shredBinding itself — that would re-enter
+	// the same lock.
 	if err := s.vault.Revoke(ctx, BindingIdentity(spent)); err != nil {
 		// Keep the row so the secret stays reachable by Unbind or the kill switch,
 		// and retryable on the next refresh. Logged, because an unrecorded orphan

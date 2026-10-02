@@ -72,11 +72,17 @@ type BindFlowStore interface {
 type MemoryBindFlowStore struct {
 	mu sync.Mutex
 	m  map[string]BindFlow
+	// now is the clock SweepExpired compares deadlines against. It is the
+	// service clock (Config.Now), wired by NewService, so the sweeper and the
+	// enforcement in CompleteBind agree about which flows are expired: with a
+	// wall-clock sweep under a logical service clock they would not (S05-9). Nil
+	// falls back to time.Now for a store used on its own.
+	now func() time.Time
 }
 
 // NewMemoryBindFlowStore returns an empty store.
 func NewMemoryBindFlowStore() *MemoryBindFlowStore {
-	return &MemoryBindFlowStore{m: make(map[string]BindFlow)}
+	return &MemoryBindFlowStore{m: make(map[string]BindFlow), now: time.Now}
 }
 
 // Put implements BindFlowStore.
@@ -124,6 +130,9 @@ func (s *MemoryBindFlowStore) PurgeUserFlows(_ context.Context, user account.Use
 // root runs this on the same ticker as the other sweeps.
 func (s *MemoryBindFlowStore) SweepExpired() int {
 	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	removed := 0
@@ -193,6 +202,18 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 	}
 	switch {
 	case flow.User != user:
+		// Consume is single-use and it happens before this check, so a caller who
+		// presents another account's state consumes a flow it does not own: the
+		// account that started the binding can no longer finish it. That is a
+		// cross-account denial of service, and it is refused by PUTTING THE FLOW
+		// BACK before answering (S05-10): state is 16 random bytes, so restoring
+		// it tells a prober nothing it did not already know, and the owner's
+		// pending flow survives. A store failure is reported instead of used as
+		// the refusal, because then the flow really is gone and the caller must
+		// know that.
+		if rerr := s.flows.Put(ctx, flow); rerr != nil {
+			return Binding{}, flow, rerr
+		}
 		return Binding{}, flow, ErrBindUser
 	case !s.now().Before(flow.ExpiresAt):
 		return Binding{}, flow, ErrUnknownBind

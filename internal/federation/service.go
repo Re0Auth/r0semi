@@ -394,6 +394,15 @@ func NewService(cfg Config) (Service, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	// The memory flow store's sweep compares deadlines against a clock of its own;
+	// hand it the one this service enforces expiry with, so a logical clock cannot
+	// make the sweeper and CompleteBind disagree about which flows are expired
+	// (S05-9). A store supplied by the caller is wired the same way, which is also
+	// how the composition root's janitor — which calls the store directly and has
+	// no clock of its own — gets it.
+	if flows, ok := cfg.Flows.(*MemoryBindFlowStore); ok {
+		flows.now = cfg.Now
+	}
 	if cfg.MaxBufferedBytes == 0 {
 		cfg.MaxBufferedBytes = defaultMaxBufferedBytes
 	}
@@ -929,9 +938,11 @@ func (s *service) fetchResource(ctx context.Context, src Source, resource, token
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Same joint budget as the raw path: a normalized fetch holds one body of up
-	// to maxBody while it parses. See Config.MaxBufferedBytes. The reservation
-	// outlives fetchResource on the success path; see the raw path for why.
-	reserve := reserveFor(resp, maxBody)
+	// to maxBody+1 while it parses (one byte past the cap, so "exactly at the
+	// limit" and "past the limit" are distinguishable). See Config.MaxBufferedBytes.
+	// The reservation outlives fetchResource on the success path; see the raw path
+	// for why.
+	reserve := reserveFor(resp, maxBody+1)
 	if !s.buffers.acquire(caller, reserve) {
 		return nil, nil, ErrBufferBudget
 	}
@@ -943,9 +954,18 @@ func (s *service) fetchResource(ctx context.Context, src Source, resource, token
 			release()
 		}
 	}()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	// One byte past the cap, exactly like the raw path (rawFetch), because the
+	// reasoning that "a cut body does not parse as JSON" was wrong: json.Valid
+	// accepts trailing whitespace, so a body whose first maxBody bytes are a
+	// complete JSON value followed by padding is cut mid-padding and still
+	// parses. Reading to maxBody alone then handed that truncated slice back as a
+	// complete 200. (Z09-2)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return nil, nil, fmt.Errorf("federation: read %s: %w", src.Name, err)
+	}
+	if len(body) > maxBody {
+		return nil, nil, ErrResponseTooLarge
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, &SourceError{Source: src.Name, Status: resp.StatusCode}

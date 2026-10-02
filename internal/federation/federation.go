@@ -150,6 +150,30 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 		if s.Game == "" || s.Name == "" || s.Issuer == "" {
 			return nil, errors.New("federation: source requires game, name and issuer")
 		}
+		// The game and source names are operator input, but they end up in the
+		// callback URL, the vault identity and the registry's own key, so they are
+		// checked rather than trusted — the same rule, and the same reason, as
+		// idp.validateProviderName (FO-04). See validateSourceName for why "." is
+		// excluded alongside the URL metacharacters (G-18).
+		if err := validateSourceName("game", s.Game); err != nil {
+			return nil, fmt.Errorf("federation: source %s/%s: %w", s.Game, s.Name, err)
+		}
+		if err := validateSourceName("name", s.Name); err != nil {
+			return nil, fmt.Errorf("federation: source %s/%s: %w", s.Game, s.Name, err)
+		}
+		// A resource's declared name is matched against the caller's path segment
+		// and its scope is sent upstream verbatim; both are validated for the same
+		// reason as the source name (FO-04).
+		for _, res := range s.Resources {
+			if res.Name != "" {
+				if err := validateSourceName("resource name", res.Name); err != nil {
+					return nil, fmt.Errorf("federation: source %s/%s: %w", s.Game, s.Name, err)
+				}
+			}
+			if err := validateResourceScope(res.Name, res.Scope); err != nil {
+				return nil, fmt.Errorf("federation: source %s/%s: %w", s.Game, s.Name, err)
+			}
+		}
 		k := sourceKey(s.Game, s.Name)
 		if _, dup := r.byKey[k]; dup {
 			return nil, fmt.Errorf("federation: duplicate source %s", k)
@@ -278,6 +302,65 @@ func validateRawBase(raw string) error {
 	if u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf(
 			"raw_base %q must not carry a query or fragment: the caller's path is appended to it", raw)
+	}
+	return nil
+}
+
+// validateSourceName checks a game or source name before it is joined into a URL
+// path, a vault identity or the registry's key.
+//
+// Same rule, and the same reason, as idp.validateProviderName: these are operator
+// values that end up in the bind callback URL
+// ({base}/auth/upstream/{game}/{source}/callback) and in every stored identity, so
+// they are checked rather than trusted (FO-04). A "/" or ".." changes the path the
+// callback resolves to, "?"/"#" truncates it and appends the callback to nothing,
+// a backslash is a separator to a Windows-hosted proxy, and whitespace or a
+// control byte produces a URL neither the operator nor the source wrote.
+//
+// The "." exclusion is the second finding (G-18): BindingIdentity joins game and
+// source with a bare "." to build the vault provider ("game.source"), and that
+// separator cannot change — existing ciphertext is bound to it as AAD — so with a
+// dot allowed in either half, ("a.b","c") and ("a","b.c") are two registry
+// entries that share one credential row: binding one overwrites the other's token
+// and unbinding either crypto-shreds the other. Refusing the separator inside the
+// halves is what keeps the join injective. This is deliberately stricter than
+// FO-04's suggested "[a-z0-9][a-z0-9._-]*": that charset would leave the collision
+// open.
+func validateSourceName(field, value string) error {
+	for i, r := range value {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+		if i == 0 && (r == '-' || r == '_') {
+			valid = false
+		}
+		if !valid {
+			return fmt.Errorf(
+				"%s %q must be lowercase letters, digits, '-' or '_' (no '.'), and start with a letter or digit",
+				field, value)
+		}
+	}
+	return nil
+}
+
+// validateResourceScope checks a declared resource scope before bindScopes hands
+// it to oauth2 as one element of the scope list.
+//
+// golang.org/x/oauth2 joins that list with spaces, so whitespace INSIDE one
+// declared scope becomes several scopes on the wire: with
+// scope = "phigros.profile.read account.id" the source is asked for a scope the
+// operator never declared and the consent screen never showed — the silent
+// privilege expansion FO-04 is about. The bindScopes doc promises "the account
+// scope plus every resource scope", and this is the only place that promise can
+// be kept. An empty scope is allowed: it means "no scope for this resource" and
+// bindScopes skips it.
+func validateResourceScope(resource, scope string) error {
+	for _, r := range scope {
+		valid := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_'
+		if !valid {
+			return fmt.Errorf(
+				"resource %s: scope %q must be letters, digits, '.', '-' or '_' only (whitespace would be sent as several scopes)",
+				resource, scope)
+		}
 	}
 	return nil
 }
