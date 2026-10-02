@@ -3,6 +3,7 @@ package referencesource
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,26 @@ const maxTapTapAttempts = 1024
 // errTooManyAttempts reports that the pending-attempt cap is reached. It is a
 // capacity signal, not an upstream failure.
 var errTooManyAttempts = errors.New("referencesource: too many pending login attempts")
+
+// taptapBindCookie names the cookie that binds a device-login attempt to the
+// browser that started it.
+//
+// The challenge hands the attempt id to the initiator's own frontend, because
+// that is how the frontend polls; the poll then establishes whatever subject the
+// upstream approved into the CALLER's session (source.establish). Nothing in
+// that pair says the two requests came from the same browser, so an attempt id —
+// which travels in a URL the initiator can hand to anyone — was the whole
+// capability: whoever loaded GET /login/taptap/poll?id=<id> became the approved
+// account. That is session fixation / login CSRF, and its victim is usually the
+// person the attacker wants to log in *as someone else*.
+//
+// The fix is a second, non-URL secret: the challenge sets it as an HttpOnly
+// cookie for the initiating browser and the poll must present the same value.
+// It is not readable by script, and a page on another origin cannot set it for
+// this one, so a browser that never started the attempt cannot satisfy it. The
+// session cookie is SameSite=Lax, which a top-level cross-site GET still sends;
+// that is why the defence is the value check and not the SameSite attribute.
+const taptapBindCookie = "refsrc_taptap_bind"
 
 // TapTapConfig tunes the source's TapTap login.
 type TapTapConfig struct {
@@ -65,6 +86,34 @@ type TapTapLogin struct {
 type attempt struct {
 	auth     taptapoauth.DeviceAuth
 	nextPoll time.Time
+	// bind is the secret the initiating browser was given as a cookie and must
+	// present when it polls. It never leaves the server in a response body.
+	bind string
+}
+
+// boundTo reports whether the browser presenting bind is the one the attempt
+// was started for. The comparison is constant-time; the values are random
+// 128-bit tokens, so this is belt to the token's suspenders rather than the
+// defence itself. An attempt with no binding is never satisfied.
+func (a *attempt) boundTo(bind string) bool {
+	if a.bind == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a.bind), []byte(bind)) == 1
+}
+
+// bindCookie builds the Set-Cookie that ties an attempt to its browser. The
+// path is the poll's own prefix, so the value is not offered anywhere else, and
+// there is no Expires: it dies with the browser session, and it is worthless
+// once the attempt is gone.
+func bindCookie(bind string) *http.Cookie {
+	return &http.Cookie{
+		Name:     taptapBindCookie,
+		Value:    bind,
+		Path:     "/login/taptap",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
 }
 
 // LoginChallenge is what the user must act on: render VerificationURL as a QR
@@ -75,6 +124,12 @@ type LoginChallenge struct {
 	UserCode        string    `json:"user_code,omitempty"`
 	IntervalSeconds int       `json:"interval_seconds"`
 	ExpiresAt       time.Time `json:"expires_at"`
+
+	// bind is the per-attempt secret the challenge sets as a cookie. It is
+	// unexported and has no JSON tag on purpose: the challenge body goes back to
+	// the initiator, and putting the binding in it would hand the attacker the
+	// thing the binding exists to withhold.
+	bind string
 }
 
 // LoginProgress is the state of a login attempt.
@@ -131,6 +186,10 @@ func (l *TapTapLogin) begin(ctx context.Context) (LoginChallenge, error) {
 	if err != nil {
 		return LoginChallenge{}, err
 	}
+	bind, err := randomLoginID("bind_")
+	if err != nil {
+		return LoginChallenge{}, err
+	}
 
 	l.mu.Lock()
 	l.sweepLocked()
@@ -138,7 +197,7 @@ func (l *TapTapLogin) begin(ctx context.Context) (LoginChallenge, error) {
 		l.mu.Unlock()
 		return LoginChallenge{}, errTooManyAttempts
 	}
-	l.attempts[id] = &attempt{auth: auth, nextPoll: l.now()}
+	l.attempts[id] = &attempt{auth: auth, nextPoll: l.now(), bind: bind}
 	l.mu.Unlock()
 
 	return LoginChallenge{
@@ -147,18 +206,28 @@ func (l *TapTapLogin) begin(ctx context.Context) (LoginChallenge, error) {
 		UserCode:        auth.UserCode,
 		IntervalSeconds: int(auth.Interval.Seconds()),
 		ExpiresAt:       auth.ExpiresAt,
+		bind:            bind,
 	}, nil
 }
 
 // poll advances a login attempt. On success it hands the TapTap account and its
 // credential to establish, which stores them under the source's own account id.
-func (l *TapTapLogin) poll(ctx context.Context, id string, establish Establish) (LoginProgress, error) {
+//
+// bind is the cookie value the caller presented; it must match the value the
+// challenge put in the initiating browser, or the attempt is not the caller's
+// (see taptapBindCookie).
+func (l *TapTapLogin) poll(ctx context.Context, id, bind string, establish Establish) (LoginProgress, error) {
 	now := l.now()
 
 	l.mu.Lock()
 	a, ok := l.attempts[id]
-	if !ok {
+	if !ok || !a.boundTo(bind) {
 		l.mu.Unlock()
+		// One answer for "no such attempt" and "not this browser's attempt":
+		// telling them apart would confirm to a caller holding only an id
+		// whether the attempt exists. The attempt is left in place, because a
+		// mismatched caller is not necessarily its owner (an attacker is the
+		// likely one) and must not be able to make the real browser lose it.
 		return LoginProgress{State: "expired", Message: "login not found or expired"}, nil
 	}
 	if !now.Before(a.auth.ExpiresAt) {
@@ -235,11 +304,19 @@ func (l *TapTapLogin) handleChallenge(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream_unavailable"})
 		return
 	}
+	// The binding goes out as a cookie, not in the body: the body is returned to
+	// the page that started the challenge, and only the browser itself may hold
+	// the value the poll is checked against.
+	http.SetCookie(w, bindCookie(challenge.bind))
 	writeJSON(w, http.StatusOK, challenge)
 }
 
 func (l *TapTapLogin) handlePoll(w http.ResponseWriter, r *http.Request, establish Establish) {
-	progress, err := l.poll(r.Context(), r.URL.Query().Get("id"), establish)
+	bind := ""
+	if c, err := r.Cookie(taptapBindCookie); err == nil {
+		bind = c.Value
+	}
+	progress, err := l.poll(r.Context(), r.URL.Query().Get("id"), bind, establish)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request", "message": err.Error()})
 		return
