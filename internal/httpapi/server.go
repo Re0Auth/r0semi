@@ -232,6 +232,12 @@ type Server struct {
 	// auditReader reads the audit log for the operator plane; nil when that plane
 	// is not configured.
 	auditReader AuditReader
+	// auditVerifyBusy admits one /v1/admin/audit/verify walk at a time. The walk
+	// reads the whole chain while holding a pooled connection, so an unbounded
+	// number of concurrent copies of it is a self-inflicted pool exhaustion; a
+	// caller that finds one running is told to retry rather than queued behind it.
+	// The zero value is "idle".
+	auditVerifyBusy atomic.Bool
 	// auditLog records events this layer owns that no other plane covers (identity
 	// unlink); nil records nothing.
 	auditLog audit.Logger

@@ -3,8 +3,10 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +22,12 @@ type stubAuditReader struct {
 	verify audit.Verification
 	head   []byte
 	err    error
+	// verifyEntered, when non-nil, receives one token each time Verify is entered
+	// (before it can return), and verifyRelease, when non-nil, is waited on inside
+	// Verify. Together they let a test hold a walk open and observe how many walks
+	// the handler admits at once.
+	verifyEntered chan struct{}
+	verifyRelease chan struct{}
 }
 
 func (s *stubAuditReader) Head(context.Context) ([]byte, error) {
@@ -38,6 +46,12 @@ func (s *stubAuditReader) Query(_ context.Context, q audit.Query) (audit.Page, e
 }
 
 func (s *stubAuditReader) Verify(context.Context) (audit.Verification, error) {
+	if s.verifyEntered != nil {
+		s.verifyEntered <- struct{}{}
+	}
+	if s.verifyRelease != nil {
+		<-s.verifyRelease
+	}
 	if s.err != nil {
 		return audit.Verification{}, s.err
 	}
@@ -280,5 +294,82 @@ func TestAuditRequiresAnAllowlist(t *testing.T) {
 	cfg.Admins = nil
 	if _, err := New(cfg); err == nil {
 		t.Fatal("a reader with an empty allowlist was accepted")
+	}
+}
+
+// S11-6 — /v1/admin/audit/verify must admit one walk at a time.
+//
+// Verify reads the whole chain while holding a pooled connection, and on a real
+// deployment that walk can run for tens of seconds. Without a gate, N concurrent
+// GETs are N concurrent chain walks and N long-lived pool acquisitions, so an
+// operator (or anyone who can reach the endpoint) can starve every other pool
+// user. The gate refuses the extra callers with a 503 and a Retry-After rather
+// than queueing them, which would only move the pile-up into the queue.
+//
+// The stub's Verify signals on entry and then blocks, so this test measures how
+// many walks the handler actually admits: exactly one inside the window. Any
+// response other than 200/503 is also a failure — a gate that surfaced as a 500
+// would look like a broken endpoint rather than a busy one.
+func TestAdminAuditVerifyRefusesASecondConcurrentWalk(t *testing.T) {
+	env := newAdminEnv(t, true)
+	browser := newBrowser(t)
+	signIn(t, browser, env.base)
+
+	entered := make(chan struct{}, 16)
+	release := make(chan struct{})
+	env.audit.verifyEntered = entered
+	env.audit.verifyRelease = release
+
+	const walkers = 8
+	statuses := make([]int, walkers)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < walkers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequest(http.MethodGet, env.base+"/v1/admin/audit/verify", nil)
+			if err != nil {
+				statuses[i] = -1
+				return
+			}
+			resp, err := browser.Do(req)
+			if err != nil {
+				statuses[i] = -1
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			statuses[i] = resp.StatusCode
+		}(i)
+	}
+	close(start)
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		wg.Wait()
+		t.Fatal("no request reached Verify at all")
+	}
+
+	// The window in which every other walker must be refused by the busy gate:
+	// the first walk cannot finish until release is closed below. The receive
+	// above already removed the first walker's token, so the concurrent count is
+	// that one plus whatever else the channel has accumulated.
+	time.Sleep(300 * time.Millisecond)
+	concurrent := 1 + len(entered)
+	close(release)
+	wg.Wait()
+
+	if concurrent != 1 {
+		t.Errorf("%d walks entered Verify concurrently, want exactly 1 "+
+			"(an ungated handler admits all %d)", concurrent, walkers)
+	}
+	for i, code := range statuses {
+		if code != http.StatusOK && code != http.StatusServiceUnavailable {
+			t.Errorf("request %d answered %d, want 200 or 503 (never 500)", i, code)
+		}
 	}
 }

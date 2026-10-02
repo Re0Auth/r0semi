@@ -172,6 +172,18 @@ func (s *Server) handleAdminAuditVerify(w http.ResponseWriter, r *http.Request) 
 	if !s.requireAdmin(w, r) {
 		return
 	}
+	// One walk at a time. Verify reads the whole chain on a single pooled
+	// connection and can take tens of seconds, so N concurrent callers are N
+	// long-lived pool acquisitions: enough of them starve the rest of the service.
+	// The second caller is refused promptly and told when to come back rather than
+	// being queued, which would just move the pile-up to the queue.
+	if !s.auditVerifyBusy.CompareAndSwap(false, true) {
+		w.Header().Set("Retry-After", "5")
+		s.writeProblem(w, r, http.StatusServiceUnavailable, "temporarily_unavailable",
+			"an audit verification is already running")
+		return
+	}
+	defer s.auditVerifyBusy.Store(false)
 	v, err := s.auditReader.Verify(r.Context())
 	if err != nil {
 		s.metrics.ObserveAuditVerify(observability.VerifyError)
