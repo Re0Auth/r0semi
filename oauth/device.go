@@ -134,6 +134,16 @@ type DeviceStore interface {
 	// applied — false means the store refused it, because the request is unknown
 	// or has already been decided.
 	RecordDecision(ctx context.Context, deviceCodeHash string, d DeviceDecision) (bool, error)
+	// ConsumeDevice atomically redeems an approved authorization: it hands the
+	// record to exactly one caller and removes it, so one consent can be spent on
+	// exactly one token pair. It reports ok=false without an error when the code
+	// is unknown, was never approved, has already been redeemed, or has expired —
+	// all of which the poll answers the same way, because none of them may issue.
+	//
+	// The read and the removal are one step on purpose. A GetDevice followed by a
+	// delete would let two polls that both read "approved" both mint tokens from a
+	// single approval.
+	ConsumeDevice(ctx context.Context, deviceCodeHash string) (DeviceAuthorizationRecord, bool, error)
 }
 
 // MemoryDeviceStore is a non-durable DeviceStore for development and tests.
@@ -216,6 +226,26 @@ func (s *MemoryDeviceStore) RecordDecision(_ context.Context, deviceCodeHash str
 	d.Explicit = append([]Scope(nil), dec.Explicit...)
 	s.byDev[deviceCodeHash] = d
 	return true, nil
+}
+
+// ConsumeDevice implements DeviceStore. The status check and the removal happen
+// under one lock, so exactly one of two concurrent polls redeems an approval; the
+// loser is told ok=false rather than being handed the same consent again.
+func (s *MemoryDeviceStore) ConsumeDevice(_ context.Context, deviceCodeHash string) (DeviceAuthorizationRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.byDev[deviceCodeHash]
+	if !ok || d.Status != DeviceApproved {
+		return DeviceAuthorizationRecord{}, false, nil
+	}
+	// Drop the user-code index entry only if it still points at this record: a
+	// user code can be reused once its old record is gone, and deleting a newer
+	// request's mapping would make that request unreachable from the page.
+	if key := NormalizeUserCode(d.UserCode); s.byUser[key] == deviceCodeHash {
+		delete(s.byUser, key)
+	}
+	delete(s.byDev, deviceCodeHash)
+	return d, true, nil
 }
 
 // SweepExpired drops every device record whose deadline has passed and reports
@@ -339,7 +369,17 @@ func (s *service) PollDeviceAuthorization(ctx context.Context, req DeviceCodeExc
 	case DeviceDenied:
 		return TokenResponse{}, protocolError("access_denied", "the user denied the request")
 	}
-	return s.issue(ctx, client.ID, rec.Subject, rec.Scopes, "")
+	// The read above saw an approval; only the consume may act on it. Issuing on
+	// the strength of the read alone would mint a fresh token pair on every poll,
+	// and would also silently revive an approval the user revoked in between.
+	consumed, ok, err := s.devices.ConsumeDevice(ctx, rec.DeviceCodeHash)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	if !ok {
+		return TokenResponse{}, protocolError("invalid_grant", "device code has already been redeemed")
+	}
+	return s.issue(ctx, client.ID, consumed.Subject, consumed.Scopes, "")
 }
 
 // DescribeDeviceAuthorization returns what the verification page must render.

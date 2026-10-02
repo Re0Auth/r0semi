@@ -578,7 +578,22 @@ func revokePredicate(f oauth.TokenFilter) (clause string, args []any) {
 // Devices implements oauth.DeviceStore on Postgres. The device code is hashed;
 // the user code is stored canonically and looked up case- and
 // separator-insensitively through an expression index.
-type Devices struct{ pool *pgxpool.Pool }
+type Devices struct {
+	pool *pgxpool.Pool
+	// now judges a consume's expiry predicate. It is the store clock, not the
+	// database's, for the reason postgres.go's single-clock policy states: a
+	// deadline written by this process is judged by the process that wrote it.
+	now func() time.Time
+}
+
+// clock reads the store clock, tolerating a Devices built without one (the
+// zero-value handle) rather than dereferencing a nil function.
+func (s *Devices) clock() time.Time {
+	if s.now == nil {
+		return time.Now()
+	}
+	return s.now()
+}
 
 const deviceCols = `device_code_hash, user_code, client_id, scopes, status, subject, explicit_scopes, expires_at, last_poll`
 
@@ -678,6 +693,29 @@ func (s *Devices) RecordDecision(ctx context.Context, deviceCodeHash string, d o
 		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+// ConsumeDevice implements oauth.DeviceStore. The DELETE ... RETURNING is the
+// claim: `status = 'approved'` and `expires_at > $2` select the one row this
+// caller may spend, and removing it makes a second poll lose the race and see
+// zero rows — reported as ok=false, not as an error, because "already redeemed"
+// is an answer the poll turns into invalid_grant.
+func (s *Devices) ConsumeDevice(ctx context.Context, deviceCodeHash string) (oauth.DeviceAuthorizationRecord, bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		DELETE FROM oauth_device_authorizations
+		 WHERE device_code_hash = $1 AND status = 'approved' AND expires_at > $2
+		 RETURNING `+deviceCols, deviceCodeHash, s.clock())
+	if err != nil {
+		return oauth.DeviceAuthorizationRecord{}, false, err
+	}
+	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[deviceRow])
+	if noRows(err) {
+		return oauth.DeviceAuthorizationRecord{}, false, nil
+	}
+	if err != nil {
+		return oauth.DeviceAuthorizationRecord{}, false, err
+	}
+	return row.device(), true, nil
 }
 
 func scanDevice(rows pgx.Rows) (oauth.DeviceAuthorizationRecord, error) {

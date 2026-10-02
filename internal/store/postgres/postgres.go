@@ -310,7 +310,7 @@ func (db *DB) Accounts() *Accounts { return &Accounts{pool: db.pool} }
 func (db *DB) Tokens() *Tokens { return &Tokens{pool: db.pool, now: db.now} }
 
 // Devices returns the device-authorization store.
-func (db *DB) Devices() *Devices { return &Devices{pool: db.pool} }
+func (db *DB) Devices() *Devices { return &Devices{pool: db.pool, now: db.now} }
 
 // Vault returns the credential-record repository. Decryption lives in the vault
 // package; this only stores opaque crypto material.

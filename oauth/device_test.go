@@ -242,3 +242,61 @@ func containsRune(s string, r rune) bool {
 	}
 	return false
 }
+
+// S01-1: an approval is a one-time grant, not a standing permission. Before the
+// fix the approved branch issued unconditionally, so every poll minted a fresh
+// access+refresh pair and an approval revoked in between was silently revived.
+//
+// The poll that issues tokens must be the poll that spends the approval, so a
+// second poll is invalid_grant — and stays that way even after the first pair is
+// revoked, because there is nothing left to spend.
+func TestDeviceAuthorizationApprovedCodeIsSingleUse(t *testing.T) {
+	svc, clients, tokens, _, clock := newTestAS(t)
+	registerClient(t, clients, "cli", ClientPublic, "", []Scope{ScopeAccountID})
+	ctx := context.Background()
+
+	start, err := svc.BeginDeviceAuthorization(ctx, DeviceAuthorizationRequest{
+		ClientID: "cli", Scopes: []Scope{ScopeAccountID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideDeviceAuthorization(ctx, start.UserCode, "usr_1", true, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	clock.advance(6 * time.Second)
+	first, err := svc.PollDeviceAuthorization(ctx, DeviceCodeExchangeRequest{ClientID: "cli", DeviceCode: start.DeviceCode})
+	if err != nil {
+		t.Fatalf("first poll: %v", err)
+	}
+	if first.AccessToken == "" || first.RefreshToken == "" {
+		t.Fatalf("first poll = %+v", first)
+	}
+
+	// After the advertised interval, a second poll must not issue a second pair.
+	clock.advance(6 * time.Second)
+	second, err := svc.PollDeviceAuthorization(ctx, DeviceCodeExchangeRequest{ClientID: "cli", DeviceCode: start.DeviceCode})
+	if err == nil {
+		t.Fatalf("the approved device code was redeemed twice: second poll = %+v", second)
+	}
+	if got := protocolCode(t, err); got != "invalid_grant" {
+		t.Fatalf("second poll = %q, want invalid_grant", got)
+	}
+	if second != (TokenResponse{}) {
+		t.Fatalf("second poll returned tokens alongside its error: %+v", second)
+	}
+
+	// Revoking the first pair must not make the spent code spendable again.
+	if _, err := tokens.RevokeTokens(ctx, TokenFilter{Subject: "usr_1"}); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance(6 * time.Second)
+	third, err := svc.PollDeviceAuthorization(ctx, DeviceCodeExchangeRequest{ClientID: "cli", DeviceCode: start.DeviceCode})
+	if err == nil || third != (TokenResponse{}) {
+		t.Fatalf("poll after revocation = %+v, %v", third, err)
+	}
+	if got := protocolCode(t, err); got != "invalid_grant" {
+		t.Fatalf("poll after revocation = %q, want invalid_grant", got)
+	}
+}
