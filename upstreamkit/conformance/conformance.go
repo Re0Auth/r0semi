@@ -91,7 +91,7 @@ func Run(ctx context.Context, target string, opts Options) []Finding {
 	r.checkOAuthMetadata()
 	r.checkAuthorizeRejectsUnknownClient()
 	r.checkTokenRejectsBadGrant()
-	r.checkRevocationEndpoint()
+	r.checkRevocationEndpoint(disc)
 	r.checkCascadeEndpoint(disc)
 	r.checkDataPlane(disc)
 	return r.findings
@@ -132,11 +132,19 @@ func (r *runner) skip(check, format string, args ...any) {
 }
 
 func (r *runner) request(method, path string, body string, headers map[string]string) (*http.Response, error) {
+	return r.requestURL(method, r.base+path, body, headers)
+}
+
+// requestURL sends to an absolute URL. It exists because the endpoints a source
+// ADVERTISES are URLs, not paths on the target: the suite must exercise the
+// advertised URL itself (docs/upstream-protocol.md §4), origin included, or it
+// judges a different endpoint than Re0Auth will call.
+func (r *runner) requestURL(method, target string, body string, headers map[string]string) (*http.Response, error) {
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(r.ctx, method, r.base+path, reader)
+	req, err := http.NewRequestWithContext(r.ctx, method, target, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -209,11 +217,18 @@ func (r *runner) checkDiscovery() (upstreamkit.Discovery, bool) {
 // when something was observed, so a credential-less run is unaffected.
 func (r *runner) checkOAuthMetadata() {
 	resp, err := r.request(http.MethodGet, "/.well-known/oauth-authorization-server", "", nil)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
 		r.warn("oauth.metadata", "authorization server metadata not reachable; inline endpoints are assumed")
 		return
 	}
+	// The body is closed before the status is judged: a non-200 document still
+	// owns a connection, and returning on the status used to leave it open for
+	// the rest of the run (S06-6).
 	defer closeBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		r.warn("oauth.metadata", "authorization server metadata not reachable; inline endpoints are assumed")
+		return
+	}
 
 	var doc struct {
 		CodeChallengeMethods []string `json:"code_challenge_methods_supported"`
@@ -393,9 +408,23 @@ func (r *runner) checkTokenRejectsBadGrant() {
 // carries a bogus token, an unknown client id and no credentials, so a 2xx means
 // the endpoint accepted a caller it authenticated nobody for — RFC 7009 §2.1
 // requires client authentication before a revocation is acted on.
-func (r *runner) checkRevocationEndpoint() {
+//
+// The endpoint is read from the discovery document, not assumed to be on
+// /oauth/revoke. A source may advertise revocation anywhere — another path, a
+// whole other host — and Re0Auth calls the advertised URL
+// (internal/federation/revocation.go). Probing the target's own decoy path gave
+// a compliant source "revocation endpoint is missing" (Z14-V1) while an
+// advertised-but-absent URL was never contacted at all. A value that is not an
+// absolute URL cannot be called by anyone and is an error, not a warning.
+func (r *runner) checkRevocationEndpoint(disc upstreamkit.Discovery) {
+	endpoint := disc.OAuth.RevocationEndpoint
+	parsed, err := url.Parse(endpoint)
+	if err != nil || !parsed.IsAbs() {
+		r.err("revoke.absolute", "revocation_endpoint is not an absolute URL: %q", endpoint)
+		return
+	}
 	form := url.Values{"token": {"conformance-bogus-token"}, "client_id": {"conformance-unknown-client"}}
-	resp, err := r.request(http.MethodPost, "/oauth/revoke", form.Encode(),
+	resp, err := r.requestURL(http.MethodPost, endpoint, form.Encode(),
 		map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
 	if err != nil {
 		r.err("revoke.reachable", "request failed: %v", err)
@@ -403,7 +432,7 @@ func (r *runner) checkRevocationEndpoint() {
 	}
 	defer closeBody(resp)
 	if resp.StatusCode == http.StatusNotFound {
-		r.err("revoke.present", "revocation endpoint is missing")
+		r.err("revoke.present", "advertised but missing: %s", endpoint)
 		return
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -441,8 +470,12 @@ func (r *runner) checkCascadeEndpoint(disc upstreamkit.Discovery) {
 	}
 
 	// No credentials, an unknown client id, and a token that means nothing.
+	// The request goes to the advertised URL itself: taking only its path and
+	// re-attaching the target's origin silently swapped the endpoint for whatever
+	// the target happened to serve at that path (Z14-V1), which both failed
+	// compliant multi-host sources and passed a decoy.
 	form := url.Values{"token": {"conformance-bogus-token"}, "client_id": {"conformance-unknown-client"}}
-	resp, err := r.request(http.MethodPost, parsed.RequestURI(), form.Encode(),
+	resp, err := r.requestURL(http.MethodPost, endpoint, form.Encode(),
 		map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
 	if err != nil {
 		r.err("cascade.reachable", "request failed: %v", err)
