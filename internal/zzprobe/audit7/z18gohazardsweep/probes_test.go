@@ -1,6 +1,8 @@
 //go:build audit7
 
-// Z18 probes: three red findings plus one green guard.
+// Z18 probes. The first three began as the zone's red findings; their fixes have
+// landed, so each is now the regression guard for its fix (names kept for the
+// audit coverage matrix):
 //
 //   - Z18-1 TestZ18ReadinessIsFailOpenWhileTheFirstCheckRuns
 //   - Z18-2 TestZ18ConcurrentLoginIsBlockedByAnotherLoginsDiscovery
@@ -89,15 +91,14 @@ func zzGet(t *testing.T, srv *httptest.Server, path string) int {
 
 // ---------------------------------------------------------------- Z18-1
 
-// TestZ18ReadinessIsFailOpenWhileTheFirstCheckRuns is red while
-// readinessCache.check answers from a nil error before any result exists.
+// TestZ18ReadinessIsFailOpenWhileTheFirstCheckRuns was the Z18-1 finding and is
+// now its regression guard (the name is kept for the audit coverage matrix).
 //
-// health.go:111-120 returns c.err whenever `fresh || c.running`. `running` is
-// true for exactly the window in which the first dependency check is in flight,
-// and in that window `checked` is still false and c.err is still nil — so every
-// /readyz that arrives while the first check runs is answered 200 "ready",
-// including when the dependency is down. The failure is silent: the caller sees
-// the same 200 it would see from a healthy instance.
+// The finding: readinessCache.check returned c.err whenever `fresh || c.running`,
+// so during the window in which the first dependency check was in flight `checked`
+// was still false and c.err was still nil, and every /readyz answered 200 "ready"
+// even with the dependency down. The cache now fails closed until the first result
+// exists, and the assertion below fails if that regresses.
 func TestZ18ReadinessIsFailOpenWhileTheFirstCheckRuns(t *testing.T) {
 	var calls atomic.Int64
 	started := make(chan struct{}, 1)
@@ -149,25 +150,24 @@ func TestZ18ReadinessIsFailOpenWhileTheFirstCheckRuns(t *testing.T) {
 	}
 
 	if code2 != http.StatusServiceUnavailable {
-		t.Errorf("RED: a /readyz that arrived while the first dependency check was still in flight answered %d "+
-			"(the dependency is down and the later, cached answer is 503). health.go:111-120 answers c.err when "+
-			"`running` is true without first requiring `checked`, so before the first result exists the zero-value "+
-			"nil error is indistinguishable from 'ready'. An orchestrator probing during this window routes traffic "+
-			"to an instance that cannot serve it; no credential or budget is needed (probes are exempt from both).",
-			code2)
+		t.Errorf("REGRESSION: a /readyz that arrived while the first dependency check was still in flight "+
+			"answered %d (the dependency is down and the later, cached answer is 503). The readiness cache "+
+			"must fail closed until the first result exists, rather than answer the zero-value nil error "+
+			"while `running` is true (Z18-1 regressed). An orchestrator probing this window would route "+
+			"traffic to an instance that cannot serve it.", code2)
 	}
 }
 
 // ---------------------------------------------------------------- Z18-2
 
-// TestZ18ConcurrentLoginIsBlockedByAnotherLoginsDiscovery is red while
-// Client.oidcProvider holds a mutex across the outbound discovery request.
+// TestZ18ConcurrentLoginIsBlockedByAnotherLoginsDiscovery was the Z18-2 finding
+// and is now its regression guard (the name is kept for the audit coverage matrix).
 //
-// idp.go:619-637 takes providerMu and then calls oidc.NewProvider — a network
-// round trip — with the lock still held. A second sign-in for the same provider
-// cannot proceed until the first one's discovery answers, so the login plane's
-// throughput for that provider is 1/(discovery latency), and a slow or hanging
-// issuer (the client's timeout is 10s) queues every user behind it.
+// The finding: Client.oidcProvider held providerMu across the outbound discovery
+// request, so a second sign-in for the same provider could not proceed until the
+// first one's discovery answered. The provider is now discovered without the lock
+// held, and the second login in this probe must finish while the first discovery is
+// still parked.
 func TestZ18ConcurrentLoginIsBlockedByAnotherLoginsDiscovery(t *testing.T) {
 	var discoCalls atomic.Int64
 	started := make(chan struct{}, 1)
@@ -257,27 +257,24 @@ func TestZ18ConcurrentLoginIsBlockedByAnotherLoginsDiscovery(t *testing.T) {
 		if err := <-second; err != nil {
 			t.Fatalf("second login (late): %v", err)
 		}
-		t.Errorf("RED: a second sign-in on the same provider did not complete while the first one's discovery was "+
-			"still in flight, although the issuer answers a later discovery immediately (%d requests seen). "+
-			"idp.go:620-633 holds providerMu across oidc.NewProvider, so every concurrent login for that provider "+
-			"queues behind one network round trip — up to the 10s client timeout per attempt when the issuer is "+
-			"slow, and a failed discovery is not cached, so each new attempt repeats it.",
+		t.Errorf("REGRESSION: a second sign-in on the same provider did not complete while the first one's "+
+			"discovery was still in flight, although the issuer answers a later discovery immediately (%d "+
+			"requests seen). The provider's discovery must run without the provider mutex held, or every "+
+			"concurrent login for that provider queues behind one network round trip (Z18-2 regressed).",
 			discoCalls.Load())
 	}
 }
 
 // ---------------------------------------------------------------- Z18-3
 
-// TestZ18IntrospectionDoesNotHandOutTheStoredScopeSlice is red while the
-// in-memory token store returns the slice it stores.
+// TestZ18IntrospectionDoesNotHandOutTheStoredScopeSlice was the Z18-3 finding and
+// is now its regression guard (the name is kept for the audit coverage matrix).
 //
-// oauth/tokens.go stores AccessToken by value but its Scopes field is a slice
-// header: the store and the caller share one backing array. Service.Introspect
-// (oauth/as.go:280) hands that array to its caller as TokenInfo.Scopes, so any
-// consumer that narrows, sorts or writes the scopes it was handed edits a live
-// token's grant. No in-repo consumer mutates it today — this is the same
-// copy-on-return invariant 05-4 established for the OP store, at a different
-// site, and the probe pins the invariant rather than a live exploit.
+// The finding: oauth/tokens.go stored AccessToken by value but its Scopes field is
+// a slice header, so the store and the caller shared one backing array and
+// Service.Introspect handed that array to its caller as TokenInfo.Scopes. The store
+// now copies the slice on return, so a consumer that narrows, sorts or writes the
+// scopes it was handed cannot edit a live token's grant.
 func TestZ18IntrospectionDoesNotHandOutTheStoredScopeSlice(t *testing.T) {
 	ctx := context.Background()
 	store := oauth.NewMemoryStore()
@@ -308,10 +305,10 @@ func TestZ18IntrospectionDoesNotHandOutTheStoredScopeSlice(t *testing.T) {
 		t.Fatalf("GetAccess (second): %v", err)
 	}
 	if again.Scopes[0] != oauth.ScopeAccountID {
-		t.Errorf("RED: rewriting the slice returned by GetAccess changed the STORED token's scope from %q to %q "+
-			"(oauth/tokens.go:224-232 returns the record without copying Scopes; oauth/as.go:280 passes it on as "+
-			"TokenInfo.Scopes). A caller that narrows or reorders the scopes it introspected therefore grants or "+
-			"revokes scopes on a live token.",
+		t.Errorf("REGRESSION: rewriting the slice returned by GetAccess changed the STORED token's scope from %q "+
+			"to %q. The store must copy Scopes on return (the copy-on-return invariant 05-4 established for the "+
+			"OP store, applied here), or a caller that narrows or reorders the scopes it introspected grants or "+
+			"revokes scopes on a live token (Z18-3 regressed).",
 			oauth.ScopeAccountID, again.Scopes[0])
 	}
 }

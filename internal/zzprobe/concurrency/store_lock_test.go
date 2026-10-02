@@ -13,18 +13,23 @@ import (
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
-// --- Finding CM-1: the store's single lock is held across the audit write ---
+// --- S13-4 regression guards: the store's single lock is NOT held across the
+// audit write ---
 //
-// memory.OIDCStore.ApproveDevice / DenyDevice call s.record(...) inside the
-// critical section (the `defer s.mu.Unlock()` has not run yet), while every other
-// auditing method in the same file mints its record after releasing the lock.
-// audit.Logger.Record is synchronous by contract ("returning nil means safe to
-// proceed") and in a durable deployment it is a Postgres batch append that takes
-// the chain-head row lock — i.e. network I/O plus a database lock.
+// Originally this block was a discovery pair: memory.OIDCStore.ApproveDevice /
+// DenyDevice used to call s.record(...) inside the critical section (the
+// `defer s.mu.Unlock()` had not run yet), while every other auditing method in
+// the same file minted its record after releasing the lock. audit.Logger.Record
+// is synchronous by contract ("returning nil means safe to proceed") and in a
+// durable deployment it is a Postgres batch append that takes the chain-head row
+// lock — i.e. network I/O plus a database lock — so a device decision stalled
+// every other request against the store.
 //
-// These two tests are a matched pair: the control proves the probe can tell
-// "held" from "not held", and the finding asserts the safe property, which
-// currently fails.
+// The fix (S13-4) moved both audit writes outside the critical section. These
+// probes are now regression guards for that fix: the control proves the probe can
+// tell "held" from "not held", and the two device probes assert the safe property
+// — that the lock is released before the audit sink runs. Remove the fix and the
+// flipped assertions below fail again.
 
 func newStoreWithBlockingAudit(t *testing.T) (*memory.OIDCStore, *blockingAudit) {
 	t.Helper()
@@ -46,10 +51,10 @@ func TestControlTokenMintAuditsOutsideTheStoreLock(t *testing.T) {
 	}
 }
 
-// Finding: approving a device authorization holds the store's only lock across
-// the audit write. Every other request against this store — every authorize, every
-// token exchange, every introspection, every grant list, the janitor's sweep —
-// waits behind an audit append.
+// Guard (was the finding): approving a device authorization must release the
+// store's only lock before the audit write runs. Every other request against this
+// store — every authorize, every token exchange, every introspection, every grant
+// list, the janitor's sweep — must not wait behind an audit append.
 func TestApproveDeviceHoldsTheStoreLockAcrossTheAuditWrite(t *testing.T) {
 	st, log := newStoreWithBlockingAudit(t)
 	ctx := context.Background()
@@ -58,12 +63,13 @@ func TestApproveDeviceHoldsTheStoreLockAcrossTheAuditWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := func() error { return st.ApproveDevice(ctx, "AAAA-BBBB", "usr_1", nil) }
-	if held := lockHeldDuring(t, st, log, op); !held {
-		t.Error("ApproveDevice did not hold the store lock while the audit write was in flight")
+	if held := lockHeldDuring(t, st, log, op); held {
+		t.Error("ApproveDevice held the store lock while the audit write was in flight: S13-4 regressed, " +
+			"so every other call on this store waits behind a (possibly remote) audit append")
 	}
 }
 
-// Finding: the same for a denial.
+// Guard (was the finding): the same for a denial.
 func TestDenyDeviceHoldsTheStoreLockAcrossTheAuditWrite(t *testing.T) {
 	st, log := newStoreWithBlockingAudit(t)
 	ctx := context.Background()
@@ -72,8 +78,8 @@ func TestDenyDeviceHoldsTheStoreLockAcrossTheAuditWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := func() error { return st.DenyDevice(ctx, "CCCC-DDDD") }
-	if held := lockHeldDuring(t, st, log, op); !held {
-		t.Error("DenyDevice did not hold the store lock while the audit write was in flight")
+	if held := lockHeldDuring(t, st, log, op); held {
+		t.Error("DenyDevice held the store lock while the audit write was in flight: S13-4 regressed")
 	}
 }
 
@@ -101,10 +107,12 @@ func (g *guardAudit) Record(context.Context, audit.Event) error {
 	return nil
 }
 
-// A callback under the store's lock cannot complete. This is the mechanism, not a
-// claim about the current wiring: today's durable sink does not call back into the
-// store, but the lock order it establishes (store lock -> audit lock) is the one
-// the vault path already documents as a hazard ("audit -> vault query -> audit").
+// Guard (was the deadlock demonstration). An audit sink that reads the store is
+// the shape that turns "a lock held across a callback" into a deadlock: the
+// callback needs the lock its caller was holding. Before S13-4 this probe proved
+// the callback could not complete. After the fix the audit write runs outside the
+// critical section, so the same callback completes — the assertion is inverted to
+// guard that ordering.
 func TestAnAuditSinkThatReadsTheStoreDeadlocksUnderTheLock(t *testing.T) {
 	g := &guardAudit{answered: make(chan bool, 1)}
 	audited, err := memory.NewOIDCStore(memory.OIDCOptions{
@@ -125,8 +133,9 @@ func TestAnAuditSinkThatReadsTheStoreDeadlocksUnderTheLock(t *testing.T) {
 	if err := audited.ApproveDevice(ctx, "EEEE-FFFF", "usr_1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if <-g.answered {
-		t.Error("an audit write that reads the store completed while the lock was held; the probe measured nothing")
+	if !<-g.answered {
+		t.Error("an audit write that reads the store did NOT complete: the store lock is held across the " +
+			"audit callback again (S13-4 regressed), so a sink that resolves its subject deadlocks")
 	}
 }
 

@@ -6,22 +6,29 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 )
 
-// Z02-1 / G-4 (regression) — `max_age` and `prompt=login` used to be accepted at
-// the authorize entrance and then silently dropped: neither the stored request
-// (oidcstore.AuthRequest now carries Prompt/MaxAge) nor the login hook honored
-// them, so a stale session completed the flow and the id_token carried the old
-// auth_time with no login_required. The fixed code treats the freshness request as
-// the re-authentication at CompleteLogin, so the id_token's auth_time is the
-// decision time. The control keeps the probe honest: with no prompt/max_age the
-// same stale session still completes and its auth_time is the session's old
-// sign-in, so this is about the request and not a general auth_time regression.
+// Z02-1 / S02-1 (fixed — now a regression guard, name kept for the coverage
+// matrix). `max_age` and `prompt=login` used to be accepted at the authorize
+// entrance and then silently dropped: neither the stored request nor the login
+// hook honored them, so a stale session completed the flow and the id_token
+// carried the old auth_time with no login_required. The fixed store refuses
+// CompleteLogin (oidcstore.ErrReauthenticationRequired) unless the recorded
+// auth_time satisfies the bound, so a two-hour-old session cannot complete a
+// freshness-bound request at all; after a real re-authentication the id_token
+// carries that recorded time rather than the decision clock.
+//
+// The control keeps the probe honest: with no prompt/max_age the same stale
+// session still completes and its auth_time is the session's old sign-in, so this
+// is about the request and not a general auth_time regression.
 func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 	e := newZoneEnv(t, zoneOptions{issuer: "https://issuer.z02"})
 
@@ -71,18 +78,20 @@ func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 		return id, loc
 	}
 
-	// complete records the STALE session sign-in time — exactly what a login hook
-	// driven by an existing browser session would — then completes the pending
-	// request through the real callback and token endpoint.
-	complete := func(id string) map[string]any {
+	// completeAt records `at` as the session's sign-in time — exactly what a login
+	// hook driven by an existing browser session would — then completes the pending
+	// request through the real callback and token endpoint. It RETURNS the
+	// CompleteLogin error instead of failing, so the probe can assert the refusal
+	// the fix introduced.
+	completeAt := func(id string, at time.Time) (map[string]any, error) {
 		t.Helper()
 		ctx := context.Background()
 		verifier := strings.Repeat("v", 64)
-		if err := e.store.SetAuthTime(ctx, id, stale); err != nil {
+		if err := e.store.SetAuthTime(ctx, id, at); err != nil {
 			t.Fatal(err)
 		}
 		if err := e.store.CompleteLogin(ctx, id, "usr_z02", []string{"openid", "account.id"}); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 		resp := e.get(t, noRedirect, e.server.URL+"/oauth/authorize/callback?id="+url.QueryEscape(id))
 		if resp.StatusCode != http.StatusFound {
@@ -105,7 +114,7 @@ func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("token status = %d: %v", status, tokens)
 		}
-		return tokens
+		return tokens, nil
 	}
 
 	authTimeOf := func(tokens map[string]any) time.Time {
@@ -135,15 +144,29 @@ func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 				t.Logf("%s returned login_required (no live session): %s", name, loc)
 				return
 			}
-			// The request is ACCEPTED (not refused as unsupported) and completes on
-			// the two-hour-old session, but the freshness requirement makes that
-			// completion the re-authentication: the id_token carries the decision
-			// time, not the stale sign-in.
-			at := authTimeOf(complete(id))
-			if age := time.Since(at); age > time.Minute {
-				t.Errorf("%s completed on a %.0f-minute-old session: the id_token's auth_time is the stale "+
-					"session sign-in, so the freshness request was ignored (want the decision time, or "+
-					"login_required when there is no live session)", name, age.Minutes())
+			// The request is ACCEPTED (not refused as unsupported), but the
+			// two-hour-old session must NOT satisfy it. The store refuses to
+			// complete rather than substituting the consent-decision clock, so the
+			// id_token can never advertise a fresh authentication that never
+			// happened.
+			if _, err := completeAt(id, stale); !errors.Is(err, oidcstore.ErrReauthenticationRequired) {
+				t.Errorf("%s: completing on a %.0f-minute-old session = %v, want "+
+					"oidcstore.ErrReauthenticationRequired; the freshness request was ignored",
+					name, time.Since(stale).Minutes(), err)
+			}
+			if ar, err := e.store.AuthRequestByID(context.Background(), id); err != nil || ar.Done() {
+				t.Errorf("%s: the refused completion left the request decided: done=%v err=%v",
+					name, ar != nil && ar.Done(), err)
+			}
+			// A real re-authentication moments ago satisfies it, and the id_token
+			// carries that recorded time (the round-trip tolerance covers the gap).
+			fresh := time.Now().UTC().Add(-5 * time.Second)
+			tokens, err := completeAt(id, fresh)
+			if err != nil {
+				t.Fatalf("%s: completing after a fresh authentication: %v", name, err)
+			}
+			if at := authTimeOf(tokens); at.Sub(fresh) < -time.Minute || at.Sub(fresh) > time.Minute {
+				t.Errorf("%s: id_token auth_time = %s, want the recorded re-authentication %s", name, at, fresh)
 			}
 		})
 	}
@@ -154,7 +177,11 @@ func TestZ02MaxAgeAndPromptLoginAreIgnored(t *testing.T) {
 	if id == "" {
 		t.Fatal("control failed: an ordinary authorize returned login_required with no prompt")
 	}
-	controlAuth := authTimeOf(complete(id))
+	controlTokens, err := completeAt(id, stale)
+	if err != nil {
+		t.Fatalf("control failed: an ordinary request did not complete on the stale session: %v", err)
+	}
+	controlAuth := authTimeOf(controlTokens)
 	if time.Since(controlAuth) < time.Hour {
 		t.Fatalf("control failed: the recorded auth_time is fresh, so the stale-session shape does not hold")
 	}
@@ -254,8 +281,20 @@ func TestZ02IDTokenClaimsAcrossGrants(t *testing.T) {
 	if deviceClaims["sub"] != "usr_dev" {
 		t.Errorf("device grant: sub = %v", deviceClaims["sub"])
 	}
-	if deviceClaims["aud"] != e.deviceID {
-		t.Errorf("device grant: aud = %v", deviceClaims["aud"])
+	switch aud := deviceClaims["aud"].(type) {
+	case string:
+		if aud != e.deviceID {
+			t.Errorf("device grant: aud = %q", aud)
+		}
+	case []any:
+		// The id_token builds `aud` as a JSON array (the production guard in
+		// internal/oidchttp asserts that shape); a single-audience array is legal
+		// OIDC, so accept it but require it to name exactly this client.
+		if len(aud) != 1 || aud[0] != e.deviceID {
+			t.Errorf("device grant: aud = %v", aud)
+		}
+	default:
+		t.Errorf("device grant: aud has unexpected type %T", deviceClaims["aud"])
 	}
 	if deviceClaims["azp"] != e.deviceID {
 		t.Errorf("device grant: azp = %v", deviceClaims["azp"])

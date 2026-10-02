@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -488,22 +489,44 @@ func TestZ09VerifyACleanTokenDoesReachTheUpstream(t *testing.T) {
 // measured shape here so the decision can be made on evidence.
 // ---------------------------------------------------------------------------
 
-// TestZ09VerifyASchemeRelativeIssuerWouldRedirectTheBindOffOrigin shows that
-// `federation.Source.Issuer` is accepted with no absolute-URL requirement
-// (federation.go:144-146 checks only non-empty), so `//evil.example` produces a
-// SCHEME-RELATIVE authorize URL, and the browser entry point at
-// federation_routes.go:364 hands that value to http.Redirect verbatim.
+// S05-6 GUARD (was the finding). `federation.Source.Issuer` used to be accepted
+// with no absolute-URL requirement (federation.go checked only non-empty), so
+// `//evil.example` produced a SCHEME-RELATIVE authorize URL, and the browser entry
+// point at federation_routes.go handed that value to http.Redirect verbatim — a
+// browser resolved it to another host. The registry now refuses any issuer (and
+// any endpoint override) that is not an absolute http(s) URL. The name is kept for
+// the audit coverage matrix.
 func TestZ09VerifyASchemeRelativeIssuerWouldRedirectTheBindOffOrigin(t *testing.T) {
+	for _, issuer := range []string{"//evil.example", "evil.example", "/oauth", "ftp://evil.example", "https://"} {
+		_, err := federation.NewRegistry(federation.Source{
+			Game: zzGame, Name: zzSource, DisplayName: "Src",
+			Issuer:   issuer,
+			ClientID: "cid", ClientSecret: "sec",
+			Resources: []federation.Resource{
+				{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: zzScope},
+			},
+		})
+		if err == nil {
+			t.Errorf("NewRegistry accepted Issuer %q. A scheme-relative or relative issuer reaches /bind's "+
+				"http.Redirect and is resolved by the browser against another host (S05-6 regressed).", issuer)
+		} else if !strings.Contains(err.Error(), "issuer") {
+			t.Errorf("the refusal of Issuer %q does not name the field, so it is not fixable at startup: %v", issuer, err)
+		}
+	}
+
+	// Positive control: an absolute https issuer is still accepted and its
+	// authorize URL really names that origin, so the loop above is about the shape
+	// and not "the registry rejects everything".
 	reg, err := federation.NewRegistry(federation.Source{
 		Game: zzGame, Name: zzSource, DisplayName: "Src",
-		Issuer:   "//evil.example",
+		Issuer:   "https://src.example",
 		ClientID: "cid", ClientSecret: "sec",
 		Resources: []federation.Resource{
 			{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: zzScope},
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewRegistry refused a scheme-relative issuer: %v", err)
+		t.Fatalf("NewRegistry refused an absolute https issuer: %v", err)
 	}
 	svc, err := federation.NewService(federation.Config{
 		Registry: reg, Bindings: federation.NewMemoryBindingStore(), Vault: newVault(t),
@@ -516,22 +539,11 @@ func TestZ09VerifyASchemeRelativeIssuerWouldRedirectTheBindOffOrigin(t *testing.
 	if err != nil {
 		t.Fatalf("BeginBind = %v", err)
 	}
-	t.Logf("BeginBind authorize URL with Issuer=//evil.example: %s", ch.AuthorizeURL)
-
-	// What federation_routes.go:364 does with it.
-	rec := httptest.NewRecorder()
-	http.Redirect(rec, httptest.NewRequest(http.MethodGet, "/bind", nil), ch.AuthorizeURL, http.StatusFound)
-	loc := rec.Header().Get("Location")
-	u, err := url.Parse(loc)
+	u, err := url.Parse(ch.AuthorizeURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("Location: %s (url.Parse host=%q)", loc, u.Host)
-	if u.Host != "evil.example" {
-		t.Fatalf("expected the redirect to name another host, got host=%q from %q", u.Host, loc)
+	if u.Host != "src.example" {
+		t.Errorf("the authorize URL names host %q, want src.example; from %q", u.Host, ch.AuthorizeURL)
 	}
-	t.Errorf("a source configured with Issuer \"//evil.example\" is accepted, and /bind answers 302 with "+
-		"Location %q, which a browser resolves to host %q. This is the binding flow's open-redirect/phishing face "+
-		"the reviewed report disclosed but did not number; it is distinct from round 6's token-exfiltration result.",
-		loc, u.Host)
 }

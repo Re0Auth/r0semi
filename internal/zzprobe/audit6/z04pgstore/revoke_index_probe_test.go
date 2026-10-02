@@ -10,8 +10,11 @@ package z04pgstore
 // in-package guard TestClientScopedRevokeIsIndexed to "every table a
 // client_id-only predicate deletes from" — six tables. This probe derives that
 // set from the adapter's own source instead of enumerating it by hand, which is
-// how a seventh table the list missed shows up: OIDCStore.RevokeTokens also
-// runs revokeMatching over oidc_devices, and that table has no client_id index.
+// how a seventh table the list missed showed up: OIDCStore.RevokeTokens also
+// runs revokeMatching over oidc_devices, and that table had no client_id index.
+// G-14 was fixed by migration 0029 and the guard now lists oidc_devices; the
+// derivation is kept because it immediately found an EIGHTH table,
+// oidc_refresh_token_tombstones, which is still unindexed (STILL-OPEN).
 
 import (
 	"regexp"
@@ -65,31 +68,37 @@ func clientScopedRevokeTables(t *testing.T) map[string]string {
 	return out
 }
 
-// TestEveryClientScopedRevokeTableHasALeadingClientIndex is the finding: the
-// table set a client_id-only filter deletes from is seven, not the six the fix
-// and its guard enumerate, and the seventh — oidc_devices — has no index whose
-// leading column is client_id. Every one of those deletes runs inside the
-// one-transaction revocation an operator fires during an incident.
+// TestEveryClientScopedRevokeTableHasALeadingClientIndex started as the G-14
+// finding: the table set a client_id-only filter deletes from is seven, not the
+// six the fix and its guard enumerated, and the seventh — oidc_devices — had no
+// index whose leading column is client_id. Migration 0029 fixed that, so the
+// oidc_devices check is now an anti-vacuous guard. The derivation is kept because
+// it finds an eighth table, oidc_refresh_token_tombstones, still without a
+// leading client_id index (STILL-OPEN, needs a migration outside this probe's
+// write scope). Every one of those deletes runs inside the one-transaction
+// revocation an operator fires during an incident.
 func TestEveryClientScopedRevokeTableHasALeadingClientIndex(t *testing.T) {
 	leading := leadingIndexCols(t)
 	tables := clientScopedRevokeTables(t)
 
 	// Anti-vacuous in both directions: the schema parser must see the
-	// indexes 0021/0022 actually created (these must pass), and must not
+	// indexes 0021/0022/0029 actually created (these must pass), and must not
 	// believe every column is indexed.
+	//
+	// G-14 used to be asserted on the other side: oidc_devices had no leading
+	// client_id index and this probe failed with a message saying so. Migration
+	// 0029 added it and the in-package guard now lists the table, so the check
+	// below is a guard for that fix rather than the finding.
 	for _, ok := range []struct{ table, col string }{
 		{"oidc_access_tokens", "client_id"},
 		{"oidc_auth_requests", "client_id"},
 		{"oauth_codes", "client_id"},
+		{"oidc_devices", "client_id"},
 	} {
 		if !leading[ok.table][ok.col] {
-			t.Fatalf("the parser does not see %s.%s's index; it is not reading migration 0021/0022 "+
+			t.Fatalf("the parser does not see %s.%s's index; it is not reading migration 0021/0022/0029 "+
 				"and every assertion below is vacuous", ok.table, ok.col)
 		}
-	}
-	if leading["oidc_devices"]["client_id"] {
-		t.Fatal("oidc_devices.client_id now has a leading index; this probe is stale — move the table " +
-			"to the fixed list and re-derive the finding")
 	}
 
 	var missing []string
@@ -103,7 +112,7 @@ func TestEveryClientScopedRevokeTableHasALeadingClientIndex(t *testing.T) {
 		t.Errorf("UNINDEXED CLIENT-SCOPED REVOKE: %s has no index with client_id as its leading column; "+
 			"admin.SuspendClient / DeleteClient and the `client` Kill Switch filter by client_id alone, "+
 			"and the delete runs inside the same incident-path transaction as the indexed tables "+
-			"(migration 0022 covered six tables; this is the seventh)", m)
+			"(migration 0022 and G-14's 0029 covered the seven; this is the eighth the derivation found)", m)
 	}
 }
 

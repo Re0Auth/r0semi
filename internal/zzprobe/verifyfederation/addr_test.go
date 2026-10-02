@@ -19,18 +19,20 @@ import (
 	"github.com/Re0Auth/r0semi/httpclient"
 )
 
-// TestVerifyZeroEightPredicateGap pins the predicate side of FO-03: which
-// addresses IsPublicAddress admits. It is an execution, not a reading.
+// TestVerifyZeroEightPredicateGap pins the predicate side of FO-03: 0.0.0.0/8 is
+// not a public destination, so IsPublicAddress must refuse it. It was a
+// finding-demonstrator (the whole /8 used to be admitted); it is now the
+// regression guard for the fix, and the anti-vacuity rows below keep it honest.
 func TestVerifyZeroEightPredicateGap(t *testing.T) {
 	cases := []struct {
 		addr string
 		want bool // true = admitted (judged public)
 	}{
 		{"0.0.0.0", false},         // unspecified
-		{"0.0.0.1", true},          // 0.0.0.0/8
-		{"0.1.2.3", true},          // 0.0.0.0/8
-		{"0.255.255.255", true},    // 0.0.0.0/8 upper edge
-		{"::ffff:0.1.2.3", true},   // IPv4-mapped form of the same
+		{"0.0.0.1", false},         // 0.0.0.0/8, refused since FO-03
+		{"0.1.2.3", false},         // 0.0.0.0/8
+		{"0.255.255.255", false},   // 0.0.0.0/8 upper edge
+		{"::ffff:0.1.2.3", false},  // IPv4-mapped form of the same
 		{"127.0.0.1", false},       // loopback (anti-vacuity)
 		{"10.0.0.5", false},        // RFC1918
 		{"169.254.169.254", false}, // link-local metadata (anti-vacuity)

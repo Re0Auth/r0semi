@@ -7,6 +7,7 @@ package z10adminauditprivacy
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Re0Auth/r0semi/audit"
@@ -39,34 +40,54 @@ func (stubDevices) DecideDeviceAuthorization(context.Context, string, string, bo
 	return nil
 }
 
-// TestZ10TheAuditReadRecordsAreAcceptedWithNoSinkToWriteThem.
+// TestZ10TheAuditReadRecordsAreAcceptedWithNoSinkToWriteThem was the Z10-7
+// finding, and is now its regression guard (the name is kept for the audit
+// coverage matrix).
 //
 // The P2-22 fix has two halves: `admin.audit.read` in handleAdminAudit and
 // `account.export` in handleExportAccount, both written through `s.auditLog` —
-// an OPTIONAL field whose doc says "a nil logger records nothing", and which the
-// read-API validation does not require. httpapi.New enforces
+// an OPTIONAL field whose doc says "a nil logger records nothing", which the
+// read-API validation did not require. httpapi.New enforced
 // `Config.Audit requires Config.Sessions` and `requires a non-empty Config.Admins`
 // out of the same worry (reading the log means reading about every account), but
-// accepts a read API with no write side: the two records then never happen, in a
-// configuration that looks correctly wired.
+// used to accept a read API with no write side: the records then never happened,
+// in a configuration that looked correctly wired. The constructor now refuses
+// that combination (Z10-7), and this probe asserts the refusal is caused by the
+// missing sink.
 func TestZ10TheAuditReadRecordsAreAcceptedWithNoSinkToWriteThem(t *testing.T) {
-	manager := auth.NewManager(auth.Options{Secure: false})
-	_, err := httpapi.New(httpapi.Config{
-		Issuer:            probeIssuer,
-		OIDC:              http.NotFoundHandler(),
-		TokenIntrospector: stubIntrospector{},
-		GrantStore:        stubGrants{},
-		DeviceStore:       stubDevices{},
-		Sessions:          manager,
-		Accounts:          account.NewMemoryStore(),
-		Admins:            []account.UserID{"usr_admin0000000000000000"},
-		Audit:             &probeAuditReader{page: audit.Page{Limit: 10}},
-		AuditLog:          nil,
-	})
+	base := func() httpapi.Config {
+		manager := auth.NewManager(auth.Options{Secure: false})
+		return httpapi.Config{
+			Issuer:            probeIssuer,
+			OIDC:              http.NotFoundHandler(),
+			TokenIntrospector: stubIntrospector{},
+			GrantStore:        stubGrants{},
+			DeviceStore:       stubDevices{},
+			Sessions:          manager,
+			Accounts:          account.NewMemoryStore(),
+			Admins:            []account.UserID{"usr_admin0000000000000000"},
+			Audit:             &probeAuditReader{page: audit.Page{Limit: 10}},
+			AuditLog:          nil,
+		}
+	}
+
+	_, err := httpapi.New(base())
 	if err == nil {
-		t.Errorf("httpapi.New accepted Config.Audit (the operator read API) with a nil Config.AuditLog. " +
-			"recordAudit returns early on a nil logger, so GET /v1/admin/audit and GET /v1/account/export " +
-			"leave no record at all while the configuration looks complete — the exact gap the P2-22 fix " +
-			"was added to close. The composition root wires both, so this is a library-level fail-open.")
+		t.Fatalf("httpapi.New accepted Config.Audit (the operator read API) with a nil Config.AuditLog. " +
+			"recordAuditOutcome returns early on a nil logger, so GET /v1/admin/audit, /verify, /head and " +
+			"GET /v1/account/export leave no record at all while the configuration looks complete — the exact " +
+			"gap the P2-22 fix was added to close (Z10-7 regressed).")
+	}
+	if !strings.Contains(err.Error(), "Config.AuditLog") {
+		t.Fatalf("httpapi.New refused the configuration for an unrelated reason (%v); this probe no longer "+
+			"isolates Z10-7", err)
+	}
+
+	// Positive control: the same configuration WITH a sink is accepted, so the
+	// refusal above is caused by the missing sink and not by the stubs.
+	withSink := base()
+	withSink.AuditLog = audit.NewMemoryLogger()
+	if _, err := httpapi.New(withSink); err != nil {
+		t.Fatalf("httpapi.New refused the same read API with an AuditLog: %v", err)
 	}
 }

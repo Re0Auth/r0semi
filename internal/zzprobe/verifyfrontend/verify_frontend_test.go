@@ -3,28 +3,22 @@
 // Package verifyfrontend holds the verifier's read-only probes for
 // docs/audit-5/findings/frontend-VERIFIED.md.
 //
-// It exists to settle four things the verified report asserts or implies, by
-// execution rather than by reading:
-//
-//   - which responses the package gives a document policy, and what the *only*
-//     other text/html response in a built binary is;
-//   - that the shell can never be conditionally validated (no ETag, no
-//     Last-Modified, and therefore no possible 304) while still being no-cache,
-//     which is what makes a browser fetch fresh bytes on every navigation;
-//   - that a Range a client chooses can strip the shell's <meta> policy while
-//     keeping its inline script;
-//   - that a missing hashed asset is answered with the shell (200, text/html),
-//     not with a 404.
+// These probes started as discovery probes for the frontend findings. The fixes
+// for A-FE-1/A-FE-2/A-FE-6/Z08-3/Z08-5 have since landed, so the probes are
+// regression guards now: they assert the fixed properties and fail if a fix is
+// reverted. Where a guard needs a positive control (range support must survive on
+// assets, a different shell must still 200), that control is built in.
 //
 // Run:
 //
-//	go test ./internal/zzprobe/verifyfrontend/ -v
+//	go test -tags audit5 ./internal/zzprobe/verifyfrontend/ -v
 package verifyfrontend
 
 import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -45,9 +39,11 @@ func do(t *testing.T, h http.Handler, target string, header http.Header) *httpte
 	return rec
 }
 
-// A package that serves more than one HTML document must not rely on the file
-// being *named* index.html to decide whether the response gets a document policy.
-// This probe states which of those two the package does.
+// Guard for A-FE-6: every HTML document the package serves gets the framing
+// policy, keyed on the response's type rather than on the file being *named*
+// index.html. Originally this was the discovery probe that pinned the opposite:
+// only index.html received a policy, so a build that shipped a second document
+// sent it with no framing guard at all.
 func TestVWhichResponsesGetTheDocumentPolicy(t *testing.T) {
 	fsys := fstest.MapFS{
 		"index.html":                 {Data: []byte("<!doctype html><title>shell</title>")},
@@ -63,7 +59,7 @@ func TestVWhichResponsesGetTheDocumentPolicy(t *testing.T) {
 	}{
 		{"/app/", "text/html", true},
 		{"/app/consent", "text/html", true},
-		{"/app/extra.html", "text/html", false}, // the report's A-FE-6 claim, pinned
+		{"/app/extra.html", "text/html", true}, // A-FE-6 guard: any HTML document gets the framing policy
 		{"/app/plain.txt", "text/plain", false},
 		{"/app/_app/immutable/chunks/a.js", "text/javascript", false},
 	} {
@@ -74,8 +70,8 @@ func TestVWhichResponsesGetTheDocumentPolicy(t *testing.T) {
 		if !strings.HasPrefix(ct, tc.wantCT) {
 			t.Errorf("%s: Content-Type = %q, want %q", tc.target, ct, tc.wantCT)
 		}
-		if got := csp != ""; got != tc.wantCSPIs {
-			t.Errorf("%s: CSP = %q, want a policy: %v", tc.target, csp, tc.wantCSPIs)
+		if got := strings.Contains(csp, "frame-ancestors 'none'"); got != tc.wantCSPIs {
+			t.Errorf("%s: CSP = %q, want a frame-ancestors 'none' policy: %v", tc.target, csp, tc.wantCSPIs)
 		}
 	}
 
@@ -123,10 +119,11 @@ func TestVTheRealBuildContainsExactlyOneHTMLDocument(t *testing.T) {
 	}
 }
 
-// no-cache without a validator: the shell cannot be reused, and it also cannot be
-// revalidated, so every navigation transfers the body. The probe asserts the
-// second half as a property (no header value can produce a 304), because that is
-// what bounds the risk the report describes.
+// Guard for A-FE-1/S12-8: the shell is no-cache but DOES carry a strong ETag, so
+// a conditional request can be answered with a 304 and no body. Originally this
+// probe pinned the opposite claim — that the shell had no validator at all and
+// every navigation re-transferred the document. The name is kept for the audit
+// coverage matrix.
 func TestVShellCannotBeConditionallyValidatedAtAll(t *testing.T) {
 	h := webui.Handler(webui.FS())
 	first := do(t, h, "/app/consent", nil)
@@ -137,10 +134,21 @@ func TestVShellCannotBeConditionallyValidatedAtAll(t *testing.T) {
 	if cc != "no-cache" {
 		t.Errorf("shell Cache-Control = %q; the report's analysis of its risk depends on no-cache", cc)
 	}
-	if etag != "" || lm != "" {
-		t.Logf("a validator appeared (%q %q): the finding is fixed; assert 304 instead", etag, lm)
+	if etag == "" {
+		t.Errorf("the shell carries no ETag: A-FE-1/S12-8 regressed, so a `no-cache` response can never " +
+			"become a 304 and every navigation re-sends the whole document")
 	}
-	// Any conditional request at all still transfers a full 200 body.
+	if strings.HasPrefix(etag, "W/") {
+		t.Errorf("shell ETag = %q is a weak validator; the shell is served with ranges disabled so a "+
+			"strong validator is what revalidation needs", etag)
+	}
+	// The validator is usable: a matching If-None-Match is answered 304 with no
+	// body, and a non-matching one still transfers the document.
+	rec := do(t, h, "/app/consent", http.Header{"If-None-Match": {etag}})
+	t.Logf("If-None-Match: %s -> %d len=%d", etag, rec.Code, rec.Body.Len())
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("If-None-Match with the server's own ETag = %d, want 304", rec.Code)
+	}
 	for _, header := range []http.Header{
 		{"If-None-Match": {`"x"`}},
 		{"If-Modified-Since": {"Wed, 21 Oct 2015 07:28:00 GMT"}},
@@ -149,19 +157,27 @@ func TestVShellCannotBeConditionallyValidatedAtAll(t *testing.T) {
 		rec := do(t, h, "/app/consent", header)
 		t.Logf("conditional %v -> %d len=%d", header, rec.Code, rec.Body.Len())
 		if rec.Code == http.StatusNotModified {
-			t.Errorf("%v produced a 304 the server never promised: a validator exists somewhere", header)
+			t.Errorf("%v produced a 304 with a validator the server never issued", header)
 		}
 	}
-	// The asset next door is the control: it does carry a validator-free but
-	// immutable directive, so the pair is not "this handler never sets headers".
-	asset := do(t, h, "/app/_app/immutable/entry/start.BmJmelwx.js", nil)
-	t.Logf("asset: %d Cache-Control=%q", asset.Code, asset.Header().Get("Cache-Control"))
+	// The asset next door is the control: it carries an immutable directive, so
+	// the pair is not "this handler never sets cache headers".
+	assetPath := regexp.MustCompile(`/app/_app/immutable/[A-Za-z0-9._/-]+\.js`).FindString(first.Body.String())
+	if assetPath == "" {
+		t.Fatal("the shell names no immutable asset; the cache-header control would be vacuous")
+	}
+	asset := do(t, h, assetPath, nil)
+	t.Logf("asset: %d Cache-Control=%q ETag=%q", asset.Code, asset.Header().Get("Cache-Control"), asset.Header().Get("ETag"))
+	if !strings.Contains(asset.Header().Get("Cache-Control"), "immutable") {
+		t.Errorf("asset Cache-Control = %q, want immutable", asset.Header().Get("Cache-Control"))
+	}
 }
 
-// A client chooses the byte range, so it can choose to receive the shell without
-// its <meta> policy but with its inline bootstrap. The probe records that the
-// mechanism is real (the report's A-FE-2), and that the header policy is still
-// the only thing left on such a response.
+// Guard for A-FE-2: a client-chosen Range cannot strip the shell's <meta> policy
+// while keeping its inline bootstrap — a document request is answered with the
+// whole representation, 200 and no Content-Range. Range support survives on the
+// hashed assets, which is the positive control. Originally this probe reproduced
+// the truncation (206) and recorded that the header policy was all that remained.
 func TestVRangeCanStripTheMetaPolicyButKeepTheScript(t *testing.T) {
 	fsys := webui.FS()
 	if !webui.Built(fsys) {
@@ -184,7 +200,7 @@ func TestVRangeCanStripTheMetaPolicyButKeepTheScript(t *testing.T) {
 	}
 	metaEnd := at + close + 1
 	// Start the range just after the meta tag so the prefix that carries the
-	// policy is discarded, while the inline script (much later) survives.
+	// policy would be discarded if the range were honored.
 	start := metaEnd
 	h := webui.Handler(fsys)
 	rec := do(t, h, "/app/consent", http.Header{"Range": {"bytes=" + itoa(start) + "-"}})
@@ -192,19 +208,32 @@ func TestVRangeCanStripTheMetaPolicyButKeepTheScript(t *testing.T) {
 	t.Logf("Range bytes=%d- -> %d Content-Range=%q len=%d meta=%v script=%v",
 		start, rec.Code, rec.Header().Get("Content-Range"), len(body),
 		strings.Contains(body, "content-security-policy"), strings.Contains(body, "<script"))
-	if rec.Code != http.StatusPartialContent {
-		t.Fatalf("Range on the shell = %d, want 206", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Errorf("Range on the shell = %d, want 200 with the whole document (the range must be ignored)", rec.Code)
 	}
-	if strings.Contains(body, "content-security-policy") {
-		t.Errorf("the truncated document still carries the meta policy, so the mechanism did not reproduce")
+	if cr := rec.Header().Get("Content-Range"); cr != "" {
+		t.Errorf("a 200 for the shell carried Content-Range %q", cr)
+	}
+	if !strings.Contains(body, "content-security-policy") {
+		t.Errorf("the served document lost its <meta> policy: the Range truncated the shell (A-FE-2 regressed)")
 	}
 	if !strings.Contains(body, "<script") {
-		t.Errorf("the truncated document carries no script, so nothing would run with a missing policy")
+		t.Errorf("the served document carries no script; the fixture is not the shell")
 	}
-	// The header is now the whole policy, and it is one directive.
-	t.Logf("header policy on the partial response: %q", rec.Header().Get("Content-Security-Policy"))
 	if got := rec.Header().Get("Content-Security-Policy"); got != "frame-ancestors 'none'" {
 		t.Errorf("header policy = %q", got)
+	}
+
+	// Positive control: a hashed asset still honors a Range, so this is a
+	// decision about documents, not a handler that ignores Range everywhere.
+	asset := regexp.MustCompile(`/app/_app/immutable/[A-Za-z0-9._/-]+\.js`).FindString(html)
+	if asset == "" {
+		t.Fatal("the shell names no immutable asset; the range control would be vacuous")
+	}
+	arec := do(t, h, asset, http.Header{"Range": {"bytes=0-6"}})
+	t.Logf("Range on asset %s -> %d Content-Range=%q", asset, arec.Code, arec.Header().Get("Content-Range"))
+	if arec.Code != http.StatusPartialContent {
+		t.Errorf("Range on an asset = %d, want 206 (range support must survive on content-hashed files)", arec.Code)
 	}
 }
 

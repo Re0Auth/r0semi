@@ -55,9 +55,11 @@ func writeOverlay(t *testing.T, dir, orig, replacement string) string {
 	return path
 }
 
-// TestZ16PubAddrProbeAcceptsAWrongExpectation: TestPubAddrRanges builds a
-// per-case verdict and a `status := "MISMATCH"`, then logs both. Flip one
-// expectation with an overlay and the test still passes.
+// TestZ16PubAddrProbeAcceptsAWrongExpectation was the Z16-6 finding: TestPubAddrRanges
+// built a per-case verdict and a `status := "MISMATCH"`, then logged both, so a
+// flipped expectation passed. The probe now has a per-case t.Errorf, so the same
+// overlay mutation must FAIL it. This is the regression guard for that fix (the
+// name is kept for the audit coverage matrix).
 func TestZ16PubAddrProbeAcceptsAWrongExpectation(t *testing.T) {
 	root := repoRoot(t)
 	const pkg = "./internal/zzprobe/pubaddr/"
@@ -85,29 +87,31 @@ func TestZ16PubAddrProbeAcceptsAWrongExpectation(t *testing.T) {
 		t.Fatal("control 2: the overlay did not reach the test, so the mutation below proves nothing")
 	}
 
-	// The mutation: Google DNS is now expected to be non-public.
+	// The mutation: Google DNS is now expected to be non-public. A probe that only
+	// logs its verdict still passes; one that asserts must fail.
 	mutated := filepath.Join(tmp, "mutated_test.go")
 	if err := os.WriteFile(mutated, []byte(strings.Replace(src, good, `{"8.8.8.8", "nonpublic"},`, 1)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	ok, out := overlayRun(t, root, writeOverlay(t, tmp, orig, mutated), pkg, []string{"audit5"}, "^TestPubAddrRanges$")
-	if !ok {
-		t.Fatalf("the probe unexpectedly failed on a wrong expectation; this finding is stale:\n%s", out)
-	}
-	if !regexp.MustCompile(`8\.8\.8\.8\s+public\s+want=nonpublic\s+MISMATCH`).MatchString(out) {
+	if ok {
 		t.Logf("output was:\n%s", out)
-		t.Fatalf("the mutated case did not print a MISMATCH; update this probe")
+		t.Errorf("TestPubAddrRanges (internal/zzprobe/pubaddr/addr_test.go) still PASSES with the expectation " +
+			"for 8.8.8.8 flipped to nonpublic: it computes a verdict and never asserts it (Z16-6 regressed), " +
+			"so a wrong expectation for 169.254.169.254 or any other of its cases would be accepted in silence. " +
+			"The package's whole purpose is to pin which addresses the SSRF guard refuses.")
 	}
-	t.Errorf("TestPubAddrRanges (internal/zzprobe/pubaddr/addr_test.go:12-54) computed a MISMATCH " +
-		"and still passed: it is the `TestProbeRegistryAcceptsPathEscapingNames` shape again — a " +
-		"verdict string built and logged, never asserted. A fake expectation for 169.254.169.254 " +
-		"or any other of its 24 cases would be accepted in silence, and the package's whole purpose " +
-		"is to pin which addresses the SSRF guard refuses.")
+	if !strings.Contains(out, "want nonpublic") {
+		t.Logf("output was:\n%s", out)
+		t.Errorf("the mutated case failed for an unexpected reason; update this probe")
+	}
 }
 
-// TestZ16LogOnlyProbesInSafeURLFile: the two probes next to the recorded
-// precedent in internal/zzprobe/federation/safeurl_test.go have no failing
-// statement at all.
+// TestZ16LogOnlyProbesInSafeURLFile was the Z16-6 finding for the two
+// internal/zzprobe/federation/safeurl_test.go probes: they had no failing
+// statement at all, so their SSRF host-normalisation and zone-id reasoning was
+// carried by log text. They now assert, and this probe is the regression guard
+// that fails if either one becomes log-only again.
 func TestZ16LogOnlyProbesInSafeURLFile(t *testing.T) {
 	root := repoRoot(t)
 	path := filepath.Join(root, "internal", "zzprobe", "federation", "safeurl_test.go")

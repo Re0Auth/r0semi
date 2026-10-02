@@ -4,12 +4,12 @@
 //
 // These do not reuse the audited zone's fixture: they drive the composed binary
 // (go build ./cmd/re0auth, memory mode, environment only) on the verifier's own
-// port 17802. That settles, independently of the author's harness:
-//
-//   - the static-surface header facts behind Z08-1 / Z08-2 / Z08-5 (including a
-//     positive control that the same probe really reaches the file server), and
-//   - whether the audited "open redirect surface" green actually reaches a
-//     redirect at all.
+// port 17802. What began as discovery probes for the static-surface header facts
+// behind Z08-1 / Z08-2 / Z08-5 is now a regression guard for the fixes: the shell
+// carries a usable validator (strong without compression, weak when compressed),
+// the immutable asset no longer varies on the session cookie, and a missing
+// hashed asset is answered with the shell. A positive control that the same probe
+// really reaches the file server is built in.
 package z08verify
 
 import (
@@ -134,9 +134,21 @@ func z08vProcess(t *testing.T) string {
 
 func z08vGet(t *testing.T, method, path string) (*http.Response, string) {
 	t.Helper()
+	return z08vGetH(t, method, path, nil)
+}
+
+// z08vGetH is z08vGet with request headers, so a probe can observe the same
+// response under a different Accept-Encoding.
+func z08vGetH(t *testing.T, method, path string, header http.Header) (*http.Response, string) {
+	t.Helper()
 	req, err := http.NewRequest(method, z08vProcess(t)+path, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for k, vs := range header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -152,9 +164,9 @@ func z08vGet(t *testing.T, method, path string) (*http.Response, string) {
 
 var z08vAssetRef = regexp.MustCompile(`/app/_app/immutable/[A-Za-z0-9._/-]+\.js`)
 
-// TestZ08VComposedStaticFacts re-derives the Z08-1 / Z08-2 / Z08-5 header facts
-// from a binary this probe built itself, with the file server's positive control
-// built in: the shell names a real asset, and that asset must come back as JS.
+// TestZ08VComposedStaticFacts guards the Z08-1 / Z08-2 / Z08-5 header facts from
+// a binary this probe built itself, with the file server's positive control built
+// in: the shell names a real asset, and that asset must come back as JS.
 func TestZ08VComposedStaticFacts(t *testing.T) {
 	shellResp, shell := z08vGet(t, http.MethodGet, "/app/consent")
 	if shellResp.StatusCode != http.StatusOK || !strings.Contains(shell, "<!doctype html") {
@@ -163,15 +175,38 @@ func TestZ08VComposedStaticFacts(t *testing.T) {
 	t.Logf("shell: cc=%q vary=%q etag=%q last-modified=%q len=%d",
 		shellResp.Header.Get("Cache-Control"), shellResp.Header.Get("Vary"),
 		shellResp.Header.Get("ETag"), shellResp.Header.Get("Last-Modified"), len(shell))
-
-	// Z08-2: no validator on a response that says "revalidate".
 	if shellResp.Header.Get("Cache-Control") != "no-cache" {
 		t.Fatalf("the shell is not no-cache (%q); the validator question does not arise",
 			shellResp.Header.Get("Cache-Control"))
 	}
-	if shellResp.Header.Get("ETag") != "" || shellResp.Header.Get("Last-Modified") != "" {
-		t.Errorf("a validator appeared (etag=%q lm=%q): Z08-2's mechanism would need revisiting",
-			shellResp.Header.Get("ETag"), shellResp.Header.Get("Last-Modified"))
+
+	// S12-8 / A-FE-1 (was the finding Z08-2): the shell now has a validator, so
+	// `no-cache` can be revalidated into a 304 instead of re-transferring the
+	// document on every navigation. Ask for identity so the compression middleware
+	// does not weaken the validator: the entity the handler hashed is then exactly
+	// the bytes on the wire, so the validator must be strong.
+	idResp, _ := z08vGetH(t, http.MethodGet, "/app/consent", http.Header{"Accept-Encoding": {"identity"}})
+	strongTag := idResp.Header.Get("ETag")
+	t.Logf("uncompressed shell: etag=%q last-modified=%q", strongTag, idResp.Header.Get("Last-Modified"))
+	if strongTag == "" {
+		t.Errorf("the shell carries no ETag even without compression: S12-8/A-FE-1 regressed, so a " +
+			"`no-cache` shell can never become a 304 and every navigation re-sends the document")
+	}
+	if strings.HasPrefix(strongTag, "W/") {
+		t.Errorf("the uncompressed shell ETag = %q is weak; the bytes on the wire are exactly the bytes "+
+			"that were hashed, so the validator must be strong", strongTag)
+	}
+	if strongTag != "" {
+		condResp, _ := z08vGetH(t, http.MethodGet, "/app/consent", http.Header{"If-None-Match": {strongTag}})
+		if condResp.StatusCode != http.StatusNotModified {
+			t.Errorf("If-None-Match with the shell's own ETag = %d, want 304", condResp.StatusCode)
+		}
+	}
+	// When the client accepts a coding, the middleware weakens the validator,
+	// because the bytes on the wire no longer match the hashed entity. That is the
+	// correct direction and is asserted so this pair is not "no validator anywhere".
+	if compTag := shellResp.Header.Get("ETag"); compTag != "" && !strings.HasPrefix(compTag, "W/") {
+		t.Errorf("a compressed shell kept a strong ETag (%q): the wire bytes are not the entity that was hashed", compTag)
 	}
 
 	// Positive control: the file server is genuinely reachable.
@@ -187,13 +222,16 @@ func TestZ08VComposedStaticFacts(t *testing.T) {
 		t.Fatalf("the asset the shell names does not load: %d %q", ar.StatusCode, ar.Header.Get("Content-Type"))
 	}
 
-	// Z08-5: the immutable directive and the session middleware's Vary coexist.
+	// Z08-5 (was the finding): the immutable directive holds and the session
+	// middleware's `Vary: Cookie` has been dropped from the content-hashed,
+	// user-independent asset, while `Accept-Encoding` (which the compression
+	// middleware legitimately adds) survives.
 	if !strings.Contains(ar.Header.Get("Cache-Control"), "immutable") {
 		t.Errorf("the asset lost its immutable directive: %q", ar.Header.Get("Cache-Control"))
 	}
-	if !strings.Contains(ar.Header.Get("Vary"), "Cookie") {
-		t.Errorf("no Vary: Cookie on the asset (%q) — Z08-5's mechanism is not reproduced here",
-			ar.Header.Get("Vary"))
+	if strings.Contains(ar.Header.Get("Vary"), "Cookie") {
+		t.Errorf("the immutable asset is served Vary: Cookie (%q): a content-hashed, user-independent "+
+			"asset must not be keyed on the session cookie (Z08-5 regressed)", ar.Header.Get("Vary"))
 	}
 	if !strings.Contains(ar.Header.Get("Vary"), "Accept-Encoding") {
 		t.Errorf("the asset lost Vary: Accept-Encoding (%q)", ar.Header.Get("Vary"))

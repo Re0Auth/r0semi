@@ -10,9 +10,11 @@ import (
 	"testing"
 )
 
-// TestZ10VerifyOnlyThePagedAuditReadIsRecorded checks Z10-6 from the source: of
-// the three reads on the operator allowlist, only the paged one calls
-// recordAudit.
+// TestZ10VerifyOnlyThePagedAuditReadIsRecorded started as the Z10-6 finding: of
+// the three reads on the operator allowlist, only the paged one called
+// recordAudit, so the chain walk and the head read — both statements about the
+// integrity of the whole log — left no record. The fix records all three; this is
+// now the regression guard for it (name kept for the audit coverage matrix).
 func TestZ10VerifyOnlyThePagedAuditReadIsRecorded(t *testing.T) {
 	const file = "internal/httpapi/audit_routes.go"
 	src := repoFile(t, file)
@@ -22,22 +24,27 @@ func TestZ10VerifyOnlyThePagedAuditReadIsRecorded(t *testing.T) {
 		"handleAdminAuditVerify": funcBodyRaw(t, file, "handleAdminAuditVerify"),
 		"handleAdminAuditHead":   funcBodyRaw(t, file, "handleAdminAuditHead"),
 	}
-	if !strings.Contains(handlers["handleAdminAudit"], `"admin.audit.read"`) {
-		t.Fatalf("the paged read no longer records admin.audit.read; Z10-6's comparison is stale")
-	}
-	for _, name := range []string{"handleAdminAuditVerify", "handleAdminAuditHead"} {
-		if strings.Contains(handlers[name], "recordAudit") {
-			t.Errorf("%s now records an audit event: Z10-6 is fixed for that endpoint and its verdict must change", name)
+	// Z10-6 guard: every operator read of the log leaves a record naming its own
+	// action. The control below (recordAudit exists and is reachable) keeps "the
+	// handler does not call it" a statement about the handler.
+	for name, action := range map[string]string{
+		"handleAdminAudit":       `"admin.audit.read"`,
+		"handleAdminAuditVerify": `"admin.audit.verify"`,
+		"handleAdminAuditHead":   `"admin.audit.head"`,
+	} {
+		if !strings.Contains(handlers[name], "recordAudit") || !strings.Contains(handlers[name], action) {
+			t.Errorf("%s no longer records %s: Z10-6 regressed, so this read of the whole log leaves no trace",
+				name, action)
 		}
 	}
 	// The verify handler really is the wide read: it calls the chain walk.
 	if !strings.Contains(handlers["handleAdminAuditVerify"], "s.auditReader.Verify(") {
 		t.Errorf("handleAdminAuditVerify no longer walks the chain; the \"widest read\" premise changed")
 	}
-	// Control that recordAudit exists and is reachable (so "no recordAudit call"
-	// is a statement about these handlers, not about the layer).
+	// Control that recordAudit exists and is reachable (so the check above is a
+	// statement about these handlers, not about the layer).
 	if !strings.Contains(src, "func (s *Server) recordAudit(") {
-		t.Fatalf("the layer's recordAudit helper is gone; the zero-hit claim would be vacuous")
+		t.Fatalf("the layer's recordAudit helper is gone; the check would be vacuous")
 	}
 	// The export route also records, which is the other half of the P2-22 fix.
 	exp := repoFile(t, "internal/httpapi/export_routes.go")
@@ -46,8 +53,10 @@ func TestZ10VerifyOnlyThePagedAuditReadIsRecorded(t *testing.T) {
 	}
 }
 
-// TestZ10VerifyTheAuditReadGuardIsNotRequiredToHaveASink checks Z10-7: httpapi.New
-// accepts the read API with no write side.
+// TestZ10VerifyTheAuditReadGuardIsNotRequiredToHaveASink started as the Z10-7
+// finding: httpapi.New accepted the read API with no write side, so the P2-22
+// records became silent no-ops. The constructor now requires Config.AuditLog; this
+// is the source-level regression guard (name kept for the audit coverage matrix).
 func TestZ10VerifyTheAuditReadGuardIsNotRequiredToHaveASink(t *testing.T) {
 	const file = "internal/httpapi/server.go"
 	src := repoFile(t, file)
@@ -56,15 +65,20 @@ func TestZ10VerifyTheAuditReadGuardIsNotRequiredToHaveASink(t *testing.T) {
 		!strings.Contains(src, "Config.Audit requires a non-empty Config.Admins") {
 		t.Fatalf("the two Config.Audit guards Z10-7 compares against are gone; re-derive the finding")
 	}
-	if strings.Contains(src, "Config.Audit requires Config.AuditLog") {
-		t.Errorf("httpapi.New now requires an AuditLog for Config.Audit: Z10-7 is fixed and its verdict must change")
+	// Z10-7 guard: a read API with no write sink is refused at construction.
+	if !strings.Contains(src, "Config.Audit requires Config.AuditLog") {
+		t.Errorf("httpapi.New no longer requires an AuditLog for Config.Audit: Z10-7 regressed and the " +
+			"read API's own records can silently become no-ops in a configuration that looks wired")
 	}
-	record := funcBodyRaw(t, "internal/httpapi/audit_routes.go", "recordAudit")
+	// The write path still declines a nil logger; the constructor guard is what
+	// makes that branch unreachable through Config.Audit. The nil check lives in
+	// recordAuditOutcome, which recordAudit delegates to.
+	record := funcBodyRaw(t, "internal/httpapi/audit_routes.go", "recordAuditOutcome")
 	if !strings.Contains(record, "s.auditLog == nil") {
-		t.Fatalf("recordAudit no longer returns early on a nil logger; Z10-7's mechanism changed")
+		t.Fatalf("recordAuditOutcome no longer returns early on a nil logger; Z10-7's mechanism changed")
 	}
 	if !strings.Contains(record, "return") {
-		t.Fatalf("recordAudit's nil-logger branch no longer returns; re-derive")
+		t.Fatalf("recordAuditOutcome's nil-logger branch no longer returns; re-derive")
 	}
 	// The composition root wires both, which is why this is a hardening item.
 	main := repoFile(t, "cmd/re0auth/main.go")

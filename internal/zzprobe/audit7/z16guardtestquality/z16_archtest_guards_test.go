@@ -75,6 +75,13 @@ func archtestRoot(t *testing.T, repo string, mutFile, mutCI func(string) string)
 	}
 	must(os.WriteFile(filepath.Join(tmp, "Makefile"), mk, 0o644))
 
+	// TestReleaseShipsNpmAttribution reads the Dockerfile too (the runtime stage
+	// must carry the npm attribution, Z13-3), so the temporary root has to contain
+	// it or the guard fatals on the missing file rather than on the mutation.
+	df, err := os.ReadFile(filepath.Join(repo, "Dockerfile"))
+	must(err)
+	must(os.WriteFile(filepath.Join(tmp, "Dockerfile"), df, 0o644))
+
 	src := filepath.Join(repo, ".github", "workflows")
 	dst := filepath.Join(tmp, ".github", "workflows")
 	must(os.MkdirAll(dst, 0o755))
@@ -98,8 +105,12 @@ const (
 		"TestWorkflowsGrantWriteScopesOnlyToTheJobThatUsesThem)$"
 )
 
-// TestZ16ArchtestGuardsAreSatisfiedByComments is the "a guard that greps a whole
-// file is satisfied by prose" probe, on the real guard.
+// TestZ16ArchtestGuardsAreSatisfiedByComments was the "a guard that greps a whole
+// file is satisfied by prose" finding (Z16-4) on the real guard. The Makefile
+// guard now parses targets/prerequisites instead of searching the file, so the
+// mutation below — commenting the `release:` rule out while leaving the same words
+// in a comment — must FAIL the guard. This is the regression guard for that fix
+// (the name is kept for the audit coverage matrix).
 func TestZ16ArchtestGuardsAreSatisfiedByComments(t *testing.T) {
 	repo := repoRoot(t)
 	bin := buildArchtest(t, repo)
@@ -123,8 +134,8 @@ func TestZ16ArchtestGuardsAreSatisfiedByComments(t *testing.T) {
 	}
 
 	// The mutation: comment the `release:` rule out, leaving the same words in a
-	// comment. Every needle the guard greps for is still present as text, and
-	// `make release` would have no rule at all.
+	// comment. A whole-file `strings.Contains` would still be satisfied; the
+	// structural guard must not be, because `make release` then has no rule at all.
 	const want = "\nrelease: dist sbom npm-attribution checksums\n"
 	tmp3 := archtestRoot(t, repo, func(mk string) string {
 		if !strings.Contains(mk, want) {
@@ -133,16 +144,14 @@ func TestZ16ArchtestGuardsAreSatisfiedByComments(t *testing.T) {
 		return strings.Replace(mk, want, "\n# release: dist sbom npm-attribution checksums\n", 1)
 	}, nil)
 	ok, out := runArchtest(t, bin, filepath.Join(tmp3, "internal", "archtest"), makefileGuard)
-	if !ok {
-		t.Fatalf("the harness is wrong: the guard is expected to stay green on a commented-out rule:\n%s", out)
+	if ok {
+		t.Errorf("TestReleaseShipsNpmAttribution passed with the `release:` rule commented out: it is a "+
+			"whole-file `strings.Contains` again (Z16-4 regressed), so it says \"the SPA's npm licence "+
+			"listing reaches a release\" while `make release` can exist only as a comment.\n%s", out)
 	}
-	t.Errorf("TestReleaseShipsNpmAttribution is a whole-file `strings.Contains` " +
-		"(internal/archtest/workflows_test.go:31-40): with the `release:` rule commented out it still " +
-		"passes (proven above, with both controls). Every one of its four needles can be satisfied by a " +
-		"comment, prose in a different target, or a rule that builds something else — so the guard says " +
-		"\"the SPA's npm licence listing reaches a release\" while `make release` can exist only as a " +
-		"comment. The fix is to parse the Makefile's targets/prerequisites (the package already does " +
-		"this for `make web` in makeTargetInstallsPnpm) and assert the dependency edge, not the text.")
+	if !strings.Contains(out, "release") {
+		t.Errorf("the guard failed for a reason unrelated to the release rule; re-derive this probe:\n%s", out)
+	}
 }
 
 // TestZ16NoGuardKeepsTheFuzzTargetListComplete: ci.yml hand-lists the fuzz

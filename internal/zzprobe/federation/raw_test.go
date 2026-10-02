@@ -317,27 +317,39 @@ func TestProbeRegistryAcceptsPathEscapingNames(t *testing.T) {
 }
 
 // The scope a source declares is used verbatim as an OAuth scope: if it carries
-// whitespace or a space, one resource's "scope" becomes several.
+// whitespace or a space, one resource's "scope" becomes several. This was the
+// finding; the registry now refuses such a scope at construction, so the probe is
+// the regression guard for that fix.
 func TestProbeScopeInjectionFromRegistry(t *testing.T) {
-	reg, err := federation.NewRegistry(federation.Source{
+	_, err := federation.NewRegistry(federation.Source{
 		Game: "phigros", Name: "src", Issuer: "https://api.example",
 		Resources: []federation.Resource{
 			{Name: "profile", Scope: "phigros.profile.read account.id"},
 		},
 	})
+	if err == nil {
+		t.Errorf("NewRegistry accepted a resource scope carrying whitespace: the declared value is used " +
+			"verbatim as an OAuth scope, so one resource's scope silently becomes several on the wire")
+	}
+
+	// Positive control: a well-formed scope is accepted, and the registry does not
+	// rewrite it — so the refusal above is about the whitespace and not "the
+	// registry refuses every scope".
+	reg, err := federation.NewRegistry(federation.Source{
+		Game: "phigros", Name: "src", Issuer: "https://api.example",
+		Resources: []federation.Resource{
+			{Name: "profile", Scope: "phigros.profile.read"},
+		},
+	})
 	if err != nil {
-		t.Fatalf("registry: %v", err)
+		t.Fatalf("NewRegistry refused a well-formed scope: %v", err)
 	}
 	src, _ := reg.Get("phigros", "src")
-	scopes := []string{}
-	for _, r := range src.Resources {
-		scopes = append(scopes, r.Scope)
+	if len(src.Resources) != 1 || src.Resources[0].Scope != "phigros.profile.read" {
+		t.Fatalf("the registry rewrote the valid scope: %+v", src.Resources)
 	}
-	t.Logf("declared resource scope %q is used verbatim in: bindScopes, the scope gate, and the wire", scopes)
-	for _, s := range scopes {
-		if strings.ContainsAny(s, " \t\n") {
-			t.Errorf("a resource scope carrying whitespace reaches the OAuth wire as several scopes: %q", s)
-		}
+	if strings.ContainsAny(src.Resources[0].Scope, " \t\n") {
+		t.Errorf("a valid resource scope carries whitespace: %q", src.Resources[0].Scope)
 	}
 }
 

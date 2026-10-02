@@ -7,6 +7,7 @@ package z10adminauditprivacy
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -101,14 +102,15 @@ func TestZ10VerifyAcceptsAForgedUnsignedRowBeforeTheChainStarts(t *testing.T) {
 	}
 }
 
-// TestZ10VerifyDoesNotCheckTheHeadAgainstTheLastRow.
+// TestZ10VerifyDoesNotCheckTheHeadAgainstTheLastRow was the Z10-9 finding and is
+// now its regression guard (the name is kept for the audit coverage matrix).
 //
-// Verify reads audit_chain.head_hash as a witness that rows were chained, but
-// never compares it to the row hash the walk actually ended on. A head pointing at
-// a value that belongs to no row therefore verifies: the log looks intact while
-// the anchor loop publishes a hash no row carries. (An anchor operator comparing
-// the published value against the table would notice; the in-place check that
-// answers GET /v1/admin/audit/verify does not.)
+// Verify reads audit_chain.head_hash as a witness that rows were chained, but used
+// to never compare it to the row hash the walk actually ended on, so a head
+// pointing at a value that belongs to no row verified: the log looked intact while
+// the anchor loop published a hash no row carried. Verify now compares the two
+// (S09-6 / Z10-9), which is also what makes a deleted tail detectable without an
+// external anchor.
 func TestZ10VerifyDoesNotCheckTheHeadAgainstTheLastRow(t *testing.T) {
 	dsn := probeDSN(t)
 	ctx := context.Background()
@@ -162,10 +164,12 @@ func TestZ10VerifyDoesNotCheckTheHeadAgainstTheLastRow(t *testing.T) {
 		t.Fatalf("verify: %v", err)
 	}
 	if v.OK {
-		t.Errorf("Verify reports ok=true while the chain head (%x) is not the hash of any row — it never "+
-			"compares the value it read as a witness against where the walk ended (v.Chained=%d). The head is "+
-			"what an external anchor publishes, so GET /v1/admin/audit/head and the hourly anchor line can "+
-			"report a value the log does not contain while the integrity check stays green.", planted, v.Chained)
+		t.Errorf("Verify reports ok=true while the chain head (%x) is not the hash of the last chained row: "+
+			"the head comparison Z10-9 added is gone, so a rewritten or truncated tail verifies and the "+
+			"published anchor can name a value the log does not contain.", planted)
+	}
+	if !strings.Contains(v.Reason, "chain head") {
+		t.Errorf("Verify failed for a reason other than the head comparison (%q); re-derive this guard", v.Reason)
 	}
 	// The planted head also makes the next append fail its own verification,
 	// which is the state an operator would have to notice instead.

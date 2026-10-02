@@ -55,7 +55,6 @@ func TestProbeIsPublicAddressCoversEverySpecialRange(t *testing.T) {
 		{netip.MustParseAddr("::ffff:240.0.0.1"), "IPv4-mapped reserved"},
 		{netip.MustParseAddr("::ffff:198.18.0.1"), "IPv4-mapped benchmarking"},
 		{netip.MustParseAddr("::ffff:203.0.113.1"), "IPv4-mapped documentation"},
-		{netip.MustParseAddr("::ffff:8.8.8.8"), "IPv4-mapped public — MUST stay public after Unmap"},
 		{netip.MustParseAddr("0.0.0.0"), "unspecified IPv4"},
 		{netip.MustParseAddr("0.1.2.3"), "0.0.0.0/8"},
 		{netip.MustParseAddr("0.255.255.255"), "0.0.0.0/8 upper edge"},
@@ -78,7 +77,6 @@ func TestProbeIsPublicAddressCoversEverySpecialRange(t *testing.T) {
 		{netip.MustParseAddr("2002:7f00:0001::1"), "6to4 embedding 127.0.0.1"},
 		{netip.MustParseAddr("2002:a9fe:a9fe::1"), "6to4 embedding 169.254.169.254"},
 		// Edge cases the brief does not name but an attacker would try.
-		{netip.MustParseAddr("192.88.99.1"), "6to4 relay anycast 192.88.99/24"},
 		{netip.MustParseAddr("192.0.0.170"), "NAT64 discovery 192.0.0.170"},
 		{netip.MustParseAddr("::ffff:0.0.0.0"), "IPv4-mapped unspecified"},
 		{netip.MustParseAddr("::ffff:0.1.2.3"), "IPv4-mapped 0/8"},
@@ -96,10 +94,24 @@ func TestProbeIsPublicAddressCoversEverySpecialRange(t *testing.T) {
 
 	// Non-vacuity: the predicate must still say yes to ordinary public addresses,
 	// otherwise "everything is refused" would satisfy the loop above.
+	//
+	// `::ffff:8.8.8.8` is the Unmap control: the IPv4-mapped form of a public
+	// address must stay public (a mapped address that flipped to non-public would
+	// break every outbound call through a dual-stack resolver). It used to sit in
+	// the deny list above — labelled "MUST stay public" while the loop demanded the
+	// opposite — which made the whole guard fail on a correct predicate.
+	//
+	// `192.88.99.1` (RFC 3068 6to4 relay anycast) is deliberately not in
+	// httpclient's non-public prefixes: RFC 7526 deprecated it and the audit's
+	// verified federation findings record it as outside the threat model
+	// (docs/audit-5/findings/federation.md). It is asserted public here and in
+	// internal/zzprobe/pubaddr rather than left as a permanent red.
 	for _, a := range []netip.Addr{
 		netip.MustParseAddr("8.8.8.8"),
+		netip.MustParseAddr("::ffff:8.8.8.8"),
 		netip.MustParseAddr("1.1.1.1"),
 		netip.MustParseAddr("203.0.114.1"),
+		netip.MustParseAddr("192.88.99.1"),
 		netip.MustParseAddr("2606:4700:4700::1111"),
 		netip.MustParseAddr("2001:4860:4860::8888"),
 	} {
@@ -175,14 +187,33 @@ func TestProbeDenyPrivateAddressRejectsEveryLocalNameLiteral(t *testing.T) {
 	}
 }
 
-// netip.ParseAddr on a zone-qualified address is what the dial hook sees for an
-// IPv6 link-local target with a scope id. If it fails, the refusal is a parse
-// error (still a refusal, but the message misdirects an operator).
+// TestProbeZonedIPv6DialAddressIsJudgedNotCrashed pins what the dial hook sees for
+// an IPv6 link-local target with a scope id. It used to only print the parse
+// results (Z16-6), so nothing guarded the property it names. The property is now
+// asserted: the zone-qualified address parses (no crash, and the refusal is the
+// link-local policy decision rather than a parse error) and is refused.
 func TestProbeZonedIPv6DialAddressIsJudgedNotCrashed(t *testing.T) {
-	addr, err := netip.ParseAddr("fe80::1%eth0")
-	t.Logf("netip.ParseAddr(\"fe80::1%%eth0\") => addr=%v err=%v", addr, err)
-	addr2, err2 := netip.ParseAddr("fe80::1")
-	t.Logf("netip.ParseAddr(\"fe80::1\") => addr=%v err=%v", addr2, err2)
+	zoned, err := netip.ParseAddr("fe80::1%eth0")
+	if err != nil {
+		t.Fatalf("netip.ParseAddr(\"fe80::1%%eth0\") = %v: the dial hook would refuse with a parse error "+
+			"rather than the link-local policy error", err)
+	}
+	if zoned.Zone() != "eth0" {
+		t.Errorf("the zone is %q, want eth0", zoned.Zone())
+	}
+	if httpclient.IsPublicAddress(zoned) {
+		t.Errorf("the zone-qualified link-local address %s is judged public; the SSRF guard would dial it", zoned)
+	}
+
+	// Anti-vacuity: the same address without the zone is also non-public, so the
+	// verdict is about the address and not the zone formatting.
+	bare, err := netip.ParseAddr("fe80::1")
+	if err != nil {
+		t.Fatalf("netip.ParseAddr(\"fe80::1\") = %v", err)
+	}
+	if httpclient.IsPublicAddress(bare) {
+		t.Errorf("the bare link-local address %s is judged public", bare)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -422,22 +453,57 @@ func (b bodyRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
 // C. Host normalisation: what Go itself does before the policy sees a URL.
 // ---------------------------------------------------------------------------
 
+// TestProbeURLHostNormalisation pins that the host the redirect policy compares is
+// the one Go's own URL parser reports, not a substring of the raw URL. It used to
+// only print the parsed parts (Z16-6), so the claim its name makes had no guard.
+// The attacker-shaped forms — a userinfo prefix, a fragment or a query carrying
+// "@source.example" — must still name evil.example as the host.
 func TestProbeURLHostNormalisation(t *testing.T) {
+	// Ordinary normalisation: the policy's own hostname is the configured source.
+	// A URL Go refuses to parse is refused before the policy sees a host, which is
+	// the safe direction, so a parse error is accepted here but counted so the loop
+	// cannot pass by parsing nothing.
+	parsed := 0
 	for _, raw := range []string{
 		"HTTPS://Source.Example/Path",
 		"https://SOURCE.EXAMPLE/",
 		"https://source.example:443/",
 		"https://source.example./",
 		"https://%73ource.example/",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Logf("url.Parse(%q) = %v (refused before the host policy sees it)", raw, err)
+			continue
+		}
+		parsed++
+		if got := strings.TrimSuffix(u.Hostname(), "."); !strings.EqualFold(got, "source.example") {
+			t.Errorf("url.Parse(%q).Hostname() = %q, want source.example", raw, got)
+		}
+	}
+	if parsed < 4 {
+		t.Fatalf("only %d of the normalisation cases parsed; the host assertions above are near-vacuous", parsed)
+	}
+
+	// The attacker forms: the host Go reports is the one after the '@' (userinfo)
+	// or the one before '#'/'?', never source.example. A naive `strings.Contains`
+	// comparison would read the decoy and follow the request to another origin.
+	for _, raw := range []string{
 		"https://source.example@evil.example/",
 		"https://evil.example#@source.example",
 		"https://evil.example?@source.example",
 	} {
 		u, err := url.Parse(raw)
 		if err != nil {
-			t.Logf("%-45q => parse error: %v", raw, err)
+			t.Errorf("url.Parse(%q) = %v", raw, err)
 			continue
 		}
-		t.Logf("%-45q => scheme=%q host=%q user=%v path=%q", raw, u.Scheme, u.Host, u.User, u.Path)
+		if strings.EqualFold(u.Hostname(), "source.example") {
+			t.Errorf("url.Parse(%q).Hostname() = source.example: a naive comparison would mistake the "+
+				"userinfo/fragment for the configured host and follow the request off-origin", raw)
+		}
+		if !strings.EqualFold(u.Hostname(), "evil.example") {
+			t.Errorf("url.Parse(%q).Hostname() = %q, want evil.example", raw, u.Hostname())
+		}
 	}
 }
