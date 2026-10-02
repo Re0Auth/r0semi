@@ -369,3 +369,32 @@ func TestIsPublicAddress(t *testing.T) {
 		}
 	}
 }
+
+// When a proxy carries the request the dial-time Control hook only ever sees the
+// proxy's address, so the target has to be judged before the request leaves
+// (S06-2). IP literals need no DNS, which is what makes this deterministic.
+func TestDenyPrivateTargetJudgesTheTargetAddress(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		host    string
+		wantErr bool
+	}{
+		{"10.0.0.5", true},
+		{"127.0.0.1", true},
+		{"169.254.169.254", true}, // the cloud metadata address
+		{"192.168.1.1", true},
+		{"100.64.0.1", true}, // carrier-grade NAT
+		{"1.1.1.1", false},
+		{"93.184.216.34", false},
+	} {
+		u := &url.URL{Scheme: "http", Host: tc.host}
+		err := denyPrivateTarget(ctx, u)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("denyPrivateTarget(%s) = %v, wantErr=%v", tc.host, err, tc.wantErr)
+			continue
+		}
+		if err != nil && !strings.Contains(err.Error(), "allow_private_addresses") {
+			t.Errorf("denyPrivateTarget(%s) = %v, want it to name the setting that permits it", tc.host, err)
+		}
+	}
+}

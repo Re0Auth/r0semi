@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"sync"
 	"syscall"
 	"time"
@@ -174,6 +175,70 @@ func denyPrivateAddress(network, address string, _ syscall.RawConn) error {
 	return nil
 }
 
+// targetAddressGuard refuses a request whose TARGET is not public when a proxy
+// will carry it (S06-2).
+//
+// The dial-time Control hook only sees the address the kernel is about to be
+// given. When http.ProxyFromEnvironment supplies a proxy, that address is the
+// PROXY's: the target is never dialed here, so a request to 10.0.0.5 sailed
+// through against a public proxy. This guard resolves the target itself before
+// the request leaves, so "the guard is on" means the destination was judged.
+//
+// It is deliberately inert when no proxy applies: there the direct dial's
+// Control hook already judges the resolved address, which is strictly stronger
+// because it cannot be raced by a second DNS answer. A proxy necessarily
+// resolves the target on our behalf, so with a proxy this is a pre-flight
+// decision and the proxy could still be steered to a different address; that
+// residual is why the check fails closed on ANY non-public answer.
+type targetAddressGuard struct{ next http.RoundTripper }
+
+func (g *targetAddressGuard) RoundTrip(req *http.Request) (*http.Response, error) {
+	proxyURL, err := http.ProxyFromEnvironment(req)
+	if err != nil {
+		return nil, fmt.Errorf("httpclient: cannot resolve the proxy for %s: %w", req.URL.Redacted(), err)
+	}
+	if proxyURL != nil {
+		if err := denyPrivateTarget(req.Context(), req.URL); err != nil {
+			return nil, err
+		}
+	}
+	return g.next.RoundTrip(req)
+}
+
+// denyPrivateTarget refuses a target URL whose every resolved address is not
+// public. A name that resolves to a mix is refused: one reachable private
+// address is enough to reach something the operator did not intend.
+func denyPrivateTarget(ctx context.Context, u *url.URL) error {
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("httpclient: refusing a request to %s: no host to judge", u.Redacted())
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if !IsPublicAddress(addr) {
+			return privateTargetError(u, addr)
+		}
+		return nil
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return fmt.Errorf("httpclient: cannot resolve the target %s: %w", u.Redacted(), err)
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("httpclient: the target %s resolved to no address", u.Redacted())
+	}
+	for _, addr := range addrs {
+		if !IsPublicAddress(addr) {
+			return privateTargetError(u, addr)
+		}
+	}
+	return nil
+}
+
+func privateTargetError(u *url.URL, addr netip.Addr) error {
+	return fmt.Errorf("httpclient: refusing to connect to %s: %s is not a public address "+
+		"(set upstream.allow_private_addresses to permit one)", u.Redacted(), addr)
+}
+
 // bulkheadTransport bounds the number of requests in flight at once.
 type bulkheadTransport struct {
 	next http.RoundTripper
@@ -312,6 +377,12 @@ func NewOutboundClient(cfg OutboundConfig) *http.Client {
 	if cfg.Breaker != nil {
 		// Outside the bulkhead: an open breaker must reject before a slot is taken.
 		rt = CircuitBreaker(rt, *cfg.Breaker)
+	}
+	if cfg.Transport.DenyPrivateAddresses {
+		// Outermost: judge the destination before a proxy can carry the request,
+		// and before a breaker or bulkhead slot is spent on it (S06-2). Without a
+		// proxy this is inert; the dial's Control hook does the judging.
+		rt = &targetAddressGuard{next: rt}
 	}
 	return &http.Client{
 		Timeout:       cfg.Timeout,

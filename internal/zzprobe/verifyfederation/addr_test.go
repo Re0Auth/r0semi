@@ -135,15 +135,18 @@ func TestVerifyZeroEightRoutesToLoopbackOnThisPlatform(t *testing.T) {
 	}
 }
 
-// TestVerifyProxyGuardJudgesTheProxyNotTheTarget executes FO-07's structural
-// claim, which the audit left unexecuted. http.ProxyFromEnvironment is read once
-// per process, so HTTP_PROXY is installed in TestMain.
+// TestVerifyProxyGuardJudgesTheProxyNotTheTarget pins the S06-2 fix. The name is
+// historical: before the fix the refusal named the PROXY, because the address
+// guard ran only on the dial; the target guard now runs before the request
+// leaves, so the refusal names the TARGET. This probe was a finding-demonstrator
+// and is now the regression guard for that direction. http.ProxyFromEnvironment
+// is read once per process, so HTTP_PROXY is installed in TestMain.
 func TestVerifyProxyGuardJudgesTheProxyNotTheTarget(t *testing.T) {
 	if proxyAddr == "" {
 		t.Skip("no test proxy was started")
 	}
-	// Fail-closed direction: the proxy is on loopback, so the guard refuses the
-	// dial -- and the error names the PROXY's address, not the target's.
+	// Fail-closed direction: the target is RFC1918, so the target guard refuses
+	// before the proxy is ever dialed, and the refusal names the target.
 	guarded := httpclient.NewOutboundClient(httpclient.OutboundConfig{
 		Timeout:   3 * time.Second,
 		Transport: httpclient.TransportConfig{DenyPrivateAddresses: true},
@@ -152,11 +155,17 @@ func TestVerifyProxyGuardJudgesTheProxyNotTheTarget(t *testing.T) {
 	resp, err := guarded.Do(req)
 	if err == nil {
 		_ = resp.Body.Close()
-		t.Fatalf("a loopback proxy was dialed with the guard on: %d", resp.StatusCode)
+		t.Fatalf("a private target was carried through the proxy with the guard on: %d", resp.StatusCode)
 	}
 	t.Logf("guard ON, target http://10.0.0.5/secret, proxy %s -> %v", proxyAddr, err)
-	if !strings.Contains(err.Error(), "127.0.0.1") && !strings.Contains(err.Error(), "::1") {
-		t.Errorf("the refusal does not name the proxy address, so this probe is not measuring what it claims: %v", err)
+	if !strings.Contains(err.Error(), "10.0.0.5") {
+		t.Errorf("the refusal does not name the TARGET address, so the guard still judges the proxy: %v", err)
+	}
+	if strings.Contains(err.Error(), proxyAddr) {
+		t.Errorf("the refusal names the proxy address (%s) instead of the target: %v", proxyAddr, err)
+	}
+	if !strings.Contains(err.Error(), "allow_private_addresses") {
+		t.Errorf("the refusal does not name the setting that permits it: %v", err)
 	}
 
 	// The other direction: with the guard off, the same request goes THROUGH the
