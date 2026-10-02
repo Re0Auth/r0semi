@@ -354,7 +354,15 @@ type settings struct {
 	noPrimaryClient bool
 
 	idpCredentials []idp.Credentials
-	sources        []federation.Source
+	// insecureIdPIssuers names the providers whose issuer is not https, in file
+	// order. The startup path warns about each one: an http issuer puts the
+	// authorization redirect, discovery, JWKS fetch and the token exchange — which
+	// carries the client secret and the authorization code — on the wire in
+	// cleartext. It is recorded rather than refused because a local/plaintext OIDC
+	// provider is a legitimate deployment shape, and there is no acknowledgement
+	// switch for it yet (S08-9).
+	insecureIdPIssuers []string
+	sources            []federation.Source
 	// adminSubjects is the operator allowlist. Empty means the operator plane is
 	// not mounted at all.
 	adminSubjects []string
@@ -461,14 +469,34 @@ func configSecretEnvNames(path string) ([]string, error) {
 		return nil, err
 	}
 	var lines []string
-	add := func(role, name string) {
-		if strings.TrimSpace(name) != "" {
-			lines = append(lines, role+"="+name)
+	// The declaration is printed verbatim, so it must be shaped like a NAME. The
+	// mistake this schema invites is pasting the secret into the *_env slot
+	// instead of the variable's name; before this check that mistake was printed
+	// to stdout — and scripts/backup-keys.sh put it in a shell variable and the CI
+	// transcript (S08-6 / Z19V-2). The refusal names the field (the position an
+	// operator needs) and never repeats the offending value: a value that happens
+	// to be alphanumeric still matches the shape, which is exactly why the check
+	// is on shape and the error is on position.
+	add := func(role, name string) error {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil
 		}
+		if !isEnvVarName(name) {
+			return fmt.Errorf(
+				"%s is not an environment variable name: that slot names the variable holding the "+
+					"secret, not the secret itself (the value is not printed here)", role)
+		}
+		lines = append(lines, role+"="+name)
+		return nil
 	}
-	add("vault.kek_env", f.Vault.KEKEnv)
+	if err := add("vault.kek_env", f.Vault.KEKEnv); err != nil {
+		return nil, err
+	}
 	for i, retired := range f.Vault.Retired {
-		add(fmt.Sprintf("vault.retired[%d].kek_env", i), retired.KEKEnv)
+		if err := add(fmt.Sprintf("vault.retired[%d].kek_env", i), retired.KEKEnv); err != nil {
+			return nil, err
+		}
 	}
 	// Map iteration is randomised, so the provider names are sorted before use: an
 	// output whose order changes run to run is not diffable.
@@ -478,13 +506,35 @@ func configSecretEnvNames(path string) ([]string, error) {
 	}
 	sort.Strings(providers)
 	for _, name := range providers {
-		add("idp."+name+".client_secret_env", f.IdP[name].ClientSecretEnv)
+		if err := add("idp."+name+".client_secret_env", f.IdP[name].ClientSecretEnv); err != nil {
+			return nil, err
+		}
 	}
 	for i, source := range f.Sources {
-		add(fmt.Sprintf("sources[%d].client_secret_env", i), source.ClientSecretEnv)
+		if err := add(fmt.Sprintf("sources[%d].client_secret_env", i), source.ClientSecretEnv); err != nil {
+			return nil, err
+		}
 	}
 	sort.Strings(lines)
 	return lines, nil
+}
+
+// isEnvVarName reports whether s is shaped like the name of an environment
+// variable rather than a value pasted into a name slot: a leading letter or
+// underscore, then letters, digits or underscores. It deliberately accepts an
+// all-alphanumeric string, because a secret can look like one; what it rejects is
+// the base64/hex/DSN shapes the mistake actually produces.
+func isEnvVarName(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return s != ""
 }
 
 // resolveClientSpec turns one [[clients]] entry into the shape the registry is
@@ -526,6 +576,76 @@ func resolveClientSpec(index int, entry clientSection) (clientSpec, error) {
 	return spec, nil
 }
 
+// resolveStorage resolves the storage driver and the DSN onto cfg. It is shared by
+// loadConfig and loadMigrateConfig so the two cannot disagree about which variable
+// holds the DSN or about when "declared but unset" is an error.
+//
+// The DSN's environment variable: a file that names one (`dsn_env`) is
+// authoritative — the literal DATABASE_URL is only the default NAME, so a stale
+// DATABASE_URL in the environment must not shadow the variable the operator
+// declared. The value is read through config.Secret, so "declared but unset" is an
+// error rather than a silent downgrade to memory (S08-2).
+func resolveStorage(cfg *settings, f file) error {
+	dsnEnv := f.Storage.DSNEnv
+	if dsnEnv == "" {
+		dsnEnv = "DATABASE_URL"
+	}
+	driver := config.FirstNonEmpty(strings.TrimSpace(os.Getenv("RE0AUTH_STORAGE_DRIVER")), f.Storage.Driver)
+	switch driver {
+	case "":
+		if f.Storage.DSNEnv != "" || os.Getenv("DATABASE_URL") != "" {
+			driver = "postgres"
+		} else {
+			driver = "memory"
+			cfg.StorageReason = "no DATABASE_URL is configured"
+		}
+	case "memory":
+		driver = "memory"
+		cfg.StorageReason = "storage.driver is memory"
+	case "postgres":
+		// Resolved below, exactly like the inferred case.
+	default:
+		return fmt.Errorf("storage.driver %q must be \"memory\" or \"postgres\"", driver)
+	}
+	if driver == "postgres" {
+		dsn, err := config.Secret(dsnEnv, "storage.dsn_env")
+		if err != nil {
+			return err
+		}
+		cfg.DatabaseURL = dsn
+	} else {
+		cfg.DatabaseURL = ""
+	}
+	cfg.StorageDriver = driver
+	return nil
+}
+
+// loadMigrateConfig resolves only what a schema rollback needs: the DSN and the
+// pool. -migrate-down is a recovery action, and it used to run the whole
+// serving-period validation first: a deployment whose KEK or audit chain key was
+// missing or being recovered could not roll back at all, for a reason that has
+// nothing to do with the rollback (Z12-5).
+//
+// It still refuses every value it actually uses — an unknown driver, a DSN variable
+// that is unset, an out-of-range pool size — through the same helpers loadConfig
+// uses, so "the narrow loader" is narrower only in what it ignores.
+func loadMigrateConfig(path string) (settings, error) {
+	var f file
+	if err := config.Read(path, &f); err != nil {
+		return settings{}, err
+	}
+	var cfg settings
+	if err := resolveStorage(&cfg, f); err != nil {
+		return settings{}, err
+	}
+	pool, err := resolvePool(f.Storage)
+	if err != nil {
+		return settings{}, err
+	}
+	cfg.Pool = pool
+	return cfg, nil
+}
+
 // loadConfig reads the TOML file at path (empty = environment only), applies the
 // environment overrides, resolves every secret by name, and validates the
 // result. It fails closed: a half-configured server never starts.
@@ -547,7 +667,7 @@ func loadConfig(path string) (settings, error) {
 		Addr:           config.FirstNonEmpty(os.Getenv("RE0AUTH_ADDR"), f.Server.Addr, "127.0.0.1:8080"),
 		Issuer:         strings.TrimRight(config.FirstNonEmpty(os.Getenv("RE0AUTH_ISSUER"), f.Server.Issuer), "/"),
 		CookieSecure:   cookieSecure,
-		KEKID:          config.FirstNonEmpty(os.Getenv("RE0AUTH_KEK_ID"), f.Vault.KEKID, "kek-1"),
+		KEKID:          config.FirstNonEmpty(f.Vault.KEKID, os.Getenv("RE0AUTH_KEK_ID"), "kek-1"),
 		InternalAddr:   config.FirstNonEmpty(os.Getenv("RE0AUTH_INTERNAL_ADDR"), f.Server.InternalAddr),
 		ExposeInternal: exposeInternal,
 	}
@@ -642,6 +762,17 @@ func loadConfig(path string) (settings, error) {
 		return settings{}, errors.New(
 			"server.max_upstream_buffer_bytes cannot be negative (there is no unbounded setting: " +
 				"that is the state which reaches the container's memory limit)")
+	}
+	if bufferedBytes == 0 {
+		// An explicit 0 is a chosen value — the field is a pointer precisely so
+		// absent and zero differ — but federation.NewService reads 0 as "not
+		// chosen" and replaces it with the 64 MiB default, so before this the
+		// operator's number was neither applied nor refused (S08-8). Refuse it here,
+		// like the negative branch: leaving the budget unset is how the default is
+		// asked for.
+		return settings{}, errors.New(
+			"server.max_upstream_buffer_bytes must be at least 1 byte (there is no \"off\": the budget " +
+				"is what bounds upstream bodies held in memory). Leave it unset to take the default")
 	}
 	if bufferedBytes == -1 {
 		bufferedBytes = defaultMaxUpstreamBufferBytes
@@ -755,43 +886,9 @@ func loadConfig(path string) (settings, error) {
 	// The reason is recorded on the settings so reportDurability can say WHY, rather
 	// than the fixed because="no DATABASE_URL" it used to print even when the
 	// variable was set.
-	// The DSN's environment variable. A file that names one (`dsn_env`) is
-	// authoritative: the literal DATABASE_URL is only the default NAME, so a stale
-	// DATABASE_URL in the environment must not shadow the variable the operator
-	// declared. The name is resolved once for both branches below, and its value is
-	// read through config.Secret, so "declared but unset" is an error rather than a
-	// silent downgrade to memory (S08-2).
-	dsnEnv := f.Storage.DSNEnv
-	if dsnEnv == "" {
-		dsnEnv = "DATABASE_URL"
+	if err := resolveStorage(&cfg, f); err != nil {
+		return settings{}, err
 	}
-	driver := config.FirstNonEmpty(strings.TrimSpace(os.Getenv("RE0AUTH_STORAGE_DRIVER")), f.Storage.Driver)
-	switch driver {
-	case "":
-		if f.Storage.DSNEnv != "" || os.Getenv("DATABASE_URL") != "" {
-			driver = "postgres"
-		} else {
-			driver = "memory"
-			cfg.StorageReason = "no DATABASE_URL is configured"
-		}
-	case "memory":
-		driver = "memory"
-		cfg.StorageReason = "storage.driver is memory"
-	case "postgres":
-		// Resolved below, exactly like the inferred case.
-	default:
-		return settings{}, fmt.Errorf("storage.driver %q must be \"memory\" or \"postgres\"", driver)
-	}
-	if driver == "postgres" {
-		dsn, err := config.Secret(dsnEnv, "storage.dsn_env")
-		if err != nil {
-			return settings{}, err
-		}
-		cfg.DatabaseURL = dsn
-	} else {
-		cfg.DatabaseURL = ""
-	}
-	cfg.StorageDriver = driver
 
 	// The connection pool. Resolved even in memory mode, where nothing uses it, so
 	// a typo is reported now rather than on the day a deployment grows a database.
@@ -832,6 +929,19 @@ func loadConfig(path string) (settings, error) {
 			return settings{}, fmt.Errorf(
 				"vault.kek_env names %q, but RE0AUTH_KEK is also set and holds a different key; "+
 					"remove the stale variable, or point both at the same key, before starting", kekName)
+		}
+	}
+	// The id that labels records has to come from the same declaration as the key.
+	// Renaming the key means bumping kek_id in the same edit; an orchestrator still
+	// injecting the old RE0AUTH_KEK_ID would otherwise label records written with
+	// the NEW key as the OLD one — the mirror image of the stale-KEK accident
+	// above, and just as unreadable once the environment is corrected (Z12V-1).
+	if id := strings.TrimSpace(f.Vault.KEKID); id != "" {
+		if stale := strings.TrimSpace(os.Getenv("RE0AUTH_KEK_ID")); stale != "" && stale != id {
+			return settings{}, fmt.Errorf(
+				"vault.kek_id is %q, but RE0AUTH_KEK_ID is also set and names %q; "+
+					"the id must match the key material: remove the stale variable, or point both "+
+					"at the same id, before starting", id, stale)
 		}
 	}
 	kekValue, err := config.Secret(kekName, "vault.kek_env")
@@ -1010,6 +1120,16 @@ func loadIdP(cfg *settings, sections map[string]idpSection) error {
 		if section.ClientID == "" {
 			return fmt.Errorf("idp.%s.client_id is required", name)
 		}
+		// Record a non-https issuer so the startup path can warn about it. The
+		// authorization redirect, discovery, JWKS fetch and the token exchange —
+		// which carries the client secret and the authorization code — all run over
+		// whatever scheme the issuer names, and there is no acknowledgement switch
+		// for it (unlike expose_internal). It is a warning rather than a refusal
+		// because a local/plaintext provider is a legitimate shape; the point is
+		// that it is never silent (S08-9).
+		if issuer := strings.TrimSpace(section.Issuer); issuer != "" && !strings.HasPrefix(issuer, "https://") {
+			cfg.insecureIdPIssuers = append(cfg.insecureIdPIssuers, name)
+		}
 		credential := idp.Credentials{
 			Provider:    provider,
 			ClientID:    section.ClientID,
@@ -1151,16 +1271,63 @@ func internalAddrIsLocal(addr string) bool {
 	return ip.IsLoopback()
 }
 
-// hasUniversalPrefix reports whether the parsed list contains a prefix that
-// matches every address (0.0.0.0/0 or ::/0). Such a prefix is what turns the
-// trust list into a no-op, so it is checked separately from "how wide is wide".
+// hasUniversalPrefix reports whether the parsed list covers every address of an
+// address family.
+//
+// A single /0 is the direct spelling, but it is not the only one: two /1 halves
+// (0.0.0.0/1 + 128.0.0.0/1, or ::/1 + 8000::/1) cover the same space, and so does
+// any set whose union merges into a /0. The guard exists to force the
+// trusted_proxies_any acknowledgement, so it has to answer the question about
+// COVERAGE rather than about the length of one entry — otherwise a generated list
+// that split the halves skips the acknowledgement the single /0 is refused for
+// (S08-5).
 func hasUniversalPrefix(prefixes []netip.Prefix) bool {
+	work := make([]netip.Prefix, 0, len(prefixes))
 	for _, p := range prefixes {
+		work = append(work, p.Masked())
+	}
+	// Merge sibling halves until nothing more merges: 0/2 + 64/2 -> 0/1, and then
+	// 0/1 + 128/1 -> 0/0. These lists are a handful of entries, so the quadratic
+	// scan is not worth avoiding.
+	for {
+		merged := false
+	outer:
+		for i := 0; i < len(work); i++ {
+			for j := i + 1; j < len(work); j++ {
+				parent, ok := mergeSiblingPrefixes(work[i], work[j])
+				if !ok {
+					continue
+				}
+				work = append(work[:j], work[j+1:]...)
+				work = append(work[:i], work[i+1:]...)
+				work = append(work, parent)
+				merged = true
+				break outer
+			}
+		}
+		if !merged {
+			break
+		}
+	}
+	for _, p := range work {
 		if p.Bits() == 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// mergeSiblingPrefixes combines two distinct prefixes of the same length that are
+// the two halves of one parent prefix (they differ only in the last network bit).
+func mergeSiblingPrefixes(a, b netip.Prefix) (netip.Prefix, bool) {
+	if a.Bits() != b.Bits() || a.Bits() == 0 || a == b {
+		return netip.Prefix{}, false
+	}
+	parent := netip.PrefixFrom(a.Addr(), a.Bits()-1).Masked()
+	if netip.PrefixFrom(b.Addr(), b.Bits()-1).Masked().Addr() != parent.Addr() {
+		return netip.Prefix{}, false
+	}
+	return parent, true
 }
 
 // parseTrustedProxies parses CIDR prefixes, and bare addresses as single-host
@@ -1292,6 +1459,14 @@ func envInt32(name string, target int32) (int32, error) {
 	}
 	n, err := strconv.ParseInt(raw, 10, 32)
 	if err != nil {
+		// Distinguish "not a number" from "a number that does not fit": the old
+		// message called 4294967297 "not an integer" — it IS one, it is just out of
+		// int32 range — which sent the operator looking for a typo instead of at
+		// the magnitude or the field's type (Z12V-3).
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("%s %q is out of range for a 32-bit pool size (max %d)",
+				name, raw, math.MaxInt32)
+		}
 		return 0, fmt.Errorf("%s %q is not an integer", name, raw)
 	}
 	return int32(n), nil

@@ -252,12 +252,31 @@ func die(stage string, err error) error {
 	return &startFailure{stage: stage, err: err}
 }
 
+// rejectPositionalArgs refuses arguments that are not flags. See main (Z12-8):
+// silently ignoring them turns a mis-typed one-shot mode into a server.
+func rejectPositionalArgs(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	return fmt.Errorf("unexpected argument %q: flags need a leading dash (e.g. -rotate-keys)", args[0])
+}
+
 // main is the only function that exits the process, and the exits below all
 // happen before any resource is opened — so none of them has a deferred cleanup
 // to strand. Everything that opens something lives in run, whose defers therefore
 // always get to run.
 func main() {
 	flag.Parse()
+
+	// A missed dash is not a flag. `re0auth -config … rotate-keys` parsed cleanly,
+	// ignored the positional argument, and SERVED instead of rotating — the
+	// one-shot mode the operator asked for ran as a long-running server with no
+	// line saying so, and the mistake only surfaced on the next deploy (Z12-8).
+	if err := rejectPositionalArgs(flag.Args()); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "re0auth:", err)
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	// -version has to work with no config and no logging configured, because the
 	// question it answers ("which build is this?") is asked by someone who is
@@ -330,7 +349,16 @@ func run() error {
 		slog.Info("no configuration file; configuring from the environment only")
 	}
 
-	cfg, err := loadConfig(configPath)
+	var cfg settings
+	var err error
+	if *migrateDown {
+		// A rollback runs before the serving stack is wired, so it resolves only
+		// the DSN and the pool: requiring the KEK or the audit chain key here
+		// refused the rollback for a reason that has nothing to do with it (Z12-5).
+		cfg, err = loadMigrateConfig(configPath)
+	} else {
+		cfg, err = loadConfig(configPath)
+	}
 	if err != nil {
 		return die("config", err)
 	}
@@ -467,6 +495,7 @@ func run() error {
 	if len(cfg.idpCredentials) == 0 {
 		slog.Warn("no identity provider is configured; nobody can sign in")
 	}
+	reportInsecureIdPIssuers(cfg.insecureIdPIssuers)
 
 	sessions := auth.NewManager(auth.Options{
 		Secure: cfg.CookieSecure, Store: store.sessions, Index: store.sessionIndex,
@@ -731,6 +760,9 @@ func run() error {
 		endpoints = append(endpoints, endpoint{
 			server:   newServer(metrics.InternalHandler()),
 			listener: internalListener,
+			// No business request is ever served here, so it is closed rather than
+			// drained; see serveUntilSignal (Z10V-2).
+			noDrain: true,
 		})
 		slog.Info("internal surface listening",
 			"addr", internalListener.Addr().String(),
@@ -754,6 +786,10 @@ func run() error {
 type endpoint struct {
 	server   *http.Server
 	listener net.Listener
+	// noDrain marks a listener with no in-flight business request to let finish
+	// (the operational surface). It is closed outright instead of being drained:
+	// see serveUntilSignal (Z10V-2).
+	noDrain bool
 }
 
 // loopGroup joins the process's background loops.
@@ -855,6 +891,19 @@ func serveUntilSignal(ctx context.Context, timeout, endpointRemovalWait time.Dur
 		defer cancel()
 		var err error
 		for _, ep := range endpoints {
+			if ep.noDrain {
+				// The operational surface has no in-flight business request to let
+				// finish, and draining it from the SAME budget spent the public
+				// listener's drain: whichever endpoint went first could consume the
+				// whole budget and leave the other with an already-expired context,
+				// so its handlers were closed without a single request finishing
+				// (Z10V-2). Closing it outright keeps the budget for the traffic
+				// that matters and still takes /metrics and /debug/pprof/ off the
+				// air.
+				slog.Info("closing the operational listener without draining in-flight requests")
+				_ = ep.server.Close()
+				continue
+			}
 			if e := ep.server.Shutdown(drainCtx); e != nil {
 				// The drain ran out of time (or failed for another reason): close
 				// the connections rather than wait on handlers that are not coming
@@ -999,6 +1048,54 @@ func reportDurability(store storage) {
 		return
 	}
 	slog.Info("storage ready", "driver", "postgres", "persistent_ports", persistentPorts)
+}
+
+// reportInsecureIdPIssuers warns, once per provider, that its issuer is not https.
+//
+// The scheme of an upstream IdP is never surfaced anywhere else at startup: an
+// http:// issuer is accepted, and the authorization redirect, discovery, JWKS
+// fetch and the token exchange (which carries the client secret and the
+// authorization code) then run in cleartext with nothing in the log to say so
+// (S08-9). There is no acknowledgement switch for it, and a local/plaintext
+// provider is a legitimate shape, so this warns rather than refuses.
+func reportInsecureIdPIssuers(issuers []string) {
+	for _, name := range issuers {
+		slog.Warn("identity provider issuer is not https: its token exchange carries the client secret "+
+			"and the authorization code in cleartext", "idp", name)
+	}
+}
+
+// keyRoleReuse returns the pairs of process keys that hold identical material.
+//
+// The vault KEK, the OP token-encryption key and the audit chain key are three
+// separate roles, and one value shared across them means a single leak covers all
+// three: the KEK unwraps stored credentials, the token key decrypts live opaque
+// access tokens, and the audit key authenticates the record chain. Nothing used to
+// say so (G-22). It is reported rather than refused: a deployment may point
+// several roles at one value while a rotation is staged, and the test fixtures do,
+// so a hard refusal would break the service and the suite before the operator can
+// act. The warning is the "at least Warn" the finding allows.
+func keyRoleReuse(kek, auditKey []byte, tokenKey [32]byte) []string {
+	var out []string
+	if len(kek) > 0 && bytes.Equal(kek, tokenKey[:]) {
+		out = append(out, "the vault KEK and the OP token key")
+	}
+	if len(auditKey) > 0 && bytes.Equal(auditKey, tokenKey[:]) {
+		out = append(out, "the audit chain key and the OP token key")
+	}
+	if len(kek) > 0 && len(auditKey) > 0 && bytes.Equal(kek, auditKey) {
+		out = append(out, "the vault KEK and the audit chain key")
+	}
+	return out
+}
+
+// reportReusedKeys warns once per pair of roles sharing one key value. See
+// keyRoleReuse (G-22).
+func reportReusedKeys(kek, auditKey []byte, tokenKey [32]byte) {
+	for _, roles := range keyRoleReuse(kek, auditKey, tokenKey) {
+		slog.Warn("the same key value is used for more than one role: one leak then covers both",
+			"roles", roles)
+	}
 }
 
 // opJanitorLoop sweeps expired records from the in-memory OP store on a ticker.
@@ -1306,6 +1403,9 @@ func openOIDC(cfg settings, store storage, sessions *auth.Manager, logger audit.
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	// Three roles, one value: say it rather than let a single leak cover all of
+	// them silently (G-22).
+	reportReusedKeys(cfg.KEK, cfg.AuditKey, tokenKey)
 	retiredTokens, err := oidcRetiredTokenKeys()
 	if err != nil {
 		return nil, nil, nil, err
