@@ -120,6 +120,11 @@ type Service interface {
 	// AuthenticateClient checks client credentials. It is used by endpoints
 	// that require a registered client but carry no grant, such as RFC 7662
 	// introspection.
+	//
+	// Unlike Exchange/Refresh/Revoke, where a public client needs no secret
+	// because PKCE and the code/refresh binding carry its proof, this is a
+	// credential check: only a ClientConfidential client can pass it, and a
+	// public client is answered with invalid_client.
 	AuthenticateClient(ctx context.Context, clientID, clientSecret string) error
 }
 

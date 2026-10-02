@@ -692,3 +692,50 @@ func TestDescribeAuthorizationValidatesPKCEChallengeShape(t *testing.T) {
 		t.Logf("residual: authorize accepted the upper-cased digest; the exchange refused it: %v", err)
 	}
 }
+
+// S01-6 (P2): AuthenticateClient went through client(..., true), which only
+// verifies a secret when the client is ClientConfidential. A registered public
+// client therefore authenticated with any secret at all — including the empty
+// one — so this "credential check" admitted any registered client and the
+// cascade-revocation gate in upstreamkit (server.go handleCascadeRevocation)
+// authenticated nothing. Unlike Exchange/Refresh/Revoke, where a public client is
+// protected by PKCE and the code/refresh binding, here the caller's identity IS
+// the check, so a non-confidential client must be refused.
+func TestAuthenticateClientRejectsPublicClient(t *testing.T) {
+	svc, clients, _, _, _ := newTestAS(t)
+	registerClient(t, clients, "public", ClientPublic, "", []Scope{ScopeAccountID})
+	registerClient(t, clients, "conf", ClientConfidential, "s3cret", []Scope{ScopeAccountID})
+	ctx := context.Background()
+
+	// Any secret — even the empty one — must be refused for a public client.
+	for _, secret := range []string{"", "anything", "s3cret"} {
+		err := svc.AuthenticateClient(ctx, "public", secret)
+		if err == nil {
+			t.Fatalf("AuthenticateClient(public, %q) succeeded; a public client cannot authenticate", secret)
+		}
+		if got := protocolCode(t, err); got != "invalid_client" {
+			t.Fatalf("AuthenticateClient(public, %q) code = %q, want invalid_client", secret, got)
+		}
+		t.Logf("public client with secret %q rejected: %v", secret, err)
+	}
+
+	// The confidential positive case must be preserved.
+	if err := svc.AuthenticateClient(ctx, "conf", "s3cret"); err != nil {
+		t.Fatalf("the correct confidential credentials were refused: %v", err)
+	}
+	// ...and its negative case.
+	err := svc.AuthenticateClient(ctx, "conf", "wrong")
+	if err == nil {
+		t.Fatal("a wrong secret for a confidential client was accepted")
+	}
+	if got := protocolCode(t, err); got != "invalid_client" {
+		t.Fatalf("confidential wrong-secret code = %q, want invalid_client", got)
+	}
+	// An unknown client is still invalid_client.
+	if err := svc.AuthenticateClient(ctx, "nobody", "s3cret"); err == nil {
+		t.Fatal("an unknown client was accepted")
+	} else if got := protocolCode(t, err); got != "invalid_client" {
+		t.Fatalf("unknown-client code = %q, want invalid_client", got)
+	}
+}
+

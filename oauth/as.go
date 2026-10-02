@@ -69,6 +69,13 @@ func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg C
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	// The memory store has no clock of its own, but its refresh tombstones carry a
+	// deadline the contract says they expire on. Hand it the same clock the
+	// service judges every other deadline with, so a defaulted clock and an
+	// injected one agree. Other Store implementations are left untouched.
+	if ms, ok := tokens.(*MemoryStore); ok {
+		ms.now = cfg.Now
+	}
 	return &service{
 		clients:      clients,
 		tokens:       tokens,
@@ -86,9 +93,25 @@ func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg C
 	}, nil
 }
 
+// AuthenticateClient checks that the caller is a registered, authenticating
+// client. It goes through client() — the same door Exchange/Refresh/Revoke use —
+// but then requires the client to actually authenticate: client() lets a public
+// client through with any secret because those endpoints bind authorization to
+// PKCE and the code/refresh record instead. That leniency is wrong here, where
+// the caller's identity IS the check (RFC 7662 introspection, upstreamkit's
+// cascade revocation). Accepting any secret for a ClientPublic made this gate
+// admit an unauthenticated caller: registration was the only requirement, and
+// "any registered public client" would pass a credential check it failed. A
+// public client is refused with invalid_client.
 func (s *service) AuthenticateClient(ctx context.Context, clientID, clientSecret string) error {
-	_, err := s.client(ctx, clientID, clientSecret, true)
-	return err
+	c, err := s.client(ctx, clientID, clientSecret, true)
+	if err != nil {
+		return err
+	}
+	if c.Type != ClientConfidential {
+		return protocolError("invalid_client", "public clients cannot authenticate")
+	}
+	return nil
 }
 
 // describe validates the parts of an authorization request that must hold
