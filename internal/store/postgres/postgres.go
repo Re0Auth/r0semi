@@ -377,7 +377,7 @@ func withMigrationLock(ctx context.Context, dsn string, connectTimeout time.Dura
 	fn func(context.Context, *sql.DB, *goose.Provider) error) error {
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return fmt.Errorf("postgres: migrate: open database/sql handle: %w", err)
+		return fmt.Errorf("postgres: migrate: open database/sql handle: %w", redactDSNParseError(err))
 	}
 	defer func() { _ = sqlDB.Close() }()
 
@@ -399,7 +399,7 @@ func withMigrationLock(ctx context.Context, dsn string, connectTimeout time.Dura
 	conn, err := sqlDB.Conn(connCtx)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("postgres: migrate: connect: %w", err)
+		return fmt.Errorf("postgres: migrate: connect: %w", redactDSNParseError(err))
 	}
 	defer func() { _ = conn.Close() }()
 

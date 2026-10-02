@@ -64,6 +64,50 @@ func TestMigrateDownRollsBackOneStep(t *testing.T) {
 	}
 }
 
+// TestMigrateDownDoesNotEchoTheDsnOnAParseFailure pins the redaction of the DSN
+// on the migration path's error text (S09-1 / Z19V-1).
+//
+// withMigrationLock is a second door into the driver's parser, separate from
+// poolConfig: sql.Open("pgx", dsn) re-parses the connection string, and the error
+// it returns is wrapped into a message that reaches stage=storage. A DSN pgconn
+// cannot redact by its own heuristics — userinfo with no '@', a keyword/value pair
+// missing its '=' — comes back verbatim, password included, unless the wrapping
+// site strips it. The three shapes below are the ones pgconn/errors.go documents
+// as "necessarily best effort".
+//
+// No database is needed: each DSN fails at parse time, so this runs on the
+// default build.
+func TestMigrateDownDoesNotEchoTheDsnOnAParseFailure(t *testing.T) {
+	// Unique to this test, so a failure says exactly which string leaked.
+	const pw = "migdown-canary-2f9c1b7a4d5e"
+
+	cases := []struct {
+		name string
+		dsn  string
+	}{
+		{"url-without-host", "postgres://migdownuser:" + pw},
+		{"userinfo-with-no-at", "migdownuser:" + pw},
+		{"keyword-value-missing-equals", "host=h password " + pw},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := MigrateDown(context.Background(), tc.dsn, DefaultPoolOptions())
+			if err == nil {
+				t.Fatalf("MigrateDown accepted an unparseable DSN")
+			}
+			// The error has to come from withMigrationLock, or the assertion
+			// below would be vacuous (some other layer might refuse first).
+			if !strings.Contains(err.Error(), "postgres: migrate") {
+				t.Fatalf("error did not travel through the migration path: %v", err)
+			}
+			if strings.Contains(err.Error(), pw) {
+				t.Errorf("the migration error echoes the DSN's password: %v", err)
+			}
+		})
+	}
+}
+
 // TestMigrateDownRefusesToDestroyTheAuditChain exercises, against a real
 // Postgres, the guard MigrateDown runs before provider.Down (Z21-2 / ADR-0008
 // §5). It drives the guard directly rather than through MigrateDown because the
