@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/Re0Auth/r0semi/oauth"
 )
 
 // G-10 (docs/issues/P2-medium.md): the device grant's poll resolves its client
@@ -145,6 +147,67 @@ func TestDeviceGrantPollRefusesUnusableSecretWithoutBurningTheCode(t *testing.T)
 	}
 	if tok, _ := body["access_token"].(string); tok == "" {
 		t.Fatalf("the recovery poll returned no access token: %v", body)
+	}
+}
+
+// TestDeviceAuthorizationAcceptsFormURLEncodedBasicSecret pins RFC 6749 §2.3.1
+// at the device authorization endpoint: the Basic credentials are
+// form-urlencoded before base64, so a compliant secret containing ' ', '+', '%'
+// or '&' reaches the server percent-encoded. The pre-flight decoded only the
+// username, hashed the still-escaped secret, and refused the client with a 401.
+func TestDeviceAuthorizationAcceptsFormURLEncodedBasicSecret(t *testing.T) {
+	f := newFixture(t)
+
+	// A literal secret whose characters all have a form-urlencoded form: '+' and
+	// '%' both force an escape, so an undecoded comparison cannot accidentally
+	// match.
+	const secret = "pass+word%end"
+	id := "http-encsec-" + randSuffix()
+	client, err := oauth.NewClient(id, "Encoded Secret", oauth.ClientConfidential, secret,
+		[]string{"https://client.example/cb"}, []oauth.Scope{oauth.ScopeAccountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.handler.clients.Create(context.Background(), client); err != nil {
+		t.Fatal(err)
+	}
+
+	deviceAuthz := func(basicID, basicSecret string) (int, map[string]any) {
+		t.Helper()
+		form := url.Values{"scope": {"account.id"}}
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+"/oauth/device_authorization",
+			strings.NewReader(form.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.SetBasicAuth(basicID, basicSecret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var out map[string]any
+		_ = json.Unmarshal(raw, &out)
+		return resp.StatusCode, out
+	}
+
+	// The compliant client: both halves percent-encoded, exactly as §2.3.1
+	// describes.
+	status, body := deviceAuthz(url.QueryEscape(id), url.QueryEscape(secret))
+	if status != http.StatusOK {
+		t.Fatalf("the form-urlencoded Basic secret was refused: %d %v", status, body)
+	}
+	if code, _ := body["device_code"].(string); code == "" {
+		t.Fatalf("accepted device_authorization returned no device_code: %v", body)
+	}
+
+	// Control: the same client with the secret left unencoded is NOT its secret.
+	// The fix decodes the pair; it does not stop checking it.
+	status, body = deviceAuthz(url.QueryEscape(id), secret)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("an unencoded Basic secret = %d %v, want 401", status, body)
 	}
 }
 

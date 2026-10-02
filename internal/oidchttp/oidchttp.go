@@ -1213,6 +1213,23 @@ func (h *Handler) validateDeviceAuthorization(w http.ResponseWriter, r *http.Req
 			return true
 		}
 		basicID = decoded
+		// RFC 6749 §2.3.1 says both halves of the Basic credentials are
+		// form-urlencoded first, then base64'd, so a compliant secret carrying
+		// ' ', '+', '%' or '&' arrives percent-encoded. The library decodes
+		// BOTH halves (pkg/op/client.go ClientBasicAuth); decoding only the
+		// username sent the still-escaped secret to Authenticate, whose SHA-256
+		// comparison then failed and refused a conformant client with a 401.
+		// Decode the secret here too, and reject a malformed pair the same way
+		// as a malformed username. The client_secret_post branch below is NOT
+		// decoded: ParseForm already unescaped the body, so a second pass would
+		// corrupt a secret that legitimately contains '%'.
+		decodedSecret, err := url.QueryUnescape(basicSecret)
+		if err != nil {
+			writeOAuthJSONError(w, http.StatusUnauthorized, "invalid_client",
+				"malformed client credentials")
+			return true
+		}
+		basicSecret = decodedSecret
 	}
 	if hasBasic && formClientID != "" && formClientID != basicID {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request",
