@@ -12,6 +12,13 @@ import (
 	"github.com/Re0Auth/r0semi/vault"
 )
 
+// maxInFlightStates caps the number of concurrently pending OAuth
+// authorization states a SocialLogin will hold. The start route is
+// unauthenticated by design, so without a cap the states map grows with the
+// request rate times StateTTL and every start pays an O(n) sweep. Reaching the
+// cap is a capacity signal, not an error in the caller's request.
+const maxInFlightStates = 4096
+
 // SocialConfig tunes the source's OAuth social login.
 type SocialConfig struct {
 	// Now injects a clock. Defaults to time.Now.
@@ -101,6 +108,11 @@ func (l *SocialLogin) handleStart(w http.ResponseWriter, r *http.Request) {
 
 	l.mu.Lock()
 	l.sweepLocked()
+	if len(l.states) >= maxInFlightStates {
+		l.mu.Unlock()
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "too_many_pending_authorizations"})
+		return
+	}
 	l.states[state] = socialState{
 		provider:  provider,
 		verifier:  verifier,

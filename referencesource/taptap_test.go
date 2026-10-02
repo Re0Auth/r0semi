@@ -3,6 +3,7 @@ package referencesource_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -312,4 +313,72 @@ func bindWithBrowser(t *testing.T, fed federation.Service, browser *http.Client)
 func replyJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// offlineEnroller is a device-authorization enroller that never touches the
+// network: every Start succeeds with a long-lived pending authorization.
+type offlineEnroller struct{}
+
+func (offlineEnroller) Start(context.Context) (taptapoauth.DeviceAuth, error) {
+	return taptapoauth.DeviceAuth{
+		DeviceID:        "device-1",
+		DeviceCode:      "dc-1",
+		UserCode:        "uc-1",
+		VerificationURL: "https://taptap.example/approve",
+		Interval:        time.Second,
+		ExpiresAt:       time.Now().Add(time.Hour),
+	}, nil
+}
+
+func (offlineEnroller) Poll(context.Context, taptapoauth.DeviceAuth) (tapsign.TapTapToken, error) {
+	return tapsign.TapTapToken{}, errors.New("not approved")
+}
+
+// offlineRedeem satisfies tapsign.Service; the flood test never reaches it.
+type offlineRedeem struct{}
+
+func (offlineRedeem) Verify(context.Context, tapsign.Credential) error { return nil }
+func (offlineRedeem) Rotate(context.Context, tapsign.Credential) (tapsign.Credential, error) {
+	return tapsign.Credential{}, nil
+}
+func (offlineRedeem) Revoke(context.Context, tapsign.Credential) error { return nil }
+func (offlineRedeem) Redeem(context.Context, tapsign.TapTapToken) (tapsign.Credential, error) {
+	return tapsign.Credential{}, nil
+}
+
+// TestS06_5TapTapChallengeFloodIsCapped floods the unauthenticated challenge
+// route with an offline enroller. On the unfixed code all 4096 requests return
+// 200 and the attempts map holds 4096 entries; once capped, the tail is refused
+// with 429 rather than being admitted.
+func TestS06_5TapTapChallengeFloodIsCapped(t *testing.T) {
+	login, err := referencesource.NewTapTapLogin(
+		referencesource.TapTapConfig{},
+		referencesource.TapTapDeps{Enroller: offlineEnroller{}, Redeem: offlineRedeem{}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	login.Mount(mux, func(context.Context, referencesource.Principal) error { return nil })
+
+	const challenges = 4096
+	refused := 0
+	for i := 0; i < challenges; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/login/taptap/challenge", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		switch rec.Code {
+		case http.StatusOK:
+		case http.StatusTooManyRequests:
+			if rec.Header().Get("Retry-After") == "" {
+				t.Fatalf("challenge %d = 429 without Retry-After", i)
+			}
+			refused++
+		default:
+			t.Fatalf("challenge %d = %d, want 200 or 429: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if refused == 0 {
+		t.Fatalf("%d challenges all returned 200: the pending-attempt map is unbounded", challenges)
+	}
 }

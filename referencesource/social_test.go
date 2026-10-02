@@ -161,6 +161,41 @@ func TestSocialLoginRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
+// TestSocialLoginStatesAreBounded floods the unauthenticated start route and
+// requires the pending-state map to stop growing. On the unfixed code all 5000
+// starts redirect (302) and the map holds 5000 entries; once capped, the tail
+// of the flood is refused with 503 rather than being admitted.
+func TestSocialLoginStatesAreBounded(t *testing.T) {
+	provider := testoidc.New()
+	defer provider.Close()
+	_, srv, _ := socialSource(t, provider)
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	const starts = 5000
+	refused := 0
+	for i := 0; i < starts; i++ {
+		resp, err := client.Get(srv.URL + "/login/google/start?return_to=/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := resp.StatusCode
+		resp.Body.Close()
+		switch code {
+		case http.StatusFound:
+		case http.StatusServiceUnavailable:
+			refused++
+		default:
+			t.Fatalf("start %d = %d, want 302 or 503", i, code)
+		}
+	}
+	if refused == 0 {
+		t.Fatalf("%d starts all issued a redirect: the pending-state map is unbounded", starts)
+	}
+}
+
 // socialCallback drives the provider callback and returns the confirmed subject.
 func socialCallback(t *testing.T, browser *http.Client, baseURL, state, code string) string {
 	t.Helper()

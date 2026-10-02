@@ -17,6 +17,17 @@ import (
 	"github.com/Re0Auth/r0semi/vault"
 )
 
+// maxTapTapAttempts caps the number of concurrently pending device
+// authorizations a TapTapLogin will hold. The challenge route is
+// unauthenticated by design, so without a cap the attempts map grows with the
+// request rate times the device-code lifetime and every challenge pays an O(n)
+// sweep.
+const maxTapTapAttempts = 1024
+
+// errTooManyAttempts reports that the pending-attempt cap is reached. It is a
+// capacity signal, not an upstream failure.
+var errTooManyAttempts = errors.New("referencesource: too many pending login attempts")
+
 // TapTapConfig tunes the source's TapTap login.
 type TapTapConfig struct {
 	// Provider is recorded in audit events. Defaults to "taptap".
@@ -123,6 +134,10 @@ func (l *TapTapLogin) begin(ctx context.Context) (LoginChallenge, error) {
 
 	l.mu.Lock()
 	l.sweepLocked()
+	if len(l.attempts) >= maxTapTapAttempts {
+		l.mu.Unlock()
+		return LoginChallenge{}, errTooManyAttempts
+	}
 	l.attempts[id] = &attempt{auth: auth, nextPoll: l.now()}
 	l.mu.Unlock()
 
@@ -209,7 +224,14 @@ func (l *TapTapLogin) poll(ctx context.Context, id string, establish Establish) 
 
 func (l *TapTapLogin) handleChallenge(w http.ResponseWriter, r *http.Request) {
 	challenge, err := l.begin(r.Context())
-	if err != nil {
+	switch {
+	case errors.Is(err, errTooManyAttempts):
+		// Capacity, not an upstream fault: tell the caller to back off rather
+		// than reporting a bad gateway.
+		w.Header().Set("Retry-After", "30")
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too_many_pending_login_attempts"})
+		return
+	case err != nil:
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream_unavailable"})
 		return
 	}
