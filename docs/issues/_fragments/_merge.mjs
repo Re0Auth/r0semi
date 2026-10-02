@@ -7,15 +7,24 @@
 // It is idempotent: re-running rebuilds the four files from the fragments.
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const out = join(here, '..');
+const root = join(out, '..', '..');
+let head = 'unknown';
+try {
+  head = execSync('git rev-parse --short HEAD', { cwd: root }).toString().trim();
+} catch { /* not a git checkout: keep the placeholder */ }
 
-// Highest priority first: the later the round, the more authoritative its severity
-// (round 7 carries the adversarial-verification verdicts).
+// Highest priority first: the later the round, the more authoritative its severity.
+// Round 9 is an independent audit of HEAD after rc.4 and carries the current
+// fix ledger (992710b), so it outranks every earlier round.
 const FRAGMENTS = [
+  { file: 'round9.md',     round: 9, prio: -1 },
+  { file: 'conformance.md', round: 9, prio: -2 },
   { file: 'round7.md',     round: 7, prio: 0 },
   { file: 'round6.md',     round: 6, prio: 1 },
   { file: 'round5.md',     round: 5, prio: 2 },
@@ -30,6 +39,14 @@ const ALIAS = new Map(Object.entries({
   'Z18v-2': 'Z14-4',                            // provider TTL on failed discovery
   'Z19V-1': 'Z19-1',                            // value pasted into a *_env name slot
   'A-FE-5': 'P2-20',                            // pnpm audit gate
+  // Round 9's own §5 de-duplication (the report recommends one row per root cause):
+  'S05-2': 'S14-2',                             // CompleteBind per-binding lock
+  'S04-1': 'S01-1',                             // approved device_code is never consumed
+  'S04-3': 'S01-2', 'S14-8': 'S01-2', 'S13-10': 'S01-2',  // MemoryDeviceStore/oauth store has no bound
+  'S13-3': 'S13-2', 'S14-1': 'S13-2', 'S14-6': 'S13-2', 'S14-7': 'S13-2', // full scan under the store mutex
+  'S14-9': 'S10-2',                             // readiness probe panic latch
+  'S14-10': 'S04-8',                            // Registry.Register unsynchronised map write
+  'S11-5': 'S11-3',                             // Kill Switch client target aborts early
 }));
 
 const canonical = (id) => ALIAS.get(id) ?? id;
@@ -101,7 +118,9 @@ for (const f of FRAGMENTS) {
 }
 
 // Round 6 called G-1/G-2/G-3 its blocking three; round 7 reproduced all of them red.
-const P0_IDS = new Set(['G-1', 'G-2', 'G-3']);
+// Round 9 independently named six of its eight Highs "go-live blockers" (§7 step 1);
+// the other two Highs (S03-1, S13-5) were conditional P0/P1 and stay P1 here.
+const P0_IDS = new Set(['G-1', 'G-2', 'G-3', 'S02-1', 'S08-2', 'S10-1', 'S13-1', 'S14-2', 'S06-1']);
 
 const p0 = blocks.filter((b) => P0_IDS.has(b.id));
 const p1 = blocks.filter((b) => !P0_IDS.has(b.id));
@@ -114,7 +133,7 @@ function header(title, blurb, count, extra = '') {
   return `# ${title}
 
 > ${blurb}
-> **条目数：${count}** ｜ 由 \`_fragments/_merge.mjs\` 从各轮抽取结果生成（${now}）。
+> **条目数：${count}** ｜ 由 \`_fragments/_merge.mjs\` 从各轮抽取结果生成（${now}，HEAD \`${head}\`）。
 > 严重度取**对抗性复核后的裁定**；同一机制多编号者已合并，别名写在 ID 列。
 ${extra}
 `;
@@ -127,28 +146,31 @@ function writeBlockFile(name, title, blurb, items, extra = '') {
 }
 
 function writeTableFile(name, title, blurb, items, extra = '') {
+  // Re-escape pipes inside cells: parseRows un-escapes them, so emitting them raw
+  // would split the row into extra columns (this had silently corrupted N-04 and
+  // Z15-2 in the generated files).
+  const cell = (c) => String(c ?? '').replace(/\|/g, '\\|');
   const table = ['| ID | 严重度 | 问题 | 位置 | 状态 | 修法要点 |', '|---|---|---|---|---|---|']
-    .concat(items.map((r) => `| ${r.cells.join(' | ')} |`)).join('\n');
+    .concat(items.map((r) => `| ${r.cells.map(cell).join(' | ')} |`)).join('\n');
   writeFileSync(join(out, name), header(title, blurb, items.length, extra) + '\n' + table + '\n', 'utf8');
 }
 
 writeBlockFile('P0-blockers.md', 'P0 · 阻断上线（BLOCKERS）',
-  '不修就不能上线。每一条都在 `HEAD = bf81b2a` 上由第七轮独立复跑/读码确认为**仍然存在**。',
+  '不修就不能上线。G-1/G-2/G-3 由第七轮在 HEAD 上复跑确认；S02-1/S06-1/S08-2/S10-1/S13-1/S14-2 由第九轮独立审计命名（§7 第 1 步），并在 `992710b` 收口。',
   p0.map((b) => ({
     ...b,
     body: b.body.map((l) => /^-\s*\*\*严重度\*\*/.test(l.trim())
-      // The rounds that found these called them "P1 · 阻断". This register sorts by
+      // Earlier rounds called their three "P1 · 阻断". This register sorts by
       // "does it block go-live", so they live in P0 — say both, so nobody is confused
       // when they trace an entry back to the round-6 report.
       ? '- **严重度**：P0 · 阻断（原文记为「P1 · 阻断」；本寄存器按「是否阻断上线」归入 P0）'
       : l),
   })),
   `
-> **为什么只有三条**：第七轮**没有**新发现 P0。这三条是第六轮认定「阻断上线」的三项
-> （refresh 重放不止损、Postgres 不裁决 refresh 过期、数据库故障时撤销答 200），
-> 第七轮用同一批探针在 HEAD 上重跑，**红探针无一转绿**；主代理另逐行核过机制
-> （见 \`docs/audit-7/findings/00-MAIN-VERIFICATION.md\` 的 V-01/V-02/V-10）。
-> 它们被放在 P0 而不是 P1，是因为它们决定「能不能上线」，而不是「影响有多大」。
+> **当前状态（HEAD \`${head}\`）：这 9 条全部 \`FIXED\`，没有未修 P0。**
+> G-1/G-2/G-3 由第六轮认定、\`79d7333\` 收口；S02-1/S06-1/S08-2/S10-1/S13-1/S14-2 是第九轮
+> 独立审计在 rc.4 之后重新发现的 8 条 High 中的 6 条，由 \`992710b\` 收口。保留在册只为溯源；
+> 是否仍有残余，以每条的状态与 \`docs/issues/README.md\` 的统计为准。
 `);
 
 writeBlockFile('P1-high.md', 'P1 · 高（HIGH）',
@@ -158,6 +180,11 @@ writeBlockFile('P1-high.md', 'P1 · 高（HIGH）',
 > 其中 \`Z11-1\`/\`Z11-4\`/\`Z11-5\`/\`Z11-V1\` 是**匿名单机**可触发的跨用户可用性缺陷
 > ——按本项目口径（「匿名可触发的 DoS」）它们处在 P1 的上沿；
 > 若按上线门槛衡量，可与 P0 一起排期。
+>
+> **第九轮补充**：\`S03-1\`（return_to 无界）与 \`S13-5\`（内存存储无界）是第九轮 8 条 High 中
+> 未被列为"上线阻断"的两条（部署形态相关），同样已在 \`992710b\` 收口。
+> 当前 HEAD 上**没有未修的 P0/P1**；第 9 轮判为"上线前应先修"的 13 条 Medium 见
+> [\`P2-triage.md\`](P2-triage.md) 的「T0 组」。
 `);
 
 writeTableFile('P2-medium.md', 'P2 · 中（MEDIUM）',
@@ -221,4 +248,29 @@ if (nd.includes(MARK_A)) {
 }
 writeFileSync(ndPath, nd, 'utf8');
 
-console.log(JSON.stringify({ ...counts, fixed: fixedLines.length, decided: decidedLines.length }));
+// --- current-state counts (open vs closed), written next to the fragments so the
+// README can quote a number that is regenerated rather than hand-maintained. ---
+const blockOpen = (b) => {
+  const line = b.body.find((l) => /^-\s*\*\*状态\*\*/.test(l.trim()));
+  return line ? !/FIXED/.test(line) : true;
+};
+const rowOpen = (r) => !/FIXED/.test(r.cells[4] ?? '');
+const open = {
+  P0: p0.filter(blockOpen).length,
+  P1: p1.filter(blockOpen).length,
+  P2: p2.filter(rowOpen).length,
+  P3: p3.filter(rowOpen).length,
+};
+const byRound = {};
+for (const [sev, items] of [['P0', p0], ['P1', p1], ['P2', p2], ['P3', p3]]) {
+  for (const it of items) {
+    const r = it.round;
+    byRound[r] ??= { total: 0, open: 0 };
+    byRound[r].total += 1;
+    if (sev === 'P0' || sev === 'P1' ? blockOpen(it) : rowOpen(it)) byRound[r].open += 1;
+  }
+}
+const summary = { generated: now, head, total: counts, open, byRound };
+writeFileSync(join(here, '_counts.json'), JSON.stringify(summary, null, 2) + '\n', 'utf8');
+
+console.log(JSON.stringify({ ...counts, open, fixed: fixedLines.length, decided: decidedLines.length }));

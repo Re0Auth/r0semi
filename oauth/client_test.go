@@ -86,6 +86,33 @@ func TestRestoreClientDoesNotRevalidateRedirectURIs(t *testing.T) {
 	}
 }
 
+// KIT-6: a row an older policy admitted is still not usable as a redirect.
+// RestoreClient keeps the URI — a tightened registration rule must not turn into
+// a deployment that cannot start — but nothing may be redirected to a scheme a
+// document interpreter runs, and the authorize path has no second check of its
+// own.
+func TestARestoredForbiddenSchemeRedirectIsNeverUsable(t *testing.T) {
+	c, err := RestoreClient("cli", "App", ClientPublic, nil,
+		[]string{"javascript:alert(1)", "data:text/html,<script>1</script>", "https://app.example/cb"},
+		nil, time.Unix(0, 0).UTC())
+	if err != nil {
+		t.Fatalf("RestoreClient rejected a stored redirect URI: %v", err)
+	}
+	for _, bad := range []string{"javascript:alert(1)", "data:text/html,<script>1</script>"} {
+		if c.AllowsRedirect(bad) {
+			t.Errorf("AllowsRedirect(%q) = true: a forbidden scheme is never a redirect target", bad)
+		}
+		if got := c.RegisteredRedirect(bad); got != "" {
+			t.Errorf("RegisteredRedirect(%q) = %q, want \"\"", bad, got)
+		}
+	}
+	// The usable entry is unaffected: this is a scheme check, not a refusal of
+	// restored clients.
+	if !c.AllowsRedirect("https://app.example/cb") {
+		t.Error("the https entry stopped working")
+	}
+}
+
 // RegisteredRedirect is the value half of AllowsRedirect, and the difference is
 // the point: a caller that redirects must send the URI the client registered, not
 // the string the request carried. The two are equal whenever the check passes, so

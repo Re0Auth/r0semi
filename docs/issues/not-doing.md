@@ -11,11 +11,13 @@
 
 | 事项 | 依据 |
 |---|---|
-| 不做 **DPoP** | `docs/oidc-decision.md`（O-1…O-9） |
+| 不做 **DPoP** | `docs/oidc-decision.md`（O-1…O-10） |
 | 不做 **`end_session`**（RP-Initiated Logout） | 同上 |
 | 不做 **PAR**（Pushed Authorization Requests） | 同上 |
 | 不做**动态客户端注册**（DCR） | 同上 |
 | 不做 **Session Management**（`check_session_iframe`） | 同上 |
+| **`id_token` 里的非标准 `client_id` 声明保持现状**（第九轮 O-10）：值是 RP 自己请求的 `client_id`，不泄漏新信息，OIDC Core 不禁止多余声明；OIDF Basic OP 的 WARNING 属**已知且接受**的差异，不是待修项 | `docs/oidc-decision.md`（O-10）、`CHANGELOG.md` |
+| 第九轮判为**信息级**、复核不再升档的条目（`S06-11` 等） | `P3-low.md` 中标 `[info]` 的行；`docs/security-audit-9.md` §4 |
 | **协议面不发任何 CORS 头** —— 这是有意的 | `docs/cors-decision.md` |
 | 不接 **KMS/HSM**：KEK 来自环境变量 | `docs/dependencies.md` §3、`docs/operations.md` |
 | `internal/core` 的 DI **不接入生产组合根** | `docs/core-runtime-decision.md` |
@@ -54,6 +56,8 @@
 | 第五轮 `P-02`（设备批准入口不查 `ExplicitConsent`） | **被第七轮反驳**：`DecideDeviceAuthorization` 确实执行 `RequireExplicitConsent`，且早于第六轮 HEAD |
 | 第五轮 `P-01` 的**影响面**（转义拼写绕过内省守卫） | 机制成立，但**什么也拿不到**（出口改写生效）⇒ 影响段被夸大 |
 | `docs/source-onboarding.md:225` 的"指数退避重试" | 是**文档写错**，不是实现缺陷（`FO-05`） |
+| 第九轮 §5 列出的同根编号（`S05-2`、`S04-1`、`S04-3`、`S13-3`、`S14-1`、`S14-6`、`S14-7`、`S14-8`、`S14-9`、`S14-10`、`S11-5`、`S13-10`） | **不是独立缺陷**：已按第九轮 §5 合并进 canonical 行（见 `P2-medium.md`/`P3-low.md` 问题列的「§5 合并」注记）；再报一次按重复计 |
+| 第 9 轮与第 2–7 轮的**编号体系并存**（`Sxx-yy` vs `G-*`/`Z*`/`KIT-*`） | 同一机制可能有两个 ID；跨轮对应关系未做机械合并，**按机制不要按 ID 判重** |
 
 ## 四、判断（可以质疑，但请带论证）
 
@@ -72,10 +76,14 @@
 ## 五、各轮抽取到的裁定条目（生成区）
 
 <!-- BEGIN GENERATED: _fragments 的「有意不做 / 已裁定」 -->
-<!-- 以下由 _fragments/_merge.mjs 生成（2026-09-30）；改动请改片段或这里的手写章节，不要只改生成区。 -->
+<!-- 以下由 _fragments/_merge.mjs 生成（2026-10-02）；改动请改片段或这里的手写章节，不要只改生成区。 -->
 
 本次各轮抽取到的「有意不做 / 已裁定」条目（原文，未改写）：
 
+
+### 第 9 轮
+
+- `oidcc-server` 的 `client_id` WARNING —— 已知且接受的行为差异，见 `docs/oidc-decision.md` O-10 与 `not-doing.md`。
 
 ### 第 7 轮
 

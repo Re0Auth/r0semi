@@ -224,12 +224,15 @@ func TestV11ReadyzWithNoProbeIsAlwaysReady(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 12 · /.well-known/oauth-protected-resource on non-GET verbs
+// 12 · /.well-known/oauth-protected-resource on non-GET verbs (G-24, fixed)
 // ---------------------------------------------------------------------------
 
-// TestV12WellKnownVerbMatrixAsTheEdgeAnswersIt asks all three well-known
-// documents the same question and records the answer, so the claim's comparison
-// ("404 here, 405 for the other two") is measured rather than assumed.
+// TestV12WellKnownVerbMatrixAsTheEdgeAnswersIt was the G-24 probe. All three
+// well-known documents now answer an unlisted verb the same way: 405 with the
+// Allow header RFC 9110 §15.5.6 requires. Comparing the protected-resource
+// document against its two siblings is what makes this a guard rather than a
+// local assertion — the defect was exactly that the third one was wired
+// differently.
 func TestV12WellKnownVerbMatrixAsTheEdgeAnswersIt(t *testing.T) {
 	srv, err := httpapi.New(vRealOPConfig(t))
 	if err != nil {
@@ -244,81 +247,26 @@ func TestV12WellKnownVerbMatrixAsTheEdgeAnswersIt(t *testing.T) {
 	}
 	verbs := []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions}
 
-	answers := map[string]map[string]int{}
-	for _, p := range paths {
-		answers[p] = map[string]int{}
-		for _, v := range verbs {
-			rec := vEdgeGet(t, h, v, p)
-			answers[p][v] = rec.Code
-			t.Logf("%-7s %-48s -> %d  Allow=%q  Content-Type=%q",
-				v, p, rec.Code, rec.Header().Get("Allow"), rec.Header().Get("Content-Type"))
-		}
-	}
-
-	// The claim's comparison.
-	var divergent []string
-	for _, v := range verbs {
-		pr := answers["/.well-known/oauth-protected-resource"][v]
-		other := answers["/.well-known/openid-configuration"][v]
-		if pr != other {
-			divergent = append(divergent, v)
-		}
-	}
-	if len(divergent) == 0 {
-		t.Logf("FALSIFIED: all three documents answer the same code for every verb")
-	} else {
-		t.Errorf("CONFIRMED (verb half): /.well-known/oauth-protected-resource diverges from the OIDC "+
-			"document on %v — protected-resource=%d, openid-configuration=%d. The mechanism is the ROUTE "+
-			"REGISTRATION, not the shared method table: server.go:519-522 registers the other two with "+
-			"`root.Handle(\"GET /.well-known/...\")` and this one with "+
-			"`root.HandleFunc(\"GET /.well-known/oauth-protected-resource\", ...)`, so a wrong verb falls "+
-			"through to `root.Handle(\"/.well-known/\", s.oidc)` and the OP answers the catch-all's "+
-			"\"unknown OAuth endpoint\" 404 for a URL it does serve. Both are valid OAuth JSON, so the "+
-			"divergence is status-code only.",
-			divergent,
-			answers["/.well-known/oauth-protected-resource"][divergent[0]],
-			answers["/.well-known/openid-configuration"][divergent[0]])
-	}
-
-	// The Allow half, measured for every document and verb.
-	var missingAllow []string
 	for _, p := range paths {
 		for _, v := range verbs {
 			rec := vEdgeGet(t, h, v, p)
-			if (rec.Code == http.StatusMethodNotAllowed || rec.Code == http.StatusNotFound) &&
-				rec.Header().Get("Allow") == "" {
-				missingAllow = append(missingAllow, v+" "+p+" ("+itoa(rec.Code)+")")
+			allow := rec.Header().Get("Allow")
+			t.Logf("%-7s %-48s -> %d  Allow=%q", v, p, rec.Code, allow)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("%s %s = %d, want 405: an unlisted verb on a document this server serves is "+
+					"refused, not routed to the /.well-known/ catch-all's 404 (G-24)", v, p, rec.Code)
+			}
+			if allow != "GET, HEAD" {
+				t.Errorf("%s %s: Allow=%q, want %q — a 405 must name what the endpoint accepts "+
+					"(RFC 9110 §15.5.6)", v, p, allow, "GET, HEAD")
 			}
 		}
 	}
-	if len(missingAllow) == 0 {
-		t.Logf("FALSIFIED (Allow half): every refusal carries an Allow header")
-		return
-	}
-	t.Errorf("CONFIRMED (Allow half, wider than claimed): %d refusals carry no Allow header at all — "+
-		"%v. RFC 9110 §15.5.6 requires Allow on a 405, and RFC 9110 §15.5.5 says a 404 SHOULD NOT carry "+
-		"one but a 405 MUST; the project's own writer (writeOAuthJSONError) never sets it either, so this "+
-		"is not special to the protected-resource document",
-		len(missingAllow), missingAllow)
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [8]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}
-
-// TestV12ProtectedResourceWrongVerbShape records exactly what the response IS,
-// including the Allow header the claim says is missing, so the report can state
-// the shape instead of a guess.
+// TestV12ProtectedResourceWrongVerbShape pins the exact shape of the response
+// the finding was about: 405 in the protocol plane's error format, with Allow,
+// rather than a 404 for a URL this server does serve.
 func TestV12ProtectedResourceWrongVerbShape(t *testing.T) {
 	srv, err := httpapi.New(vRealOPConfig(t))
 	if err != nil {
@@ -332,16 +280,12 @@ func TestV12ProtectedResourceWrongVerbShape(t *testing.T) {
 	t.Logf("POST %s = %d Allow=%q Content-Type=%q Body=%q",
 		target, rec.Code, allow, rec.Header().Get("Content-Type"), rec.Body.String())
 
-	if rec.Code == http.StatusMethodNotAllowed {
-		if allow == "" {
-			t.Errorf("CONFIRMED (Allow half): the 405 carries no Allow header, which RFC 9110 §15.5.6 " +
-				"requires")
-			return
-		}
-		t.Logf("FALSIFIED (Allow half): the 405 does carry Allow=%q", allow)
-		return
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST %s = %d, want 405", target, rec.Code)
 	}
-	t.Errorf("CONFIRMED (verb half): POST %s = %d, not 405", target, rec.Code)
+	if allow != "GET, HEAD" {
+		t.Errorf("POST %s: Allow=%q, want %q", target, allow, "GET, HEAD")
+	}
 }
 
 // TestV12TheOtherTwoDocumentsDoAnswer405 is the claim's control, measured the

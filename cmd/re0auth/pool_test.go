@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -115,6 +116,32 @@ func TestResolvePoolRejectsUnparseableEnvironment(t *testing.T) {
 
 	if _, err := resolvePool(storageSection{}); err == nil {
 		t.Fatal("a non-numeric RE0AUTH_STORAGE_MAX_CONNS was accepted")
+	}
+}
+
+// Z12-9: the file path and the environment path must agree about what is out of
+// range. The TOML decoder hands the file's integer through as an int, so a value
+// past int32 used to be truncated silently (4294967296 read as 0, 4294967297 as
+// 1) while the environment path refused the same value — one setting, two
+// meanings. The values are built at run time so this also compiles on a 32-bit
+// target, where the case cannot arise at all.
+func TestResolvePoolRefusesAFileSizeOutsideInt32(t *testing.T) {
+	for _, n := range []int{int(1)<<40 + 1, int(1) << 40, -(int(1) << 40)} {
+		v := n
+		if _, err := resolvePool(storageSection{MaxConns: &v}); err == nil {
+			t.Errorf("resolvePool accepted storage.max_conns = %d; the environment path refuses that value", n)
+		}
+	}
+
+	// The largest representable size is not an out-of-range value: the check is a
+	// bound, not a narrowing for its own sake.
+	max := math.MaxInt32
+	got, err := resolvePool(storageSection{MaxConns: &max})
+	if err != nil {
+		t.Fatalf("resolvePool refused the largest representable pool size: %v", err)
+	}
+	if got.MaxConns != math.MaxInt32 {
+		t.Errorf("MaxConns = %d, want %d", got.MaxConns, math.MaxInt32)
 	}
 }
 

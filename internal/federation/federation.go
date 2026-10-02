@@ -159,8 +159,20 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 			s.RevocationEndpoint = issuer + "/oauth/revoke"
 		}
 		s.Issuer = issuer
-		if s.Status == "" {
+		// status shares token_class's shape and its failure mode: an unrecognised
+		// spelling is an operator's attempt at "out of service" that the rest of
+		// the package reads as "in service". Only the exact string "retired" is
+		// excluded by candidates(), so a typo keeps the source selectable and
+		// keeps it deciding another source's scope gate. Refuse it here, where
+		// token_class is refused, so the composition root and the published
+		// discovery document cannot disagree about the vocabulary.
+		switch s.Status {
+		case "":
 			s.Status = StatusActive
+		case StatusActive, StatusDegraded, StatusRetired:
+		default:
+			return nil, fmt.Errorf("federation: source %s: status %q must be %q, %q or %q",
+				k, s.Status, StatusActive, StatusDegraded, StatusRetired)
 		}
 		// token_class is the operator's honest declaration of what the source can
 		// do, and unbind.go reads it as "long_lived means cannot revoke per client,

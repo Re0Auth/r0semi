@@ -27,6 +27,24 @@
   拒绝：库的校验要求「请求 scope ⊆ 原始授权 scope」，而 O-6 从不把 `offline_access` 存进那份请求。
   现在它在 refresh 这条腿上被忽略，其余 scope 仍严格执行子集校验（refresh 不能借此放宽）。
 
+### 第 2–7 轮遗留的 8 条 P2（已全部收口）
+
+- **`sources[].status` 必须写在词表里（Z09-1）**：只接受 `active | degraded | retired`（空值即
+  `active`）。`Retired`、`retired `、`disabled` 之类此前被静默当作可服务源继续读取，并且仍然决定
+  **另一个源**的 scope 闸门；现在它们在 `NewRegistry` 被按名拒绝，启动即失败并指出字段与取值。
+  与 `token_class` 的既有校验同形。
+- **`oauth.ClientCredentials` 是一请求一身份（KIT-2，公共库行为变化）**：同时带 Basic 与
+  **不一致**的 `client_id` / `client_secret` 时不再"Basic 赢"，而是返回空凭据 —— 每个调用方都
+  按未认证处理；两处写法一致时照常放行。此前下游若按表单判身份会与 kit 不一致。
+- **禁用 scheme 的重定向永不生效（KIT-6）**：`javascript:` / `data:` / `vbscript:` / `file:` /
+  `blob:` / `about:` 即使存在于 registry（历史行；`RestoreClient` 仍不重校验，因此不会阻止启动）
+  也不再匹配任何请求，authorize 拒绝而不是照单重定向。
+- **`/.well-known/oauth-protected-resource` 的未列动词现在答 405 + `Allow`（G-24）**：与另两份
+  well-known 文档同形（此前答 404，且三份 405 都不带 `Allow`，违反 RFC 9110 §15.5.6）。
+- 非行为面：`storage.max_conns` / `min_conns` 的文件与 env 两条路径对 int32 越界值判据一致
+  （Z12-9，真库池大小由 CI 的 postgres:16 作业守卫）；CI 的 `load` 作业读自己的输出（Z16-1）；
+  `probes` 作业编译全部 tag 探针（Z16-3）；前端依赖审计门早已是 `--audit-level low`（A-FE-5）。
+
 ### 配置与运维影响
 
 - **`storage.dsn_env` 现在总是被解析**（S08-2）。此前 driver 由 `dsn_env` 推断为 postgres 时并不读该

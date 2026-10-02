@@ -1,10 +1,19 @@
 # 已修复（仅供溯源）
 
 > **这里不是待办。** 保留它只为了回答"这条当初为什么存在、后来被哪个 commit 收掉"。
-> 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-09-30）。
+> 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-02）。
+
+### 第 9 轮
+
+- 第九轮 8 条 High + S02-2 — `992710b`（逐条修法与复现测试见 `docs/security-audit-9.md`「修复状态」）
+- S02-1 `prompt=login`/`max_age` 重认证、S02-2 `prompt=none` 有会话回 `consent_required`、S03-1 `return_to` 2048 字节上限、
 
 ### 第 7 轮
 
+- Z09-1 — `sources[].status` 在 `NewRegistry` 按 `active|degraded|retired` 词表校验，词表外值拒绝启动；恒红探针改写为守卫 — 本轮
+- Z16-1 — ci.yml 的 `load` 作业读自己的输出（`make load | tee load.txt` + `grep -q 'capacity profile:'`）；`TestZ16LoadJobIsGreenWithZeroMeasurement` 由红转绿 — 本轮
+- Z12-9 — 配置边界加 `math.MinInt32/MaxInt32` 范围检查（`poolSize()`）+ 真库池大小守卫 `TestOpenHonoursTheConfiguredPoolSize` — `55c64ab` + 本轮
+- Z16-3 — N-04 落地的 `probes` 作业已 `go vet -tags audit5,audit6,audit7 ./...`（全部 tag 文件一起编译）；残余仅是 lint 不带 tag — `4dff4a3`
 - KIT-1 — 匿名 cascade 现在回 401（`TestE1_`/`TestE3_`/`TestF3_` 转绿）。
 - KIT-3 — 暂停/删除客户端的令牌现在 `active=false` 且数据面 401（`TestA4_`/`TestA5_`/`TestE10_` 转绿）。
 - CS-4 — `token_class` 现在在 `federation.go:173-180` 白名单校验。
@@ -54,6 +63,7 @@
 
 ### 第 6 轮
 
+- G-24 — 三份 well-known 文档的动词闸门同形：405 + `Allow`（httpapi `onlyMethods`、oidchttp `methodNotAllowed`）；`TestZ06WellKnownVerbMatrixCoversEveryDocument` 由红转绿 — 本轮
 - （无）第 7 轮在 HEAD=`bf81b2a` 复跑第 6 轮全部红探针仍红，**第 6 轮无发现被修复**（`00-MAIN-VERIFICATION.md:20-66`）。
 - B-1 — 第五轮阻断项 id_token 缺必需 `sub`；第 6 轮实测已修（`_audit/protocol.md:206`）。
 - B-2 — id_token 可在 `/oauth/userinfo` 当 access token 用；第 6 轮实测已修（`_audit/protocol.md:207`）。
@@ -71,6 +81,9 @@
 
 ### 第 5 轮
 
+- KIT-2 — `oauth.ClientCredentials` 一请求一身份：Basic 与表单同时出现且不一致 ⇒ 空凭据（调用方按未认证处理），一致则照常 — 本轮
+- KIT-6 — `RegisteredRedirect` 对 `javascript:`/`data:` 等禁用 scheme 永不匹配；`RestoreClient` 仍不重校验，历史行不阻止启动 — 本轮
+- A-FE-5 / P2-20 — 前端依赖审计门降到 `--audit-level low` 并 ignore 已知不可达告警 — `c3c40a7`
 - P0-1 — `id_token` 两条签发路径补上 `sub` — `02dd448`
 - P0-2 — userinfo 拒绝三段式 JWS 形状 bearer、`SetUserinfoFromToken` 校验 tokenID — 同批 `02dd448`
 - P0-3 — 数据面内存按字节约束、重标 `max_in_flight` 并加 `GOMEMLIMIT` — `fb3cff3`

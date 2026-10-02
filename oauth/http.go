@@ -30,11 +30,28 @@ import (
 // client that never encoded is out of spec, and a secret containing a literal
 // `+` will read back as a space — that is the spec's ambiguity, not ours, and
 // encoding correctly is the client's side of it.
+//
+// # One request, one identity
+//
+// RFC 6749 §2.3.1 gives two ways to present the same credentials, not two
+// credentials. A request that carries a Basic header AND a disagreeing
+// `client_id` / `client_secret` pair has not stated a preference: it has stated
+// two clients, and whichever one a given server reads first is a difference no
+// client can see. This function used to let Basic win outright — matching the
+// library — while leaving the form fields intact for anything downstream that
+// reads them (the kit's own cascade, a resource server built from it). When both
+// are present and disagree, it now returns no credentials at all, which every
+// caller already treats as "unauthenticated".
 func ClientCredentials(r *http.Request) (id, secret string) {
+	formID, formSecret := r.PostFormValue("client_id"), r.PostFormValue("client_secret")
 	if u, p, ok := r.BasicAuth(); ok {
-		return unescapeForm(u), unescapeForm(p)
+		id, secret = unescapeForm(u), unescapeForm(p)
+		if (formID != "" && formID != id) || (formSecret != "" && formSecret != secret) {
+			return "", ""
+		}
+		return id, secret
 	}
-	return r.PostFormValue("client_id"), r.PostFormValue("client_secret")
+	return formID, formSecret
 }
 
 func unescapeForm(v string) string {

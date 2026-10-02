@@ -1,25 +1,26 @@
 //go:build audit7
 
-// Z09-1: `sources[].status` is never validated.
+// Z09-1 regression guard (round 7, fixed): `sources[].status` is validated at
+// the registry.
 //
-// `docs/upstream-protocol.md` §10 fixes the lifecycle vocabulary as
-// `active | degraded | retired`, and `federation.candidates` excludes a source by
-// comparing its status to the exact string "retired". Everything else — a
-// capitalised spelling, a trailing space, a synonym — falls through `statusRank`'s
-// `default:` branch to "worst rank, still selectable", so a source the operator
-// believes is out of service keeps answering reads (and keeps deciding the scope
-// gate, which is the other half of FO-V2).
+// The original defect: `docs/upstream-protocol.md` §10 fixes the lifecycle
+// vocabulary as `active | degraded | retired`, but `NewRegistry` only defaulted
+// an empty value and `statusRank`'s `default:` branch kept every other spelling
+// selectable. The only thing that retired a source was an exact string
+// comparison against "retired", so `Retired`, `retired ` or `disabled` kept
+// answering reads — and kept deciding another source's scope gate. `token_class`
+// had been validated at that same call since CS-4, for exactly this reason.
 //
-// The other operator declaration of the same kind, `token_class`, IS validated at
-// the registry — the CS-4 fix added exactly that check for exactly this reason
-// ("a typo like long_live would otherwise be silently read as revocable").
-// `status` is the value that check was not applied to.
+// This file used to assert the defect. It now asserts the fix, in the same
+// three shapes the finding named: the registry refuses a spelling outside the
+// vocabulary, it still accepts the four legal values, and a source that really
+// is `retired` is still never served.
 package zzprobe_z09federationdataplane
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Re0Auth/r0semi/internal/federation"
@@ -41,8 +42,8 @@ func zzStatusSource(t *testing.T, body string) *httptest.Server {
 	return s
 }
 
-// zzStatusRegistry builds a one-source registry whose only difference between
-// cases is the spelling of `status`.
+// zzStatusRegistry builds a one-source registry. It is only used with values
+// inside the vocabulary; the refusal cases call NewRegistry directly.
 func zzStatusRegistry(t *testing.T, up string, status federation.SourceStatus) *federation.Registry {
 	t.Helper()
 	reg, err := federation.NewRegistry(federation.Source{
@@ -53,27 +54,72 @@ func zzStatusRegistry(t *testing.T, up string, status federation.SourceStatus) *
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewRegistry refused status %q: %v", status, err)
+		t.Fatalf("NewRegistry refused the in-vocabulary status %q: %v", status, err)
 	}
 	return reg
 }
 
-func TestZ09StatusSpellingDecidesWhetherARetiredSourceStillServes(t *testing.T) {
-	cases := []struct {
-		name string
-		// status is what the operator wrote in the sources table.
-		status federation.SourceStatus
-		// wantServed is what docs/upstream-protocol.md §10 requires: only a value
-		// in the lifecycle vocabulary may be selected, and "retired" never may.
-		wantServed bool
-	}{
-		{"control: the exact spelling is out of service", federation.StatusRetired, false},
-		{"a capitalised spelling", federation.SourceStatus("Retired"), false},
-		{"a trailing space", federation.SourceStatus("retired "), false},
-		{"another word", federation.SourceStatus("disabled"), false},
-		{"control: an empty value is active and is served", federation.SourceStatus(""), true},
+// TestZ09StatusOutsideTheLifecycleVocabularyIsRefused: every spelling an
+// operator might reach for instead of the documented one is an error at the
+// registry, named as a status problem — not a source that quietly stays live.
+func TestZ09StatusOutsideTheLifecycleVocabularyIsRefused(t *testing.T) {
+	for _, s := range []federation.SourceStatus{
+		"Retired", "retired ", " RETIRED", "disabled", "off", "Active", "DEGRADED", "degraded ", "0",
+	} {
+		_, err := federation.NewRegistry(federation.Source{
+			Game: zzGame, Name: "src", Issuer: "https://src.example",
+			Status:    s,
+			Resources: []federation.Resource{{Name: "profile", Scope: zzProfileScope}},
+		})
+		if err == nil {
+			t.Errorf("NewRegistry accepted status %q. The vocabulary is active|degraded|retired "+
+				"(docs/upstream-protocol.md §10), and the rest of the package reads an unrecognised value "+
+				"as a selectable source that still decides the scope gate", s)
+			continue
+		}
+		if !strings.Contains(err.Error(), "status") || !strings.Contains(err.Error(), string(s)) {
+			t.Errorf("status %q was refused, but the error does not name the field and the value, which is "+
+				"what makes it fixable at startup: %v", s, err)
+		}
 	}
+}
 
+// TestZ09TheLifecycleVocabularyIsStillAccepted: the check is a gate on the
+// vocabulary, not a blanket refusal. An unset status is still active.
+func TestZ09TheLifecycleVocabularyIsStillAccepted(t *testing.T) {
+	for _, tc := range []struct {
+		in   federation.SourceStatus
+		want federation.SourceStatus
+	}{
+		{"", federation.StatusActive},
+		{federation.StatusActive, federation.StatusActive},
+		{federation.StatusDegraded, federation.StatusDegraded},
+		{federation.StatusRetired, federation.StatusRetired},
+	} {
+		reg := zzStatusRegistry(t, "https://src.example", tc.in)
+		got, ok := reg.Get(zzGame, "src")
+		if !ok {
+			t.Fatalf("status %q: the source is not in the registry", tc.in)
+		}
+		if got.Status != tc.want {
+			t.Errorf("status %q resolved to %q, want %q", tc.in, got.Status, tc.want)
+		}
+	}
+}
+
+// TestZ09ARetiredSourceIsStillNeverServed: the fix did not move where retiring
+// happens. A retired source is excluded from the candidate set (unpinned and
+// pinned), so the read is refused rather than answered by an upstream that the
+// operator believes is out of service.
+func TestZ09ARetiredSourceIsStillNeverServed(t *testing.T) {
+	cases := []struct {
+		name   string
+		status federation.SourceStatus
+		served bool
+	}{
+		{"an active source is served", federation.StatusActive, true},
+		{"a retired source is not served", federation.StatusRetired, false},
+	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			up := zzStatusSource(t, `{"served_by":"src"}`)
@@ -83,134 +129,15 @@ func TestZ09StatusSpellingDecidesWhetherARetiredSourceStillServes(t *testing.T) 
 			}, nil)
 			at := mint("usr_v", zzProfileScope)
 
-			// 1. unpinned: what a normal downstream read does.
 			code, hdr, body := zzGet(t, srv.Client(), srv.URL+"/v1/games/"+zzGame+"/profile", at)
-
-			// 2. pinned: `?source=` takes the other branch of candidates(), which
-			//    is where the retired check is written out a second time.
 			codePin, hdrPin, _ := zzGet(t, srv.Client(),
 				srv.URL+"/v1/games/"+zzGame+"/profile?source=src", at)
+			t.Logf("status=%q: unpinned=%d Re0Auth-Source=%q | pinned=%d Re0Auth-Source=%q | body=%s",
+				tc.status, code, hdr.Get("Re0Auth-Source"), codePin, hdrPin.Get("Re0Auth-Source"), body)
 
-			// 3. the public discovery document, which is supposed to publish the
-			//    lifecycle state from that fixed vocabulary.
-			_, _, srcBody := zzGet(t, srv.Client(), srv.URL+"/v1/sources", at)
-			var listing struct {
-				Data []struct {
-					Status string `json:"status"`
-				} `json:"data"`
-			}
-			if err := json.Unmarshal(srcBody, &listing); err != nil {
-				t.Fatalf("GET /v1/sources is not the documented shape: %v (%s)", err, srcBody)
-			}
-			published := ""
-			if len(listing.Data) > 0 {
-				published = listing.Data[0].Status
-			}
-
-			t.Logf("status=%q: unpinned=%d Re0Auth-Source=%q | pinned=%d Re0Auth-Source=%q | "+
-				"/v1/sources says status=%q | body=%s",
-				tc.status, code, hdr.Get("Re0Auth-Source"), codePin, hdrPin.Get("Re0Auth-Source"), published, body)
-
-			served := code == http.StatusOK
-			switch {
-			case served && !tc.wantServed:
-				t.Errorf("a source whose status is %q was SELECTED and served data (unpinned %d, pinned %d). "+
-					"docs/upstream-protocol.md §10 fixes the vocabulary as active|degraded|retired, and the only "+
-					"thing that retires a source is an exact string comparison (federation.go statusRank's default "+
-					"branch keeps an unrecognised value selectable). An operator who writes \"Retired\", \"retired \" "+
-					"or any synonym believes the source is out of service while it keeps answering reads and keeps "+
-					"deciding the scope gate", tc.status, code, codePin)
-			case !served && tc.wantServed:
-				t.Errorf("a source that IS in service (status %q) was not served (unpinned %d, pinned %d): the probe "+
-					"is not discriminating", tc.status, code, codePin)
-			}
-			if tc.status != "" && published != string(tc.status) {
-				t.Errorf("/v1/sources published status %q for a source configured with %q: the discovery document "+
-					"repeats whatever the operator wrote, including values outside the vocabulary", published, tc.status)
-			}
-			if tc.status == "" && published != string(federation.StatusActive) {
-				t.Errorf("/v1/sources published %q for an unset status; want %q", published, federation.StatusActive)
-			}
-		})
-	}
-}
-
-// The registry-side statement, without a server: NewRegistry accepts every
-// spelling. This is the direct comparison with the token_class check, which
-// refuses an unrecognised value at the same call.
-func TestZ09RegistryAcceptsAnyStatusSpelling(t *testing.T) {
-	for _, s := range []federation.SourceStatus{
-		"Retired", "retired ", " RETIRED", "disabled", "off", "Active", "DEGRADED", "degraded ",
-	} {
-		_, err := federation.NewRegistry(federation.Source{
-			Game: zzGame, Name: "src", Issuer: "https://src.example",
-			Status:    s,
-			Resources: []federation.Resource{{Name: "profile", Scope: zzProfileScope}},
-		})
-		if err != nil {
-			t.Logf("status %q was refused: %v", s, err)
-			continue
-		}
-		t.Errorf("NewRegistry accepted status %q. `token_class` is validated at this same call with the "+
-			"rationale that a typo must not be silently reinterpreted; `status` decides whether a source is "+
-			"out of service and is not", s)
-	}
-}
-
-// The other half of FO-V2, reached through the same defect: a retired source that
-// was spelled differently still participates in the scope gate, so retiring a
-// source silently changes what a token must hold to read a DIFFERENT source.
-//
-// This is the denial direction — the request is refused, not served — and it is
-// why "the gate excludes retired sources" is only true for one spelling.
-func TestZ09AMisspelledRetirementStillDecidesAnotherSourcesGate(t *testing.T) {
-	cases := []struct {
-		name   string
-		status federation.SourceStatus
-	}{
-		{"control: the exact spelling is excluded from the gate", federation.StatusRetired},
-		{"a capitalised spelling still decides the gate", federation.SourceStatus("Retired")},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// The source the user is NOT bound to declares the scope the token
-			// holds; the source the user IS bound to declares the other one. If the
-			// not-bound source is (correctly) out of the candidate set, the gate
-			// requires only the live source's scope and the read is served.
-			live := zzStatusSource(t, `{"served_by":"b-live"}`)
-			off := zzStatusSource(t, `{"served_by":"a-off"}`)
-			reg, err := federation.NewRegistry(
-				federation.Source{
-					Game: zzGame, Name: "a-off", DisplayName: "Off", Issuer: off.URL, Status: tc.status,
-					Resources: []federation.Resource{
-						{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.score.read"},
-					},
-				},
-				federation.Source{
-					Game: zzGame, Name: "b-live", DisplayName: "Live", Issuer: live.URL,
-					Resources: []federation.Resource{
-						{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: zzProfileScope},
-					},
-				},
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			srv, mint := zzHarness(t, reg, []zzBind{
-				{User: "usr_v", Game: zzGame, Source: "b-live", Access: "live-token"},
-			}, nil)
-			at := mint("usr_v", zzProfileScope)
-
-			code, hdr, body := zzGet(t, srv.Client(), srv.URL+"/v1/games/"+zzGame+"/profile", at)
-			t.Logf("status(a-off)=%q: %d Re0Auth-Source=%q body=%s", tc.status, code, hdr.Get("Re0Auth-Source"), body)
-
-			if code != http.StatusOK {
-				t.Errorf("a token holding the scope of the source that would actually serve (b-live: %q) was "+
-					"refused with %d, because a source spelled %q — an operator's attempt at %q — is still part of "+
-					"the requirement set. The requirement set named it (see the body), so a source the operator "+
-					"believes is out of service is deciding another source's authorization criterion. This is "+
-					"FO-V2's shape, and its fix (candidates() excluding retired sources) holds only for the exact "+
-					"spelling. Body: %s", zzProfileScope, code, tc.status, federation.StatusRetired, body)
+			if got := code == http.StatusOK; got != tc.served {
+				t.Errorf("status %q: served=%v (unpinned %d, pinned %d), want served=%v",
+					tc.status, got, code, codePin, tc.served)
 			}
 		})
 	}

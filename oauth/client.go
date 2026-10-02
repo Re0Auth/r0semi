@@ -190,12 +190,35 @@ func (c Client) AllowsRedirect(uri string) bool {
 // a reader (or a taint analyser, gosecurity:S5146) cannot tell an echoed request
 // value from an attacker-chosen destination by looking at the variable alone.
 func (c Client) RegisteredRedirect(uri string) string {
+	// A registered URI that targets a scheme no redirect may use never matches,
+	// even against itself. RestoreClient deliberately does not re-validate what
+	// an earlier policy admitted, so a registry can still carry such a row and
+	// the authorize path has no second check of its own (KIT-6). The test here is
+	// narrower than validRedirectURI on purpose: applying the registration rules
+	// retroactively would turn a tightened rule into a client that cannot use a
+	// URI it registered while they were in force, whereas a scheme a document
+	// interpreter executes is the case where "registered" must not mean "usable".
+	if forbiddenRedirectScheme(uri) {
+		return ""
+	}
 	for _, r := range c.RedirectURIs {
-		if r == uri {
+		if r == uri && !forbiddenRedirectScheme(r) {
 			return r
 		}
 	}
 	return ""
+}
+
+// forbiddenRedirectScheme reports whether raw targets a scheme a redirect must
+// never use. It parses the way validRedirectURI does, so the two agree about
+// which part of the string is the scheme; a URI that does not parse is treated
+// as forbidden because the caller is about to hand it to a browser.
+func forbiddenRedirectScheme(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return true
+	}
+	return forbiddenRedirectSchemes[strings.ToLower(u.Scheme)]
 }
 
 // forbiddenRedirectSchemes are schemes a redirect must never target. Each one

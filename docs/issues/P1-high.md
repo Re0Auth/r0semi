@@ -1,13 +1,44 @@
 # P1 · 高（HIGH）
 
 > 低门槛前提（一次登录、一个公开 client、一次匿名连接）即可扩大权限、读他人数据，或破坏生产稳定性。
-> **条目数：11** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-09-30）。
+> **条目数：13** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-02，HEAD `5940afe`）。
 > 严重度取**对抗性复核后的裁定**；同一机制多编号者已合并，别名写在 ID 列。
 
 > 其中 `Z11-1`/`Z11-4`/`Z11-5`/`Z11-V1` 是**匿名单机**可触发的跨用户可用性缺陷
 > ——按本项目口径（「匿名可触发的 DoS」）它们处在 P1 的上沿；
 > 若按上线门槛衡量，可与 P0 一起排期。
+>
+> **第九轮补充**：`S03-1`（return_to 无界）与 `S13-5`（内存存储无界）是第九轮 8 条 High 中
+> 未被列为"上线阻断"的两条（部署形态相关），同样已在 `992710b` 收口。
+> 当前 HEAD 上**没有未修的 P0/P1**；第 9 轮判为"上线前应先修"的 13 条 Medium 见
+> [`P2-triage.md`](P2-triage.md) 的「T0 组」。
 
+
+### S03-1 return_to 无长度上限且被整段写进服务端 session
+- **严重度**：P1 · 高（第九轮 High；原判 high，对抗性验证 confirmed）
+- **位置**：`internal/auth/auth.go:612; internal/auth/auth.go:616; internal/auth/auth.go:289; internal/safeurl/safeurl.go:34`
+- **影响**：`safeurl.RelativePath` 只校验形状、无字节上限；scs 在响应结束时重写整个 session，于是任意匿名 `GET /auth/{provider}/start` 可为每条请求持久化约 60 KiB 的攻击者选定字节。内存模式进程 RAM 无界增长，Postgres 模式 `sessions.data` 无界增长（SweepExpired 每 15 分钟最多删 1000 行，追不上 50/s 的到达率）。这与同文件对 handle 设的 128 字节上限（"session 整体重写，其字节不能由调用方决定"）自相矛盾。
+- **修法**：给 `return_to` 加 `maxReturnToBytes`（如 2048），超长即替换/拒绝，再写入 session。
+- **状态**：FIXED（992710b）
+- **证据**：`internal/safeurl.MaxRelativePathBytes`、`internal/auth/zz_audit9_returnto_test.go`；完整机制与验证备注见 `docs/security-audit-9.md` §1
+- **来源**：`docs/security-audit-9.md` §1（第九轮独立审计）
+- **首次记录**：第 9 轮
+
+
+---
+
+### S13-5 内存 OP 存储所有 map 无上限；refresh tombstone 每次轮换留一条、存活 30 天，且 5 分钟清扫持全局锁全表扫描
+- **严重度**：P1 · 高（第九轮 High；原判 high，对抗性验证 confirmed）
+- **位置**：`internal/store/memory/oidc.go:34; internal/store/memory/oidc.go:44; internal/store/memory/oidc.go:52; internal/store/memory/oidc.go:639; internal/store/memory/oidc.go:1153; internal/store/memory/oidc.go:1174; internal/store/memory/oidc.go:1180; internal/store/memory/oidc.go:1488`
+- **影响**：每次 refresh 轮换写一条以被消费令牌自身 30 天到期时间为期限的 tombstone，速率无 per-subject/进程上限。默认限流下可达 ~1.3e8 条、数 GB，OOM 或 GC 死亡；即便低速率，每 5 分钟的 `opJanitor` 也要持 `s.mu` 整表扫描，周期性冻结全部令牌操作。
+- **修法**：给 store 加总量/tombstone 上限（默认 65536），超出丢弃最旧；清扫尽量移出全局锁或分片。
+- **状态**：FIXED（992710b）
+- **证据**：`internal/store/memory/zz_audit9_tombstones_test.go`、`MaxRefreshTombstones`；完整机制与验证备注见 `docs/security-audit-9.md` §1
+- **来源**：`docs/security-audit-9.md` §1（第九轮独立审计）
+- **首次记录**：第 9 轮
+
+
+---
 
 ### Z07-2 抹除链最后一步失败时审计日志唯一记录谎报成功，500 文案却承诺「审计记录了失败的那一步」
 - **位置**：`internal/lifecycle/lifecycle.go:262`

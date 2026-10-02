@@ -77,7 +77,7 @@
 | Z08-8 | P3 | 账户页把 `?error=` 原始值插进 DOM（已转义、非 XSS），构成受长度限制的 UI 欺骗/钓鱼画布 | `web/src/routes/+page.svelte:63-84` | OPEN | `authErrorMessage` 的 `default` 分支改为固定文案（不回显 `code`），或仅白名单前缀映射；依据 `Z08-VERIFIED.md:24`、`Z08-VERIFIED.md:96-103` |
 | Z08V-1 | P3 | 「开放重定向面」的绿是假守卫：内存模式无 IdP，`/auth/{p}/start` 回 404、`/bind` 匿名回 401，探针永远到不了任何重定向 sink（产品无洞，是报告守卫无效） | `internal/zzprobe/audit7/z08frontendbrowser/realproc_test.go` | OPEN | 删掉该条「探过没破」，或用已配 provider 的全接线夹具走完 start→callback 再断言 `Location`；依据 `Z08-VERIFIED.md:25`、`Z08-VERIFIED.md:114-128` |
 | Z08V-2 | P3 | Z08-3 的「构建产物无 `version.json` 引用」是错的：产物 `chunks/DqohD3-m.js` 确实带 `fetch(.../_app/version.json)` 与版本比对逻辑（方向是低估风险） | `docs/audit-7/findings/Z08-frontend-browser.md:133` | OPEN | 更正该事实，并据此给 `_app/version.json` 明确缓存指令；依据 `Z08-VERIFIED.md:26`、`Z08-VERIFIED.md:130-136` |
-| Z09-1 | P2 | `sources[].status` 无词汇表闸门：任何拼写变体（`Retired`/`retired `/`disabled`）被静默当作可服务源继续读取，并继续决定**另一个源**的 scope 闸门 | `internal/federation/federation.go:53-62` | OPEN | 照 `token_class` 同形在 `NewRegistry` 加显式 switch、词表外值拒绝启动（拒绝 vs 归一化是裁定）；同时更正 CS-4 的假文档断言 | 
+| Z09-1 | P2 | `sources[].status` 无词汇表闸门：任何拼写变体（`Retired`/`retired `/`disabled`）被静默当作可服务源继续读取，并继续决定**另一个源**的 scope 闸门 | `internal/federation/federation.go:162-176` | FIXED（本轮） | `NewRegistry` 照 `token_class` 同形加显式 switch：空值→`active`，词表外值按名拒绝启动（拒绝而非归一化，与 token_class 的既有裁定一致）；恒红探针 `audit7/z09federationdataplane/status_test.go` 改写为守卫（拒词表外值 / 收四个合法值 / `retired` 仍不被服务） | 
 | Z09-4 | P2 | 缓冲预算全局先到先得、无 per-subject 分摊：15 个 raw 并发读（零字节或 ≥4 MiB body）即把其他用户的满额读 shed 成 503 | `internal/federation/service.go:108-113` | FIXED（6665193） | 三选一（裁定）：按调用方配额 / 按已读字节预留 / 首字节期限；并在 `MaxBufferedBytes` 注释写明"全局先到先得" | 
 | Z09V-1 | P2 | 共享 per-host 熔断器把"一个账号凭据坏了"当"源坏了"：5 次 401 让**其他账号** 30s 内读不到该源 | `httpclient/circuitbreaker.go:196-204` | FIXED（b17c76f） | 401 按调用方/binding 计失败而非 host 熔断（裁定）；P1-3 目标用"同一 binding 连续 N 次 401 ⇒ 该 binding 冷却"达成 | 
 | Z09-2 | P3 | 归一化读没有"超过上限即拒绝"：4 MiB 上游体被静默截断后作为完整的 200 交出（`json.Valid` 接受尾随空白） | `internal/federation/service.go:760-775` | OPEN | 照抄 raw 两行：`LimitReader(..., maxBody+1)` + `len(body)>maxBody → ErrResponseTooLarge` | 
@@ -100,7 +100,7 @@
 | Z12-2 | P2 | `-rotate-keys` 扫到 0 条时退 0，恰好满足文档写下的放行闸门（「`rewrapped=0 skipped=0` 且退出 0」） | `cmd/re0auth/main.go:1209-1231`（文档闸门 `config/re0auth.example.toml:229-231`） | FIXED（b17c76f） | `Scanned == 0` 时非零退出 |
 | Z12-4 | P2 | 文件里配的列表无法被环境清空（`RE0AUTH_ADMIN_SUBJECTS=""` ≠ 无人）：空串被当未设置，`/v1/admin` 仍挂着且无日志 | `cmd/re0auth/config.go:799`（`:564`、`:655`） | FIXED（b17c76f） | 与 `rate_limit` 同形用指针区分缺省与显式空，或启动日志公布三个列表生效长度 |
 | Z12-6 | P2 | `rate_limit = NaN` 被接受并让限流器**放行一切**；复核补强：`+Inf` 语义同为永远允许，TOML 小写 `nan` 也成立（大写 `NaN` 被拒） | `cmd/re0auth/config.go:512-522`（`main.go:225-228`） | FIXED（b17c76f） | 解析后加 `math.IsNaN/IsInf` 即拒，判据改成非 NaN 安全形式 |
-| Z12-9 | P2 | 文件里的池大小被截断到 int32（`4294967297` 读成 1、`4294967296` 读成 0），环境变量路径却拒绝越界值——两路径语义不一致 | `cmd/re0auth/config.go:1062-1067`（环境路径 `:1116-1126`） | OPEN-PG | 先做 `math.MinInt32/MaxInt32` 范围检查，或字段声明为 `*int32`；真 pgxpool 实际池大小只能在真 Postgres 上定论 |
+| Z12-9 | P2 | 文件里的池大小被截断到 int32（`4294967297` 读成 1、`4294967296` 读成 0），环境变量路径却拒绝越界值——两路径语义不一致 | `cmd/re0auth/config.go:1138-1143`（环境路径 `envInt32`） | FIXED（55c64ab + 本轮真库守卫） | 已在配置边界加 `math.MinInt32/MaxInt32` 范围检查（`poolSize()`，随 gosec G115 全开一并收口），文件/env 两条路径同判据；真 pgxpool 实际池大小的守卫见 `internal/store/postgres`（`TEST_DATABASE_URL`，CI 的 `postgres:16`） |
 | Z13-1 | P2 | 两个备份脚本默认输出目录 `./backups` 既不在 `.gitignore` 也不在 `.dockerignore`；一次 `git add -A` 送上 KEK 与全部长期密钥 | `scripts/backup.sh:12`、`scripts/backup-keys.sh:23` | FIXED（17914d4） | `.gitignore` 与 `.dockerignore` 各加 `/backups/`、`*.dump`、`*.env`（或默认落点改 `$TMPDIR`/必填） |
 | Z13-3 | P2 | 运行镜像不带 npm 归属清单，而 Makefile 自己要求它随「每个二进制、归档和镜像」分发（SPA 经 `go:embed` 进同一二进制） | `Dockerfile:74`（`Makefile:205-221`） | FIXED（17914d4） | web 阶段落 `pnpm licenses list --json` 到 `/out/`，runtime `COPY`，并更新 `workflows_test.go:21-41` 与 `artifacts_test.go:606` 两处白名单 |
 | Z13-4 | P2（age 半）/ P3（umask 半） | `backup-keys.sh` 的 umask 与 age 检查都在它们该保护的东西之后：age 缺失时明文密钥 env 残留（复核升 P2、与 P2-14 同形）；`mkdir` 早于 `umask 077`（umask 半维持 P3，权限位本机 noacl 无效、不采信） | `scripts/backup-keys.sh:24`（`:72`、`:73/:45`、`:100`） | FIXED（6665193） | `umask 077` 提到 `:24` 之前；age 存在性与 recipient 检查提到 `: > "$out"` 之前，或整段写入放 `mktemp -d` 并失败清理 |
@@ -126,9 +126,9 @@
 | Z15-3 | P3 | 内存 store 的 `DeleteAuthRequest` 在全局锁下遍历全部待兑换 code（Postgres 走 `oidc_codes(request_id)` 索引） | `internal/store/memory/oidc.go:449-468` | OPEN | 加 `codeByRequest`（requestID→TokenHash）并在同一临界区维护（来源：`Z15-VERIFIED.md:58-65`） |
 | Z15-4 | P3 | `negotiate` 快速路径对每个已配置 coding 重新 `strings.Split` 一次头部，成本随服务端配置增长 | `internal/compress/compress.go:180-193` | OPEN | 快速路径先切一次成切片再 `EqualFold` 匹配（来源：`Z15-VERIFIED.md:67-77`） |
 | Z15V-1 | P2 | 会话清扫与 Z15-1 跑在同一 15 分钟循环、同样无 `LIMIT`；单句撞超时第二句永不执行（孤儿行持续累积） | `internal/store/postgres/sessions.go:144-151` | FIXED（4dff4a3） | 同 Z15-1 的有界批 + 每句独立提交，anti-join 也分批（来源：`Z15-VERIFIED.md:83-96`） |
-| Z16-1 | P2 | CI 的 `load` 门禁在「什么都没测」时仍然绿：job 内没有任何一步读 `make load` 的输出 | `.github/workflows/ci.yml:407-428` | OPEN | load job 加一行 `grep -q 'capacity profile:'`（照抄 perf.yml）（来源：`Z16-VERIFIED.md:29-36`） |
+| Z16-1 | P2 | CI 的 `load` 门禁在「什么都没测」时仍然绿：job 内没有任何一步读 `make load` 的输出 | `.github/workflows/ci.yml:536-568` | FIXED（本轮） | `load` 步骤改为 `make load \| tee load.txt` + `grep -q 'capacity profile:' load.txt`（照抄 perf.yml）；守卫即 `audit7/z16guardtestquality` 的 `TestZ16LoadJobIsGreenWithZeroMeasurement`（本轮由红转绿） |
 | Z16-2 | P2 | gosec 的 `includes` 是白名单：CI lint 门禁对有真实生产命中的规则（G112/G114/G115/G104/G107）永远不会红 | `.golangci.yml:55-61` | FIXED（55c64ab） | 把 `includes` 换成 `excludes`，或把 G112/G114/G115 与 G104/G107 显式加回（来源：`Z16-VERIFIED.md:38-47`、`00-MAIN-VERIFICATION.md:533-547`） |
-| Z16-3 | P2 | 101 个 `audit5` 标签探针在任何 CI 门禁之外，连编译/vet/lint 都看不到（对 N-04 的补充） | `.github/workflows/*.yml`（无 `-tags` 步骤） | OPEN | CI 加 `probe-compile` job：`go vet -tags audit5 ./...`（可再加 audit6/audit7）（来源：`Z16-VERIFIED.md:49-58`） |
+| Z16-3 | P2 | 101 个 `audit5` 标签探针在任何 CI 门禁之外，连编译/vet/lint 都看不到（对 N-04 的补充） | `.github/workflows/ci.yml:329-375` | FIXED（4dff4a3） | N-04 落地的 `probes` 作业已 `go vet -tags audit5,audit6,audit7 ./...`（全部 tag 文件一起编译）+ 三套 tag 的显式绿名单测试；守卫探针由红翻绿。**残余（另计，不再按本条上报）**：`golangci-lint run ./...` 仍不带 tag，`audit5` 测试只跑绿名单内的包（来源：`Z16-VERIFIED.md:49-58`） |
 | Z16-4 | P3 | `internal/archtest` 的 Makefile 守卫是整文件 `strings.Contains`，把目标行整行注释掉仍 PASS | `internal/archtest/workflows_test.go:31-40` | OPEN | 复用同包结构解析，断言 `release` 的前置真含 `npm-attribution`/`checksums`（来源：`Z16-VERIFIED.md:60-65`） |
 | Z16-5 | P3 | `ci.yml` 的 fuzz 目标清单靠手维护，没有任何守卫保证它完整（删掉 5 条无人发现） | `.github/workflows/ci.yml:467-478` | OPEN | archtest 用 `go test -list '^Fuzz'` 枚举目标并断言全在清单（来源：`Z16-VERIFIED.md:67-72`） |
 | Z16-6 | P3 | 又三条「算出结论只打印」的探针，其中一条可被 `-overlay` 注入的假期望骗过仍 PASS | `internal/zzprobe/pubaddr/addr_test.go:12-54`、`internal/zzprobe/federation/safeurl_test.go:425-443,181-186` | OPEN | 三条各补真断言（地址表逐例 `t.Errorf`、归一化断言 scheme/host 白名单、区域 ID 断言 err）（来源：`Z16-VERIFIED.md:74-80`） |
@@ -175,6 +175,10 @@
 
 ## 已修复（仅 ID + 一句话，供溯源）
 
+- Z09-1 — `sources[].status` 在 `NewRegistry` 按 `active|degraded|retired` 词表校验，词表外值拒绝启动；恒红探针改写为守卫 — 本轮
+- Z16-1 — ci.yml 的 `load` 作业读自己的输出（`make load | tee load.txt` + `grep -q 'capacity profile:'`）；`TestZ16LoadJobIsGreenWithZeroMeasurement` 由红转绿 — 本轮
+- Z12-9 — 配置边界加 `math.MinInt32/MaxInt32` 范围检查（`poolSize()`）+ 真库池大小守卫 `TestOpenHonoursTheConfiguredPoolSize` — `55c64ab` + 本轮
+- Z16-3 — N-04 落地的 `probes` 作业已 `go vet -tags audit5,audit6,audit7 ./...`（全部 tag 文件一起编译）；残余仅是 lint 不带 tag — `4dff4a3`
 - KIT-1 — 匿名 cascade 现在回 401（`TestE1_`/`TestE3_`/`TestF3_` 转绿）。
 - KIT-3 — 暂停/删除客户端的令牌现在 `active=false` 且数据面 401（`TestA4_`/`TestA5_`/`TestE10_` 转绿）。
 - CS-4 — `token_class` 现在在 `federation.go:173-180` 白名单校验。

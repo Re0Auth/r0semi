@@ -268,15 +268,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == RFC8414Path:
 		// O-1: identical content, one source. Rewrite to the OIDC document.
 		if !endpointMethods[RFC8414Path][r.Method] {
-			writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
-				"this endpoint does not accept "+r.Method)
+			methodNotAllowed(w, RFC8414Path, r.Method)
 			return
 		}
 		h.serveDiscovery(w, r, OIDCDiscoveryPath)
 	case r.URL.Path == OIDCDiscoveryPath:
 		if !endpointMethods[OIDCDiscoveryPath][r.Method] {
-			writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
-				"this endpoint does not accept "+r.Method)
+			methodNotAllowed(w, OIDCDiscoveryPath, r.Method)
 			return
 		}
 		h.serveDiscovery(w, r, OIDCDiscoveryPath)
@@ -490,8 +488,7 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// introspection tokens into URLs and logs; the mirror image was a PUT reaching
 	// an endpoint that had no method policy at all.
 	if !endpointMethods[r.URL.Path][r.Method] {
-		writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
-			"this endpoint does not accept "+r.Method)
+		methodNotAllowed(w, r.URL.Path, r.Method)
 		return
 	}
 	// The same table that decides the method decides whether the parameters may
@@ -1449,6 +1446,27 @@ func writeUserinfoInvalidToken(w http.ResponseWriter, description string) {
 
 // writeOAuthJSONError keeps the protocol plane's error format uniform even where
 // the library would otherwise write plain text.
+// methodNotAllowed refuses a verb with the Allow header RFC 9110 §15.5.6
+// requires on a 405. The set comes from the same table that refused the request,
+// so the header cannot drift from the policy it describes; the order is fixed
+// rather than the map's, so the response is byte-stable.
+func methodNotAllowed(w http.ResponseWriter, path, method string) {
+	var allow []string
+	for _, m := range []string{
+		http.MethodGet, http.MethodHead, http.MethodPost,
+		http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions,
+	} {
+		if endpointMethods[path][m] {
+			allow = append(allow, m)
+		}
+	}
+	if len(allow) > 0 {
+		w.Header().Set("Allow", strings.Join(allow, ", "))
+	}
+	writeOAuthJSONError(w, http.StatusMethodNotAllowed, "invalid_request",
+		"this endpoint does not accept "+method)
+}
+
 func writeOAuthJSONError(w http.ResponseWriter, status int, code, description string) {
 	if status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", `Basic realm="oauth"`)

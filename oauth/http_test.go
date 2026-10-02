@@ -76,6 +76,40 @@ func TestClientCredentialsWithNothingPresent(t *testing.T) {
 	}
 }
 
+// KIT-2: Basic plus a disagreeing form identity is TWO clients, and the answer
+// is no credentials rather than "Basic wins". Every caller treats (empty, empty)
+// as unauthenticated, so the request fails closed wherever it is read — which is
+// the property a downstream reading the form fields needs.
+func TestClientCredentialsRefusesTwoDisagreeingIdentities(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"a different form client_id", "client_id=other"},
+		{"a different form client_secret", "client_secret=other-secret"},
+		{"both different", "client_id=other&client_secret=other-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/oauth/token", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.SetBasicAuth("cli", "sec")
+			if id, secret := ClientCredentials(req); id != "" || secret != "" {
+				t.Fatalf("two identities read as (%q, %q); want no credentials", id, secret)
+			}
+		})
+	}
+
+	// The same identity written both ways is still one identity: a client that
+	// repeats itself must not be refused.
+	req := httptest.NewRequest("POST", "/oauth/token",
+		strings.NewReader("client_id=cli&client_secret=sec"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("cli", "sec")
+	if id, secret := ClientCredentials(req); id != "cli" || secret != "sec" {
+		t.Fatalf("an agreeing duplicate was read as (%q, %q), want (cli, sec)", id, secret)
+	}
+}
+
 func TestBuildRedirectAppendsAndSkipsEmpty(t *testing.T) {
 	got := BuildRedirect("https://app.example/cb?existing=1", map[string]string{
 		"code":  "abc",

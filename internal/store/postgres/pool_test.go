@@ -138,6 +138,17 @@ func TestPoolStatsReflectsPoolConfig(t *testing.T) {
 	}
 }
 
+// TestPoolStatsReflectsPoolConfig is the no-database half of the mapping.
+// TestOpenHonoursTheConfiguredPoolSize below is the half Z12-9's `OPEN-PG` status
+// was waiting on: the same claim against a real pgxpool over a real database,
+// which runs in CI's postgres:16 job and skips locally.
+func TestOpenHonoursTheConfiguredPoolSize(t *testing.T) {
+	db := openTestDBWith(t, PoolOptions{MaxConns: 3, MinConns: 0})
+	if got := db.PoolStats().MaxConns(); got != 3 {
+		t.Errorf("PoolStats().MaxConns() = %d, want the configured 3", got)
+	}
+}
+
 // TestPoolConfigDoesNotEchoTheDsnOnAParseFailure is the no-database guard for
 // Z19V-1. pgx's own redaction is explicitly best effort, and the shapes below are
 // the ones its heuristics miss: it quotes the input back verbatim, password

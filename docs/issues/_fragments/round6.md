@@ -94,13 +94,14 @@
 | G-21 | P3 | vault 错误文本内嵌原始 `usr_…`，经 `-rotate-keys` die 路径与 unbind/cascade warn 路径进进程日志 | `vault/repo.go:29`、`vault/service.go:273`、`vault/rotate.go:113` | OPEN | 错误里用形状代替身份（只报 provider + kek_id）；attr 守卫结构上看不见这个通道 |
 | G-22 | P3 | 三把 32 字节密钥可共用同一值被无提示接受（KEK == token key，乃至 audit key） | `cmd/re0auth/config.go:719`、`cmd/re0auth/main.go:1385` | OPEN | `loadConfig` 解析完三把密钥后两两比较，相同即拒绝启动（或至少 Warn） |
 | G-23 | P2 | 第五轮仍红的 7 处 `usr_…` 进 slog attr，确认仍未修 | `internal/admin/admin.go:499`、`internal/auth/auth.go:231`、`internal/federation/bind.go:208`、`internal/federation/refresh.go:155/160`、`internal/httpapi/account_routes.go:80`、`internal/httpapi/binding_routes.go:57` | FIXED（6665193） | 统一改记形状（`"self", bool` / 只记 action）；与 G-21 是同一不变量的两半，一起收 |
-| G-24 | P2 | `/.well-known/oauth-protected-resource` 对非 GET 动词答 404（同族另两份文档答 405），且 405 不带 `Allow` 头（RFC 9110 §15.5.6 MUST） | `internal/httpapi/server.go:522`；`internal/oidchttp/oidchttp.go:256/263` 不设 Allow | OPEN | 动词闸门与另两份 well-known 文档同形，并补 `Allow` 头 |
+| G-24 | P2 | `/.well-known/oauth-protected-resource` 对非 GET 动词答 404（同族另两份文档答 405），且 405 不带 `Allow` 头（RFC 9110 §15.5.6 MUST） | `internal/httpapi/server.go:509-535`；`internal/oidchttp/oidchttp.go:270-296` | FIXED（本轮） | 三份 well-known 文档的动词闸门同形：httpapi 的 `onlyMethods` 给 protected-resource 405+`Allow: GET, HEAD`，oidchttp 的 `methodNotAllowed` 给两份 discovery 同形 405+`Allow`（集合取自拒绝它的同一张表）；守卫：`audit6/z06httpedge` 的 `TestZ06WellKnownVerbMatrixCoversEveryDocument`、`audit6/zverify` 的 `TestV12*` |
 | 04-7 | P3 | 0022 一类索引迁移在单个 goose 事务里非并发建索引：在役升级窗口对相关表是写冻结 | `internal/store/postgres/migrations/0022_bulk_revoke_client_indexes.sql` | OPEN-PG | 记录在 migration-decision；表会大时改 `CREATE INDEX CONCURRENTLY` + `-- +goose NO TRANSACTION`（0017-0022 同形） |
 | P-02 | P3 | 设备流批准不检查 `ExplicitConsent`，与同意面不对称（机制在、闸门缺） | `internal/httpapi/device_routes.go:114`、`internal/store/memory/oidc.go:1086` | OPEN | `ApproveDevice`（含 Postgres）在 `Resolve` 后调 `RequireExplicitConsent` 并把 `explicit` 一路传下去；今天目录无此类 scope 故不可达 |
 | P-03 | P3 | discovery 缓存无 Host 维度：动态 issuer 下一次伪造 Host 永久固定两份文档 | `internal/oidchttp/oidchttp.go:346`（缓存键）；`serveDiscovery` `:293` | OPEN | 缓存键改 `IssuerFromRequest(r) + path`，或 `Config.Issuer == ""` 时禁用缓存；生产强制 issuer 必填故限动态形态 |
 
 ## 已修复（仅 ID + 一句话，供溯源）
 
+- G-24 — 三份 well-known 文档的动词闸门同形：405 + `Allow`（httpapi `onlyMethods`、oidchttp `methodNotAllowed`）；`TestZ06WellKnownVerbMatrixCoversEveryDocument` 由红转绿 — 本轮
 - （无）第 7 轮在 HEAD=`bf81b2a` 复跑第 6 轮全部红探针仍红，**第 6 轮无发现被修复**（`00-MAIN-VERIFICATION.md:20-66`）。
 - B-1 — 第五轮阻断项 id_token 缺必需 `sub`；第 6 轮实测已修（`_audit/protocol.md:206`）。
 - B-2 — id_token 可在 `/oauth/userinfo` 当 access token 用；第 6 轮实测已修（`_audit/protocol.md:207`）。

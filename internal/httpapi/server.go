@@ -506,6 +506,34 @@ func (s *Server) specRoutes() []route {
 	}
 	return routes
 }
+
+// onlyMethods wraps a handler with a method policy: any other verb is refused
+// with 405 and the Allow header RFC 9110 §15.5.6 requires.
+//
+// The document handler behind it is this package's own, so it does not inherit
+// the method table the OP applies to the two discovery documents it owns. The
+// alternative — registering the pattern without a method — is not a policy
+// either: the request then reaches the handler whatever the verb, and with the
+// "GET " prefix it falls through to the /.well-known/ catch-all, which answers
+// 404 for a URL this server does serve (G-24).
+func onlyMethods(method string, h http.HandlerFunc) http.Handler {
+	// net/http serves HEAD through a GET handler, so a GET policy is really
+	// "GET or HEAD" and the header should say what the mux accepts.
+	allow := method
+	if method == http.MethodGet {
+		allow = "GET, HEAD"
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != method && !(method == http.MethodGet && r.Method == http.MethodHead) {
+			w.Header().Set("Allow", allow)
+			writeOAuthError(w, r, http.StatusMethodNotAllowed, "invalid_request",
+				"this endpoint does not accept "+r.Method)
+			return
+		}
+		h(w, r)
+	})
+}
+
 func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	// Operational probes. They belong to no plane — an orchestrator reads the
@@ -519,7 +547,11 @@ func (s *Server) Handler() http.Handler {
 	root.Handle("GET /.well-known/oauth-authorization-server", s.oidc)
 	root.Handle("GET /.well-known/openid-configuration", s.oidc)
 	root.Handle("/oauth/", s.oidc)
-	root.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleResourceMetadata)
+	// Same method policy as the two documents the OP owns (above), and for the
+	// same reason: an unlisted verb on a URL this server serves is 405 with
+	// Allow, not the catch-all's 404 (G-24).
+	root.Handle("/.well-known/oauth-protected-resource",
+		onlyMethods(http.MethodGet, s.handleResourceMetadata))
 	// The rest of the namespace, so an unknown path or a wrong method under
 	// /.well-known answers in the protocol plane rather than falling through to the
 	// business catch-all. More specific patterns still win, so the three documents
