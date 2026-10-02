@@ -203,6 +203,18 @@ func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.User
 			return d.fail(ctx, actor, subject, "bindings", err, res)
 		}
 		res.Bindings = outcome
+		// The federation sweep reports a per-binding failure by folding it into
+		// Failed rather than returning an error, so err == nil above does not mean
+		// every binding was disconnected locally. A binding that could not be
+		// removed locally still holds the account's credential, so treating this
+		// step as done would erase the account and report outcome=ok while a
+		// secret it was supposed to shred survives — the one thing this package
+		// exists to prevent. res.Bindings is assigned first so the failure record
+		// still carries bindings_revoked/bindings_failed and failed_at=bindings.
+		if outcome.Failed > 0 {
+			return d.fail(ctx, actor, subject, "bindings", fmt.Errorf(
+				"lifecycle: %d of %d bindings could not be removed locally", outcome.Failed, outcome.Total), res)
+		}
 	}
 
 	n, err := d.cfg.Vault.DeleteSubject(ctx, string(subject))

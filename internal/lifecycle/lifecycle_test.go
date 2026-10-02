@@ -240,7 +240,53 @@ func TestDeleteAccountStopsAtTheFailingStep(t *testing.T) {
 	}
 }
 
-// TestDeleteAccountFailsWhenTheRecordCannotBeWritten: unlike the operator plane,
+// TestDeleteAccountStopsWhenABindingRemovalFailed: a binding sweep that returns
+// no error can still have failed to remove a binding locally. The federation
+// service folds that into the summary's Failed count rather than erroring, so
+// DeleteAccount has to read the count itself. Treating it as success would erase
+// the account and record outcome=ok while a binding — and the credential it
+// holds — is still there.
+func TestDeleteAccountStopsWhenABindingRemovalFailed(t *testing.T) {
+	var calls []string
+	r := func() recorder { return recorder{calls: &calls} }
+	logger := audit.NewMemoryLogger()
+	d, err := New(Config{
+		Accounts: fakeAccounts{recorder: r()},
+		Tokens:   fakeTokens{recorder: r()},
+		Vault:    fakeVault{recorder: r()},
+		Bindings: fakeBindings{recorder: r(), outcome: BindingOutcome{Total: 2, Revoked: 1, Failed: 1}},
+		Sessions: fakeSessions{recorder: r()},
+		OIDC:     fakeOIDC{recorder: r()},
+		Flows:    fakeFlows{recorder: r()},
+		Audit:    logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := d.DeleteAccount(context.Background(), "usr_actor", "usr_target")
+	if err == nil {
+		t.Fatalf("a binding that could not be removed locally must fail the erasure (result %+v)", res)
+	}
+	if got := strings.Join(calls, ","); got != "bindings" {
+		t.Errorf("calls = %v, want it to stop at the bindings step", got)
+	}
+
+	events := logger.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want exactly one", events)
+	}
+	if events[0].Outcome != audit.OutcomeError {
+		t.Errorf("outcome = %q, want %q", events[0].Outcome, audit.OutcomeError)
+	}
+	if got := events[0].Detail["failed_at"]; got != "bindings" {
+		t.Errorf("failed_at = %q, want bindings", got)
+	}
+	if got := events[0].Detail["bindings_failed"]; got != "1" {
+		t.Errorf("bindings_failed = %q, want \"1\"", got)
+	}
+}
+
 // an unprovable erasure is refused. The account row is already gone, but DeleteUser
 // is idempotent, so a retry produces the record.
 func TestDeleteAccountFailsWhenTheRecordCannotBeWritten(t *testing.T) {
