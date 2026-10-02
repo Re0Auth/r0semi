@@ -45,9 +45,14 @@ const (
 )
 
 // DeviceAuthorizationRequest starts an RFC 8628 device authorization.
+//
+// ClientSecret is the confidential client's credential (RFC 8628 §3.1 applies
+// RFC 6749 §3.2.1): it may be empty for a public client, which authenticates with
+// PKCE at redemption rather than a shared secret.
 type DeviceAuthorizationRequest struct {
-	ClientID string
-	Scopes   []Scope
+	ClientID     string
+	ClientSecret string
+	Scopes       []Scope
 }
 
 // DeviceAuthorizationResponse is the RFC 8628 §3.2 payload handed to the client.
@@ -282,11 +287,23 @@ func (s *MemoryDeviceStore) SweepExpired(now time.Time) int {
 	return removed
 }
 
-// BeginDeviceAuthorization starts a device authorization. The scopes are
-// validated here, exactly as the interactive flow validates them, so an
-// unregistered client or scope fails before any user is bothered.
+// BeginDeviceAuthorization starts a device authorization.
+//
+// Unlike the interactive authorize endpoint, this one authenticates a
+// confidential client (S04-2): the device holder cannot redeem without the
+// secret anyway (PollDeviceAuthorization authenticates), so an anonymous start
+// buys nothing but a consent screen that presents a trusted client's registered
+// name to whoever follows the user_code. A public client keeps the "none" method
+// — it has no secret and is bound by PKCE at redemption.
+//
+// The scopes are validated here too, so an unregistered client or scope fails
+// before any user is bothered, and a request with no scopes is refused rather
+// than minting a scope-less token pair (S04-9).
 func (s *service) BeginDeviceAuthorization(ctx context.Context, req DeviceAuthorizationRequest) (DeviceAuthorizationResponse, error) {
-	client, _, err := s.describeScopes(ctx, req.ClientID, req.Scopes)
+	if len(req.Scopes) == 0 {
+		return DeviceAuthorizationResponse{}, protocolError("invalid_scope", "scope is required")
+	}
+	client, _, err := s.describeAuthenticatedScopes(ctx, req.ClientID, req.ClientSecret, req.Scopes)
 	if err != nil {
 		return DeviceAuthorizationResponse{}, err
 	}
@@ -312,8 +329,10 @@ func (s *service) BeginDeviceAuthorization(ctx context.Context, req DeviceAuthor
 
 	s.record(ctx, "oauth.device.begin", "", client.ID, audit.OutcomeOK)
 	verify := strings.TrimRight(s.issuer, "/") + s.verifyPath
-	// RFC 8628 §3.2: interval is in seconds and the client must respect it.
-	interval := int64(s.pollInterval / time.Second)
+	// RFC 8628 §3.2: interval is in seconds and the client must respect it. It is
+	// rounded UP: a 2500ms interval advertised as 2 truncates a floor into a
+	// promise the server then punishes with slow_down (S04-6).
+	interval := int64((s.pollInterval + time.Second - 1) / time.Second)
 	if interval < 1 {
 		interval = 1
 	}
@@ -350,24 +369,27 @@ func (s *service) PollDeviceAuthorization(ctx context.Context, req DeviceCodeExc
 	if !now.Before(rec.ExpiresAt) {
 		return TokenResponse{}, protocolError("expired_token", "the device code has expired")
 	}
-	// Polling faster than the advertised interval is not an error to hide: we
-	// tell the client to slow down, and do not stamp LastPoll, so backing off
-	// for the full interval converges.
-	if !rec.LastPoll.IsZero() && now.Before(rec.LastPoll.Add(s.pollInterval)) {
-		return TokenResponse{}, protocolError("slow_down", "polling faster than the advertised interval")
-	}
-	// Stamp the poll — and only the stamp. Writing the record read above back
-	// would erase a decision that landed in between, which is exactly what
-	// DeviceStore.RecordPoll exists to make impossible.
-	if err := s.devices.RecordPoll(ctx, rec.DeviceCodeHash, now); err != nil {
-		return TokenResponse{}, err
-	}
-
+	// A decided request reports its outcome even to a poll that came too soon.
+	// Throttling it first hid a denial (or an approval) behind slow_down, so a
+	// client polling on its own faster cadence never learned the terminal answer
+	// the user had already given (S04-6). The pending case below still throttles.
 	switch rec.Status {
-	case DevicePending:
-		return TokenResponse{}, protocolError("authorization_pending", "the user has not decided yet")
 	case DeviceDenied:
 		return TokenResponse{}, protocolError("access_denied", "the user denied the request")
+	case DevicePending:
+		// Polling faster than the advertised interval is not an error to hide: we
+		// tell the client to slow down, and do not stamp LastPoll, so backing off
+		// for the full interval converges.
+		if !rec.LastPoll.IsZero() && now.Before(rec.LastPoll.Add(s.pollInterval)) {
+			return TokenResponse{}, protocolError("slow_down", "polling faster than the advertised interval")
+		}
+		// Stamp the poll — and only the stamp. Writing the record read above back
+		// would erase a decision that landed in between, which is exactly what
+		// DeviceStore.RecordPoll exists to make impossible.
+		if err := s.devices.RecordPoll(ctx, rec.DeviceCodeHash, now); err != nil {
+			return TokenResponse{}, err
+		}
+		return TokenResponse{}, protocolError("authorization_pending", "the user has not decided yet")
 	}
 	// The read above saw an approval; only the consume may act on it. Issuing on
 	// the strength of the read alone would mint a fresh token pair on every poll,
@@ -485,12 +507,31 @@ func (s *service) DecideDeviceAuthorization(ctx context.Context, userCode, subje
 }
 
 // describeScopes validates a client and its requested scopes without the
-// redirect_uri/PKCE requirements of the interactive flow.
+// redirect_uri/PKCE requirements of the interactive flow. It does not
+// authenticate: it is the verification page's and the decision's read of an
+// already-created request, which carries no secret.
 func (s *service) describeScopes(ctx context.Context, clientID string, scopes []Scope) (Client, []Descriptor, error) {
 	client, err := s.client(ctx, clientID, "", false)
 	if err != nil {
 		return Client{}, nil, err
 	}
+	return s.resolveScopes(client, scopes)
+}
+
+// describeAuthenticatedScopes is describeScopes plus client authentication, for
+// the device authorization endpoint (RFC 8628 §3.1). A public client passes with
+// any secret — it has none — and a confidential one must prove its own.
+func (s *service) describeAuthenticatedScopes(ctx context.Context, clientID, clientSecret string, scopes []Scope) (Client, []Descriptor, error) {
+	client, err := s.client(ctx, clientID, clientSecret, true)
+	if err != nil {
+		return Client{}, nil, err
+	}
+	return s.resolveScopes(client, scopes)
+}
+
+// resolveScopes is the shared half of the two helpers: every requested scope must
+// be known and registered to the client.
+func (s *service) resolveScopes(client Client, scopes []Scope) (Client, []Descriptor, error) {
 	descriptors, err := s.scopes.Resolve(scopes, client.ID)
 	if err != nil {
 		return Client{}, nil, protocolError("invalid_scope", err.Error())
@@ -509,8 +550,17 @@ func (s *service) freeUserCode(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if _, err := s.devices.GetDeviceByUserCode(ctx, code); errors.Is(err, ErrDeviceNotFound) {
+		// Only "not found" means the code is free. Every other error is a store
+		// failure: retrying cannot fix it, and folding it into the loop turned an
+		// infrastructure fault into "could not allocate a unique user code" with
+		// the cause dropped (S04-5).
+		switch _, err := s.devices.GetDeviceByUserCode(ctx, code); {
+		case err == nil:
+			continue // taken, redraw
+		case errors.Is(err, ErrDeviceNotFound):
 			return code, nil
+		default:
+			return "", err
 		}
 	}
 	return "", errors.New("oauth: could not allocate a unique user code")

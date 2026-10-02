@@ -369,7 +369,10 @@ type ClientAdmin interface {
 	SetStatus(ctx context.Context, id string, status ClientStatus) error
 	// RotateSecret replaces a confidential client's secret digest. An unknown id
 	// is ErrClientNotFound; a public client is ErrNoSecretToRotate, because it has
-	// no secret and giving it one would break RestoreClient's validation.
+	// no secret and giving it one would break RestoreClient's validation. The
+	// digest must be exactly sha256.Size bytes — what NewSecretHash produces and
+	// what RestoreClient demands — so a wrong-length rotation is refused instead
+	// of being stored and silently locking the client out on the next restart.
 	RotateSecret(ctx context.Context, id string, secretHash []byte) error
 	// Delete removes the registration. Deleting an absent client is not an
 	// error, which keeps an operator's retry idempotent.
@@ -459,8 +462,11 @@ func (r *MemoryClientRegistry) SetStatus(_ context.Context, id string, status Cl
 
 // RotateSecret implements ClientAdmin.
 func (r *MemoryClientRegistry) RotateSecret(_ context.Context, id string, secretHash []byte) error {
-	if len(secretHash) == 0 {
-		return errors.New("oauth: a rotation needs a secret hash")
+	// The shape RestoreClient enforces. A shorter (or longer) digest used to be
+	// stored as-is, so the client authenticated fine until the process restarted,
+	// when RestoreClient refused the row and the client became unknown.
+	if len(secretHash) != sha256.Size {
+		return fmt.Errorf("oauth: a rotation needs a %d-byte secret hash, got %d", sha256.Size, len(secretHash))
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -375,7 +376,13 @@ func (s *service) Revoke(ctx context.Context, req RevokeRequest) error {
 	// turn this endpoint into an oracle for whether a stolen string is a live
 	// token (G-8, docs/audit-7/findings/Z20-VERIFIED.md). The foreign branch
 	// therefore revokes NOTHING — RFC 7009's verify, then do not advertise.
-	owner, err := s.tokens.TokenOwner(ctx, req.Token)
+	//
+	// The owner read also resolves a SPENT refresh value from its tombstone
+	// (SpentRefreshOwner), which is what makes DeleteRefresh's documented
+	// tombstone-clear reachable at all: TokenOwner answers only for a live value,
+	// so before this the request returned the uniform success above and the
+	// tombstone outlived the revocation that claimed to have cleared it (S01-8).
+	owner, err := s.revocableOwner(ctx, req.Token)
 	switch {
 	case errors.Is(err, ErrTokenNotFound):
 		return nil
@@ -394,6 +401,26 @@ func (s *service) Revoke(ctx context.Context, req RevokeRequest) error {
 	}
 	s.record(ctx, "oauth.revoke", "", client.ID, audit.OutcomeOK)
 	return nil
+}
+
+// revocableOwner names the client a value belongs to for RFC 7009's ownership
+// check. TokenOwner answers for a live access or refresh value; a spent refresh
+// value has only a tombstone left, so its owner comes from the optional
+// SpentRefreshOwner extension when the store offers one. A store that does not
+// keeps the old answer (ErrTokenNotFound), and the revocation stays the uniform
+// success that clears nothing.
+func (s *service) revocableOwner(ctx context.Context, value string) (string, error) {
+	owner, err := s.tokens.TokenOwner(ctx, value)
+	if err == nil {
+		return owner, nil
+	}
+	if !errors.Is(err, ErrTokenNotFound) {
+		return "", err
+	}
+	if spent, ok := s.tokens.(SpentRefreshOwner); ok {
+		return spent.SpentRefreshOwner(ctx, value)
+	}
+	return "", ErrTokenNotFound
 }
 
 func (s *service) Introspect(ctx context.Context, accessToken string) (TokenInfo, error) {
@@ -471,6 +498,15 @@ func (s *service) issue(ctx context.Context, clientID, subject string, scopes []
 		return TokenResponse{}, err
 	}
 	if err := s.tokens.SaveRefresh(ctx, rt, refresh); err != nil {
+		// The access record is already live but the pair can never be delivered:
+		// the response is this error. Leaving it behind mints a usable bearer
+		// token nobody can name or revoke, so the write is undone. A rollback
+		// failure is reported alongside the original error, because a leaked
+		// access token must not be hidden behind the cleaner-looking save error
+		// (S01-4).
+		if delErr := s.tokens.DeleteAccess(ctx, at); delErr != nil {
+			return TokenResponse{}, fmt.Errorf("oauth: save refresh token: %w (access-token rollback also failed: %v)", err, delErr)
+		}
 		return TokenResponse{}, err
 	}
 	s.record(ctx, "oauth.token", subject, clientID, audit.OutcomeOK)
@@ -483,13 +519,29 @@ func (s *service) issue(ctx context.Context, clientID, subject string, scopes []
 	}, nil
 }
 
+// dummyClientSecretHash is the fixed digest the unknown-client branch compares
+// against. It is not a credential: it exists so the refusal spends the same
+// constant-time comparison a real secret check does, instead of returning after a
+// single map miss and letting an attacker time client-id enumeration (S01-5).
+var dummyClientSecretHash = NewSecretHash("oauth:no-such-client")
+
 // client resolves a client and, when auth is set, authenticates a confidential
 // one. Public clients have no secret; their code/refresh binding plus PKCE is
 // what protects them.
+//
+// An unknown client and a wrong secret answer with the SAME description and the
+// same comparison work. The kit's contract (upstreamkit/server.go) is that an
+// unauthenticated caller must not be able to tell an unknown client from a bad
+// secret; different text — or a path that skips the digest comparison — is a
+// client-id oracle (S01-5). The distinction stays server-side, in the audit
+// plane.
 func (s *service) client(ctx context.Context, id, secret string, auth bool) (Client, error) {
 	c, err := s.clients.Get(ctx, id)
 	if errors.Is(err, ErrClientNotFound) {
-		return Client{}, protocolError("invalid_client", "unknown client")
+		if auth {
+			subtle.ConstantTimeCompare(dummyClientSecretHash, NewSecretHash(secret))
+		}
+		return Client{}, protocolError("invalid_client", "invalid client credentials")
 	}
 	if err != nil {
 		return Client{}, err
@@ -500,14 +552,23 @@ func (s *service) client(ctx context.Context, id, secret string, auth bool) (Cli
 	return c, nil
 }
 
+// record writes one OAuth audit event. A failure is logged, not swallowed: the
+// token or the revocation has already happened, so refusing now would not undo it,
+// but an audit record that vanishes without a trace is the outcome this project
+// does not accept. The direction is the OP store's (log and proceed); the raw
+// subject is deliberately not logged, so it cannot outlive its pseudonymisation
+// key (S01-9/N-03).
 func (s *service) record(ctx context.Context, action, subject, clientID, outcome string) {
-	_ = s.audit.Record(ctx, audit.Event{
+	if err := s.audit.Record(ctx, audit.Event{
 		Action:   action,
 		Subject:  subject,
 		Provider: "oauth",
 		Outcome:  outcome,
 		Detail:   map[string]string{"client_id": clientID},
-	})
+	}); err != nil {
+		slog.Error("oauth audit record failed",
+			"action", action, "client_id", clientID, "outcome", outcome, "err", err)
+	}
 }
 
 // validPKCEChallenge reports whether challenge has the only shape an S256 PKCE

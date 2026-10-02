@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Scope is a namespaced permission such as "phigros.score.read".
@@ -155,7 +156,13 @@ func DefaultDescriptors() []Descriptor {
 }
 
 // Registry resolves scopes to descriptors.
+//
+// A provider package registers its descriptors at composition time while request
+// handlers may already be resolving scopes, so the map is guarded: Register takes
+// the write lock, and Get/Descriptors/Resolve take the read lock. Without it a
+// registration racing a request is a concurrent map read and write.
 type Registry struct {
+	mu      sync.RWMutex
 	byScope map[Scope]Descriptor
 }
 
@@ -189,6 +196,8 @@ func (r *Registry) Register(d Descriptor) error {
 	if d.Title == "" {
 		return fmt.Errorf("oauth: scope %s needs a title", d.Scope)
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if _, exists := r.byScope[d.Scope]; exists {
 		return fmt.Errorf("oauth: duplicate scope %s", d.Scope)
 	}
@@ -198,12 +207,16 @@ func (r *Registry) Register(d Descriptor) error {
 
 // Get returns the descriptor for a scope.
 func (r *Registry) Get(s Scope) (Descriptor, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	d, ok := r.byScope[s]
 	return d, ok
 }
 
 // Descriptors returns every descriptor, ordered by scope.
 func (r *Registry) Descriptors() []Descriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make([]Descriptor, 0, len(r.byScope))
 	for _, d := range r.byScope {
 		out = append(out, d)
@@ -215,6 +228,8 @@ func (r *Registry) Descriptors() []Descriptor {
 // Resolve validates a requested scope set: every scope must be known and, when
 // the descriptor restricts clients, the requesting client must be allowed.
 func (r *Registry) Resolve(scopes []Scope, clientID string) ([]Descriptor, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	seen := make(map[Scope]struct{}, len(scopes))
 	out := make([]Descriptor, 0, len(scopes))
 	for _, s := range scopes {

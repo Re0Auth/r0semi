@@ -33,3 +33,19 @@ func LimitFormBody(w http.ResponseWriter, r *http.Request) error {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxFormBytes)
 	return nil
 }
+
+// IsBodyTooLarge reports whether err is the overflow MaxBytesReader raises once a
+// body past MaxFormBytes is read — the shape a chunked/gzip body with no declared
+// length takes when ParseForm reads it.
+//
+// LimitFormBody's declared-length pre-check is the only path that returns
+// ErrBodyTooLarge directly, so a caller that classifies every ParseForm error as
+// "malformed form body" reports an undeclared oversized body as a 400 rather than
+// the 413 the cap promises (S01-13/KIT-8). The three ParseForm call sites
+// (upstreamkit token/revoke/cascade) should answer 413 when this is true; the
+// helper lives here, next to the cap and the sentinel, so they share one
+// classification.
+func IsBodyTooLarge(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr)
+}

@@ -155,15 +155,20 @@ func unionScopes(a, b []Scope) []Scope {
 }
 
 // ListBySubject implements Store by scanning both tables.
+//
+// The scan runs under the read lock, so it no longer serialises with the token
+// reads an account page's other requests perform (S01-11/S04-4), and every
+// returned record's Scopes are a copy so a caller cannot rewrite stored grants
+// through the slice it was handed (Z18v-1).
 func (s *MemoryStore) ListBySubject(_ context.Context, subject string) ([]GrantRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	var out []GrantRecord
 	for _, t := range s.access {
 		if t.Subject == subject {
 			out = append(out, GrantRecord{
-				Kind: TokenKindAccess, ClientID: t.ClientID, Scopes: t.Scopes,
+				Kind: TokenKindAccess, ClientID: t.ClientID, Scopes: cloneScopes(t.Scopes),
 				IssuedAt: t.IssuedAt, ExpiresAt: t.ExpiresAt,
 			})
 		}
@@ -171,7 +176,7 @@ func (s *MemoryStore) ListBySubject(_ context.Context, subject string) ([]GrantR
 	for _, t := range s.refresh {
 		if t.Subject == subject {
 			out = append(out, GrantRecord{
-				Kind: TokenKindRefresh, ClientID: t.ClientID, Scopes: t.Scopes,
+				Kind: TokenKindRefresh, ClientID: t.ClientID, Scopes: cloneScopes(t.Scopes),
 				IssuedAt: t.IssuedAt, ExpiresAt: t.ExpiresAt,
 			})
 		}

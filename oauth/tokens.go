@@ -221,6 +221,26 @@ type RefreshFamilyResolver interface {
 	RefreshFamily(ctx context.Context, value string) (string, error)
 }
 
+// SpentRefreshOwner is an OPTIONAL Store extension: it names the client a refresh
+// value that has ALREADY been rotated belonged to, read from the tombstone the
+// rotation left.
+//
+// TokenOwner deliberately answers only for a live value — GetRefresh's contract
+// says a read must never be the thing that judges a replay — but RFC 7009
+// revocation still has to clear the tombstone that DeleteRefresh promises to
+// clear, and only the owner may do that: clearing another client's tombstone
+// would suppress its replay detection. Without this the service could not name
+// the owner of a spent value, Revoke answered the uniform idempotent success,
+// and the tombstone survived it (S01-8).
+//
+// It is deliberately not part of Store: a store that persists no tombstone
+// owner, or chooses not to answer, keeps the old behaviour — the revocation of a
+// spent value stays the uniform success that clears nothing. An expired or
+// unknown value is ErrTokenNotFound.
+type SpentRefreshOwner interface {
+	SpentRefreshOwner(ctx context.Context, value string) (string, error)
+}
+
 // TokenFilter selects tokens for bulk revocation. An empty filter matches every
 // token; when both fields are set they combine with AND.
 type TokenFilter struct {
@@ -284,8 +304,13 @@ type refreshTombstone struct {
 }
 
 // MemoryStore is a non-durable Store for development and tests.
+//
+// mu is a RWMutex, not a Mutex: an introspection read must not queue behind the
+// grants page's full-table scan. Every mutation (save, consume, delete, sweep,
+// family revocation) still takes the write lock, and every read takes the read
+// lock, so the scans that S04-4/S01-11 complain about let other readers run.
 type MemoryStore struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	codes   map[string]AuthorizationCode
 	access  map[string]AccessToken
 	refresh map[string]RefreshToken
@@ -355,24 +380,27 @@ func (s *MemoryStore) SweepExpired(now time.Time) int {
 	return removed
 }
 
-// SaveCode implements Store.
+// SaveCode implements Store. The stored record owns its scope slice: a caller
+// that keeps the slice it passed and mutates it must not reach into the store.
 func (s *MemoryStore) SaveCode(_ context.Context, value string, c AuthorizationCode) error {
+	c.Scopes = cloneScopes(c.Scopes)
 	s.mu.Lock()
 	s.codes[TokenHash(value)] = c
 	s.mu.Unlock()
 	return nil
 }
 
-// GetCode implements Store. It is a read under the same mutex the claim takes,
+// GetCode implements Store. It is a read under the same lock the claim takes,
 // so the exchange can judge every binding before ConsumeCode decides whether the
 // code is spent. A failed binding therefore costs the caller nothing.
 func (s *MemoryStore) GetCode(_ context.Context, value string) (AuthorizationCode, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	c, ok := s.codes[TokenHash(value)]
 	if !ok {
 		return AuthorizationCode{}, ErrTokenNotFound
 	}
+	c.Scopes = cloneScopes(c.Scopes)
 	return c, nil
 }
 
@@ -387,25 +415,30 @@ func (s *MemoryStore) ConsumeCode(_ context.Context, value string) (Authorizatio
 		return AuthorizationCode{}, ErrTokenNotFound
 	}
 	delete(s.codes, key)
+	c.Scopes = cloneScopes(c.Scopes)
 	return c, nil
 }
 
-// SaveAccess implements Store.
+// SaveAccess implements Store. The stored record owns its scope slice.
 func (s *MemoryStore) SaveAccess(_ context.Context, value string, t AccessToken) error {
+	t.Scopes = cloneScopes(t.Scopes)
 	s.mu.Lock()
 	s.access[TokenHash(value)] = t
 	s.mu.Unlock()
 	return nil
 }
 
-// GetAccess implements Store.
+// GetAccess implements Store. The returned record's Scopes are a copy: a caller
+// that mutates them must not be able to rewrite the authorization state of a live
+// token (S01-12/Z18-3).
 func (s *MemoryStore) GetAccess(_ context.Context, value string) (AccessToken, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	t, ok := s.access[TokenHash(value)]
 	if !ok {
 		return AccessToken{}, ErrTokenNotFound
 	}
+	t.Scopes = cloneScopes(t.Scopes)
 	return t, nil
 }
 
@@ -418,11 +451,13 @@ func (s *MemoryStore) DeleteAccess(_ context.Context, value string) error {
 	return nil
 }
 
-// TokenOwner implements Store.
+// TokenOwner implements Store. It answers for a LIVE value only: a spent refresh
+// value is left to ConsumeRefresh to recognise as a replay (see SpentRefreshOwner
+// for the read RFC 7009 revocation uses instead).
 func (s *MemoryStore) TokenOwner(_ context.Context, value string) (string, error) {
 	key := TokenHash(value)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if t, ok := s.access[key]; ok {
 		return t.ClientID, nil
 	}
@@ -432,27 +467,47 @@ func (s *MemoryStore) TokenOwner(_ context.Context, value string) (string, error
 	return "", ErrTokenNotFound
 }
 
-// SaveRefresh implements Store.
+// SpentRefreshOwner implements SpentRefreshOwner: the owner of a refresh value
+// that has already been rotated, read from its tombstone. The tombstone deadline
+// is judged exactly as ConsumeRefresh judges it, so a value past its own deadline
+// is an ordinary unknown rather than a revocation target.
+func (s *MemoryStore) SpentRefreshOwner(_ context.Context, value string) (string, error) {
+	key := TokenHash(value)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tomb, spent := s.tombstones[key]
+	if !spent {
+		return "", ErrTokenNotFound
+	}
+	if s.now != nil && !s.now().Before(tomb.ExpiresAt) {
+		return "", ErrTokenNotFound
+	}
+	return tomb.ClientID, nil
+}
+
+// SaveRefresh implements Store. The stored record owns its scope slice.
 func (s *MemoryStore) SaveRefresh(_ context.Context, value string, t RefreshToken) error {
+	t.Scopes = cloneScopes(t.Scopes)
 	s.mu.Lock()
 	s.refresh[TokenHash(value)] = t
 	s.mu.Unlock()
 	return nil
 }
 
-// GetRefresh implements Store. It is a read under the same mutex ConsumeRefresh
+// GetRefresh implements Store. It is a read under the same lock ConsumeRefresh
 // claims under, with nothing deleted: a caller resolving which account a token
 // names can therefore try again after a failure. A spent value is only a
 // tombstone here, and a tombstone is not returned as a live record — the reuse
 // signal belongs to ConsumeRefresh, whose claim is what makes presenting the
 // value again a theft report.
 func (s *MemoryStore) GetRefresh(_ context.Context, value string) (RefreshToken, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	t, ok := s.refresh[TokenHash(value)]
 	if !ok {
 		return RefreshToken{}, ErrTokenNotFound
 	}
+	t.Scopes = cloneScopes(t.Scopes)
 	return t, nil
 }
 
@@ -483,6 +538,7 @@ func (s *MemoryStore) ConsumeRefresh(_ context.Context, value string) (RefreshTo
 	s.tombstones[key] = refreshTombstone{
 		FamilyID: t.FamilyID, ClientID: t.ClientID, Subject: t.Subject, ExpiresAt: t.ExpiresAt,
 	}
+	t.Scopes = cloneScopes(t.Scopes)
 	return t, nil
 }
 
@@ -545,8 +601,8 @@ func (s *MemoryStore) RevokeRefreshFamily(_ context.Context, familyID string) (i
 func (s *MemoryStore) RefreshFamily(_ context.Context, value string) (string, error) {
 	key := TokenHash(value)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if t, ok := s.refresh[key]; ok {
 		return t.FamilyID, nil
 	}
@@ -568,4 +624,12 @@ func (s *MemoryStore) RefreshFamily(_ context.Context, value string) (string, er
 func TokenHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// cloneScopes returns an owned copy of a scope slice for a Store boundary. The
+// Store hands records out and takes them in, and a returned record whose Scopes
+// aliased the stored backing array let any caller rewrite the authorization state
+// of a live token by mutating what it was given (S01-12, Z18-3, Z18v-1).
+func cloneScopes(in []Scope) []Scope {
+	return append([]Scope(nil), in...)
 }
