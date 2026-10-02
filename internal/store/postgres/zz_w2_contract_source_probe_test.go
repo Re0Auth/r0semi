@@ -87,7 +87,7 @@ func TestW2KIT10ClientsDeleteRevokesInOneTransaction(t *testing.T) {
 	}
 	covered := map[string]bool{}
 	for _, src := range []string{
-		string(source), // Tokens.RevokeTokens
+		string(source),  // Tokens.RevokeTokens
 		string(oidcSrc), // OIDCStore.RevokeTokens
 	} {
 		for _, sig := range []string{

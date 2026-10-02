@@ -15,9 +15,10 @@ import (
 // unspent authorization code could still mint a fresh pair.
 //
 // The three assertions the finding calls for are all here:
-//   (a) the token cannot be introspected after the delete,
-//   (b) no token row and no authorization survives it,
-//   (c) the control: deleting a client that holds nothing still succeeds.
+//
+//	(a) the token cannot be introspected after the delete,
+//	(b) no token row and no authorization survives it,
+//	(c) the control: deleting a client that holds nothing still succeeds.
 //
 // The registry is wired by NewService — the same composition production uses for
 // the in-memory engine — so this probe fails again the moment that wiring (or
