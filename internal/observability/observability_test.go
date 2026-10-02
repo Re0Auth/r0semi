@@ -212,6 +212,14 @@ func TestUnknownLabelValuesAreCollapsed(t *testing.T) {
 // must be inert rather than a panic in the middle of serving a request.
 func TestNilMetricsIsSafe(t *testing.T) {
 	var m *Metrics
+	// The property under test is the absence of a panic, and only the *method*
+	// names which one dereferenced the nil receiver: without this the failure is a
+	// bare nil-dereference stack in the middle of serving a request.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("a nil *Metrics must be inert; a domain call panicked: %v", r)
+		}
+	}()
 	m.ObserveLogin("github", LoginSuccess)
 	m.ObserveTokenIssued("authorization_code")
 	m.ObserveTokenError("refresh_token", "invalid_grant")

@@ -150,6 +150,27 @@ func TestConcurrentUseIsSafe(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+
+	// Race-freedom itself is the race detector's claim, but the table the locked
+	// path maintains is assertable without it: 5000 operations on one key must leave
+	// exactly one bucket. A leaked or duplicated bucket hands that key a second full
+	// burst — a fail-open that never shows up as a wrong verdict.
+	if n := l.Size(); n != 1 {
+		t.Fatalf("after concurrent use of one key the limiter tracks %d keys, want 1", n)
+	}
+	// The contended key is still tracked on its own rather than spilled onto the
+	// shard's overflow bucket, and a key that saw no concurrency is tracked too: the
+	// table must still be usable after the load. Spilling means sharing one budget
+	// with every other untracked key, which is a weaker guarantee than this test's.
+	if v := l.Check("shared"); v.Shared || v.Limit != 1000 {
+		t.Fatalf("the contended key reported shared=%v limit=%d, want shared=false limit=1000", v.Shared, v.Limit)
+	}
+	if v := l.Check("uncontended"); v.Shared || v.Limit != 1000 {
+		t.Fatalf("a fresh key reported shared=%v limit=%d, want shared=false limit=1000", v.Shared, v.Limit)
+	}
+	if n := l.Size(); n != 2 {
+		t.Fatalf("after two distinct keys the limiter tracks %d keys, want 2", n)
+	}
 }
 
 // The cost of admitting a new key must not grow with the number of tracked keys.
