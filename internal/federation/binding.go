@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Re0Auth/r0semi/internal/account"
@@ -166,11 +167,56 @@ type BindingPager interface {
 type MemoryBindingStore struct {
 	mu sync.RWMutex
 	m  map[string]Binding
+	// index lists the map's keys in (user, game, source) order -- the order
+	// sortBindings used to impose. A listing or a page walks it instead of
+	// materialising and re-sorting the whole map, and every mutation keeps it in
+	// sync: Put/Create insert the key with a binary search, Delete removes it, and
+	// PutIfVersion rewrites only the payload (the key does not move).
+	index []bindingIndexKey
+	// rowsCopied counts the rows ListAll and ListAllPage have copied out. It exists
+	// so a probe can show that paging copies each row once rather than materialising
+	// the whole table per page; nothing in the read path depends on it.
+	rowsCopied atomic.Int64
+}
+
+// bindingIndexKey is the ordered part of a binding: exactly the fields the index,
+// the listing order and the page cursor compare. The payload lives only in the map,
+// so a version bump does not make the index stale.
+type bindingIndexKey struct {
+	user   account.UserID
+	game   string
+	source string
 }
 
 // NewMemoryBindingStore returns an empty store.
 func NewMemoryBindingStore() *MemoryBindingStore {
 	return &MemoryBindingStore{m: make(map[string]Binding)}
+}
+
+// indexOf returns the position of key in the ordered index and whether it is
+// present. When absent, the position is where it must be inserted.
+func (s *MemoryBindingStore) indexOf(key bindingIndexKey) (int, bool) {
+	i := sort.Search(len(s.index), func(i int) bool { return !bindingIndexLess(s.index[i], key) })
+	if i < len(s.index) && s.index[i] == key {
+		return i, true
+	}
+	return i, false
+}
+
+// insertIndex records key in the ordered index. The caller must have already
+// established that key is absent.
+func (s *MemoryBindingStore) insertIndex(key bindingIndexKey) {
+	i, _ := s.indexOf(key)
+	s.index = append(s.index, bindingIndexKey{})
+	copy(s.index[i+1:], s.index[i:])
+	s.index[i] = key
+}
+
+// removeIndex drops key from the ordered index if it is there.
+func (s *MemoryBindingStore) removeIndex(key bindingIndexKey) {
+	if i, ok := s.indexOf(key); ok {
+		s.index = append(s.index[:i], s.index[i+1:]...)
+	}
 }
 
 // Get implements BindingStore.
@@ -187,8 +233,12 @@ func (s *MemoryBindingStore) Get(_ context.Context, user account.UserID, game, s
 // Put implements BindingStore.
 func (s *MemoryBindingStore) Put(_ context.Context, b Binding) error {
 	s.mu.Lock()
-	s.m[bindingKey(b.User, b.Game, b.Source)] = b
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	key := bindingKey(b.User, b.Game, b.Source)
+	if _, ok := s.m[key]; !ok {
+		s.insertIndex(bindingIndexKey{user: b.User, game: b.Game, source: b.Source})
+	}
+	s.m[key] = b
 	return nil
 }
 
@@ -216,6 +266,7 @@ func (s *MemoryBindingStore) Create(_ context.Context, b Binding) (bool, error) 
 	if _, ok := s.m[key]; ok {
 		return false, nil
 	}
+	s.insertIndex(bindingIndexKey{user: b.User, game: b.Game, source: b.Source})
 	s.m[key] = b
 	return true, nil
 }
@@ -224,8 +275,12 @@ func (s *MemoryBindingStore) Create(_ context.Context, b Binding) (bool, error) 
 // which keeps unbinding idempotent.
 func (s *MemoryBindingStore) Delete(_ context.Context, user account.UserID, game, source string) error {
 	s.mu.Lock()
-	delete(s.m, bindingKey(user, game, source))
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	key := bindingKey(user, game, source)
+	if _, ok := s.m[key]; ok {
+		delete(s.m, key)
+		s.removeIndex(bindingIndexKey{user: user, game: game, source: source})
+	}
 	return nil
 }
 
@@ -235,18 +290,13 @@ func (s *MemoryBindingStore) List(_ context.Context, user account.UserID) ([]Bin
 	defer s.mu.RUnlock()
 
 	out := make([]Binding, 0, len(s.m))
-	for _, b := range s.m {
-		if b.User == user {
-			out = append(out, b)
+	// The index is globally (user, game, source) ordered, so restricting it to one
+	// user yields (game, source) order -- the sorted order the account page wants.
+	for _, k := range s.index {
+		if k.user == user {
+			out = append(out, s.m[bindingKey(k.user, k.game, k.source)])
 		}
 	}
-	// Sorted, so the account page does not reorder itself between two loads.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Game != out[j].Game {
-			return out[i].Game < out[j].Game
-		}
-		return out[i].Source < out[j].Source
-	})
 	return out, nil
 }
 
@@ -260,16 +310,20 @@ func (s *MemoryBindingStore) ListAll(_ context.Context) ([]Binding, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	out := make([]Binding, 0, len(s.m))
-	for _, b := range s.m {
-		out = append(out, b)
+	out := make([]Binding, 0, len(s.index))
+	for _, k := range s.index {
+		out = append(out, s.m[bindingKey(k.user, k.game, k.source)])
 	}
-	sortBindings(out)
+	s.rowsCopied.Add(int64(len(out)))
 	return out, nil
 }
 
 // ListAllPage implements BindingPager: the bindings after the cursor, in the same
 // order ListAll returns them.
+//
+// The ordered index makes this a bounded read rather than a full scan: the cursor
+// is located by binary search, so a page copies only its own rows and never sorts
+// the table.
 func (s *MemoryBindingStore) ListAllPage(_ context.Context, afterUser, afterGame, afterSource string, limit int) ([]Binding, error) {
 	if limit <= 0 {
 		limit = 1
@@ -277,53 +331,50 @@ func (s *MemoryBindingStore) ListAllPage(_ context.Context, afterUser, afterGame
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	all := make([]Binding, 0, len(s.m))
-	for _, b := range s.m {
-		all = append(all, b)
+	// bindingIndexAfter is monotone over the sorted index (a contiguous run of
+	// trues), so its first true position is exactly the cursor's successor.
+	pos := sort.Search(len(s.index), func(i int) bool {
+		return bindingIndexAfter(s.index[i], afterUser, afterGame, afterSource)
+	})
+	end := pos + limit
+	if end > len(s.index) {
+		end = len(s.index)
 	}
-	sortBindings(all)
 
-	out := make([]Binding, 0, limit)
-	for _, b := range all {
-		if !bindingAfter(b, afterUser, afterGame, afterSource) {
-			continue
-		}
-		out = append(out, b)
-		if len(out) == limit {
-			break
-		}
+	out := make([]Binding, 0, end-pos)
+	for _, k := range s.index[pos:end] {
+		out = append(out, s.m[bindingKey(k.user, k.game, k.source)])
 	}
+	s.rowsCopied.Add(int64(len(out)))
 	return out, nil
 }
 
-// bindingAfter reports whether b sorts after the (user, game, source) cursor. An
-// empty cursor is the start of the list, which is safe because a real account id
-// is never empty.
-func bindingAfter(b Binding, user, game, source string) bool {
+// bindingIndexAfter is the cursor test: whether the key sorts after
+// (user, game, source). An empty cursor is the start of the list, which is safe
+// because a real account id is never empty.
+func bindingIndexAfter(k bindingIndexKey, user, game, source string) bool {
 	if user == "" && game == "" && source == "" {
 		return true
 	}
 	switch {
-	case b.User != account.UserID(user):
-		return b.User > account.UserID(user)
-	case b.Game != game:
-		return b.Game > game
+	case k.user != account.UserID(user):
+		return k.user > account.UserID(user)
+	case k.game != game:
+		return k.game > game
 	default:
-		return b.Source > source
+		return k.source > source
 	}
 }
 
-// sortBindings orders bindings the one way every listing does, so a page boundary
-// means the same thing to the store and to its caller.
-func sortBindings(out []Binding) {
-	sort.Slice(out, func(i, j int) bool {
-		switch {
-		case out[i].User != out[j].User:
-			return out[i].User < out[j].User
-		case out[i].Game != out[j].Game:
-			return out[i].Game < out[j].Game
-		default:
-			return out[i].Source < out[j].Source
-		}
-	})
+// bindingIndexLess orders bindings the one way every listing does, so a page
+// boundary means the same thing to the store and to its caller.
+func bindingIndexLess(a, b bindingIndexKey) bool {
+	switch {
+	case a.user != b.user:
+		return a.user < b.user
+	case a.game != b.game:
+		return a.game < b.game
+	default:
+		return a.source < b.source
+	}
 }

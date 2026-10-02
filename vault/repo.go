@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -137,6 +138,16 @@ type RecordPager interface {
 type MemoryRepo struct {
 	mu      sync.RWMutex
 	records map[Identity]Record
+	// ids indexes the records' keys in identityLess order, so a listing or a page
+	// never has to materialise and re-sort the whole map. Every mutation keeps it in
+	// sync: Put inserts a new key with a binary search, Delete and DeleteSubject
+	// remove keys, and RewrapIfUnchanged rewrites only the payload (the key does not
+	// move).
+	ids []Identity
+	// rowsCopied counts the rows List and ListPage have cloned out. It exists so a
+	// probe can show that paging copies each row once rather than materialising the
+	// whole table per page; nothing in the read path depends on it.
+	rowsCopied atomic.Int64
 }
 
 // NewMemoryRepo returns an empty in-memory credential store.
@@ -144,10 +155,39 @@ func NewMemoryRepo() *MemoryRepo {
 	return &MemoryRepo{records: make(map[Identity]Record)}
 }
 
+// indexOf returns the position of id in the ordered index and whether it is
+// present. When absent, the position is where it must be inserted.
+func (r *MemoryRepo) indexOf(id Identity) (int, bool) {
+	i := sort.Search(len(r.ids), func(i int) bool { return !identityLess(r.ids[i], id) })
+	if i < len(r.ids) && r.ids[i] == id {
+		return i, true
+	}
+	return i, false
+}
+
+// insertIndex records id in the ordered index. The caller must have already
+// established that id is absent.
+func (r *MemoryRepo) insertIndex(id Identity) {
+	i, _ := r.indexOf(id)
+	r.ids = append(r.ids, Identity{})
+	copy(r.ids[i+1:], r.ids[i:])
+	r.ids[i] = id
+}
+
+// removeIndex drops id from the ordered index if it is there.
+func (r *MemoryRepo) removeIndex(id Identity) {
+	if i, ok := r.indexOf(id); ok {
+		r.ids = append(r.ids[:i], r.ids[i+1:]...)
+	}
+}
+
 // Put implements Repo. Existing records are replaced.
 func (r *MemoryRepo) Put(_ context.Context, rec Record) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, ok := r.records[rec.Identity]; !ok {
+		r.insertIndex(rec.Identity)
+	}
 	r.records[rec.Identity] = cloneRecord(rec)
 	return nil
 }
@@ -190,6 +230,7 @@ func (r *MemoryRepo) Delete(_ context.Context, id Identity) error {
 		return ErrNotFound
 	}
 	delete(r.records, id)
+	r.removeIndex(id)
 	return nil
 }
 
@@ -203,16 +244,11 @@ func (r *MemoryRepo) List(_ context.Context) ([]Record, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	ids := make([]Identity, 0, len(r.records))
-	for id := range r.records {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return identityLess(ids[i], ids[j]) })
-
-	out := make([]Record, 0, len(ids))
-	for _, id := range ids {
+	out := make([]Record, 0, len(r.ids))
+	for _, id := range r.ids {
 		out = append(out, cloneRecord(r.records[id]))
 	}
+	r.rowsCopied.Add(int64(len(out)))
 	return out, nil
 }
 
@@ -226,24 +262,32 @@ func identityLess(a, b Identity) bool {
 
 // ListPage implements RecordPager: the records after the cursor, in the same order
 // List returns them.
+//
+// The ordered index makes this a bounded read rather than a full scan: the cursor
+// is located by binary search, so a page copies only its own rows and never sorts
+// the table.
 func (r *MemoryRepo) ListPage(_ context.Context, afterSubject, afterProvider string, limit int) ([]Record, error) {
 	if limit <= 0 {
 		limit = 1
 	}
-	all, err := r.List(context.Background())
-	if err != nil {
-		return nil, err
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// recordAfter is monotone over the sorted index (a contiguous run of trues), so
+	// its first true position is exactly the cursor's successor.
+	pos := sort.Search(len(r.ids), func(i int) bool {
+		return recordAfter(r.ids[i], afterSubject, afterProvider)
+	})
+	end := pos + limit
+	if end > len(r.ids) {
+		end = len(r.ids)
 	}
-	out := make([]Record, 0, limit)
-	for _, rec := range all {
-		if !recordAfter(rec.Identity, afterSubject, afterProvider) {
-			continue
-		}
-		out = append(out, rec)
-		if len(out) == limit {
-			break
-		}
+
+	out := make([]Record, 0, end-pos)
+	for _, id := range r.ids[pos:end] {
+		out = append(out, cloneRecord(r.records[id]))
 	}
+	r.rowsCopied.Add(int64(len(out)))
 	return out, nil
 }
 
@@ -267,14 +311,18 @@ func (r *MemoryRepo) DeleteSubject(_ context.Context, subject string) (int, erro
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := 0
-	for id := range r.records {
-		if id.Subject == subject {
-			delete(r.records, id)
-			n++
-		}
+	// One subject's records are a contiguous run in (subject, provider) order, so
+	// the run is found by binary search and removed as a block.
+	lo := sort.Search(len(r.ids), func(i int) bool { return r.ids[i].Subject >= subject })
+	hi := lo
+	for hi < len(r.ids) && r.ids[hi].Subject == subject {
+		delete(r.records, r.ids[hi])
+		hi++
 	}
-	return n, nil
+	if hi > lo {
+		r.ids = append(r.ids[:lo], r.ids[hi:]...)
+	}
+	return hi - lo, nil
 }
 
 func cloneRecord(rec Record) Record {
