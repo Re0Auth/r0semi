@@ -172,16 +172,7 @@ func isRefreshRejected(err error) bool {
 	if !errors.As(err, &re) {
 		return false
 	}
-	if re.ErrorCode == "invalid_grant" {
-		return true
-	}
-	if re.Response != nil {
-		switch re.Response.StatusCode {
-		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-			return true
-		}
-	}
-	return false
+	return re.ErrorCode == "invalid_grant"
 }
 
 func isUnauthorized(err error) bool {

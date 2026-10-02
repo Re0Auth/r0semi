@@ -130,6 +130,55 @@ func TestFetchRebindsWhenRefreshRejected(t *testing.T) {
 	}
 }
 
+// A token endpoint that answers with a retryable-looking status — a CDN/WAF HTML
+// 403, or a transient OAuth error code carried on a 400 — is not a dead grant.
+// The binding row and its encrypted secret must both survive, and the caller must
+// still see a failure rather than silently losing the binding.
+func TestFetchKeepsBindingWhenRefreshTokenEndpointReturnsRetryableStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		ctype  string
+		body   string
+	}{
+		{"cdn html 403", http.StatusForbidden, "text/html", "<html><body>Forbidden</body></html>"},
+		{"transient oauth error on 400", http.StatusBadRequest, "application/json", `{"error":"temporarily_unavailable"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/oauth/token" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", tc.ctype)
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+
+			svc, b := refreshService(t, srv.URL)
+			ctx := context.Background()
+			b.bind(t, "usr_1", sourceName, "stale", "rt-1", time.Now().Add(-time.Hour))
+
+			_, err := svc.Fetch(ctx, FetchRequest{User: "usr_1", Game: game, Resource: "profile"})
+			if err == nil {
+				t.Fatal("Fetch succeeded despite a failed refresh")
+			}
+			if errors.Is(err, ErrNotBound) {
+				t.Fatalf("a retryable token-endpoint failure was treated as a dead grant: %v", err)
+			}
+			if _, gerr := b.store.Get(ctx, "usr_1", game, sourceName); gerr != nil {
+				t.Fatalf("the binding was removed: %v", gerr)
+			}
+			identity := BindingIdentity(Binding{User: "usr_1", Game: game, Source: sourceName})
+			if exists, _ := b.vault.Exists(ctx, identity); !exists {
+				t.Fatal("the encrypted secret was revoked")
+			}
+		})
+	}
+}
+
 // Without a refresh token a 401 is surfaced as-is.
 func TestFetchWithoutRefreshTokenFails(t *testing.T) {
 	up := refreshUpstream(t, "fresh-token", http.StatusOK)
