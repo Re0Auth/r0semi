@@ -89,6 +89,17 @@ func TestReleaseShipsNpmAttribution(t *testing.T) {
 		t.Errorf("`npm-attribution` does not name the listing artifact (recipe: %v)", attributionRecipe)
 	}
 
+	// The name the build actually writes must be the name the checksums glob
+	// covers. Checking prerequisites alone left this open: the listing could be
+	// written under a name `sha256sum re0auth_${VERSION}_*` does not match, and
+	// `gh release create dist/*` would publish it unchecksummed (Z13-6).
+	written := npmAttributionWrittenFile(t, mk)
+	glob := checksumsGlob(t, mk)
+	if stem := strings.TrimSuffix(glob, "*"); !strings.HasPrefix(written, stem) {
+		t.Errorf("`checksums` hashes the pattern %q, which does not cover the npm licence listing the "+
+			"build writes (%q): the file would be published unchecksummed", glob, written)
+	}
+
 	// The image is the third shipping form of the same embedded SPA. This gate used
 	// to read only the Makefile, so it stayed green while the runtime stage copied
 	// LICENSE and NOTICE and nothing else — the archive had the listing and the
@@ -508,4 +519,44 @@ func TestWorkflowsGrantWriteScopesOnlyToTheJobThatUsesThem(t *testing.T) {
 		t.Fatalf("only %d jobs with a permissions block were read; the job-level parse is not "+
 			"reading the workflows", jobsChecked)
 	}
+}
+
+// npmAttributionWrittenFile returns the basename of the npm licence listing the
+// `dist` recipe writes, so the guard can compare it with the checksums glob
+// instead of trusting that a name containing "npm-attribution" is enough.
+func npmAttributionWrittenFile(t *testing.T, makefile []byte) string {
+	t.Helper()
+	recipe, ok := makeRecipe(makefile, "dist")
+	if !ok {
+		t.Fatal("the Makefile has no `dist:` target")
+	}
+	re := regexp.MustCompile(`(?:\.\./)?dist/(\S*npm-attribution\.json)`)
+	for _, line := range recipe {
+		if m := re.FindStringSubmatch(line); m != nil {
+			return m[1]
+		}
+	}
+	t.Fatal("the `dist` recipe writes no npm-attribution.json under dist/")
+	return ""
+}
+
+// checksumsGlob returns the versioned pattern the `checksums` recipe hashes,
+// e.g. `re0auth_$${VERSION}_*`. A fixed file list is refused: the listing is not
+// covered by it unless it happens to name the file, which is what the wildcard
+// makes structural.
+func checksumsGlob(t *testing.T, makefile []byte) string {
+	t.Helper()
+	recipe, ok := makeRecipe(makefile, "checksums")
+	if !ok {
+		t.Fatal("the Makefile has no `checksums:` target")
+	}
+	for _, line := range recipe {
+		for _, field := range strings.Fields(line) {
+			if strings.Contains(field, "*") && strings.Contains(field, "re0auth_") {
+				return field
+			}
+		}
+	}
+	t.Fatal("the `checksums` recipe hashes no versioned glob")
+	return ""
 }
