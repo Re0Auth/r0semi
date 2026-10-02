@@ -185,13 +185,31 @@ func (c *readinessCache) check(ctx context.Context, probe ReadinessProbe) (readi
 	settled := c.settled
 	c.mu.Unlock()
 
+	// The in-flight marker is released on EVERY exit from this point, including a
+	// panic out of the probe. It used to be cleared only on the normal return path
+	// below, so a probe that panicked left running=true and settled unclosed
+	// forever: every later caller took the `fresh || c.running` branch, waited out
+	// readinessColdStartWait and answered "checking" (503) without ever running the
+	// probe again — a healthy instance pulled from rotation for good.
+	//
+	// The guard checks c.settled == settled so this can only ever close the
+	// channel it created; it is a no-op if another check has since replaced it.
+	// Closing here (rather than in the body below) is what keeps a panic from
+	// double-closing: the normal path must not close settled itself.
+	defer func() {
+		c.mu.Lock()
+		if c.settled == settled {
+			c.running = false
+			close(settled)
+		}
+		c.mu.Unlock()
+	}()
+
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readinessTimeout)
 	defer cancel()
 	err := probe(probeCtx)
 
 	c.mu.Lock()
-	c.running = false
-	close(settled)
 	if errors.Is(err, context.Canceled) {
 		// Not a statement about the dependency, so it must not replace the last
 		// one. The verdict stays whatever it was — ready, not-ready, or still
