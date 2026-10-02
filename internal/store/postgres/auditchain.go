@@ -325,7 +325,16 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 			// ceiling migration 0030 sealed: the serial cannot reuse an id, so a
 			// NULL-hash row with a higher id was inserted after the seal — it is a
 			// forged row, not a migration-era one (Z10-2).
-			if id > legacyCeiling {
+			//
+			// legacyCeiling == 0 means no row was ever sealed as pre-chain, so
+			// there is no id a NULL-hash row may legitimately carry. The id
+			// comparison alone missed exactly that case: a row planted at id 0
+			// with OVERRIDING SYSTEM VALUE made `id > 0` false and, while the
+			// chain had not started, the walk accepted it as legacy. A genuine
+			// migration-era row always has id >= 1 (the identity starts there)
+			// AND was present when 0030 sealed the ceiling, so it cannot be
+			// reached with legacyCeiling == 0.
+			if legacyCeiling == 0 || id > legacyCeiling {
 				v.OK = false
 				v.FirstBadID = id
 				v.Reason = "unchained row appears past the legacy ceiling recorded when the chain was sealed"

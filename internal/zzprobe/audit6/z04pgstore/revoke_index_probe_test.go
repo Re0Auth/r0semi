@@ -12,9 +12,10 @@ package z04pgstore
 // set from the adapter's own source instead of enumerating it by hand, which is
 // how a seventh table the list missed showed up: OIDCStore.RevokeTokens also
 // runs revokeMatching over oidc_devices, and that table had no client_id index.
-// G-14 was fixed by migration 0029 and the guard now lists oidc_devices; the
-// derivation is kept because it immediately found an EIGHTH table,
-// oidc_refresh_token_tombstones, which is still unindexed (STILL-OPEN).
+// G-14 was fixed by migration 0029; the derivation then immediately found an
+// EIGHTH table, oidc_refresh_token_tombstones, which migration 0031 indexed and
+// which the in-package guard now derives rather than lists (so it cannot miss a
+// ninth). Both tests below are guards for those fixes, not findings.
 
 import (
 	"regexp"
@@ -71,34 +72,44 @@ func clientScopedRevokeTables(t *testing.T) map[string]string {
 // TestEveryClientScopedRevokeTableHasALeadingClientIndex started as the G-14
 // finding: the table set a client_id-only filter deletes from is seven, not the
 // six the fix and its guard enumerated, and the seventh — oidc_devices — had no
-// index whose leading column is client_id. Migration 0029 fixed that, so the
-// oidc_devices check is now an anti-vacuous guard. The derivation is kept because
-// it finds an eighth table, oidc_refresh_token_tombstones, still without a
-// leading client_id index (STILL-OPEN, needs a migration outside this probe's
-// write scope). Every one of those deletes runs inside the one-transaction
-// revocation an operator fires during an incident.
+// index whose leading column is client_id. Migration 0029 fixed that. The
+// derivation then found an eighth, oidc_refresh_token_tombstones, and migration
+// 0031 indexed it; the set is now fully covered, so this test is the guard for
+// both fixes. Every one of these deletes runs inside the one-transaction
+// revocation an operator fires during an incident, under the pool's statement
+// timeout.
 func TestEveryClientScopedRevokeTableHasALeadingClientIndex(t *testing.T) {
 	leading := leadingIndexCols(t)
 	tables := clientScopedRevokeTables(t)
 
 	// Anti-vacuous in both directions: the schema parser must see the
-	// indexes 0021/0022/0029 actually created (these must pass), and must not
-	// believe every column is indexed.
+	// indexes 0021/0022/0025/0029/0031 actually created (these must pass), and
+	// must not believe every column is indexed.
 	//
 	// G-14 used to be asserted on the other side: oidc_devices had no leading
 	// client_id index and this probe failed with a message saying so. Migration
-	// 0029 added it and the in-package guard now lists the table, so the check
-	// below is a guard for that fix rather than the finding.
+	// 0029 added it; migration 0031 did the same for
+	// oidc_refresh_token_tombstones, so the checks below are guards for those
+	// fixes rather than findings.
 	for _, ok := range []struct{ table, col string }{
 		{"oidc_access_tokens", "client_id"},
+		{"oidc_refresh_tokens", "client_id"},
 		{"oidc_auth_requests", "client_id"},
 		{"oauth_codes", "client_id"},
 		{"oidc_devices", "client_id"},
+		{"oidc_refresh_token_tombstones", "client_id"},
 	} {
 		if !leading[ok.table][ok.col] {
-			t.Fatalf("the parser does not see %s.%s's index; it is not reading migration 0021/0022/0029 "+
+			t.Fatalf("the parser does not see %s.%s's index; it is not reading migration 0021/0022/0025/0029/0031 "+
 				"and every assertion below is vacuous", ok.table, ok.col)
 		}
+	}
+	// The derivation must still see the table this round fixed: if the regex
+	// silently stopped matching its revokeMatching call site, the coverage check
+	// below would pass for it without checking anything.
+	if _, ok := tables["oidc_refresh_token_tombstones"]; !ok {
+		t.Fatalf("the derivation no longer sees oidc_refresh_token_tombstones (%v); the guard would be "+
+			"vacuous for the table migration 0031 added the index for", tables)
 	}
 
 	var missing []string
@@ -112,46 +123,49 @@ func TestEveryClientScopedRevokeTableHasALeadingClientIndex(t *testing.T) {
 		t.Errorf("UNINDEXED CLIENT-SCOPED REVOKE: %s has no index with client_id as its leading column; "+
 			"admin.SuspendClient / DeleteClient and the `client` Kill Switch filter by client_id alone, "+
 			"and the delete runs inside the same incident-path transaction as the indexed tables "+
-			"(migration 0022 and G-14's 0029 covered the seven; this is the eighth the derivation found)", m)
+			"(migration 0022 / 0029 / 0031 covered the derived set; this is a table the derivation sees "+
+			"and the migrations do not)", m)
 	}
 }
 
 // TestTheClientScopedRevokeGuardCoversTheDerivedTableSet is the guard-quality
-// half: the in-package guard TestClientScopedRevokeIsIndexed (revoke_predicate_
-// test.go) enumerates its tables by hand and claims to list "every table a
-// client_id-only predicate deletes from". A guard that shares the assumption of
-// the fix it was shipped with cannot catch the fix's omission — this probe
-// fails while the guard's list and the adapter's statements disagree.
+// half. The in-package guard TestClientScopedRevokeIsIndexed
+// (revoke_predicate_test.go) used to enumerate its tables by hand and claim to
+// list "every table a client_id-only predicate deletes from" — the exact shape
+// that let oidc_devices and then oidc_refresh_token_tombstones escape it. This
+// probe now requires that the guard DERIVES the set from the adapter's
+// revokeMatching call sites (the same derivation this probe uses), so the two
+// cannot disagree about a table a future delete site adds. The old hand list is
+// a failure: a hand list is the bug, not the fix.
 func TestTheClientScopedRevokeGuardCoversTheDerivedTableSet(t *testing.T) {
-	derived := clientScopedRevokeTables(t)
+	// Anti-vacuous: the derived set this name is about must exist.
+	if derived := clientScopedRevokeTables(t); len(derived) < 5 {
+		t.Fatalf("derived only %d client-scoped revoke tables; the guard-quality check is vacuous", len(derived))
+	}
 
 	guard := readShipped(t, adapterDir+"/revoke_predicate_test.go")
-	list := regexp.MustCompile(`(?s)func TestClientScopedRevokeIsIndexed.*?for _, table := range \[\]string\{(.*?)\}`)
-	m := list.FindStringSubmatch(guard)
-	if m == nil {
-		t.Fatal("the guard's table list was not found; the probe is not reading revoke_predicate_test.go")
-	}
-	guarded := make(map[string]bool)
-	for _, table := range strings.Split(m[1], ",") {
-		table = strings.Trim(strings.TrimSpace(table), `"`)
-		if table != "" {
-			guarded[table] = true
-		}
-	}
-	if len(guarded) < 6 {
-		t.Fatalf("parsed only %d guarded tables; the extraction is broken", len(guarded))
-	}
+	code := stripGoComments(guard)
 
-	var unguarded []string
-	for table := range derived {
-		if !guarded[table] {
-			unguarded = append(unguarded, table)
-		}
+	// The guard must read the adapter's call sites.
+	if !strings.Contains(code, "revokeMatching") {
+		t.Error("TestClientScopedRevokeIsIndexed no longer derives its table set from the adapter's " +
+			"revokeMatching call sites: without that read a new client-scoped delete table is invisible to " +
+			"the guard, which is how oidc_devices (G-14) and oidc_refresh_token_tombstones were missed")
 	}
-	sort.Strings(unguarded)
-	for _, table := range unguarded {
-		t.Errorf("the guard's hand-written table list omits %s, which the adapter deletes from with a "+
-			"client_id-only filter: a future index on it would not be checked, and its absence today is "+
-			"invisible to the guard — derive the list from the revokeMatching call sites instead", table)
+	if !strings.Contains(code, "clientScopedRevokeTables") {
+		t.Error("the guard no longer calls the derivation helper; re-derive the table set instead of " +
+			"enumerating it by hand")
+	}
+	// The old failure mode must not come back: a `for _, table := range []string{…}`
+	// table list in the guard is a hand enumeration.
+	if m := regexp.MustCompile(`for _, table := range \[\]string\{`).FindString(code); m != "" {
+		t.Error("the guard enumerates its tables by hand again (" + m + "); derive the set from the " +
+			"revokeMatching call sites so the next delete site fails the guard instead of silently scanning")
+	}
+	// The guard's own anti-vacuous check must survive: a derivation that found
+	// nothing would make every assertion below it pass.
+	if !strings.Contains(code, "derived only") {
+		t.Error("the guard has no anti-vacuous check on the derived set: an empty derivation would pass " +
+			"every index assertion vacuously")
 	}
 }

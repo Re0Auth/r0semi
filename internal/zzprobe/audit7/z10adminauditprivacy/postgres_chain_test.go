@@ -16,17 +16,25 @@ import (
 	"github.com/Re0Auth/r0semi/internal/store/postgres"
 )
 
-// TestZ10VerifyAcceptsAForgedUnsignedRowBeforeTheChainStarts.
+// TestZ10VerifyAcceptsAForgedUnsignedRowBeforeTheChainStarts was the Z10-2
+// finding and is now its regression guard (the name is kept for the audit
+// coverage matrix, as with the Z10-9 test below).
 //
 // Verify counts every row whose row_hash is NULL that appears before the chain
 // began as "legacy" and carries on. That is right for rows written before
-// migration 0013 — but nothing bounds what "before the chain" is, and
+// migration 0013 — but nothing bounded what "before the chain" was, and
 // audit_events.id is an identity column an attacker with SQL access can override
-// (OVERRIDING SYSTEM VALUE), so a forged row can be placed below the first chained
-// row. The chain's own documentation (migration 0013) lists what it catches —
-// editing, deleting mid-chain, reordering, rewriting — and insertion is not among
-// them; there is nothing in the log that says which NULL-hash rows are genuinely
-// pre-0013.
+// (OVERRIDING SYSTEM VALUE), so a forged row could be placed below the first
+// chained row. Migration 0030 added audit_chain.legacy_ceiling_id for the
+// post-seal case, but the comparison `id > ceiling` is false for a row planted
+// at id 0 while the ceiling is still 0, and no chained row has been walked yet,
+// so the row was blessed as legacy.
+//
+// Verify now requires a non-zero ceiling for any NULL-hash row to be legacy. A
+// genuine migration-era row has id >= 1 and was present when 0030 sealed the
+// ceiling, so the check cannot misclassify one. This probe is the live half: it
+// needs a real identity column and the real ORDER BY id walk, so it skips
+// without TEST_DATABASE_URL.
 func TestZ10VerifyAcceptsAForgedUnsignedRowBeforeTheChainStarts(t *testing.T) {
 	dsn := probeDSN(t)
 	ctx := context.Background()
@@ -93,12 +101,14 @@ func TestZ10VerifyAcceptsAForgedUnsignedRowBeforeTheChainStarts(t *testing.T) {
 	if v.OK {
 		t.Errorf("Verify reports ok=true (chained=%d legacy=%d) for a log that now contains a row nobody signed, "+
 			"inserted after the migration ran and placed before the chain start. It is accepted as \"legacy\" "+
-			"because Verify treats every NULL row_hash before the first chained row as pre-0013. Nothing records "+
-			"which rows were genuinely pre-0013, so a database-write attacker can plant audit entries "+
-			"(an operator action, a consent decision) that the integrity check blesses.", v.Chained, v.Legacy)
+			"because Verify treats every NULL row_hash before the first chained row as pre-0013 — the very "+
+			"acceptance migration 0030's ceiling and its id-0 case exist to refuse.", v.Chained, v.Legacy)
 	}
-	if v.Legacy == 0 {
-		t.Errorf("the forged row is not even counted as legacy (%+v); the probe did not insert what it thinks", v)
+	if !strings.Contains(v.Reason, "legacy ceiling") {
+		t.Errorf("Verify failed for %q, not the legacy-ceiling check; re-derive this guard", v.Reason)
+	}
+	if v.Legacy != 0 {
+		t.Errorf("the walk counted the forged row as legacy (%+v) instead of stopping on it", v)
 	}
 }
 

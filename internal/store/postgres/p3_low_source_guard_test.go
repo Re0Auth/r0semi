@@ -165,11 +165,15 @@ func TestVerifyComparesTheWalkedTailToTheChainHead(t *testing.T) {
 
 // TestVerifyBoundsLegacyRowsAtTheSealedCeiling pins Z10-2: a row with a NULL hash
 // is only "legacy" if its id is at or below the ceiling migration 0030 recorded.
+// A ceiling of 0 means nothing was ever sealed as pre-chain, so no NULL-hash row
+// can be legacy — the id comparison alone accepted a forged row at id 0, where
+// `id > 0` is false (see TestVerifyRejectsAnUnchainedRowWithNoSealedCeiling).
 func TestVerifyBoundsLegacyRowsAtTheSealedCeiling(t *testing.T) {
 	method := receiverMethod(t, sourceOf(t, "auditchain.go"), "auditchain.go", "Verify")
-	if !strings.Contains(flatten(method), "if id > legacyCeiling {") {
-		t.Error("Verify does not reject a NULL-hash row past the legacy ceiling, so an unsigned row inserted " +
-			"after the seal is reported as a migration-era row (Z10-2)")
+	if !strings.Contains(flatten(method), "if legacyCeiling == 0 || id > legacyCeiling {") {
+		t.Error("Verify does not reject a NULL-hash row when no legacy ceiling was sealed, nor past one " +
+			"that was: an unsigned row inserted after the seal — or at id 0 while the ceiling is still 0 — " +
+			"is reported as a migration-era row (Z10-2)")
 	}
 
 	migration := migrationOf(t, "0030_audit_legacy_ceiling.sql")
@@ -182,6 +186,28 @@ func TestVerifyBoundsLegacyRowsAtTheSealedCeiling(t *testing.T) {
 	if !strings.Contains(migration, "-- +goose Down") ||
 		!strings.Contains(migration, "DROP COLUMN IF EXISTS legacy_ceiling_id") {
 		t.Error("0030's Down does not remove the column it added")
+	}
+}
+
+// TestVerifyRejectsAnUnchainedRowWithNoSealedCeiling pins the residual Z10-2 case
+// the ceiling comparison alone missed.
+//
+// legacy_ceiling_id is 0 both on a log that never had a pre-chain row and on a
+// chain that has not started. A writer with DB write access can plant a row at
+// id 0 with OVERRIDING SYSTEM VALUE; `id > legacyCeiling` is then `0 > 0`, false,
+// and because no chained row has been walked yet the row was counted as legacy
+// and the walk answered ok. Every genuine migration-era row has id >= 1 and was
+// present when 0030 sealed the ceiling, so requiring a non-zero ceiling cannot
+// misclassify one.
+func TestVerifyRejectsAnUnchainedRowWithNoSealedCeiling(t *testing.T) {
+	method := receiverMethod(t, sourceOf(t, "auditchain.go"), "auditchain.go", "Verify")
+	if !strings.Contains(flatten(method), "if legacyCeiling == 0 || id > legacyCeiling {") {
+		t.Error("Verify still accepts a NULL-hash row while legacy_ceiling_id is 0: the id-0 row a writer " +
+			"can plant with OVERRIDING SYSTEM VALUE has `id > 0` false and is blessed as a migration-era " +
+			"row (Z10-2)")
+	}
+	if !strings.Contains(flatten(method), "legacy ceiling") {
+		t.Error("Verify's refusal does not name the legacy ceiling it detected")
 	}
 }
 
