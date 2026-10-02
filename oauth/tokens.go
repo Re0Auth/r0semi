@@ -198,6 +198,29 @@ type Store interface {
 	TokenOwner(ctx context.Context, value string) (string, error)
 }
 
+// RefreshFamilyResolver is an OPTIONAL Store extension: it names the rotation
+// family a refresh value belongs to, live or already spent, WITHOUT claiming it.
+//
+// The service needs the family *before* it consumes, because the claim and the
+// step that follows it must be one atomic act per family (S14-5): on the reuse
+// branch a replay revokes the family, on the rotation branch it mints into it,
+// and if those two can interleave the revocation can land before the mint and
+// leave a live generation behind. A store that can answer this lets the service
+// take a per-family lock across the whole step, so generations of one chain
+// serialize while unrelated chains do not.
+//
+// It is deliberately not part of Store: an implementation that cannot answer it
+// is not broken and does not fail to compile. The service falls back to a single
+// service-wide lock, which is coarser but still atomic. A value the store never
+// issued reports ErrTokenNotFound, and the service then serializes on the value
+// alone — nothing can be revoked for it, but two presentations of the same value
+// still must not overlap. Like GetRefresh, a value already spent is *resolved*
+// here (from its tombstone), not reported as a replay: judging a replay stays
+// ConsumeRefresh's job.
+type RefreshFamilyResolver interface {
+	RefreshFamily(ctx context.Context, value string) (string, error)
+}
+
 // TokenFilter selects tokens for bulk revocation. An empty filter matches every
 // token; when both fields are set they combine with AND.
 type TokenFilter struct {
@@ -509,6 +532,31 @@ func (s *MemoryStore) RevokeRefreshFamily(_ context.Context, familyID string) (i
 		}
 	}
 	return removed, nil
+}
+
+// RefreshFamily implements RefreshFamilyResolver. It is the non-destructive read
+// peer of ConsumeRefresh's family answer: a live value names the family on its
+// record, and a value already spent names it on the tombstone it left, so the
+// service can serialize a replay's revocation and a rotation's mint on the same
+// family. The tombstone deadline is judged exactly as ConsumeRefresh judges it,
+// with the clock the service injected: past it the value is an ordinary unknown,
+// because a replay there could not produce a usable token and the family must not
+// be locked or revoked for it.
+func (s *MemoryStore) RefreshFamily(_ context.Context, value string) (string, error) {
+	key := TokenHash(value)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.refresh[key]; ok {
+		return t.FamilyID, nil
+	}
+	if tomb, spent := s.tombstones[key]; spent {
+		if s.now != nil && !s.now().Before(tomb.ExpiresAt) {
+			return "", ErrTokenNotFound
+		}
+		return tomb.FamilyID, nil
+	}
+	return "", ErrTokenNotFound
 }
 
 // TokenHash is the at-rest form of an opaque token. Store implementations MUST

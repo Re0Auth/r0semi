@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
@@ -30,6 +31,14 @@ type service struct {
 	pollInterval time.Duration
 	verifyPath   string
 	now          func() time.Time
+
+	// refreshLocks serializes the claim-and-act step of Refresh per rotation
+	// family (S14-5), so a replay's family revocation cannot interleave with a
+	// rotation's mint. refreshLocksMu guards the map itself, not the families:
+	// entries are created and dropped under it and each family's own mutex is
+	// held only for the step. See lockRefreshFamily.
+	refreshLocksMu sync.Mutex
+	refreshLocks   map[string]*refreshFamilyLock
 }
 
 func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg Config) (Service, error) {
@@ -90,6 +99,7 @@ func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg C
 		pollInterval: cfg.DevicePollInterval,
 		verifyPath:   cfg.VerificationPath,
 		now:          cfg.Now,
+		refreshLocks: make(map[string]*refreshFamilyLock),
 	}, nil
 }
 
@@ -283,6 +293,25 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 	case err != nil && !errors.Is(err, ErrTokenNotFound):
 		return TokenResponse{}, err
 	}
+
+	// S14-5: the claim and the step that follows it are one act per family. The
+	// reuse branch below revokes the family; the rotation branch below mints into
+	// it. Without a family-wide turnstile a replay can revoke between the
+	// winner's ConsumeRefresh and its issue, and the mint then repopulates a
+	// family that was just reported dead — the thief keeps a live generation for
+	// the rest of the refresh TTL. Everything from the claim to the mint or the
+	// revocation runs under this lock, so the two steps can only run whole, one
+	// after the other: a rotation that goes first is followed by a detection that
+	// revokes the generation it just minted, and a detection that goes first has
+	// already deleted the record the rotation would claim, so that claim finds
+	// nothing and mints nothing. The key is the family itself, so unrelated
+	// chains never wait on each other.
+	key, err := s.refreshFamilyKey(ctx, req.RefreshToken)
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	unlock := s.lockRefreshFamily(key)
+	defer unlock()
 
 	rt, err := s.tokens.ConsumeRefresh(ctx, req.RefreshToken)
 	var reuse *RefreshReuseError
@@ -531,4 +560,72 @@ func newToken() (string, error) {
 		return "", fmt.Errorf("oauth: random: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// refreshFamilyLock is one rotation family's turnstile. refs counts the callers
+// that hold or are waiting for it, so the map entry can be dropped once the last
+// one leaves; without the count the service's lock map would keep one entry for
+// every family it ever saw, which is the same unbounded growth the tombstones
+// are swept to avoid.
+type refreshFamilyLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockRefreshFamily serializes every state change of one rotation family and
+// returns the release. The key is the family when the store can name it, the
+// presented value when the store reports it unknown, and one service-wide key
+// when the store cannot name families at all (coarser, but still atomic).
+//
+// It never blocks unrelated families: the map is consulted under refreshLocksMu
+// only long enough to find or create the family's own mutex, which is then taken
+// outside that guard.
+func (s *service) lockRefreshFamily(key string) func() {
+	s.refreshLocksMu.Lock()
+	l := s.refreshLocks[key]
+	if l == nil {
+		l = &refreshFamilyLock{}
+		s.refreshLocks[key] = l
+	}
+	l.refs++
+	s.refreshLocksMu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+
+		s.refreshLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(s.refreshLocks, key)
+		}
+		s.refreshLocksMu.Unlock()
+	}
+}
+
+// refreshFamilyKey names the serialization key for a presented refresh value. A
+// store that implements RefreshFamilyResolver answers for a live value from its
+// record and for a spent one from its tombstone, so a replay and the rotation it
+// races share one key. A store that cannot answer is not a Store failure: the
+// service falls back to a single key, which serializes every refresh but keeps
+// the claim-and-act step atomic on any implementation. An unknown value gets the
+// value's own key — nothing can be revoked for it, so it needs no family-wide
+// wait, but two concurrent presentations of the same unknown value still must not
+// interleave.
+func (s *service) refreshFamilyKey(ctx context.Context, value string) (string, error) {
+	resolver, ok := s.tokens.(RefreshFamilyResolver)
+	if !ok {
+		return "refresh:global", nil
+	}
+	family, err := resolver.RefreshFamily(ctx, value)
+	switch {
+	case err == nil && family != "":
+		return "refresh:family:" + family, nil
+	case err != nil && !errors.Is(err, ErrTokenNotFound):
+		// A store that cannot answer must not paint over its failure with an
+		// unserialized claim: fail closed, the same way a failed family
+		// revocation does.
+		return "", err
+	}
+	return "refresh:value:" + TokenHash(value), nil
 }
