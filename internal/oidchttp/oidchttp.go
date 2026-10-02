@@ -296,21 +296,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // implements it; O-9 says Re0Auth does not offer RP-initiated logout, and an
 // advertised endpoint that is out of contract is worse than a missing one.
 //
-// The rendered document is cached for the life of the handler, because it cannot
-// change: the issuer, the endpoints and the scope catalog are fixed at
-// construction, and the library's own marshalling reads nothing else. Rendering it
-// per request cost 53µs and 336 allocations on an endpoint that needs no
-// credentials — an amplification anyone could ask for as often as the limiter
-// allowed. Only a 200 is cached; an error response must not become the process's
-// permanent answer.
+// The rendered document is cached for the life of the handler, because for a
+// static issuer it cannot change: the issuer, the endpoints and the scope catalog
+// are fixed at construction, and the library's own marshalling reads nothing else.
+// Rendering it per request cost 53µs and 336 allocations on an endpoint that
+// needs no credentials — an amplification anyone could ask for as often as the
+// limiter allowed. Only a 200 is cached; an error response must not become the
+// process's permanent answer.
+//
+// S02-5 / P-03: the cache key is the path, which is blind to the Host, so a
+// cached entry is only served to a request that resolves to the issuer the entry
+// was rendered for. With Config.Issuer empty the issuer (and every advertised
+// endpoint URL) comes from the request Host, so without that check the first
+// caller — an attacker forging Host — fixed the advertised issuer for the life of
+// the process. The dynamic shape is the development/test shape; production
+// requires a configured issuer.
 func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path string) {
-	if doc, ok := h.discovery.get(path); ok {
+	issuer := h.issuerFor(r)
+	if doc, ok := h.discovery.get(path); ok && (doc.issuer == "" || doc.issuer == issuer) {
 		doc.write(w)
 		return
 	}
 
 	clone := r.Clone(r.Context())
 	clone.URL.Path = path
+	// S02-7: RawPath is the escaped spelling the request arrived with, and go-chi
+	// routes on it whenever it is non-empty (v5.3.2 mux.go:454). Leaving the
+	// stale escape while rewriting only Path made a percent-encoded alias (RFC
+	// 8414's own alias included) match no route and 404 before the document was
+	// ever rendered. Clearing it makes the router read the one path we set.
+	clone.URL.RawPath = ""
 	bw := acquireBufferedWriter()
 	// Discovery is public metadata; clients and intermediaries may cache it, and
 	// an explicit max-age is what keeps them from re-fetching it per request.
@@ -321,6 +336,7 @@ func (h *Handler) serveDiscovery(w http.ResponseWriter, r *http.Request, path st
 		status: bw.status,
 		header: bw.header.Clone(),
 		body:   stripUnsupportedDiscoveryFields(bw.body.Bytes()),
+		issuer: issuer,
 	}
 	releaseBufferedWriter(bw)
 	if doc.status == http.StatusOK {
@@ -334,6 +350,12 @@ type discoveryDoc struct {
 	status int
 	header http.Header
 	body   []byte
+	// issuer is the issuer this document was rendered for. A cache hit is only
+	// served when it matches the request's issuer, so the path-keyed cache can
+	// never answer one Host with another Host's document (S02-5 / P-03). An empty
+	// issuer is an unattributed entry, which only tests plant directly; it is
+	// served as-is.
+	issuer string
 }
 
 // write sends the document. The header is added rather than assigned, so this
@@ -654,6 +676,11 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// instance — in plain text, and a client that has to parse two shapes on one
 	// plane has no contract at all.
 	bw := acquireBufferedWriter()
+	// S14-11: the release is deferred, so a panic anywhere below — the provider
+	// handles requests built from untrusted input — cannot skip it and leak this
+	// pooled writer for the life of the process. The writer never escapes this
+	// handler, so returning it is always correct once we hold it.
+	defer releaseBufferedWriter(bw)
 	h.provider.ServeHTTP(bw, r)
 	body := bw.body.Bytes()
 
@@ -734,7 +761,6 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// ADR-0011: the provider's CORS headers are removed at the ServeHTTP boundary
 	// (corsFreeWriter), so nothing has to be done about them here.
 	bw.flush(w, body)
-	releaseBufferedWriter(bw)
 }
 
 // corsFreeWriter drops the CORS response headers a dependency may set.
@@ -992,6 +1018,15 @@ func (h *Handler) scopeProblem(client oauth.Client, scopes []string) string {
 	return ""
 }
 
+// maxAuthorizeParamBytes bounds the caller-chosen authorize parameters the
+// library persists and later echoes: `state` (into every authorization response)
+// and `nonce` (into every id_token derived from the grant). PKCE, request ids and
+// handle ids already have entrance bounds; these two had none, so one GET could
+// carry ~60 KB (cmd/re0auth caps MaxHeaderBytes at 64 KiB) into the stored auth
+// request and back out through every response. A few hundred bytes is already far
+// beyond any real client.
+const maxAuthorizeParamBytes = 512
+
 // validateAuthorize is the pre-flight the library does not do.
 //
 // `q` is the parameter set serveOAuth parsed for this request, not a fresh read:
@@ -1022,6 +1057,22 @@ func (h *Handler) validateAuthorize(w http.ResponseWriter, r *http.Request, q ur
 	if redirectURI == "" {
 		writeOAuthJSONError(w, http.StatusBadRequest, "invalid_request", "the redirect_uri is not registered for this client")
 		return true
+	}
+	// S02-10: bound the caller-chosen parameters the library persists verbatim
+	// (`state` on the auth request, `nonce` into the id_token). Refused through
+	// the redirect, like the PKCE refusals below, because redirect_uri is
+	// validated by now and RFC 6749 §4.1.2.1 says the client is told through it.
+	for _, name := range [...]string{"state", "nonce"} {
+		if len(q.Get(name)) > maxAuthorizeParamBytes {
+			params := map[string]string{
+				"error":             "invalid_request",
+				"error_description": name + " must be at most " + strconv.Itoa(maxAuthorizeParamBytes) + " bytes",
+				"state":             q.Get("state"),
+				"iss":               h.issuerFor(r),
+			}
+			http.Redirect(w, r, oauth.BuildRedirect(redirectURI, params), http.StatusFound)
+			return true
+		}
 	}
 	// RFC 9207 + ADR-0005 §6: only a response mode that can carry `iss` is offered.
 	// A form_post response is rendered by the library as a 200 HTML form, which the
@@ -1668,7 +1719,16 @@ func knownOAuthPath(path string) bool {
 //   - O-6 (revised): offline_access is accepted but never surfaced. Re0Auth
 //     always issues a refresh token, and treats offline_access as a
 //     compatibility no-op rather than a scope the client can see.
+//
+// S02-9: neither rule can fire when the raw bytes do not contain the field name
+// at all, so a body that mentions neither is returned untouched without the full
+// JSON decode and map allocation the token endpoint would otherwise pay on every
+// 200. The scan is a substring test: a body that merely embeds those words in a
+// value still takes the decoding path, which is the safe direction.
 func sanitizeTokenResponse(body []byte) []byte {
+	if !bytes.Contains(body, []byte("id_token")) && !bytes.Contains(body, []byte("offline_access")) {
+		return body
+	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body
