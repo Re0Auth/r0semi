@@ -159,11 +159,11 @@ type BindingOutcome struct {
 
 // Report is what the Kill Switch actually did. A number, not an assurance: the
 // whole point of the endpoint is to be able to tell an incident responder how
-// much was cut. Bindings is nil when no binding sweep ran; BindingsUnavailable
-// says the target had a binding dimension but this deployment has no binding port
-// to sweep — so "no bindings existed" and "this deployment cannot sweep bindings"
-// never look identical. FlowsPurged counts the in-flight bind flows a `subject`
-// sweep removed.
+// much was cut. Bindings is nil when no binding sweep ran; BindingsUnavailable,
+// SessionsUnavailable and FlowsUnavailable say the target had that dimension but
+// this deployment has no port able to sweep it — so "there was nothing there" and
+// "this deployment cannot reach it" never look identical. FlowsPurged counts the
+// in-flight bind flows a `subject` sweep removed.
 type Report struct {
 	TokensRevoked    int             `json:"tokens_revoked"`
 	SessionsRevoked  int64           `json:"sessions_revoked"`
@@ -175,6 +175,17 @@ type Report struct {
 	// that `all` — which must still cut tokens and sessions — is not refused by a
 	// missing binding port, while the responder can still tell the two cases apart.
 	BindingsUnavailable bool `json:"bindings_unavailable,omitempty"`
+	// SessionsUnavailable is set when the target includes a session dimension but
+	// the deployment has no session revoker. Without it `sessions_revoked: 0`
+	// reads as "nobody was signed in" when it means "this deployment cannot sign
+	// anyone out" (S11-2, Z10-4).
+	SessionsUnavailable bool `json:"sessions_unavailable,omitempty"`
+	// FlowsUnavailable is set when the target includes an in-flight-flow dimension
+	// that this deployment cannot sweep: `all` has no port to enumerate accounts
+	// with, and a deployment with no flow port has none at all. A pending bind
+	// flow outlives the binding and can create a new one, so a sweep that leaves
+	// it alive has to say so (S11-3).
+	FlowsUnavailable bool `json:"flows_unavailable,omitempty"`
 }
 
 type service struct {
@@ -239,6 +250,9 @@ func (s *service) Register(ctx context.Context, actor string, req RegisterReques
 	}
 	s.record(ctx, actor, "admin.client.register", id, audit.OutcomeOK, map[string]string{
 		"type": string(client.Type),
+		// The subject is stored as a keyed pseudonym, so the row names the client
+		// it is about explicitly (Z10-8).
+		"client_id": id,
 	})
 	return Registration{Client: client, Secret: secret}, nil
 }
@@ -253,7 +267,9 @@ func (s *service) RotateClientSecret(ctx context.Context, actor, clientID string
 		return "", err
 	}
 	err = s.clients.RotateSecret(ctx, clientID, oauth.NewSecretHash(secret))
-	s.record(ctx, actor, "admin.client.rotate_secret", clientID, outcome(err), nil)
+	s.record(ctx, actor, "admin.client.rotate_secret", clientID, outcome(err), map[string]string{
+		"client_id": clientID,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -264,12 +280,15 @@ func (s *service) RotateClientSecret(ctx context.Context, actor, clientID string
 // that a failure in the purge cannot leave the client able to mint new tokens.
 func (s *service) SuspendClient(ctx context.Context, actor, clientID string) error {
 	if err := s.clients.SetStatus(ctx, clientID, oauth.ClientSuspended); err != nil {
-		s.record(ctx, actor, "admin.client.suspend", clientID, audit.OutcomeError, nil)
+		s.record(ctx, actor, "admin.client.suspend", clientID, audit.OutcomeError, map[string]string{
+			"client_id": clientID,
+		})
 		return err
 	}
 	removed, err := s.tokens.RevokeTokens(ctx, oauth.TokenFilter{ClientID: clientID})
 	s.record(ctx, actor, "admin.client.suspend", clientID, outcome(err), map[string]string{
 		"tokens_revoked": strconv.Itoa(removed),
+		"client_id":      clientID,
 	})
 	return err
 }
@@ -277,7 +296,9 @@ func (s *service) SuspendClient(ctx context.Context, actor, clientID string) err
 // ActivateClient implements Service.
 func (s *service) ActivateClient(ctx context.Context, actor, clientID string) error {
 	err := s.clients.SetStatus(ctx, clientID, oauth.ClientActive)
-	s.record(ctx, actor, "admin.client.activate", clientID, outcome(err), nil)
+	s.record(ctx, actor, "admin.client.activate", clientID, outcome(err), map[string]string{
+		"client_id": clientID,
+	})
 	return err
 }
 
@@ -288,6 +309,7 @@ func (s *service) DeleteClient(ctx context.Context, actor, clientID string) erro
 	removed, revokeErr := s.tokens.RevokeTokens(ctx, oauth.TokenFilter{ClientID: clientID})
 	s.record(ctx, actor, "admin.client.delete", clientID, outcome(errors.Join(deleteErr, revokeErr)), map[string]string{
 		"tokens_revoked": strconv.Itoa(removed),
+		"client_id":      clientID,
 	})
 	return errors.Join(deleteErr, revokeErr)
 }
@@ -325,7 +347,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 	// leave the client able to mint more tokens.
 	if target.ClientID != "" {
 		if err := s.clients.SetStatus(ctx, target.ClientID, oauth.ClientSuspended); err != nil {
-			s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, nil)
+			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
 			return rep, err
 		}
 		rep.ClientsSuspended = 1
@@ -340,7 +362,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 		})
 		rep.TokensRevoked = removed
 		if err != nil {
-			s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, nil)
+			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
 			return rep, err
 		}
 	}
@@ -359,12 +381,16 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 			n, err = s.sessions.RevokeSubjectSessions(ctx, target.Subject)
 		}
 		if err != nil {
-			s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, map[string]string{
-				"tokens_revoked": strconv.Itoa(rep.TokensRevoked),
-			})
+			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
 			return rep, err
 		}
 		rep.SessionsRevoked = n
+	} else if target.All || target.Subject != "" {
+		// The target has a session dimension and this deployment has no revoker to
+		// serve it. Saying so is what keeps `sessions_revoked: 0` — "nobody was
+		// signed in" — apart from "this deployment cannot sign anyone out"
+		// (S11-2, Z10-4), the same distinction BindingsUnavailable draws.
+		rep.SessionsUnavailable = true
 	}
 
 	// Bindings. `all` and the dedicated `bindings` target sweep the deployment;
@@ -386,9 +412,7 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 			outcome, err = s.bindings.RevokeAllBindings(ctx)
 		}
 		if err != nil {
-			s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, map[string]string{
-				"tokens_revoked": strconv.Itoa(rep.TokensRevoked),
-			})
+			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
 			return rep, err
 		}
 		rep.Bindings = &outcome
@@ -399,21 +423,31 @@ func (s *service) KillSwitch(ctx context.Context, actor string, target Target) (
 	// In-flight bind flows. Only a `subject` sweep: a pending flow is a capability
 	// that outlives the binding — completing it creates a new binding and a new
 	// upstream token — so a sweep that cuts one account's bindings must remove it,
-	// exactly as an erasure does. `all` has no per-account flow port, so it does not
-	// touch them here.
+	// exactly as an erasure does. `all` has no per-account flow port, so it cannot
+	// reach them; either way, a sweep that leaves them alive has to say so rather
+	// than report a zero that reads as "there were none" (S11-3).
 	if target.Subject != "" && s.flows != nil {
 		purged, err := s.flows.PurgeUserFlows(ctx, target.Subject)
 		if err != nil {
-			s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeError, map[string]string{
-				"tokens_revoked": strconv.Itoa(rep.TokensRevoked),
-			})
+			s.recordKill(ctx, actor, target, audit.OutcomeError, rep)
 			return rep, err
 		}
 		rep.FlowsPurged = purged
+	} else if target.All || target.Subject != "" {
+		rep.FlowsUnavailable = true
 	}
 
-	s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), audit.OutcomeOK, killDetail(rep, target))
+	s.recordKill(ctx, actor, target, audit.OutcomeOK, rep)
 	return rep, nil
+}
+
+// recordKill writes the Kill Switch's audit row from the report on every path,
+// success and failure alike. A failure row that carried only some of the counts
+// discarded work that had already happened: the durable record has to describe
+// the partial sweep the same way the success row describes a complete one
+// (S11-4, Z10V-1).
+func (s *service) recordKill(ctx context.Context, actor string, target Target, outcome string, rep Report) {
+	s.record(ctx, actor, "admin.kill_switch", target.auditSubject(), outcome, killDetail(rep, target))
 }
 
 // setCount is how many targets are named. Exactly one is required, so a request
@@ -465,11 +499,24 @@ func killDetail(rep Report, target Target) map[string]string {
 		"tokens_revoked":   strconv.Itoa(rep.TokensRevoked),
 		"sessions_revoked": strconv.FormatInt(rep.SessionsRevoked, 10),
 	}
+	// The client id is the subject of a client-scoped row, and the audit sink
+	// stores every subject as a keyed pseudonym — so a reader of the log cannot
+	// answer "which client" without this compensating field (Z10-8). oidc.token
+	// already carries one.
+	if target.ClientID != "" {
+		detail["client_id"] = target.ClientID
+	}
 	if rep.FlowsPurged != 0 {
 		detail["flows_purged"] = strconv.Itoa(rep.FlowsPurged)
 	}
 	if rep.BindingsUnavailable {
 		detail["bindings_unavailable"] = "true"
+	}
+	if rep.SessionsUnavailable {
+		detail["sessions_unavailable"] = "true"
+	}
+	if rep.FlowsUnavailable {
+		detail["flows_unavailable"] = "true"
 	}
 	if rep.Bindings != nil {
 		detail["bindings_total"] = strconv.Itoa(rep.Bindings.Total)
