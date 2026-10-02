@@ -329,9 +329,13 @@ async function call<T>(
 	if (opts.csrf) headers['X-CSRF-Token'] = opts.csrf;
 
 	let res: Response | undefined;
+	// One deadline per attempt, held outside the loop because it now has to outlive
+	// `fetch`: that resolves as soon as the response headers arrive, so clearing the
+	// timer there left the body with no deadline at all.
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+		timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 		try {
 			res = await fetch(path, {
 				method,
@@ -351,11 +355,11 @@ async function call<T>(
 				local('network_error', cause instanceof Error ? cause.message : 'network request failed')
 			);
 		}
-		clearTimeout(timer);
 
 		// Only idempotent requests are retried, and only on the statuses that mean
 		// "try again", never on a 4xx the client caused.
 		if (method === 'GET' && attempt < MAX_ATTEMPTS && [502, 503, 504].includes(res.status)) {
+			clearTimeout(timer);
 			const after = retryAfterSeconds(res) ?? 0;
 			await sleep(Math.min(after * 1000, 2000) + 100 * attempt);
 			continue;
@@ -364,32 +368,38 @@ async function call<T>(
 	}
 	if (!res) throw new ApiError(0, local('network_error', 'network request failed'));
 
-	if (res.status === 204) return undefined as T;
+	// The deadline covers the body too. `fetch` above resolves on headers alone, so
+	// a server that never finishes its body would otherwise hang the caller forever.
+	try {
+		if (res.status === 204) return undefined as T;
 
-	const text = await res.text();
-	let body: unknown;
-	if (text) {
-		try {
-			body = JSON.parse(text);
-		} catch {
-			// A JSON content type that is not JSON means something between here and
-			// the server answered instead: a proxy, a captive portal, an error page.
-			// Saying so is more useful than a SyntaxError.
+		const text = await res.text();
+		let body: unknown;
+		if (text) {
+			try {
+				body = JSON.parse(text);
+			} catch {
+				// A JSON content type that is not JSON means something between here and
+				// the server answered instead: a proxy, a captive portal, an error page.
+				// Saying so is more useful than a SyntaxError.
+				throw new ApiError(
+					res.status,
+					local('malformed_response', `expected JSON, got ${res.headers.get('content-type') ?? 'no content type'}`)
+				);
+			}
+		}
+
+		if (!res.ok) {
 			throw new ApiError(
 				res.status,
-				local('malformed_response', `expected JSON, got ${res.headers.get('content-type') ?? 'no content type'}`)
+				looksLikeProblem(body) ? body : local('malformed_response', `unexpected ${res.status} response shape`),
+				retryAfterSeconds(res)
 			);
 		}
+		return body as T;
+	} finally {
+		clearTimeout(timer);
 	}
-
-	if (!res.ok) {
-		throw new ApiError(
-			res.status,
-			looksLikeProblem(body) ? body : local('malformed_response', `unexpected ${res.status} response shape`),
-			retryAfterSeconds(res)
-		);
-	}
-	return body as T;
 }
 
 export const api = {
