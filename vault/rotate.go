@@ -75,11 +75,16 @@ func (s *service) Rotate(ctx context.Context) (Rotation, error) {
 	// The outcome is not unconditionally "ok": a run that left records unre-wrapped
 	// must not read as a completed rotation in the audit trail, because that trail
 	// is what an operator consults before deleting the retired key.
+	//
+	// A sink that cannot take the event fails the whole run, as it does for
+	// Enroll/Use/Revoke: an operator who automates "exit 0 => remove the retired
+	// key" must not be handed an exit 0 whose only evidence was never written. The
+	// rotation is idempotent, so re-running it is safe (G-19).
 	outcome := audit.OutcomeOK
 	if out.Skipped > 0 {
 		outcome = audit.OutcomeError
 	}
-	_ = s.record(ctx, audit.Event{
+	if err := s.record(ctx, audit.Event{
 		Action:  "vault.rotate_keys",
 		Outcome: outcome,
 		Detail: map[string]string{
@@ -88,7 +93,9 @@ func (s *service) Rotate(ctx context.Context) (Rotation, error) {
 			"rewrapped": strconv.Itoa(out.Rewrapped),
 			"skipped":   strconv.Itoa(out.Skipped),
 		},
-	})
+	}); err != nil {
+		return out, err
+	}
 	return out, nil
 }
 
@@ -113,7 +120,7 @@ func (s *service) rotateRecords(ctx context.Context, records []Record, out *Rota
 				return fmt.Errorf(
 					"vault: rotate: %s is tagged %q but the current key cannot unwrap it: "+
 						"the key material changed without changing kek_id: %w",
-					rec.Identity, current, err)
+					identityRef(rec.Identity), current, err)
 			}
 			Scrub(dek)
 			out.AlreadyCurrent++
@@ -124,16 +131,16 @@ func (s *service) rotateRecords(ctx context.Context, records []Record, out *Rota
 		if !ok {
 			return fmt.Errorf(
 				"vault: rotate: %s was wrapped by key %q, which is not configured; "+
-					"declare it as a retired key and run again", rec.Identity, rec.KEKID)
+					"declare it as a retired key and run again", identityRef(rec.Identity), rec.KEKID)
 		}
 		dek, err := old.Unwrap(ctx, rec.WrappedDEK, aad)
 		if err != nil {
-			return fmt.Errorf("vault: rotate: unwrap %s: %w", rec.Identity, err)
+			return fmt.Errorf("vault: rotate: unwrap %s: %w", identityRef(rec.Identity), err)
 		}
 		wrapped, err := s.current.Wrap(ctx, dek, aad)
 		Scrub(dek)
 		if err != nil {
-			return fmt.Errorf("vault: rotate: re-wrap %s: %w", rec.Identity, err)
+			return fmt.Errorf("vault: rotate: re-wrap %s: %w", identityRef(rec.Identity), err)
 		}
 
 		// The envelope ONLY, and only if the row is still the one that was read.
@@ -150,7 +157,7 @@ func (s *service) rotateRecords(ctx context.Context, records []Record, out *Rota
 			UpdatedAt:  time.Now().UTC(),
 		})
 		if err != nil {
-			return fmt.Errorf("vault: rotate: persist %s: %w", rec.Identity, err)
+			return fmt.Errorf("vault: rotate: persist %s: %w", identityRef(rec.Identity), err)
 		}
 		if !applied {
 			// The row changed (or is gone) since the page was read. It was NOT

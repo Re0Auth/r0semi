@@ -255,6 +255,15 @@ func (s *service) Enroll(ctx context.Context, id Identity, secret []byte, meta m
 		s.observe(metricOpEnroll, metricAuditError, start)
 		return err
 	}
+	// A re-enrollment replaces the secret, not the credential's birth: Put writes
+	// the whole row, so CreatedAt has to be carried over from the row being
+	// replaced or the time the account first held this credential is lost (S07-9).
+	// A read that fails leaves this write's own timestamp, and the Put below
+	// reports the repository failure itself.
+	createdAt := now
+	if prev, err := s.repo.Get(ctx, id); err == nil {
+		createdAt = prev.CreatedAt
+	}
 	if err := s.repo.Put(ctx, Record{
 		Identity:   id,
 		Version:    recordVersion,
@@ -263,7 +272,7 @@ func (s *service) Enroll(ctx context.Context, id Identity, secret []byte, meta m
 		Nonce:      nonce,
 		Ciphertext: ct,
 		Meta:       cloneMeta(meta),
-		CreatedAt:  now,
+		CreatedAt:  createdAt,
 		UpdatedAt:  now,
 	}); err != nil {
 		s.observe(metricOpEnroll, metricRepoError, start)
@@ -284,7 +293,7 @@ func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) e
 
 	rec, err := s.repo.Get(ctx, id)
 	if err != nil {
-		_ = s.record(ctx, audit.Event{
+		aerr := s.record(ctx, audit.Event{
 			Action:   "vault.use",
 			Subject:  id.Subject,
 			Provider: id.Provider,
@@ -298,38 +307,46 @@ func (s *service) Use(ctx context.Context, id Identity, fn func(secret []byte) e
 			result = metricNotFound
 		}
 		s.observe(metricOpUse, result, start)
-		return err
+		// The audit failure is joined, not dropped: this sink is fail-closed on the
+		// success path, so an unavailable log must be visible here too. Join keeps
+		// errors.Is(err, ErrNotFound) true for callers (Z19-3).
+		return errors.Join(err, aerr)
 	}
 
-	aad := bindingAAD(rec.Version, id.Subject, id.Provider)
+	// The AAD is built from the record's own identity, as Rotate builds it
+	// (rotate.go). Deriving it from the requested id made the read path and the
+	// rotation disagree about which row they were addressing (S07-4).
+	aad := bindingAAD(rec.Version, rec.Identity.Subject, rec.Identity.Provider)
 	key, ok := s.keys[rec.KEKID]
 	if !ok {
-		// Saying which key is missing is the difference between "a rotation was left
-		// half-configured" and "the ciphertext is corrupt".
-		_ = s.record(ctx, audit.Event{
+		aerr := s.record(ctx, audit.Event{
 			Action: "vault.use", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeError,
 		})
 		s.observe(metricOpUse, metricKeyUnavailable, start)
-		return fmt.Errorf("vault: %s was wrapped by key %q, which is not configured; "+
-			"declare it as a retired key if this deployment rotated away from it", id, rec.KEKID)
+		// Saying which key is missing is the difference between "a rotation was left
+		// half-configured" and "the ciphertext is corrupt"; saying which subject it
+		// belongs to is not needed, and it would reach the process log (G-21).
+		return errors.Join(fmt.Errorf("vault: %s was wrapped by key %q, which is not configured; "+
+			"declare it as a retired key if this deployment rotated away from it",
+			identityRef(rec.Identity), rec.KEKID), aerr)
 	}
 	dek, err := key.Unwrap(ctx, rec.WrappedDEK, aad)
 	if err != nil {
-		_ = s.record(ctx, audit.Event{
+		aerr := s.record(ctx, audit.Event{
 			Action: "vault.use", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeError,
 		})
 		s.observe(metricOpUse, metricDecryptError, start)
-		return fmt.Errorf("vault: unwrap DEK: %w", err)
+		return errors.Join(fmt.Errorf("vault: unwrap DEK: %w", err), aerr)
 	}
 	defer Scrub(dek)
 
 	plain, err := openSecret(dek, rec.Nonce, rec.Ciphertext, aad)
 	if err != nil {
-		_ = s.record(ctx, audit.Event{
+		aerr := s.record(ctx, audit.Event{
 			Action: "vault.use", Subject: id.Subject, Provider: id.Provider, Outcome: audit.OutcomeError,
 		})
 		s.observe(metricOpUse, metricDecryptError, start)
-		return err
+		return errors.Join(err, aerr)
 	}
 	defer Scrub(plain)
 

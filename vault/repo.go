@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -27,16 +28,39 @@ type Identity struct {
 	Provider string
 }
 
+// String renders the identity as "provider:subject". It is convenient in a test
+// message and deliberately NOT used in this package's error text: an error from
+// here reaches the -rotate-keys die path (cmd/re0auth) and the unbind/cascade warn
+// paths, and a raw usr_… in a retained process log outlives the erasure's
+// pseudonym key. Use identityRef for anything a caller prints or logs (G-21).
 func (i Identity) String() string { return i.Provider + ":" + i.Subject }
 
-// ErrInvalidIdentity reports an empty subject or provider.
+// identityRef renders an identity for an error message without writing the subject.
+// What an operator needs in order to locate a row is its provider and the kek_id
+// that could not open it; the subject is personal data the message does not need.
+func identityRef(id Identity) string {
+	return fmt.Sprintf("provider %q (subject %d bytes)", id.Provider, len(id.Subject))
+}
+
+// ErrInvalidIdentity reports an empty or over-long subject or provider.
 var ErrInvalidIdentity = errors.New("vault: invalid identity")
+
+// maxIdentityFieldLen bounds one identity field. bindingAAD length-prefixes both
+// fields with a uint32, so a field at or above 2^32 would truncate in the prefix
+// and could collide with a different, shorter identity. A stored subject is
+// generated ("usr_" plus 16 hex characters) and a provider is a configured name,
+// so this bound is far above any real identity and far below the prefix's reach
+// (S07-11).
+const maxIdentityFieldLen = 1024
 
 func (i Identity) validate() error {
 	if i.Subject == "" {
 		return ErrInvalidIdentity
 	}
 	if i.Provider == "" {
+		return ErrInvalidIdentity
+	}
+	if len(i.Subject) > maxIdentityFieldLen || len(i.Provider) > maxIdentityFieldLen {
 		return ErrInvalidIdentity
 	}
 	return nil

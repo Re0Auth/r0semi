@@ -141,13 +141,13 @@ func (w *LocalKeyWrapper) open(nonce, ct, aad []byte) ([]byte, error) {
 func bindingAAD(version byte, subject, provider string) []byte {
 	b := make([]byte, 0, 1+4+len(subject)+4+len(provider))
 	b = append(b, version)
-	// The prefix is uint32 by the AAD's own layout. A credential subject or
-	// provider is a bounded identity string, so the truncation G115 warns about
-	// is not reachable, and this AAD builder has no error return to carry a
-	// length check (G115).
-	b = binary.BigEndian.AppendUint32(b, uint32(len(subject))) //nolint:gosec // G115: 4 GiB identity is not a stored shape
+	// The prefix is uint32 by the AAD's own layout, and Identity.validate refuses a
+	// field longer than maxIdentityFieldLen. That bound — not the hope that no store
+	// holds a 4 GiB identity — is what makes the conversion below unable to truncate
+	// (S07-11, G115).
+	b = binary.BigEndian.AppendUint32(b, uint32(len(subject))) //nolint:gosec // G115: validate caps identity fields at maxIdentityFieldLen
 	b = append(b, subject...)
-	b = binary.BigEndian.AppendUint32(b, uint32(len(provider))) //nolint:gosec // G115: 4 GiB identity is not a stored shape
+	b = binary.BigEndian.AppendUint32(b, uint32(len(provider))) //nolint:gosec // G115: validate caps identity fields at maxIdentityFieldLen
 	b = append(b, provider...)
 	return b
 }
