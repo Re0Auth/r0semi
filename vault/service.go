@@ -242,6 +242,19 @@ func (s *service) Enroll(ctx context.Context, id Identity, secret []byte, meta m
 	}
 
 	now := time.Now().UTC()
+	// Fail closed: the enrollment is audited before it is persisted, mirroring
+	// Use's ordering (I3). An unavailable audit log must leave no record behind,
+	// rather than reporting an error for a write that already happened and would
+	// linger unaudited.
+	if err := s.record(ctx, audit.Event{
+		Action:   "vault.enroll",
+		Subject:  id.Subject,
+		Provider: id.Provider,
+		Outcome:  audit.OutcomeOK,
+	}); err != nil {
+		s.observe(metricOpEnroll, metricAuditError, start)
+		return err
+	}
 	if err := s.repo.Put(ctx, Record{
 		Identity:   id,
 		Version:    recordVersion,
@@ -255,15 +268,6 @@ func (s *service) Enroll(ctx context.Context, id Identity, secret []byte, meta m
 	}); err != nil {
 		s.observe(metricOpEnroll, metricRepoError, start)
 		return fmt.Errorf("vault: persist credential: %w", err)
-	}
-	if err := s.record(ctx, audit.Event{
-		Action:   "vault.enroll",
-		Subject:  id.Subject,
-		Provider: id.Provider,
-		Outcome:  audit.OutcomeOK,
-	}); err != nil {
-		s.observe(metricOpEnroll, metricAuditError, start)
-		return err
 	}
 	s.observe(metricOpEnroll, metricOK, start)
 	return nil

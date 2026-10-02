@@ -191,6 +191,30 @@ func TestUseFailsClosedWhenAuditFails(t *testing.T) {
 	}
 }
 
+// I3: an Enroll whose audit write fails must not leave a persisted record. The
+// audit comes first, so the failure returns before anything is written, rather
+// than reporting an error for a write that already happened and lingers
+// unaudited.
+func TestEnrollFailsClosedWhenAuditFails(t *testing.T) {
+	repo := NewMemoryRepo()
+	svc, err := NewService(repo, testKey(t), failingLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	id := Identity{Subject: "u", Provider: "taptap"}
+
+	if err := svc.Enroll(ctx, id, []byte("secret"), nil); err == nil {
+		t.Fatal("Enroll succeeded despite an unavailable audit log")
+	}
+	if _, err := repo.Get(ctx, id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after a failed audit = %v, want ErrNotFound", err)
+	}
+	if ok, err := svc.Exists(ctx, id); err != nil || ok {
+		t.Fatalf("Exists after a failed audit = %v, %v; want false, nil", ok, err)
+	}
+}
+
 // The ciphertext is bound to its identity: moving a record to another subject
 // does not make it decryptable.
 func TestCiphertextBindsIdentity(t *testing.T) {
