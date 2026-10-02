@@ -43,23 +43,32 @@ func (c *client) Verify(ctx context.Context, cred Credential) error {
 	}
 	resp, err := c.do(ctx, http.MethodGet, "/users/me", cred.SessionToken)
 	if err != nil {
-		return err
+		return c.finish(ctx, "tapsign.verify", cred, err)
 	}
 	defer drain(resp)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return nil
+		return c.finish(ctx, "tapsign.verify", cred, nil)
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return ErrInvalidCredential
+		return c.finish(ctx, "tapsign.verify", cred, ErrInvalidCredential)
 	default:
-		return fmt.Errorf("tapsign: verify: unexpected status %d", resp.StatusCode)
+		return c.finish(ctx, "tapsign.verify", cred,
+			fmt.Errorf("tapsign: verify: unexpected status %d", resp.StatusCode))
 	}
 }
 
 func (c *client) Rotate(ctx context.Context, cred Credential) (Credential, error) {
 	next, err := c.rotate(ctx, cred)
-	return next, c.finish(ctx, "tapsign.rotate", cred, err)
+	ferr := c.finish(ctx, "tapsign.rotate", cred, err)
+	if err == nil && ferr != nil {
+		// The rotation itself succeeded and the audit write is the only failure,
+		// so `next` is the only live credential. Mark the failure so a caller can
+		// tell that case from a rotation that did not happen, instead of
+		// discarding `next` and locking the user out (S07-10).
+		ferr = errors.Join(ErrRotationAuditFailed, ferr)
+	}
+	return next, ferr
 }
 
 func (c *client) Revoke(ctx context.Context, cred Credential) error {
@@ -89,6 +98,9 @@ func (c *client) rotate(ctx context.Context, cred Credential) (Credential, error
 
 	switch resp.StatusCode {
 	case http.StatusOK:
+		if resp.Body == nil {
+			return Credential{}, errors.New("tapsign: rotate: upstream returned no response body")
+		}
 		var out struct {
 			SessionToken string `json:"sessionToken"`
 		}
@@ -124,7 +136,14 @@ func (c *client) do(ctx context.Context, method, path, session string) (*http.Re
 	if session != "" {
 		req.Header.Set("X-LC-Session", session)
 	}
-	return c.doer.Do(req)
+	resp, err := c.doer.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("tapsign: the Doer returned no response")
+	}
+	return resp, nil
 }
 
 func (c *client) doJSON(ctx context.Context, method, path string, body any) (*http.Response, error) {
@@ -137,7 +156,14 @@ func (c *client) doJSON(ctx context.Context, method, path string, body any) (*ht
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return c.doer.Do(req)
+	resp, err := c.doer.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("tapsign: the Doer returned no response")
+	}
+	return resp, nil
 }
 
 // Redeem exchanges a TapTap OAuth token for a built-in-account Credential by
@@ -175,9 +201,15 @@ func redeemResult(resp *http.Response, err error) (Credential, error) {
 	if err != nil {
 		return Credential{}, err
 	}
+	if resp == nil {
+		return Credential{}, errors.New("tapsign: redeem: the Doer returned no response")
+	}
 	defer drain(resp)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return Credential{}, fmt.Errorf("tapsign: redeem: unexpected status %d", resp.StatusCode)
+	}
+	if resp.Body == nil {
+		return Credential{}, errors.New("tapsign: redeem: upstream returned no response body")
 	}
 	var out struct {
 		SessionToken string `json:"sessionToken"`
@@ -221,7 +253,13 @@ func outcomeOf(err error) string {
 	}
 }
 
+// drain reads and closes a response body so the connection can be reused. A
+// bespoke Doer may return a response without a body (see httpclient.drain), so
+// both nil cases are tolerated rather than dereferenced (S07-8).
 func drain(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
 	_ = resp.Body.Close()
 }

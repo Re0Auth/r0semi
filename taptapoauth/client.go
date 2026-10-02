@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Re0Auth/r0semi/httpclient"
 	"github.com/Re0Auth/r0semi/tapsign"
@@ -27,7 +28,37 @@ const (
 	// tapUserAgent matches the official TapTap Android SDK, which is what the
 	// public device flow expects.
 	tapUserAgent = "TapTapAndroidSDK/3.16.5"
+
+	// The upstream-supplied interval and expires_in are untrusted int64 JSON
+	// values. Both are clamped to protocol-sane ranges before they become
+	// time.Durations: without an upper bound a hostile peer can set interval to
+	// ~292 years (the client never polls again but the attempt is retained), and
+	// the seconds*time.Second multiplication can overflow int64 for inputs just
+	// under the wrap point (S07-5).
+	minInterval     = time.Second
+	maxInterval     = 60 * time.Second
+	defaultInterval = 5 * time.Second
+	minExpires      = time.Second
+	maxExpires      = 30 * time.Minute
+	defaultExpires  = 5 * time.Minute
 )
+
+// boundedSeconds converts an upstream seconds field to a Duration, clamping it
+// to [min,max] and using def for a non-positive value. Clamping the integer
+// BEFORE multiplying keeps seconds*time.Second away from int64 overflow.
+func boundedSeconds(sec int64, min, max, def time.Duration) time.Duration {
+	if sec <= 0 {
+		return def
+	}
+	if sec > int64(max/time.Second) {
+		return max
+	}
+	d := time.Duration(sec) * time.Second
+	if d < min {
+		return min
+	}
+	return d
+}
 
 type client struct {
 	deviceCodeEndpoint string
@@ -93,14 +124,8 @@ func (c *client) Start(ctx context.Context) (DeviceAuth, error) {
 		return DeviceAuth{}, errors.New("taptapoauth: upstream omitted device_code or verification_url")
 	}
 
-	interval := time.Duration(data.Interval) * time.Second
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
-	expires := time.Duration(data.ExpiresIn) * time.Second
-	if expires <= 0 {
-		expires = 5 * time.Minute
-	}
+	interval := boundedSeconds(data.Interval, minInterval, maxInterval, defaultInterval)
+	expires := boundedSeconds(data.ExpiresIn, minExpires, maxExpires, defaultExpires)
 
 	return DeviceAuth{
 		DeviceID:        deviceID,
@@ -199,6 +224,9 @@ func (c *client) fetchAccount(ctx context.Context, kid, macKey string) (account,
 	if err != nil {
 		return account{}, fmt.Errorf("taptapoauth: user info request: %w", err)
 	}
+	if resp == nil || resp.Body == nil {
+		return account{}, errors.New("taptapoauth: user info: the Doer returned no response body")
+	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
@@ -235,6 +263,9 @@ func (c *client) postForm(ctx context.Context, endpoint string, form url.Values)
 	resp, err := c.doer.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("taptapoauth: request: %w", err)
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, 0, errors.New("taptapoauth: request: the Doer returned no response body")
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
@@ -329,13 +360,20 @@ func tokenBusinessError(data json.RawMessage) error {
 
 // maxErrorDetail bounds how much upstream-supplied text can reach an error, and
 // therefore a log line. The reply is untrusted and may be as large as maxBody
-// (1 MiB), and a raw newline in it would forge a log entry. The value is
-// flattened and capped for display only; classification runs on the unbounded
-// value before this, so a recognized error code is unaffected.
+// (1 MiB), and a raw newline in it would forge a log entry. Every non-printable
+// rune is replaced, not only CR/LF: an ESC sequence would otherwise reach an
+// operator's terminal and manipulate or forge what it displays (S07-7). The
+// value is flattened and capped for display only; classification runs on the
+// unbounded value before this, so a recognized error code is unaffected.
 const maxErrorDetail = 200
 
 func boundDetail(s string) string {
-	s = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(s))
+	s = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if !unicode.IsPrint(r) {
+			return ' '
+		}
+		return r
+	}, s))
 	if r := []rune(s); len(r) > maxErrorDetail {
 		s = string(r[:maxErrorDetail]) + "…"
 	}
