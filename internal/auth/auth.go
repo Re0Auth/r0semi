@@ -8,6 +8,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -41,7 +42,7 @@ const (
 	keyFlowNonce    = "flow_nonce"
 )
 
-var flowKeys = []string{keyFlowState, keyFlowProvider, keyFlowMode, keyFlowReturnTo, keyFlowVerifier}
+var flowKeys = []string{keyFlowState, keyFlowProvider, keyFlowMode, keyFlowReturnTo, keyFlowVerifier, keyFlowNonce}
 
 // Options configures the session manager.
 type Options struct {
@@ -164,6 +165,15 @@ func (m *Manager) SignIn(ctx context.Context, user account.UserID) error {
 	// it is recorded at sign-in and read back by the login hook.
 	m.sessions.Put(ctx, keyAuthTime, time.Now().UTC().Format(time.RFC3339Nano))
 	if err := m.sessions.RenewToken(ctx); err != nil {
+		// A session that cannot be rotated is not handed out authenticated. The
+		// token it would keep is not the one the index records — and a pre-login
+		// token was never in the index at all — so an operator could not reach it
+		// by subject, which is the invariant the index exists to hold (S03-2).
+		// Destroy alone is not enough: it returns before clearing the values when
+		// its store delete fails, which is one of the ways RenewToken fails, so
+		// the account values are removed explicitly as well.
+		_ = m.sessions.Destroy(ctx)
+		_ = m.sessions.Clear(ctx)
 		return err
 	}
 	if m.index == nil {
@@ -208,12 +218,21 @@ func (m *Manager) SignOut(ctx context.Context) error {
 // session down with this instead. Every other caller uses SignOut, which records
 // the event the log is for.
 func (m *Manager) EndSession(ctx context.Context) error {
+	var token string
 	if m.index != nil {
-		if token := m.sessions.Token(ctx); token != "" {
-			_ = m.index.Forget(ctx, token)
-		}
+		token = m.sessions.Token(ctx)
 	}
-	return m.sessions.Destroy(ctx)
+	if err := m.sessions.Destroy(ctx); err != nil {
+		// The store still holds the session, so its index entry must stay: it is
+		// what keeps the live session reachable by a subject sweep. Forgetting it
+		// before the destroy succeeds would leave an unrevocable live session
+		// (S03-3).
+		return err
+	}
+	if m.index != nil && token != "" {
+		_ = m.index.Forget(ctx, token)
+	}
+	return nil
 }
 
 // recordAudit writes one authentication event. A write failure is logged, not
@@ -234,6 +253,10 @@ func recordAudit(ctx context.Context, l audit.Logger, e audit.Event) {
 	}
 }
 
+// csrfDerivationLabel domain-separates the CSRF token derived from a session
+// token from every other use of that token.
+const csrfDerivationLabel = "r0semi/csrf/1"
+
 // CSRFToken returns the session's CSRF token, creating one if needed. The
 // frontend reads it (e.g. from /v1/sessions/current) and echoes it in
 // X-CSRF-Token on writes.
@@ -241,9 +264,31 @@ func (m *Manager) CSRFToken(ctx context.Context) string {
 	if tok := m.sessions.GetString(ctx, keyCSRF); tok != "" {
 		return tok
 	}
-	tok := randomToken(32)
+	tok := m.newCSRFToken(ctx)
 	m.sessions.Put(ctx, keyCSRF, tok)
 	return tok
+}
+
+// newCSRFToken derives the first CSRF token from the session token rather than
+// minting an independent random value.
+//
+// Two requests that both find the key empty — the SPA's bootstrap read and its
+// first view fetch run in parallel — must agree on the value they hand out. With
+// a fresh random value per request, whichever request commits last is the one
+// the session holds, and every other caller has been handed a token ValidCSRF
+// rejects (Z07-4). The session token is the per-session secret both requests
+// already share and the browser never exposes to script (the session cookie is
+// HttpOnly), so deriving from it makes the first creation idempotent without a
+// compare-and-set the session store cannot express.
+func (m *Manager) newCSRFToken(ctx context.Context) string {
+	token := m.sessions.Token(ctx)
+	if token == "" {
+		// A destroyed session has no token to bind to; an independent random
+		// value is all that is available.
+		return randomToken(32)
+	}
+	sum := sha256.Sum256([]byte(csrfDerivationLabel + "\x00" + token))
+	return hex.EncodeToString(sum[:])
 }
 
 // ValidCSRF reports whether the request carries the session's CSRF token.
@@ -705,13 +750,21 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	verifier := h.manager.sessions.GetString(ctx, keyFlowVerifier)
 	nonce := h.manager.sessions.GetString(ctx, keyFlowNonce)
 	flowProvider := h.manager.sessions.GetString(ctx, keyFlowProvider)
-	h.clearFlow(ctx)
 
+	// The provider comparison comes before the flow is consumed. A callback that
+	// names the wrong provider is not this flow's callback, and burning the
+	// pending login it happens to carry the state of is a self-inflicted outage:
+	// the state is valid, the flow is still live and the person still needs it
+	// (RP-6). Everything from here on is this flow's callback, so the single-use
+	// state is spent below — including on a provider refusal, where a replay must
+	// not be able to exchange a code.
 	if flowProvider != string(provider) {
 		h.denyLogin(ctx, string(provider), codeProviderMismatch)
 		http.Error(w, "provider mismatch", http.StatusBadRequest)
 		return
 	}
+	h.clearFlow(ctx)
+
 	if denied := r.URL.Query().Get("error"); denied != "" {
 		// The provider's own `error` value is reflected input, so it is not used
 		// as a label: the bounded fact is that the provider refused.
@@ -765,8 +818,18 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, account.ErrNotFound):
 		created, _, cerr := h.accounts.CreateWithIdentity(ctx, ident)
 		if cerr != nil {
-			h.failLogin(w, r, provider, returnTo, codeSignupFailed)
-			return
+			// A concurrent first login of the same identity can create the account
+			// between the lookup above and this insert; the insert then loses the
+			// race. A second read is what tells a lost race (the account exists now)
+			// from a real signup failure (it does not) — reporting signup_failed
+			// turns the loser's successful login into an error (S03-4).
+			existing, ferr := h.accounts.FindByIdentity(ctx, ident.Provider, ident.Subject)
+			if ferr != nil {
+				h.failLogin(w, r, provider, returnTo, codeSignupFailed)
+				return
+			}
+			user = existing
+			break
 		}
 		h.recordAuth(ctx, "auth.signup", provider, string(created.ID), audit.OutcomeOK, "")
 		user = created.ID
