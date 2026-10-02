@@ -270,6 +270,11 @@ type MemoryStore struct {
 	// the live maps are. Without them a replay is indistinguishable from a value
 	// that was never issued.
 	tombstones map[string]refreshTombstone
+	// now judges the tombstone deadline in ConsumeRefresh. The store has no clock
+	// of its own — expiry is the service's judgment everywhere else — so the
+	// service injects its clock at construction (NewService). A nil now keeps the
+	// tombstone alive forever, which is the old, never-expiring behaviour.
+	now func() time.Time
 }
 
 // NewMemoryStore returns an empty store.
@@ -439,6 +444,14 @@ func (s *MemoryStore) ConsumeRefresh(_ context.Context, value string) (RefreshTo
 	t, ok := s.refresh[key]
 	if !ok {
 		if tomb, spent := s.tombstones[key]; spent {
+			// The tombstone expires on the spent token's own deadline: after it,
+			// a replay could not have produced a usable token anyway, so it is an
+			// ordinary unknown value rather than a theft signal. Without this the
+			// family would be revoked for a value that is already dead — the PG
+			// store filters the same way with `expires_at > clock()`.
+			if s.now != nil && !s.now().Before(tomb.ExpiresAt) {
+				return RefreshToken{}, ErrTokenNotFound
+			}
 			return RefreshToken{}, &RefreshReuseError{FamilyID: tomb.FamilyID}
 		}
 		return RefreshToken{}, ErrTokenNotFound
