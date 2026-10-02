@@ -41,8 +41,15 @@ type OIDCStore struct {
 	authRequests      map[string]*oidcstore.AuthRequest
 	authRequestExpiry map[string]time.Time
 	codes             map[string]codeRecord // by TokenHash(code)
-	accessTokens      map[string]accessToken
-	refreshTokens     map[string]refreshToken
+	// codeByRequest indexes the pending codes by the auth request that minted
+	// them, so DeleteAuthRequest, RevokeGrant, RevokeTokens and PurgeSubject can
+	// find a request's codes without walking every code in the store under the
+	// global lock — the scan Postgres replaces with `oidc_codes(request_id)`
+	// (Z15-3). Maintained in the same critical section as codes, through the
+	// helpers below, and checkIndexes asserts the two cannot drift.
+	codeByRequest map[string]map[string]struct{}
+	accessTokens  map[string]accessToken
+	refreshTokens map[string]refreshToken
 	// refreshTombstones is what is left of a spent refresh token, keyed by the
 	// same value hash. It exists for one reason: RFC 9700 §4.14.2 says a replay
 	// of a rotated refresh token is itself the theft signal, and the whole family
@@ -160,6 +167,58 @@ func (s *OIDCStore) deleteRequestLocked(id string) bool {
 	delete(s.authRequestExpiry, id)
 	s.requestBySubject.remove(a.Subject, id)
 	return true
+}
+
+// putCodeLocked records a pending authorization code under its value hash and
+// files it under the request that minted it. Re-saving a hash that is already
+// present moves it to the new request, mirroring the map overwrite it replaces.
+func (s *OIDCStore) putCodeLocked(key, requestID string, expiresAt time.Time) {
+	if old, ok := s.codes[key]; ok {
+		s.removeCodeFromIndexLocked(old.requestID, key)
+	}
+	s.codes[key] = codeRecord{requestID: requestID, expiresAt: expiresAt}
+	keys, ok := s.codeByRequest[requestID]
+	if !ok {
+		keys = make(map[string]struct{}, 1)
+		s.codeByRequest[requestID] = keys
+	}
+	keys[key] = struct{}{}
+}
+
+func (s *OIDCStore) removeCodeFromIndexLocked(requestID, key string) {
+	keys, ok := s.codeByRequest[requestID]
+	if !ok {
+		return
+	}
+	delete(keys, key)
+	if len(keys) == 0 {
+		delete(s.codeByRequest, requestID)
+	}
+}
+
+func (s *OIDCStore) deleteCodeLocked(key string) bool {
+	c, ok := s.codes[key]
+	if !ok {
+		return false
+	}
+	delete(s.codes, key)
+	s.removeCodeFromIndexLocked(c.requestID, key)
+	return true
+}
+
+// deleteCodesForRequestLocked drops every code the request minted and returns how
+// many it removed. The index makes this the request's own set rather than a walk
+// over every code in the store.
+func (s *OIDCStore) deleteCodesForRequestLocked(requestID string) int {
+	keys := s.codeByRequest[requestID]
+	if len(keys) == 0 {
+		return 0
+	}
+	for k := range keys {
+		delete(s.codes, k)
+	}
+	delete(s.codeByRequest, requestID)
+	return len(keys)
 }
 
 // --- candidate sets for a filtered revocation. Each returns the keys to examine:
@@ -344,6 +403,7 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		authRequests:      make(map[string]*oidcstore.AuthRequest),
 		authRequestExpiry: make(map[string]time.Time),
 		codes:             make(map[string]codeRecord),
+		codeByRequest:     make(map[string]map[string]struct{}),
 		accessTokens:      make(map[string]accessToken),
 		refreshTokens:     make(map[string]refreshToken),
 		refreshTombstones: make(map[string]refreshTombstone),
@@ -490,7 +550,7 @@ func (s *OIDCStore) AuthRequestByCode(_ context.Context, code string) (op.AuthRe
 	if !ok {
 		return nil, errors.New("memory: auth request not found")
 	}
-	delete(s.codes, key)
+	s.deleteCodeLocked(key)
 	s.deleteRequestLocked(c.requestID)
 	return cloneAuthRequest(a), nil
 }
@@ -500,7 +560,31 @@ func cloneAuthRequest(a *oidcstore.AuthRequest) *oidcstore.AuthRequest {
 	out.Scopes = append([]string(nil), a.Scopes...)
 	out.Prompt = append([]string(nil), a.Prompt...)
 	out.MaxAge = cloneMaxAge(a.MaxAge)
+	// CodeChallenge and AuthTime are pointers: copying the struct alone left the
+	// returned handle sharing them with the stored record, so a caller writing
+	// through either changed the store (G-16).
+	out.CodeChallenge = cloneCodeChallenge(a.CodeChallenge)
+	out.AuthTime = cloneTime(a.AuthTime)
 	return &out
+}
+
+// cloneCodeChallenge copies the pointed-to challenge, for the same reason
+// cloneMaxAge does.
+func cloneCodeChallenge(in *oidc.CodeChallenge) *oidc.CodeChallenge {
+	if in == nil {
+		return nil
+	}
+	v := *in
+	return &v
+}
+
+// cloneTime copies the pointed-to instant.
+func cloneTime(in *time.Time) *time.Time {
+	if in == nil {
+		return nil
+	}
+	v := *in
+	return &v
 }
 
 // cloneMaxAge copies the pointed-to value, so a caller writing through one
@@ -517,7 +601,7 @@ func cloneMaxAge(in *uint) *uint {
 func (s *OIDCStore) SaveAuthCode(_ context.Context, id, code string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.codes[oauth.TokenHash(code)] = codeRecord{requestID: id, expiresAt: s.now().Add(s.requestTTL)}
+	s.putCodeLocked(oauth.TokenHash(code), id, s.now().Add(s.requestTTL))
 	return nil
 }
 
@@ -536,11 +620,7 @@ func (s *OIDCStore) DeleteAuthRequest(ctx context.Context, id string) error {
 		subject, clientID, denied = a.Subject, a.ClientID, !a.IsDone
 	}
 	s.deleteRequestLocked(id)
-	for k, c := range s.codes {
-		if c.requestID == id {
-			delete(s.codes, k)
-		}
-	}
+	s.deleteCodesForRequestLocked(id)
 	s.mu.Unlock()
 	// A refused request leaves as much trace as an approved one: who was asked,
 	// which client, and the answer no. The subject is empty for a request nobody
@@ -1219,7 +1299,7 @@ func (s *OIDCStore) SweepExpired() int {
 	}
 	for k, c := range s.codes {
 		if now.After(c.expiresAt) {
-			delete(s.codes, k)
+			s.deleteCodeLocked(k)
 			removed++
 		}
 	}
@@ -1389,13 +1469,18 @@ func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string,
 	}
 	s.devices[h] = d
 	clientID := d.clientID
+	granted := append([]string(nil), d.scopes...)
 	s.mu.Unlock()
 	// The audit write is a synchronous, potentially remote append, and the store
 	// has exactly one lock: holding it here made every other call — every
 	// authorize, exchange, introspection and sweep — wait behind the sink
 	// (S13-4). The record describes a state change that has already happened, so
 	// it is written after the lock is released, as the other auditing methods do.
-	s.record(ctx, "oidc.device.approve", subject, clientID, audit.OutcomeOK)
+	//
+	// It goes through recordConsent rather than record because the device
+	// decision is where narrowing happens: the event has to name the granted
+	// scope set, or the log cannot answer what was actually authorized (Z20-3).
+	s.recordConsent(ctx, "oidc.device.approve", subject, clientID, granted, audit.OutcomeOK)
 	return nil
 }
 
@@ -1533,10 +1618,8 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 	}
 	// Codes hang off their request, so they go with it rather than waiting for
 	// the sweep to expire them.
-	for k, c := range s.codes {
-		if purged[c.requestID] {
-			delete(s.codes, k)
-		}
+	for id := range purged {
+		s.deleteCodesForRequestLocked(id)
 	}
 	// A device authorization for this client and subject is a capability that
 	// outlives the tokens: leaving it would let the holder of the device_code mint
@@ -1601,10 +1684,8 @@ func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, e
 		s.deleteRequestLocked(id)
 		purged[id] = true
 	}
-	for k, c := range s.codes {
-		if purged[c.requestID] {
-			delete(s.codes, k)
-		}
+	for id := range purged {
+		s.deleteCodesForRequestLocked(id)
 	}
 	// Device authorizations are capabilities, not tokens, so they are not counted
 	// here — but they are revoked with the rest: a held device_code would
@@ -1643,11 +1724,8 @@ func (s *OIDCStore) PurgeSubject(_ context.Context, subject string) (int, error)
 	// Codes hang off their request, so they go with it rather than waiting for the
 	// sweep to expire them. Leaving them behind would keep a usable authorization
 	// code alive after the account it belongs to was erased.
-	for k, c := range s.codes {
-		if purged[c.requestID] {
-			delete(s.codes, k)
-			removed++
-		}
+	for id := range purged {
+		removed += s.deleteCodesForRequestLocked(id)
 	}
 	for k, d := range s.devices {
 		if d.subject == subject {

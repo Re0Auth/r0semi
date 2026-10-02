@@ -161,6 +161,41 @@ func TestDevicePollingIsThrottled(t *testing.T) {
 	}
 }
 
+// G-15: the throttle anchors on the last ATTEMPT, not on the last admitted poll —
+// a rejected poll still pushes the deadline out, so a client that keeps polling
+// early is throttled until a full interval after its most recent attempt. This is
+// the semantic the register adjudicates for both backends; Postgres anchors on the
+// last admitted poll today and has to be changed there.
+func TestDeviceThrottleAnchorsOnTheLastAttempt(t *testing.T) {
+	clock := newTestClock()
+	store := clockedStore(t, clock)
+	ctx := context.Background()
+	if err := store.StoreDeviceAuthorization(ctx, "cli", "device-attempt", "ATTT-0001",
+		clock.Now().Add(10*time.Minute), []string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Admitted first poll: the anchor is its timestamp.
+	if _, err := store.GetDeviceAuthorizatonState(ctx, "cli", "device-attempt"); err != nil {
+		t.Fatalf("first poll refused: %v", err)
+	}
+	clock.Advance(oidcstore.DefaultDevicePollInterval - time.Second)
+	// Rejected — and the rejection moves the anchor to now.
+	if _, err := store.GetDeviceAuthorizatonState(ctx, "cli", "device-attempt"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("early poll = %v, want context.DeadlineExceeded", err)
+	}
+	clock.Advance(2 * time.Second)
+	// More than one interval after the FIRST poll, but not after the rejected
+	// attempt: still throttled, because the anchor is the last attempt.
+	if _, err := store.GetDeviceAuthorizatonState(ctx, "cli", "device-attempt"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("poll after the first interval but not the last attempt = %v, want context.DeadlineExceeded (G-15: the anchor is the last attempt)", err)
+	}
+	clock.Advance(oidcstore.DefaultDevicePollInterval + time.Second)
+	if _, err := store.GetDeviceAuthorizatonState(ctx, "cli", "device-attempt"); err != nil {
+		t.Fatalf("poll a full interval after the last attempt refused: %v", err)
+	}
+}
+
 func TestGrantsAreDerivedFromTokensAndRevocable(t *testing.T) {
 	store, _ := testStore(t)
 	ctx := context.Background()

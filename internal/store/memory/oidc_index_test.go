@@ -103,6 +103,35 @@ func checkIndexes(t *testing.T, store *OIDCStore) {
 			t.Fatalf("auth request %q is not indexed under its subject", id)
 		}
 	}
+
+	// The code index (Z15-3) agrees with the codes map in both directions.
+	seen = make(map[string]bool)
+	for requestID, keys := range store.codeByRequest {
+		if requestID == "" {
+			t.Fatal("a code was indexed under an empty request id")
+		}
+		if len(keys) == 0 {
+			t.Fatalf("the code index keeps an empty set for request %q", requestID)
+		}
+		for k := range keys {
+			if seen[k] {
+				t.Fatalf("code %q is indexed twice", k)
+			}
+			seen[k] = true
+			c, ok := store.codes[k]
+			if !ok {
+				t.Fatalf("the code index points at a missing record %q", k)
+			}
+			if c.requestID != requestID {
+				t.Fatalf("code %q is indexed under %q but belongs to %q", k, requestID, c.requestID)
+			}
+		}
+	}
+	for k, c := range store.codes {
+		if !seen[k] {
+			t.Fatalf("code %q is not indexed under its request %q", k, c.requestID)
+		}
+	}
 }
 
 // The scripted sequence: every operation that touches an indexed map, in an order
