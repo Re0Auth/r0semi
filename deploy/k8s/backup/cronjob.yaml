@@ -20,6 +20,13 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 2
+      # A dump that hangs must not become a permanent outage of the whole backup
+      # schedule: concurrencyPolicy is Forbid, so a job that never finishes makes
+      # every later run skip, silently and indefinitely. The deadline ends it and
+      # the failed history surfaces it (S15-3); the in-container `timeout` below
+      # makes the failure pg_dump's own exit code rather than a SIGKILL from the
+      # deadline.
+      activeDeadlineSeconds: 600
       template:
         metadata:
           # Its OWN label, distinct from the app's selector: the dump pod must be
@@ -66,7 +73,9 @@ spec:
                   umask 077
                   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
                   out="/backups/re0auth-$stamp.dump"
-                  pg_dump --format=custom --no-owner --no-privileges \
+                  # 540s, inside the job's 600s deadline: the dump fails on its own
+                  # terms while the pod still has time to report it (S15-3).
+                  timeout 540 pg_dump --format=custom --no-owner --no-privileges \
                           --dbname="$DATABASE_URL" --file="$out"
                   sha256sum "$out" > "$out.sha256"
                   # Retention is what keeps the volume from filling up and the backups

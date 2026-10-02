@@ -20,7 +20,22 @@ umask 077
 mkdir -p "$dir"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-out="$dir/re0auth-$stamp.dump"
+plain="$dir/re0auth-$stamp.dump"
+out="$plain"
+
+# Every failure after this point must take the plaintext with it. The operator who
+# set BACKUP_AGE_RECIPIENT believes the directory holds ciphertext only, and
+# `set -e` exits at the failing command — so the shred/rm further down never runs
+# when `age` itself fails (bad recipient, full disk), leaving a plaintext dump
+# behind an exit code the operator reads as "the backup failed" (S15-1).
+cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$plain" "$plain.age" "$plain.sha256" "$plain.age.sha256" || true
+  fi
+  return "$status"
+}
+trap cleanup EXIT
 
 # Check the encryption tool BEFORE dumping. Otherwise a missing `age` leaves a
 # plaintext dump on disk that the operator believes was encrypted, and only then
