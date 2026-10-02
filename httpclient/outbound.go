@@ -37,6 +37,8 @@ type TransportConfig struct {
 	// ResponseHeaderTimeout bounds the wait for the upstream's response headers,
 	// which is where a hung source shows up. It should sit below the client's
 	// overall Timeout so the error names the headers rather than the deadline.
+	// The default is 15s, below the 20s defaultOutboundTimeout below (Z11-6): it
+	// used to be 30s, above it, which contradicted this comment.
 	ResponseHeaderTimeout time.Duration
 	// ExpectContinueTimeout bounds the wait for a 100-continue.
 	ExpectContinueTimeout time.Duration
@@ -58,7 +60,7 @@ func DefaultTransportConfig() TransportConfig {
 		IdleConnTimeout:       90 * time.Second,
 		DialTimeout:           10 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
 }
@@ -112,10 +114,17 @@ func NewTransport(cfg TransportConfig) *http.Transport {
 }
 
 // nonPublicPrefixes are address blocks that are not public but that
-// IsPrivate/IsLoopback/IsLinkLocalUnicast do not already report: carrier-grade
-// NAT, IETF protocol assignments, the documentation ranges, benchmarking, the
-// reserved block, and the two IPv6 forms that embed an IPv4 address.
+// IsPrivate/IsLoopback/IsLinkLocalUnicast do not already report: the "this
+// network" block, carrier-grade NAT, IETF protocol assignments, the
+// documentation ranges, benchmarking, the reserved block, and the two IPv6
+// forms that embed an IPv4 address.
 var nonPublicPrefixes = []netip.Prefix{
+	// 0.0.0.0/8 ("this network", RFC 1122 §3.2.1.3): every address but 0.0.0.0
+	// itself is a global unicast to netip, so it fell through the allow-list.
+	// Linux routes 0/8 to the loopback when no more specific route exists, which
+	// makes it an SSRF alias for 127.0.0.0/8 (FO-03). Listed first and matched
+	// after Unmap, so the IPv4-mapped ::ffff:0.x forms are covered too.
+	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),   // RFC 6598 carrier-grade NAT
 	netip.MustParsePrefix("192.0.0.0/24"),    // IETF protocol assignments
 	netip.MustParsePrefix("192.0.2.0/24"),    // documentation
