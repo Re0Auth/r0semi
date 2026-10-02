@@ -126,8 +126,10 @@ func newFullConfig(t *testing.T) Config {
 		// A stub, so the documented surface includes DELETE /v1/account. The point
 		// here is that every mountable route is described, not what the deleter does.
 		Deleter: stubDeleter{},
-		// Likewise for the audit read endpoints.
-		Audit: &stubAuditReader{},
+		// Likewise for the audit read endpoints. The write side is required with the
+		// read side (Z10-7), so the full surface wires both.
+		Audit:    &stubAuditReader{},
+		AuditLog: audit.NewMemoryLogger(),
 	}
 }
 

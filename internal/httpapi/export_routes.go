@@ -7,13 +7,19 @@ import (
 	"time"
 )
 
-// accountExport is the whole of GET /v1/account/export: everything Re0Auth holds
-// about the signed-in account, in one document.
+// accountExport is GET /v1/account/export: the account's profile, its linked
+// identities, its connected data sources and the grants it has issued, in one
+// document.
 //
 // It is assembled from the same view builders the list endpoints use, not from a
 // second set of structs. That is the point: a credential that never appears in
 // GET /v1/bindings or GET /v1/grants cannot appear here either, because there is
 // only one function that turns each record into its public shape.
+//
+// It is deliberately not "everything Re0Auth holds". Browser sessions, the tokens
+// the account has issued to clients, and the audit history about it are left out,
+// and the notice below says so rather than letting the document look complete
+// (S11-8).
 type accountExport struct {
 	ExportedAt string `json:"exported_at"`
 	Profile    struct {
@@ -31,19 +37,28 @@ type accountExport struct {
 }
 
 // exportNotice is the machine-readable counterpart of docs/api-design.md §4
-// ("账号数据导出"). It records that the omission of credentials was a decision,
-// not an oversight.
+// ("账号数据导出"). It records that the omissions were a decision, not an
+// oversight.
 type exportNotice struct {
 	// CredentialsExcluded is always true. It is a field rather than a comment so
 	// a reader of the file can tell the omission was deliberate.
-	CredentialsExcluded bool   `json:"credentials_excluded"`
-	Reason              string `json:"reason"`
+	CredentialsExcluded bool `json:"credentials_excluded"`
+	// Reason enumerates every deliberate omission, not only the credentials one:
+	// a notice that named credentials alone implied the rest of the document was
+	// the whole record, which it is not (S11-8).
+	Reason string `json:"reason"`
 }
 
 const exportCredentialsReason = "Upstream credentials (access and refresh tokens) are not included: " +
 	"they are live secrets whose disclosure would let anyone act as this account at the source. " +
 	"Re0Auth holds no password or platform credential to export. " +
-	"To revoke a source's access, disconnect the binding instead."
+	"To revoke a source's access, disconnect the binding instead. " +
+	"Also deliberately absent, and not an oversight: browser sessions, the access and refresh " +
+	"tokens this account has issued to clients, and the audit history recorded about the account. " +
+	"Sessions and issued tokens are live credentials of the same kind as the ones above, and the " +
+	"audit history is pseudonymised operator data, not a copy of the account's own record. " +
+	"This document is therefore the account's profile, linked identities, connected sources and " +
+	"issued grants — not every record the service holds about it."
 
 // handleExportAccount returns the signed-in account's data as a downloadable
 // document.
@@ -63,12 +78,12 @@ func (s *Server) handleExportAccount(w http.ResponseWriter, r *http.Request) {
 
 	record, err := s.accounts.GetUser(ctx, user)
 	if err != nil {
-		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "account lookup failed")
+		s.writeAccountError(w, r, err, "account lookup failed")
 		return
 	}
 	identities, err := s.accounts.Identities(ctx, user)
 	if err != nil {
-		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "identity lookup failed")
+		s.writeAccountError(w, r, err, "identity lookup failed")
 		return
 	}
 	grants, err := s.grants.Grants(ctx, string(user))

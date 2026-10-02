@@ -1,8 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 
@@ -41,8 +39,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body deleteAccountRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+	if !s.decodeJSONBody(w, r, &body, 1<<16) {
 		return
 	}
 	if body.Acknowledge != deleteAccountAcknowledgement {

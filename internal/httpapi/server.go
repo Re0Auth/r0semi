@@ -308,6 +308,13 @@ func New(cfg Config) (*Server, error) {
 		// there must be an operator allowlist to read it through.
 		return nil, errors.New("httpapi: Config.Audit requires a non-empty Config.Admins")
 	}
+	if cfg.Audit != nil && cfg.AuditLog == nil {
+		// The read API's own records (admin.audit.read/verify/head) go through the
+		// write side (recordAudit). Accepting the read half with no sink assembled a
+		// server whose operator-plane records were silent no-ops — an audit log
+		// with no log — so the pair is required together (Z10-7).
+		return nil, errors.New("httpapi: Config.Audit requires Config.AuditLog")
+	}
 	adminAllowed := make(map[account.UserID]bool, len(cfg.Admins))
 	for _, a := range cfg.Admins {
 		adminAllowed[a] = true

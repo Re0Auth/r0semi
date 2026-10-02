@@ -1,9 +1,7 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -64,6 +62,21 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "no active session")
 		return false
 	}
+	// The session claim is not proof that the account still exists. The allowlist
+	// is a static map built from configuration at New time, so a session that
+	// outlived its account row — the window after an erasure revoked one store's
+	// sessions but not this one's, or a restore that brought sessions back without
+	// their accounts — still passed every check below. Re-read the account, so
+	// operator authority follows the account rather than a cookie (S03-6).
+	//
+	// Config.Admin requires Config.Sessions, which requires Config.Accounts, so
+	// this is never nil on an assembled server; the guard is for a hand-built one.
+	if s.accounts != nil {
+		if _, err := s.accounts.GetUser(r.Context(), user); err != nil {
+			s.writeAccountError(w, r, err, "account lookup failed")
+			return false
+		}
+	}
 	if !s.adminAllowed[user] {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown resource")
 		return false
@@ -110,7 +123,9 @@ func (s *Server) handleAdminListClients(w http.ResponseWriter, r *http.Request) 
 	for _, c := range clients {
 		views = append(views, newAdminClientView(c))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	// No-transform: this body carries the session's CSRF token, so it must not be
+	// compressed (S10-4).
+	writeJSONNoTransform(w, http.StatusOK, map[string]any{
 		"data":       views,
 		"csrf_token": s.sessions.CSRFToken(r.Context()),
 	})
@@ -130,8 +145,7 @@ func (s *Server) handleAdminRegisterClient(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var body adminRegisterRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+	if !s.decodeJSONBody(w, r, &body, 1<<20) {
 		return
 	}
 	typ := oauth.ClientType(body.Type)
@@ -251,8 +265,7 @@ func (s *Server) handleAdminKillSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body killSwitchRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+	if !s.decodeJSONBody(w, r, &body, 1<<20) {
 		return
 	}
 

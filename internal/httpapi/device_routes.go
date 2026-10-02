@@ -1,9 +1,7 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 
@@ -72,7 +70,9 @@ func (s *Server) handleDeviceVerification(w http.ResponseWriter, r *http.Request
 	}
 
 	s.sessions.Bind(r.Context(), deviceBindKind, auth.UserCode)
-	writeJSON(w, http.StatusOK, map[string]any{
+	// No-transform: this body carries the session's CSRF token, so it must not be
+	// compressed (S10-4).
+	writeJSONNoTransform(w, http.StatusOK, map[string]any{
 		"state":      "pending",
 		"user_code":  auth.UserCode,
 		"client":     map[string]string{"id": auth.Client.ID, "name": auth.Client.Name},
@@ -102,8 +102,7 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body deviceDecisionBody
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+	if !s.decodeJSONBody(w, r, &body, 1<<20) {
 		return
 	}
 	// The handle was bound under the normalised spelling, so the decision must be
@@ -119,6 +118,19 @@ func (s *Server) handleDeviceDecision(w http.ResponseWriter, r *http.Request) {
 	if !s.sessions.Bound(r.Context(), deviceBindKind, body.UserCode) ||
 		!s.sessions.OwnerMatches(r.Context(), deviceBindKind, body.UserCode, user) {
 		s.writeProblem(w, r, http.StatusNotFound, "not_found", "unknown user code")
+		return
+	}
+
+	// The decision is a closed enum on the wire, so anything else is refused
+	// before the code is touched. It used to be read as `approve == (decision ==
+	// "approve")`, which turned a typo into a denial — and consumed the user code
+	// doing it, so the browser could neither approve nor retry the grant it had
+	// just been shown (Z08-7). This is the same whitelist the consent endpoint
+	// applies to its own `decision`.
+	switch body.Decision {
+	case "approve", "deny":
+	default:
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", `decision must be "approve" or "deny"`)
 		return
 	}
 

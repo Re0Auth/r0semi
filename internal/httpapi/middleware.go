@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -123,6 +125,38 @@ func (s *Server) withBodyLimit(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// decodeJSONBody reads a bounded JSON body, reporting an oversized one as the
+// middleware's own plane-shaped 413 rather than as malformed JSON.
+//
+// withBodyLimit has already wrapped r.Body in http.MaxBytesReader (via
+// oauth.LimitFormBody) and answers 413 itself when the length is DECLARED over
+// the cap. A chunked body declares nothing, so the cap is enforced while reading
+// and the reader returns *http.MaxBytesError in the middle of the decode — which
+// every JSON handler here classified as "malformed JSON body", giving one
+// oversized body two different answers depending on how the client framed it
+// (S13-9). The refusal below is deliberately byte-for-byte the middleware's.
+//
+// The cap is applied with a second MaxBytesReader rather than an io.LimitReader:
+// a LimitReader that stops at the same count as the reader underneath it returns
+// EOF one read before that reader would have reported the overflow, which is how
+// the oversized body became a truncated one in the first place.
+func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	if limit <= 0 || limit > int64(oauth.MaxFormBytes) {
+		limit = int64(oauth.MaxFormBytes)
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeProblem(w, r, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large")
+			return false
+		}
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+		return false
+	}
+	return true
 }
 
 // withRequestContext assigns the identifiers every request carries — the request

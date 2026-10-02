@@ -120,8 +120,25 @@ func writeOAuthError(w http.ResponseWriter, r *http.Request, status int, code, d
 // accounts (there is no Vary here either), and a browser cache would keep the CSRF
 // token on disk after the session ended.
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	writeJSONWithCacheControl(w, status, v, "no-store")
+}
+
+// writeJSONNoTransform is writeJSON for the four responses that hand the browser
+// the session's CSRF token (the session bootstrap, the consent view, the device
+// verification view and the admin client list).
+//
+// It adds no-transform, which makes the compression middleware skip the body (see
+// compress.hasNoTransform): a response that carries a secret beside text the
+// caller influenced is the BREACH precondition, and the business plane is the
+// compressed one, so the defence has to be per response rather than per plane.
+// The other business responses keep compressing — that plane is where it pays.
+func writeJSONNoTransform(w http.ResponseWriter, status int, v any) {
+	writeJSONWithCacheControl(w, status, v, "no-store, no-transform")
+}
+
+func writeJSONWithCacheControl(w http.ResponseWriter, status int, v any, cacheControl string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Cache-Control", cacheControl)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }

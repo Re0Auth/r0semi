@@ -25,7 +25,7 @@ func (s *Server) handleListIdentities(w http.ResponseWriter, r *http.Request) {
 	}
 	identities, err := s.accounts.Identities(r.Context(), user)
 	if err != nil {
-		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "identity lookup failed")
+		s.writeAccountError(w, r, err, "identity lookup failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": identityViews(identities)})

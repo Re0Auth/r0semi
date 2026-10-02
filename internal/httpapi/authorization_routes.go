@@ -2,9 +2,7 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 
@@ -106,7 +104,9 @@ func (s *Server) handleGetAuthorizationRequest(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	// No-transform: this body carries the session's CSRF token, so it must not be
+	// compressed (S10-4).
+	writeJSONNoTransform(w, http.StatusOK, map[string]any{
 		"id":               view.ID,
 		"client":           map[string]string{"id": view.ClientID, "name": view.ClientName},
 		"scopes":           s.scopeViews(view.Scopes),
@@ -141,8 +141,7 @@ func (s *Server) handleAuthorizationDecision(w http.ResponseWriter, r *http.Requ
 	}
 
 	var body decisionBody
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+	if !s.decodeJSONBody(w, r, &body, 1<<20) {
 		return
 	}
 

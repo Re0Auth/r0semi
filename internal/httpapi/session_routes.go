@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/Re0Auth/r0semi/internal/account"
@@ -26,17 +28,19 @@ func (s *Server) handleCurrentSession(w http.ResponseWriter, r *http.Request) {
 	}
 	record, err := s.accounts.GetUser(ctx, user)
 	if err != nil {
-		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "account lookup failed")
+		s.writeAccountError(w, r, err, "account lookup failed")
 		return
 	}
 	identities, err := s.accounts.Identities(ctx, user)
 	if err != nil {
-		s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", "identity lookup failed")
+		s.writeAccountError(w, r, err, "identity lookup failed")
 		return
 	}
 	views := identityViews(identities)
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	// No-transform: this body carries the session's CSRF token, so it must not be
+	// compressed (S10-4).
+	writeJSONNoTransform(w, http.StatusOK, map[string]any{
 		"user_id":             string(record.ID),
 		"primary_identity_id": string(record.PrimaryIdentity),
 		"csrf_token":          s.sessions.CSRFToken(ctx),
@@ -63,7 +67,18 @@ func identityViews(identities []account.Identity) []identityView {
 
 // handleSignOut destroys the session. It is a write, so it requires the CSRF
 // token issued by handleCurrentSession.
+//
+// The session comes first, like every other write on this plane: without it the
+// CSRF check answers 403, and a caller with no session at all would be told its
+// token was wrong rather than that it is not signed in. The frontend reads the
+// problem code, not the status: `unauthenticated` is what sends it to the sign-in
+// page, and 403/invalid_request sent it looking for a CSRF token it has no way to
+// obtain (Z07-6).
 func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.sessions.User(r.Context()); !ok {
+		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "no active session")
+		return
+	}
 	if !s.sessions.ValidCSRF(r) {
 		s.writeProblem(w, r, http.StatusForbidden, "invalid_request", "missing or invalid CSRF token")
 		return
@@ -73,4 +88,28 @@ func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeAccountError maps an account-store lookup failure for a signed-in session.
+//
+// An account whose row is gone is not an internal error: the session names an
+// account that no longer exists, so the session is torn down and the caller is
+// told it is unauthenticated. Answering 500 instead left the stale cookie
+// answering 500 on every session-scoped read until it expired (S03-5, Z07-7).
+//
+// The teardown is EndSession, not SignOut: a missing row means, in production,
+// that the erasure already destroyed the account's pseudonym key, and an
+// auth.logout event carrying the raw usr_… would make the audit sink mint a new
+// key and re-link the account the erasure unlinked (the same reasoning as
+// handleDeleteAccount).
+func (s *Server) writeAccountError(w http.ResponseWriter, r *http.Request, err error, detail string) {
+	if errors.Is(err, account.ErrNotFound) {
+		if derr := s.sessions.EndSession(r.Context()); derr != nil {
+			slog.Warn("could not clear a session whose account is gone",
+				"request_id", requestID(r), "err", derr)
+		}
+		s.writeProblem(w, r, http.StatusUnauthorized, "unauthenticated", "no active session")
+		return
+	}
+	s.writeProblem(w, r, http.StatusInternalServerError, "internal_error", detail)
 }

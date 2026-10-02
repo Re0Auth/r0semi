@@ -37,8 +37,10 @@ func TestBusinessPlaneResponsesAreNotCached(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200 (the assertion below needs a body to protect)", resp.StatusCode)
 			}
-			if got := resp.Header.Get("Cache-Control"); got != "no-store" {
-				t.Errorf("Cache-Control = %q, want no-store", got)
+			// no-store must be one of the directives, not the whole value: the
+			// responses carrying a CSRF token also carry no-transform (S10-4).
+			if got := resp.Header.Get("Cache-Control"); !strings.Contains(got, "no-store") {
+				t.Errorf("Cache-Control = %q, want it to contain no-store", got)
 			}
 		})
 	}

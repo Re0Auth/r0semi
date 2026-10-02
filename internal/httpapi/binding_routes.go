@@ -1,9 +1,7 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -199,8 +197,7 @@ func (s *Server) handleCascadeRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body cascadeRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil {
-		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "malformed JSON body")
+	if !s.decodeJSONBody(w, r, &body, 1<<16) {
 		return
 	}
 	if body.Acknowledge != cascadeAcknowledgement {
