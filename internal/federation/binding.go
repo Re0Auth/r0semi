@@ -173,10 +173,20 @@ type MemoryBindingStore struct {
 	// sync: Put/Create insert the key with a binary search, Delete removes it, and
 	// PutIfVersion rewrites only the payload (the key does not move).
 	index []bindingIndexKey
+	// byUser indexes the same keys by owner, each list in (game, source) order.
+	// List walks one account's list instead of filtering the whole deployment's
+	// index under the read lock, and sizes its result from that list, so an
+	// account page costs what the account holds rather than what the deployment
+	// holds (S14-4, S05-3). Kept in sync by the same three mutators as index.
+	byUser map[account.UserID][]bindingIndexKey
 	// rowsCopied counts the rows ListAll and ListAllPage have copied out. It exists
 	// so a probe can show that paging copies each row once rather than materialising
 	// the whole table per page; nothing in the read path depends on it.
 	rowsCopied atomic.Int64
+	// listScanned counts the index entries List has walked. Like rowsCopied it is
+	// diagnostic only, and exists so a probe can show that an account page reads
+	// one account's index rather than the whole deployment's.
+	listScanned atomic.Int64
 }
 
 // bindingIndexKey is the ordered part of a binding: exactly the fields the index,
@@ -190,7 +200,10 @@ type bindingIndexKey struct {
 
 // NewMemoryBindingStore returns an empty store.
 func NewMemoryBindingStore() *MemoryBindingStore {
-	return &MemoryBindingStore{m: make(map[string]Binding)}
+	return &MemoryBindingStore{
+		m:      make(map[string]Binding),
+		byUser: make(map[account.UserID][]bindingIndexKey),
+	}
 }
 
 // indexOf returns the position of key in the ordered index and whether it is
@@ -219,6 +232,43 @@ func (s *MemoryBindingStore) removeIndex(key bindingIndexKey) {
 	}
 }
 
+// insertUserIndex records key in its owner's list, which is ordered by
+// (game, source) alone: the user is constant within one list. The caller must
+// have already established that the key is absent from the store.
+func (s *MemoryBindingStore) insertUserIndex(key bindingIndexKey) {
+	keys := s.byUser[key.user]
+	i := sort.Search(len(keys), func(i int) bool { return !bindingUserIndexLess(keys[i], key) })
+	keys = append(keys, bindingIndexKey{})
+	copy(keys[i+1:], keys[i:])
+	keys[i] = key
+	s.byUser[key.user] = keys
+}
+
+// removeUserIndex drops key from its owner's list if it is there. An owner with
+// no bindings is removed from the map, so the map holds only accounts that hold
+// something.
+func (s *MemoryBindingStore) removeUserIndex(key bindingIndexKey) {
+	keys := s.byUser[key.user]
+	i := sort.Search(len(keys), func(i int) bool { return !bindingUserIndexLess(keys[i], key) })
+	if i >= len(keys) || keys[i] != key {
+		return
+	}
+	keys = append(keys[:i], keys[i+1:]...)
+	if len(keys) == 0 {
+		delete(s.byUser, key.user)
+		return
+	}
+	s.byUser[key.user] = keys
+}
+
+// bindingUserIndexLess orders one owner's bindings the way List returns them.
+func bindingUserIndexLess(a, b bindingIndexKey) bool {
+	if a.game != b.game {
+		return a.game < b.game
+	}
+	return a.source < b.source
+}
+
 // Get implements BindingStore.
 func (s *MemoryBindingStore) Get(_ context.Context, user account.UserID, game, source string) (Binding, error) {
 	s.mu.RLock()
@@ -236,7 +286,9 @@ func (s *MemoryBindingStore) Put(_ context.Context, b Binding) error {
 	defer s.mu.Unlock()
 	key := bindingKey(b.User, b.Game, b.Source)
 	if _, ok := s.m[key]; !ok {
-		s.insertIndex(bindingIndexKey{user: b.User, game: b.Game, source: b.Source})
+		indexKey := bindingIndexKey{user: b.User, game: b.Game, source: b.Source}
+		s.insertIndex(indexKey)
+		s.insertUserIndex(indexKey)
 	}
 	s.m[key] = b
 	return nil
@@ -266,7 +318,9 @@ func (s *MemoryBindingStore) Create(_ context.Context, b Binding) (bool, error) 
 	if _, ok := s.m[key]; ok {
 		return false, nil
 	}
-	s.insertIndex(bindingIndexKey{user: b.User, game: b.Game, source: b.Source})
+	indexKey := bindingIndexKey{user: b.User, game: b.Game, source: b.Source}
+	s.insertIndex(indexKey)
+	s.insertUserIndex(indexKey)
 	s.m[key] = b
 	return true, nil
 }
@@ -279,23 +333,29 @@ func (s *MemoryBindingStore) Delete(_ context.Context, user account.UserID, game
 	key := bindingKey(user, game, source)
 	if _, ok := s.m[key]; ok {
 		delete(s.m, key)
-		s.removeIndex(bindingIndexKey{user: user, game: game, source: source})
+		indexKey := bindingIndexKey{user: user, game: game, source: source}
+		s.removeIndex(indexKey)
+		s.removeUserIndex(indexKey)
 	}
 	return nil
 }
 
 // List implements BindingStore.
+//
+// It walks the account's own index, in (game, source) order, and sizes the result
+// from it. The whole deployment's index is never touched, so a page for one
+// account does not pay for the accounts it is not showing (S14-4), and the
+// returned slice is allocated for what the account holds rather than for the
+// deployment (S05-3).
 func (s *MemoryBindingStore) List(_ context.Context, user account.UserID) ([]Binding, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	out := make([]Binding, 0, len(s.m))
-	// The index is globally (user, game, source) ordered, so restricting it to one
-	// user yields (game, source) order -- the sorted order the account page wants.
-	for _, k := range s.index {
-		if k.user == user {
-			out = append(out, s.m[bindingKey(k.user, k.game, k.source)])
-		}
+	keys := s.byUser[user]
+	s.listScanned.Add(int64(len(keys)))
+	out := make([]Binding, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, s.m[bindingKey(k.user, k.game, k.source)])
 	}
 	return out, nil
 }

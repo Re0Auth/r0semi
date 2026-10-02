@@ -143,6 +143,14 @@ func (s *service) BeginBind(ctx context.Context, user account.UserID, game, sour
 	if !ok {
 		return BindChallenge{}, ErrUnknownSource
 	}
+	// A retired source is refused here for the same reason candidates() excludes
+	// it: it is out of service, and starting a new credential against it would
+	// create a binding the data plane will never use (S05-7). The rest of the
+	// plane already answers ErrSourceRetired, so the bind flow must not be the one
+	// path that still says yes.
+	if src.Status == StatusRetired {
+		return BindChallenge{}, ErrSourceRetired
+	}
 	if src.ClientID == "" || s.baseURL == "" {
 		return BindChallenge{}, ErrBindUnavailable
 	}
@@ -204,6 +212,13 @@ func (s *service) CompleteBind(ctx context.Context, user account.UserID, state, 
 	src, ok := s.registry.Get(flow.Game, flow.Source)
 	if !ok {
 		return Binding{}, flow, ErrUnknownSource
+	}
+	// Checked again here, not only in BeginBind: a flow can outlive the
+	// configuration that started it, and this is the step that would write the
+	// credential. Refusing before the exchange means no token is fetched for a
+	// source the operator has taken out of service (S05-7).
+	if src.Status == StatusRetired {
+		return Binding{}, flow, ErrSourceRetired
 	}
 	token, err := s.oauthConfig(src).Exchange(s.oauthContext(ctx), code, oauth2.VerifierOption(flow.Verifier))
 	if err != nil {

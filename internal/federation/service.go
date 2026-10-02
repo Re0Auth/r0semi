@@ -271,8 +271,16 @@ type Config struct {
 	Flows BindFlowStore
 	Doer  httpclient.Doer
 	// HTTPClient performs the OAuth token exchange. Defaults to Doer when it is
-	// an *http.Client, else http.DefaultClient.
+	// an *http.Client, else to a bounded client built here.
 	HTTPClient *http.Client
+	// AllowPrivateUpstreams lets the fallback client above reach private,
+	// loopback and link-local addresses. It mirrors the deployment setting
+	// `upstream.allow_private_addresses` (cmd/re0auth) and is opt-in for the same
+	// reason: a self-hosted data source on a private network is a supported shape,
+	// but it must be declared. It is consulted only when the caller supplies a
+	// Doer that is not an *http.Client and no HTTPClient; a caller that supplies
+	// HTTPClient — the composition root does — sets the guard there (S06-9).
+	AllowPrivateUpstreams bool
 	// BaseURL is Re0Auth's public base URL; the bind callback is
 	// {BaseURL}/auth/upstream/{game}/{source}/callback.
 	BaseURL string
@@ -372,8 +380,15 @@ func NewService(cfg Config) (Service, error) {
 			// Not http.DefaultClient: that is the one client in the process with no
 			// timeout and no redirect policy, and this one posts the authorization
 			// code and the client secret. A caller that supplies only a Doer still
-			// gets a bounded client for the exchange.
-			cfg.HTTPClient = httpclient.NewOutboundClient(httpclient.OutboundConfig{})
+			// gets a bounded client for the exchange — bounded in time (the outbound
+			// timeout) and in ADDRESS: the zero-value OutboundConfig left the
+			// private-address guard off, so a source whose issuer resolved to an
+			// internal listener got the client secret posted there (S06-9). A
+			// deployment whose sources really are private declares it, exactly as it
+			// does for the composition root's own client.
+			cfg.HTTPClient = httpclient.NewOutboundClient(httpclient.OutboundConfig{
+				Transport: httpclient.TransportConfig{DenyPrivateAddresses: !cfg.AllowPrivateUpstreams},
+			})
 		}
 	}
 	if cfg.Now == nil {

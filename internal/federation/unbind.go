@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/vault"
@@ -120,8 +121,11 @@ func (s *service) revokeUpstream(ctx context.Context, src Source, binding Bindin
 		//
 		// The wire answer is a stable code, not err.Error(): the underlying error can
 		// name internal hosts and paths, and the user-facing copy says what they can
-		// do about it. The text goes to the log, where an operator can read it.
-		slog.Warn("upstream revocation could not open the binding secret", "source", src.Name, "err", err)
+		// do about it. The text goes to the log, where an operator can read it --
+		// with the binding's vault identity (provider:subject, i.e. the account id)
+		// taken back out, because that is a person, not a diagnostic (S05-8).
+		slog.Warn("upstream revocation could not open the binding secret",
+			"source", src.Name, "err", redactBindingIdentity(err, binding))
 		return RevocationUnavailable, upstreamRevocationFailed
 	}
 
@@ -141,3 +145,24 @@ func (s *service) revokeUpstream(ctx context.Context, src Source, binding Bindin
 // machine token, not a message: the details are in the log, and the UI renders
 // its own copy for the `unavailable` outcome.
 const upstreamRevocationFailed = "upstream_revocation_failed"
+
+// redactBindingIdentity removes the binding's vault identity from an error
+// message before the message reaches the log.
+//
+// vault.Use reports a missing KEK by naming the Identity it was asked for
+// (vault/service.go), and Identity.String() is "provider:subject" — the subject
+// being the account id of the person whose binding this is. A log line is
+// operational evidence that is retained and shipped far beyond the request, so it
+// must not be where that identity is persisted (S05-8). Only the identity
+// substring is replaced: the rest of the diagnostic — the key id, the operation
+// that failed — survives, because that is what makes the line actionable.
+func redactBindingIdentity(err error, b Binding) error {
+	if err == nil {
+		return nil
+	}
+	id := BindingIdentity(b).String()
+	if id == "" || !strings.Contains(err.Error(), id) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), id, "<binding>"))
+}

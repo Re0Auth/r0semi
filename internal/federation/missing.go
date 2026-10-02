@@ -60,20 +60,35 @@ func (s *service) MissingBindings(ctx context.Context, user account.UserID, scop
 
 	// Every source the data plane would try for a resource whose declared scope is
 	// wanted, grouped by scope — the same set candidates() builds, per resource.
+	//
+	// The candidates for a (game, resource name) pair are built ONCE here, not per
+	// declaration: the previous inner lookup called registry.Sources(src.Game),
+	// which copies and sorts a whole game's source list, for every (source,
+	// resource) pair — the O((sources x resources)^2) shape S05-4 names. AllSources
+	// is already grouped by game and sorted by name, so a single pass appends each
+	// source to every resource name it declares, and each list comes out in exactly
+	// the order registry.Sources(game) returned.
+	type resourceKey struct{ game, resource string }
+	candidatesByResource := make(map[resourceKey][]Source)
+	sources := s.registry.AllSources()
+	for _, src := range sources {
+		if src.Status == StatusRetired {
+			continue
+		}
+		for _, res := range src.Resources {
+			key := resourceKey{game: src.Game, resource: res.Name}
+			candidatesByResource[key] = append(candidatesByResource[key], src)
+		}
+	}
+
 	byScope := make(map[string][]Source)
 	seen := make(map[string]map[string]bool)
-	for _, src := range s.registry.AllSources() {
+	for _, src := range sources {
 		for _, res := range src.Resources {
 			if res.Scope == "" || !wanted[res.Scope] {
 				continue
 			}
-			for _, cand := range s.registry.Sources(src.Game) {
-				if cand.Status == StatusRetired {
-					continue
-				}
-				if _, ok := cand.Resource(res.Name); !ok {
-					continue
-				}
+			for _, cand := range candidatesByResource[resourceKey{game: src.Game, resource: res.Name}] {
 				key := sourceKey(cand.Game, cand.Name)
 				if seen[res.Scope] == nil {
 					seen[res.Scope] = make(map[string]bool)

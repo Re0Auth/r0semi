@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 var (
@@ -135,6 +136,11 @@ func (s Source) Resource(name string) (Resource, bool) {
 type Registry struct {
 	byGame map[string][]Source
 	byKey  map[string]Source
+	// sourcesCopied counts the Source values Sources has copied out. Like
+	// MemoryBindingStore.rowsCopied it is diagnostic only: a probe reads it to show
+	// that a caller walks the sources once instead of copying the whole game per
+	// resource declaration (S05-4). Nothing in the read path depends on it.
+	sourcesCopied atomic.Int64
 }
 
 // NewRegistry builds a registry, rejecting incomplete or duplicate sources.
@@ -148,6 +154,14 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 		if _, dup := r.byKey[k]; dup {
 			return nil, fmt.Errorf("federation: duplicate source %s", k)
 		}
+		// The issuer is the base of every URL this source's requests are built
+		// from and of the browser redirect the bind flow sends, so it has to be an
+		// absolute http(s) URL before anything joins to it (S05-6). A
+		// scheme-relative "//evil.example" loads fine and makes /bind answer a 302
+		// naming another host; a relative path fails far from the typo.
+		if err := validateEndpointURL("issuer", s.Issuer); err != nil {
+			return nil, fmt.Errorf("federation: source %s: %w", k, err)
+		}
 		issuer := strings.TrimRight(s.Issuer, "/")
 		if s.AuthorizationEndpoint == "" {
 			s.AuthorizationEndpoint = issuer + "/oauth/authorize"
@@ -159,6 +173,23 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 			s.RevocationEndpoint = issuer + "/oauth/revoke"
 		}
 		s.Issuer = issuer
+		// The overrides are used as whole request URLs (the token exchange, the
+		// revocation POST, the cascade request) and as a browser redirect target,
+		// so they carry the same requirement as the issuer, whether they were set
+		// explicitly or derived from it above (S05-6).
+		for _, ep := range []struct{ field, value string }{
+			{"authorization_endpoint", s.AuthorizationEndpoint},
+			{"token_endpoint", s.TokenEndpoint},
+			{"revocation_endpoint", s.RevocationEndpoint},
+			{"cascade_revocation_endpoint", s.CascadeRevocationEndpoint},
+		} {
+			if ep.value == "" {
+				continue
+			}
+			if err := validateEndpointURL(ep.field, ep.value); err != nil {
+				return nil, fmt.Errorf("federation: source %s: %w", k, err)
+			}
+		}
 		// status shares token_class's shape and its failure mode: an unrecognised
 		// spelling is an operator's attempt at "out of service" that the rest of
 		// the package reads as "in service". Only the exact string "retired" is
@@ -200,6 +231,26 @@ func NewRegistry(sources ...Source) (*Registry, error) {
 		r.byGame[s.Game] = append(r.byGame[s.Game], s)
 	}
 	return r, nil
+}
+
+// validateEndpointURL checks an operator-supplied http(s) endpoint before any
+// request URL or browser redirect is built from it.
+//
+// It is validateRawBase's rule for the values that are used whole rather than
+// joined to a caller path: the issuer, the two OAuth endpoint overrides, and the
+// two revocation overrides (S05-6). None has a legitimate relative form — the
+// upstream protocol fixes them as absolute URLs — and a value that is not one
+// either sends a request somewhere the operator did not write or hands the
+// browser a Location it resolves against Re0Auth's own origin.
+func validateEndpointURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s %q is not a URL: %w", field, raw, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s %q must be an absolute http(s) URL", field, raw)
+	}
+	return nil
 }
 
 // validateRawBase checks a source's native API root before anything is ever joined
@@ -262,6 +313,7 @@ func (r *Registry) Get(game, name string) (Source, bool) {
 func (r *Registry) Sources(game string) []Source {
 	out := append([]Source(nil), r.byGame[game]...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	r.sourcesCopied.Add(int64(len(out)))
 	return out
 }
 
