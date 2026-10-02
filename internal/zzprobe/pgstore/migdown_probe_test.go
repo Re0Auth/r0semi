@@ -104,7 +104,7 @@ func objectsDroppedIn(sql string) map[string]bool {
 //
 // The interesting question about a Down section is NOT "does it name every
 // index its Up created". A `DROP TABLE` removes a table's indexes with it, so an
-// index left unnamed in a Down whose table is also dropped is correct 鈥?and the
+// index left unnamed in a Down whose table is also dropped is correct —and the
 // first version of this probe asserted the stricter property, reported 15
 // offenders, and was wrong. The two probes below are the versions that hold:
 //
@@ -180,7 +180,7 @@ func downExecutesNothing(t *testing.T, name string) bool {
 // An index whose own name is dropped is fine. An index whose TABLE is dropped is
 // fine, because the DROP TABLE takes it. The defect is the third case: an index
 // that no Down names and whose table no Down drops survives the rollback, and the
-// next `goose up` runs the same CREATE INDEX against a name that still exists 鈥?// `relation "oauth_device_user_code_idx" already exists`, the migration aborts,
+// next `goose up` runs the same CREATE INDEX against a name that still exists —// `relation "oauth_device_user_code_idx" already exists`, the migration aborts,
 // and the advisory lock is held until an operator intervenes.
 //
 // It is database-free on purpose: "CREATE INDEX <name> where <name> exists" is a
@@ -379,17 +379,17 @@ func indexTargets(up string) map[string]string {
 }
 
 // TestNoIndexSurvivesTheFullDownSequence tests the documented operator story in
-// docs/migration-decision.md (ADR-0008 搂1 and 搂4: migrations roll back under
+// docs/migration-decision.md (ADR-0008 §1 and §4: migrations roll back under
 // `-migrate-down`, one step per invocation, and the rollback story is
 // restore-from-backup) against the strongest reading of it: if every migration's
-// Down is run in reverse order 鈥?which is what repeated `-migrate-down`, or a
-// single goose `down-to 0`, does 鈥?is the schema actually back at zero?
+// Down is run in reverse order —which is what repeated `-migrate-down`, or a
+// single goose `down-to 0`, does —is the schema actually back at zero?
 //
 // The property that decides it is cheap and database-free. An index survives the
 // whole sequence iff no Down in the repository names it AND no Down drops the
 // table it is on. If any index survives, then re-applying the Up that created it
 // runs `CREATE INDEX <name>` against an object that still exists, and Postgres
-// answers `relation "<name>" already exists` 鈥?the migration aborts mid-run and
+// answers `relation "<name>" already exists` —the migration aborts mid-run and
 // the advisory lock is held until the operator intervenes.
 //
 // Only indexes created by a migration that also *drops its table* in Down are

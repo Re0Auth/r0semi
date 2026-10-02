@@ -25,7 +25,7 @@ import (
 //
 // The disclosure question matters because a pgconn.PgError's Error() is
 // "ERROR: duplicate key value violates unique constraint \"accounts_identities_provider_subject_key\"
-// (SQLSTATE 23505)" 鈥?the constraint name, and in some shapes the failing row's
+// (SQLSTATE 23505)" —the constraint name, and in some shapes the failing row's
 // values. So the check is that the mapping is by CODE only, and that the
 // original error is not wrapped into the value that travels onward.
 func TestUniqueViolationMappingDropsNoSQLDetail(t *testing.T) {
@@ -75,7 +75,7 @@ func TestUniqueViolationMappingDropsNoSQLDetail(t *testing.T) {
 // NOT enforce, because the audit chain's own migration says it plainly: the
 // append-only property is a convention plus the chain, not a database control.
 //
-// This is a *documented* limitation (docs/architecture.md 搂4.16: "杩佺Щ閲屾病鏈?// trigger銆佹病鏈夋潈闄愰檺鍒?), so it is not reported as a defect. The probe exists so
+// This is a *documented* limitation (docs/architecture.md §4.16: "迁移里没有 trigger、没有权限限制?), so it is not reported as a defect. The probe exists so
 // that the claim "there is no trigger and no GRANT/REVOKE in this schema" is a
 // checkable fact rather than a reading, and so that adding one later fails here
 // and forces the documentation to be updated with it.
@@ -86,14 +86,14 @@ func TestTokenTablesHaveNoRowLevelSecurityOrTrigger(t *testing.T) {
 		body := stripLineComments(readMigration(t, name))
 		for _, m := range featureRE.FindAllStringSubmatch(body, -1) {
 			found++
-			t.Logf("%s declares %s 鈥?docs/architecture.md 搂4.16 says the schema has no triggers and no "+
+			t.Logf("%s declares %s —docs/architecture.md §4.16 says the schema has no triggers and no "+
 				"privilege restrictions; update that text if this is deliberate", name, strings.ToUpper(m[1]))
 		}
 	}
 	if found == 0 {
 		t.Log("CONFIRMED: no migration declares a trigger, a policy, row-level security, a role or any " +
-			"GRANT/REVOKE 鈥?the append-only property of audit_events is the chain plus convention, exactly " +
-			"as docs/architecture.md 搂4.16 states")
+			"GRANT/REVOKE —the append-only property of audit_events is the chain plus convention, exactly " +
+			"as docs/architecture.md §4.16 states")
 	}
 }
 
@@ -105,7 +105,7 @@ func TestTokenTablesHaveNoRowLevelSecurityOrTrigger(t *testing.T) {
 // The adapter is inconsistent here, and the inconsistency is invisible from the
 // outside: every one of these methods reports an error when a statement fails,
 // so a partial application looks like an ordinary failure. What differs is what
-// the retry has to reason about 鈥?and for the Kill Switch the count it returns is
+// the retry has to reason about —and for the Kill Switch the count it returns is
 // the operator's evidence that the account is contained.
 //
 // The probe reads the method bodies out of the source and asserts the set of
@@ -157,7 +157,7 @@ func TestMultiStatementMutationsRunInATransaction(t *testing.T) {
 		for _, m := range methods {
 			body := methodBody(t, code, m)
 			if strings.Contains(body, ".Begin(") {
-				t.Errorf("%s: %s now opens a transaction 鈥?remove it from this list and from the report", file, m)
+				t.Errorf("%s: %s now opens a transaction —remove it from this list and from the report", file, m)
 				continue
 			}
 			// Count the writes, not the Exec calls: RevokeTokens routes through
@@ -196,7 +196,7 @@ func countWrites(body string) int {
 	return n
 }
 
-// methodBody returns the source of one method, from its `func (鈥? Name(` line to
+// methodBody returns the source of one method, from its `func (— Name(` line to
 // the next top-level `func ` or `// ` block comment, which is enough to see
 // whether a transaction is opened inside it.
 func methodBody(t *testing.T, code, name string) string {

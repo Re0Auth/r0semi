@@ -26,6 +26,7 @@ try {
 // already-ruled items (S11-1, FO-02) into the register as DECIDED-NONGOAL, so it
 // outranks everything (prio -3) and its S11-1 row replaces round9's OPEN one.
 const FRAGMENTS = [
+  { file: 'round11.md',    round: 11, prio: -4 },
   { file: 'round10.md',    round: 10, prio: -3 },
   { file: 'round9.md',     round: 9, prio: -1 },
   { file: 'conformance.md', round: 9, prio: -2 },
@@ -256,9 +257,10 @@ writeFileSync(ndPath, nd, 'utf8');
 // README can quote a number that is regenerated rather than hand-maintained. ---
 const blockOpen = (b) => {
   const line = b.body.find((l) => /^-\s*\*\*状态\*\*/.test(l.trim()));
-  return line ? !/FIXED/.test(line) : true;
+  // DECIDED-NONGOAL / NOT-A-DEFECT are terminal states, not open work.
+  return line ? !/FIXED|DECIDED-NONGOAL|NOT-A-DEFECT/.test(line) : true;
 };
-const rowOpen = (r) => !/FIXED/.test(r.cells[4] ?? '');
+const rowOpen = (r) => !/FIXED|DECIDED-NONGOAL|NOT-A-DEFECT/.test(r.cells[4] ?? '');
 const open = {
   P0: p0.filter(blockOpen).length,
   P1: p1.filter(blockOpen).length,

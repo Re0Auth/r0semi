@@ -31,7 +31,7 @@ import (
 // of the distinction.
 //
 // dir is a parameter so disk_read_probe_test.go can point this at a damaged copy
-// and require the missing index to be noticed 鈥?the anti-vacuous half of every
+// and require the missing index to be noticed —the anti-vacuous half of every
 // claim built on it.
 func indexLeadingColsIn(t *testing.T, dir string) map[string]map[string]bool {
 	t.Helper()
@@ -51,7 +51,7 @@ func indexLeadingColsIn(t *testing.T, dir string) map[string]map[string]bool {
 			table := unquote(m[1])
 			cols := strings.Split(m[2], ",")
 			first := strings.TrimSpace(cols[0])
-			if i := strings.Index(first, "("); i > 0 { // expression index: upper(x), replace(x,鈥?
+			if i := strings.Index(first, "("); i > 0 { // expression index: upper(x), replace(x,—
 				first = strings.TrimSpace(first[:i])
 			}
 			add(table, first)
@@ -210,7 +210,7 @@ func TestEverySingleColumnPredicateHasALeadingIndex(t *testing.T) {
 // TestKnownUnindexedPredicatesAreStillUnindexed is the honest half: it does not
 // pretend the uncovered predicates should fail the build. It states, as an
 // executable fact rather than a claim in prose, that these columns have no
-// leading index today 鈥?so a reader can check the claim by running one test, and
+// leading index today —so a reader can check the claim by running one test, and
 // a change that adds the index fails here and forces the inventory to be updated.
 func TestKnownUnindexedPredicatesAreStillUnindexed(t *testing.T) {
 	leading := indexLeadingCols(t)
@@ -226,7 +226,7 @@ func TestKnownUnindexedPredicatesAreStillUnindexed(t *testing.T) {
 	}
 	for _, k := range known {
 		if leading[k.table][k.column] {
-			t.Errorf("%s.%s now HAS a leading index, so the known-gap list is stale: %s 鈥?remove this entry "+
+			t.Errorf("%s.%s now HAS a leading index, so the known-gap list is stale: %s —remove this entry "+
 				"(and re-run TestEverySingleColumnPredicateHasALeadingIndex)", k.table, k.column, k.why)
 			continue
 		}
@@ -234,7 +234,7 @@ func TestKnownUnindexedPredicatesAreStillUnindexed(t *testing.T) {
 			t.Errorf("%s was not found in the schema at all; the inventory names a table no migration defines", k.table)
 			continue
 		}
-		t.Logf("CONFIRMED UNINDEXED: %s.%s 鈥?%s", k.table, k.column, k.why)
+		t.Logf("CONFIRMED UNINDEXED: %s.%s —%s", k.table, k.column, k.why)
 	}
 }
 
@@ -247,12 +247,12 @@ func TestKnownUnindexedPredicatesAreStillUnindexed(t *testing.T) {
 //
 //	sweep.go:60      table, column from the expiredTables literal
 //	oauth.go:292     table from a literal slice at each call site (:237, :955, :966)
-//	oauth.go:317/321 `client_id` / `subject` 鈥?literal column names, and the values
+//	oauth.go:317/321 `client_id` / `subject` —literal column names, and the values
 //	                 travel as $n parameters
-//	oidc.go:988/994  clause from revokePredicate 鈥?same shape
+//	oidc.go:988/994  clause from revokePredicate —same shape
 //	auditread.go:43  column and op are literal arguments at every call site (:64,
 //	                 :67, :70, :73, :76); the VALUE is a $n parameter
-//	oidc.go:712      deviceState's `where` 鈥?a literal at both call sites (:693, :702)
+//	oidc.go:712      deviceState's `where` —a literal at both call sites (:693, :702)
 //
 // This test asserts the property that makes all of them safe, mechanically: no
 // file in the adapter passes a variable into the SQL-building helpers in a way

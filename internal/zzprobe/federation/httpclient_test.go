@@ -117,7 +117,7 @@ func TestProbeCircuitBreakerIsPerHost(t *testing.T) {
 //
 // The source says `Retry-After: 86400`; the client must give up quickly rather
 // than sleeping it out. This is a wall-clock assertion because the cap is on
-// wall-clock time 鈥?the ADR removed the injectable clock deliberately.
+// wall-clock time —the ADR removed the injectable clock deliberately.
 func TestProbeRetryAfterCapIsReal(t *testing.T) {
 	var attempts atomic.Int32
 	srv := newFlakyServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +142,7 @@ func TestProbeRetryAfterCapIsReal(t *testing.T) {
 	}
 }
 
-// A Retry-After shorter than the backoff: ADR-0009 搂"鏈夋剰鎺ュ彈鐨勮涔夊彉鍖? says the
+// A Retry-After shorter than the backoff: ADR-0009 §"鏈夋剰鎺ュ彈鐨勮涔夊彉鍖? says the
 // upstream's value now wins outright (it used to be max(backoff, retryAfter)).
 // This checks the jitter is applied to it, which the ADR claims (卤50%).
 func TestProbeRetryAfterJitterAndFloor(t *testing.T) {
@@ -275,7 +275,7 @@ func TestProbeRetryBodyReplay(t *testing.T) {
 	}
 
 	// (c) GET with a replayable body (GetBody set by http.NewRequest for a
-	// bytes.Reader) IS retried 鈥?check the second attempt carries the body, not
+	// bytes.Reader) IS retried —check the second attempt carries the body, not
 	// an empty one.
 	bodies = nil
 	req3, _ := http.NewRequest(http.MethodGet, srv.URL+"/x", bytes.NewReader([]byte("REPLAYABLE")))
@@ -316,7 +316,7 @@ func TestProbeBulkheadSlotReturnsOnClose(t *testing.T) {
 // A POST to a source's revocation endpoint is not retried by Retry (POST is not
 // idempotent), but the data plane does not wrap its doer in Retry at all. This
 // records where Retry is actually installed, because the documented promise to
-// sources ("鎸囨暟閫€閬块噸璇?, source-onboarding.md 搂4) is about the data plane.
+// sources ("鎸囨暟閫€閬块噸璇?, source-onboarding.md §4) is about the data plane.
 // TestProbeRetryIsNotInstalledOnTheDataPlane pins the wiring the finding was
 // about rather than describing it: the data plane's federation client is built
 // by NewOutboundClient, whose decorator stack (transport, bulkhead, breaker,

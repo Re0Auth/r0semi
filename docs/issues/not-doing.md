@@ -81,6 +81,12 @@
 本次各轮抽取到的「有意不做 / 已裁定」条目（原文，未改写）：
 
 
+### 第 10 轮
+
+- S11-1 — DECIDED-NONGOAL：`admin.*` 的 `detail["actor"]` 记操作员原始 `usr_` —— 已裁定（企业审计合规），不加改动 — 依据：`docs/issues/not-doing.md`（第 7 轮生成区，原文）。
+- FO-02 — DECIDED-NONGOAL：探针在 CAS 输掉的分支触发、残留的是入册旧密钥，证据不成立；跨实例 refresh 残余竞态 `BRIEF §5` 已列为有意不做 — 依据：`22-audit5-red-reconciliation.md:202`。
+- （更正，Z20-2）raw 透传的 scope 闸门**已不再是**「源的任一资源 scope」：现在的闸门是显式的 `<game>.raw.read`（`internal/httpapi/federation_routes.go` 的 `rawGate`）。第 7 轮生成区里那条「raw 的 scope 闸门是源的任一资源 scope — 文档化决定，不作发现」只描述**旧实现**，不再适用 — 依据：`docs/upstream-protocol.md` §9.1。
+
 ### 第 9 轮
 
 - `oidcc-server` 的 `client_id` WARNING —— 已知且接受的行为差异，见 `docs/oidc-decision.md` O-10 与 `not-doing.md`。

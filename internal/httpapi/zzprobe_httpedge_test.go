@@ -2,7 +2,7 @@
 
 package httpapi
 
-// zzprobe_httpedge_test.go 鈥?adversarial probes for the HTTP edge (routing,
+// zzprobe_httpedge_test.go —adversarial probes for the HTTP edge (routing,
 // middleware, sessions, CSRF, rate limiting, request parsing).
 //
 // Temporary probe file created by an audit sub-agent. It is the only new file in
@@ -420,12 +420,12 @@ func zzSeedsFor(n int, plane, target string) []string {
 // The bucket key is plane + client address, and the address comes from
 // X-Forwarded-For whenever the peer is one of the configured trusted proxies. A
 // caller whose requests arrive through a proxy that *appends* to
-// X-Forwarded-For 鈥?rather than overwriting it 鈥?is therefore believed about its
+// X-Forwarded-For —rather than overwriting it —is therefore believed about its
 // own address, so it can present a new address per request. Each new address is a
 // new bucket, and a new bucket starts with the full burst. The limiter caps how
 // many buckets it tracks (default 10,000 over 16 shards), which bounds the free
 // budget at *one request per tracked key* rather than at the rate the operator
-// configured 鈥?with no wait, since the refill interval here is 1000 seconds.
+// configured —with no wait, since the refill interval here is 1000 seconds.
 //
 // The walk counts how many requests a single TCP peer is actually allowed before
 // the first refusal, in each deployment shape.

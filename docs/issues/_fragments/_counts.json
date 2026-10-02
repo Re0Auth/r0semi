@@ -1,6 +1,6 @@
 {
   "generated": "2026-10-02",
-  "head": "9ce8a4b",
+  "head": "8decec0",
   "total": {
     "P0": 9,
     "P1": 13,
@@ -10,29 +10,37 @@
   "open": {
     "P0": 0,
     "P1": 0,
-    "P2": 21,
-    "P3": 225
+    "P2": 0,
+    "P3": 25
   },
   "byRound": {
     "2": {
-      "total": 11,
-      "open": 10
+      "total": 5,
+      "open": 4
     },
     "5": {
-      "total": 16,
-      "open": 10
+      "total": 6,
+      "open": 0
     },
     "6": {
-      "total": 27,
-      "open": 13
+      "total": 14,
+      "open": 0
     },
     "7": {
-      "total": 117,
-      "open": 77
+      "total": 49,
+      "open": 9
     },
     "9": {
-      "total": 149,
-      "open": 136
+      "total": 25,
+      "open": 12
+    },
+    "10": {
+      "total": 1,
+      "open": 0
+    },
+    "11": {
+      "total": 220,
+      "open": 0
     }
   }
 }

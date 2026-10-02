@@ -1,17 +1,33 @@
-# P3 · 低 / 提示（LOW）
+# 第 11 轮：本会话修复的状态合并
 
-> 加固、纵深防御、文档与实现不一致、可维护性。**这一类最大，也最容易被永久搁置。**
-> **条目数：226** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-02，HEAD `8decec0`）。
-> 严重度取**对抗性复核后的裁定**；同一机制多编号者已合并，别名写在 ID 列。
+> 由提交标题反查：某条寄存器 ID 在本会话（`6be9bb2..HEAD`）的提交标题里被点名，即记 `FIXED`。
+> 未点名的保持原状态，避免把没有证据的条目误标。优先级最高（prio -4），用于覆盖前几轮的 OPEN 行。
 
-> 三个反复出现的形态，建议成批处理而不是逐条修：
-> ① **修复只修了一半**（同族只覆盖了一个面）；
-> ② **假守卫**（测试结构上不可能失败，或探针永远到不了它声称的路径）；
-> ③ **注释断言了实现没有的性质**。
-
+## P2/P3
 
 | ID | 严重度 | 问题 | 位置 | 状态 | 修法要点 |
 |---|---|---|---|---|---|
+| S01-1 | P2 | 已批准的 device_code 可无限次兑换：每次轮询都铸出全新令牌对，而非消费掉该授权（§5 合并：S04-1） | oauth/device.go:302-308; oauth/device.go:269-309 | FIXED（153d910） | 轮询命中 DeviceApproved 后无条件 `s.issue`，从不标记消费或删除记录；撤销授权也会被静默撤销掉。属 `oauth` 包手写 AS（生产二进制未挂载该端点，嵌入/套件路径可达）。；让 approved 记录单次消费（置 spent/删除）后再签发；`DeviceStore` 增消费操作。 |
+| S01-2 | P2 | MemoryDeviceStore 从不清理 pending/decided 记录，设备授权无界增长（§5 合并：S04-3、S14-8、S13-10） | oauth/device.go:139-163; oauth/device.go:224-247; oauth/as.go:57-59 | FIXED（79a767c） | `SaveDevice` 只插入 byDev/byUser，包内无删除、无过期清扫、无 `SweepExpired` 对应物；过期只在读时判。；加删除/清扫 API 并接入后台循环；给每用户与总量设上限。 |
+| S01-3 | P2 | MemoryStore.ConsumeRefresh 忽略 tombstone 期限，过期已消费值仍触发家族撤销（PG 正确报未知） | oauth/tokens.go:440-450; oauth/tokens.go:248-261; oauth/as.go:264-283; internal/store/postgres/oauth.go:269-284 | FIXED（7c5f515） | tombstone 带 `ExpiresAt` 且注释承诺按其自身期限到期，但 `ConsumeRefresh` 从不读该字段。；消费时比较 `tomb.ExpiresAt` 与 store 时钟，过期按未知令牌处理。 |
+| S01-6 | P2 | AuthenticateClient 把公开客户端当"已认证"，cascade 撤销闸门对公开客户端形同虚设 | oauth/as.go:437-448; oauth/as.go:89-92; upstreamkit/server.go:330-357 | FIXED（d8de48a） | `client(..., auth=true)` 只在 `ClientConfidential` 时校验 secret，公开客户端忽略 secret 无条件成功。；公开客户端一律认证失败（或要求机密）；套件补"无认证 must 被拒"断言。 |
+| S02-3 | P2 | 设备授权端点拒绝合规的 Basic secret：client_id 做了 form-unescape，secret 没有 | internal/oidchttp/oidchttp.go:1114; internal/oidchttp/oidchttp.go:1152; internal/oidchttp/oidchttp.go:1175 | FIXED（284c5be） | `basicSecret` 原样比对存储的 SHA-256，而 RFC 6749 §2.3.1 要求 client 对两者都做 form-urlencode。；id 与 secret 成对解码后再认证。 |
+| S02-4 | P2 | ValidateSigner 的 2048 位下限只作用于当前键，不覆盖 JWKS 里公布的 retired key | internal/oidcstore/oidcstore.go:62; internal/oidcstore/oidcstore.go:69; internal/oidcstore/oidcstore.go:73 | FIXED（3617ac2） | retired key 的 Public 与当前键一起进 KeySet 并用于 id_token hint / access token 验证，弱键可继续验签。；对 KeySet 中全部签名键统一执行位数下限。 |
+| S05-1 | P2 | 刷新拒绝把任何 400/401/403 都判为"授权已死"并加密销毁绑定 | internal/federation/refresh.go:170; internal/federation/refresh.go:179; internal/federation/refresh.go:142 | FIXED（1c3f249） | 不看 OAuth error code 与响应体；`refreshRejected` 直接 `vault.Revoke` + `bindings.Delete`，连可重试的配置错误也一并 shred。；按 error code 分类（invalid_grant 才判死），可重试错误保留绑定并标冷却。 |
+| S06-3 | P2 | oidcProvider 持 providerMu 跨一次网络 discovery，失败又不缓存 ⇒ 一个死 issuer 串行化所有并发登录 | idp/idp.go:705; idp/idp.go:711; idp/idp.go:713 | FIXED（d4a60f2） | 锁覆盖整个 `oidc.NewProvider`（10s 超时），失败不推进 `discoveredAt`，每次请求重试。；发现移出锁（double-checked）或 singleflight + 短超时 + 负缓存。 |
+| S06-4 | P2 | SocialLogin.states 无界 map，且每次未认证 start 都在锁下 O(n) 清扫 | referencesource/social.go:102; referencesource/social.go:104; referencesource/social.go:193 | FIXED（03c1ae1） | 无上限、无周期清扫，过期只靠每次新 start 的全表扫描执行。；给在途授权设上限 + 周期清扫（不随请求数线性）。 |
+| S06-5 | P2 | TapTapLogin.attempts 同样无界、每 challenge 一次 O(n) 清扫，未认证可达 | referencesource/taptap.go:124; referencesource/taptap.go:126; referencesource/taptap.go:258 | FIXED（03c1ae1） | 每条 entry 还持有 DeviceAuth（含验证 URL/码），单条内存不小。；同 S06-4。 |
+| S07-2 | P2 | vault.Enroll 先持久化凭据、后写审计事件 ⇒ 审计失败时对一次已发生的写入报错，留下未审计（federation 里还是孤儿）的秘密 | vault/service.go:245; vault/service.go:259 | FIXED（13e753e） | 与 `Use` 的 fail-closed（先审计后交明文）相反。；先审计后写入，或写入失败时回滚并在错误里 Join 审计错误。 |
+| S08-1 | P2 | Vault KEK 解析硬编码 RE0AUTH_KEK 优先于 vault.kek_env，重命名的键被静默忽略 | cmd/re0auth/config.go:729-743; cmd/re0auth/config.go:471; scripts/backup-keys.sh:74-77 | FIXED（dc7400a） | 其他设置都遵循 env > 文件约定或专用 RE0AUTH_ 覆盖，KEK 却先读死名字。；`kek_env` 存在时只读它；与 `RE0AUTH_KEK` 不一致时拒绝启动并点名。 |
+| S08-4 | P2 | DeleteAccount 在本地移除 Failed>0 时仍报成功并写 outcome=ok | internal/lifecycle/lifecycle.go:200-206; internal/lifecycle/lifecycle.go:313-315; internal/federation/killswitch.go:140-146; internal/federation/killswitch.go:180-183 | FIXED（fceaccd） | `RevokeUserBindings` 只在无法枚举时返错；单条绑定的本地移除失败被折叠进结果。；把 Failed>0 反映到 outcome 与错误，别写 ok。 |
+| S09-1 | P2 | 迁移回退路径可把带密码的 DSN 写进日志：withMigrationLock 不过滤驱动的解析错误 | internal/store/postgres/postgres.go:378; internal/store/postgres/postgres.go:399; internal/store/postgres/postgres.go:402; internal/store/postgres/postgres.go:240; internal/store/postgres/postgres.go:452 | FIXED（232d162） | `MigrateDown` 直接走 `withMigrationLock`，从不经过 `poolConfig` 的 `redactDSNParseError`。；对该路径的错误同样调用 `redactDSNParseError`。 |
+| S09-2 | P2 | Tokens.RevokeTokens 并非事务，尽管 revokeMatching 注释声称在事务里 ⇒ 批量 Kill Switch/擦除可半执行 | internal/store/postgres/oauth.go:466; internal/store/postgres/oauth.go:471; internal/store/postgres/oauth.go:517; internal/store/postgres/oidc.go:1503 | FIXED（fac6ad7） | `revokeMatching` 跑在 `s.pool`（autocommit），之后另有两条 DELETE 也在池上。；把 revokeMatching 与其后的 DELETE 包进同一事务。 |
+| S10-2 | P2 | readiness 探针 panic 会把 /readyz 永久钉在 "checking"(503)（§5 合并：S14-9） | internal/httpapi/health.go:183; internal/httpapi/health.go:194 | FIXED（ee3d20b） | `check` 在调用探针前置 `running=true`，只在正常返回路径复位；panic 后 `settled` 永不关闭。；`defer` 复位 `running`/关闭 `settled`，panic 也走异常路径复位。 |
+| S11-6 | P2 | /v1/admin/audit/verify 同步全表走链、无并发约束，最长持有池连接 45s | internal/httpapi/audit_routes.go:171; internal/store/postgres/auditchain.go:220; internal/store/postgres/auditchain.go:264 | FIXED（0220f24） | 开事务、抬 statement_timeout 到 45s、整表扫描；无 per-endpoint 并发上限也无结果缓存。；加并发上限（或缓存结果），必要时改成可中断的分段校验。 |
+| S12-1 | P2 | 每次尝试的请求超时在读取响应体之前就被解除 | web/src/lib/api.ts:334; web/src/lib/api.ts:354; web/src/lib/api.ts:369 | FIXED（a8a5122） | `fetch` 在响应头到达即 resolve，唯一 deadline 在 `res.text()` 之前被 clear，body 卡住时 abort 永不触发。；把 clearTimeout 移到 body 读取完成之后（或到 finally）。 |
+| S13-2 | P2 | StoreDeviceAuthorization 每次公开请求都持 store 全局锁 O(n) 扫描（§5 合并：S13-3、S14-1、S14-6、S14-7） | internal/store/memory/oidc.go:1050; internal/store/memory/oidc.go:1053; internal/store/memory/oidc.go:1124 | FIXED（a0487e1） | 唯一 mutex 同时守所有令牌操作，设备授权端点公开可达。；为设备记录建索引/分桶，避免持全局锁扫描。 |
+| S14-3 | P2 | 内存 store 分页器每页重排全表：vault Rotate 与 federation Kill Switch 变成 O(N²logN) | vault/repo.go:229; vault/repo.go:233; vault/rotate.go:45; internal/federation/binding.go:255; internal/federation/binding.go:262; internal/federation/killswitch.go:58 | FIXED（c3401b5） | 每页都物化全部行、排序、再用游标过滤，游标不减少工作量。；让游标真正参与分页（持久有序索引或快照）。 |
+| S14-5 | P2 | refresh 家族撤销与轮换非原子，并发重放可留下新世代 token | oauth/as.go:264; oauth/as.go:276; oauth/as.go:308; oauth/as.go:418; oauth/as.go:421; oauth/tokens.go:434 | FIXED（042d7d0） | `ConsumeRefresh` 原子，但 `ConsumeRefresh → RevokeRefreshFamily` 与 `ConsumeRefresh → issue` 不是。；把"消费+撤销/签发"做成一个原子步骤（或家族级锁）。 |
 | S01-10 | P3 | Client secrets are stored as an unsalted SHA-256 digest, so a weak config-file secret is off-line crackable if the store leaks | oauth/client.go:99-105; oauth/client.go:107-114; cmd/re0auth/main.go:1634-1643 | FIXED（fddbde4） | 见 `docs/security-audit-9.md` §3（类别：security） |
 | S01-11 | P3 | MemoryStore serialises all token operations on one Mutex and scans every record under the lock, so account-page reads and sweeps block token introspection | oauth/tokens.go:263-273; oauth/tokens.go:298-328; oauth/grants.go:157-221 | FIXED（c17ce23） | 见 `docs/security-audit-9.md` §3（类别：performance） |
 | S01-12 | P3 | Store reads return struct copies whose Scopes slices alias the stored backing array, so a caller mutating a returned record corrupts stored authorization state | oauth/tokens.go:373-382; oauth/tokens.go:341-349; oauth/tokens.go:421-429; oauth/as.go:370-376 | FIXED（c17ce23） | 见 `docs/security-audit-9.md` §3（类别：correctness） |
@@ -211,30 +227,223 @@
 | A-FE-3 | P3 | 同意页显示的 scope 集合 ≠ 服务器授予的 scope 集合（OIDC claim scope 静默补授） | `internal/httpapi/authorization_routes.go:185-201`、`internal/oidchttp/oidchttp.go:1251-1262` | FIXED（fddbde4） | 三选一裁定：同意页加一行常驻说明 / `scopeViews` 回显式「未描述」占位 / 给 `NarrowScopes` 加「批准集必须覆盖 displayed」的不变量 — 来源：`docs/audit-5/findings/frontend.md:87（第 5 轮）` |
 | A-FE-V1 | P3 | 「显示少于授予」有第二/第三份独立实现（设备流）⇒ 只改一处覆盖不到 | `internal/store/memory/oidc.go:1250,1283-1288`、`internal/store/postgres/oidc.go:1060,1094-1102` | FIXED（fddbde4） | 与 A-FE-3 共用同一判据；修 A-FE-3 时必须一并覆盖设备流两后端 — 来源：`docs/audit-5/findings/frontend-VERIFIED.md:297（第 5 轮）` |
 | A-FE-6 | P3 | `internal/webui` 只对 shell 设文档策略，非 HTML 资源不带 CSP | `internal/webui/webui.go:123-127` | FIXED（93009b0） | 把 `shellCSP` 扩成「任何 `text/html` 响应」，并断言 shell 上存在 `frame-ancestors`（真实组合根已由 `withSecurityHeaders` 兜住，属纵深防御） — 来源：`docs/audit-5/findings/frontend.md:140（第 5 轮）` |
-| S11-1 | P3 | Admin audit detail stores the raw operator account id in `Detail["actor"]`, defeating pseudonym-key destruction | `internal/admin/admin.go:485`、`internal/admin/admin.go:490`；`audit/audit.go:73`、`audit/audit.go:84` | DECIDED-NONGOAL | 按 `not-doing.md` 已有裁定（第 7 轮生成区）：「`admin.*` 的 `detail["actor"]` 记操作员原始 `usr_` — **已裁定（企业审计合规）**」。本轮确认，不作为缺陷开工。已知残余边界：该操作员日后抹除自己的账号不会解除这些行的关联（第 2 轮已记录）。 |
-| S03-11 | P3 | core.App.Remove races with an in-flight load, allowing a removed fiber to be marked active without its scope | internal/core/app.go:99; internal/core/app.go:105; internal/core/app.go:334 | OPEN | 见 `docs/security-audit-9.md` §3（类别：correctness） |
-| S03-7 | P3 | MemoryStore.Identities scans every identity in the process and holds the lock for the whole scan | internal/account/account.go:231; internal/account/account.go:281; internal/account/account.go:283 | OPEN | 见 `docs/security-audit-9.md` §3（类别：performance） |
-| S08-3 | P3 | DeleteAccount writes an outcome=ok record claiming the pseudonym key was destroyed before Destroy runs, and the correcting record is best-effort | internal/lifecycle/lifecycle.go:262-271; internal/lifecycle/lifecycle.go:277-291; internal/lifecycle/lifecycle.go:299-302 | OPEN | 见 `docs/security-audit-9.md` §3（类别：correctness） |
-| S13-11 | P3 | perfreport divides by the baseline median without a zero check, producing NaN/Inf deltas and a NaN geomean | cmd/perfreport/main.go:355; cmd/perfreport/main.go:373 | OPEN | 见 `docs/security-audit-9.md` §3（类别：correctness） |
-| S15-10 | P3 | scripts/backup-keys.sh is committed mode 100644 while the documented invocation runs it directly | scripts/backup-keys.sh:1; docs/operations.md:90-92 | OPEN | 见 `docs/security-audit-9.md` §3（类别：correctness） |
-| S15-8 | P3 | Three alert rules keyed on generic go_*/process_* metrics carry no job selector and can fire on unrelated targets | deploy/prometheus/re0auth.rules.yml:304-348; deploy/prometheus/re0auth.rules.yml:4-7 | OPEN | 见 `docs/security-audit-9.md` §3（类别：reliability） |
-| S02-11 | P3 · 信息 | [info] DenyAuthorization uses the static issuer only, so a dynamic-issuer deployment emits a denial without the RFC 9207 iss parameter | internal/oidchttp/oidchttp.go:1794; internal/oidchttp/oidchttp.go:1444 | OPEN | 见 `docs/security-audit-9.md` §4（类别：correctness） |
-| S10-5 | P3 · 信息 | [info] Limiter.Check heap-allocates a *rate.Reservation on every request | internal/ratelimit/ratelimit.go:289; internal/ratelimit/ratelimit.go:295 | OPEN | 见 `docs/security-audit-9.md` §4（类别：performance） |
-| S12-12 | P3 · 信息 | [info] SignIn appends return_to after a URL fragment, unlike the equivalent link() path | web/src/lib/components/SignIn.svelte:50; web/src/lib/components/SignIn.svelte:52 | OPEN | 见 `docs/security-audit-9.md` §4（类别：correctness） |
-| S12-2 | P3 · 信息 | [info] Dev root redirect does not match a request that carries a query string | web/vite.config.ts:27; web/vite.config.ts:28 | OPEN | 见 `docs/security-audit-9.md` §4（类别：correctness） |
-| S12-7 | P3 · 信息 | [info] Sources page re-runs O(available x bindings) scans on every reactive invalidation | web/src/routes/sources/+page.svelte:82; web/src/routes/sources/+page.svelte:89; web/src/routes/sources/+page.svelte:288 | OPEN | 见 `docs/security-audit-9.md` §4（类别：performance） |
-| S15-12 | P3 · 信息 | [info] Backup CronJob writes plaintext database dumps; no age encryption path is wired, unlike scripts/backup.sh | deploy/k8s/backup/cronjob.yaml:59-70; docs/operations.md:125-126 | OPEN | 见 `docs/security-audit-9.md` §4（类别：security） |
-| NF-Z07-1 | P3 | `/bind` 归属守卫是单侧的：探针只证明「B 被拒」，无法区分「B 被拒」与「所有人被拒」（守卫空洞，非产品漏洞） | `internal/zzprobe/audit7/z07authsessionlifecycle/handle_binding_test.go` | OPEN | 在该探针补一步「A 自己用同一 state 打 callback」的对照，断言其不是 400（夹具下应为 303 `bind_failed`）；依据 `Z07-VERIFIED.md:165-186` |
-| Z08V-1 | P3 | 「开放重定向面」的绿是假守卫：内存模式无 IdP，`/auth/{p}/start` 回 404、`/bind` 匿名回 401，探针永远到不了任何重定向 sink（产品无洞，是报告守卫无效） | `internal/zzprobe/audit7/z08frontendbrowser/realproc_test.go` | OPEN | 删掉该条「探过没破」，或用已配 provider 的全接线夹具走完 start→callback 再断言 `Location`；依据 `Z08-VERIFIED.md:25`、`Z08-VERIFIED.md:114-128` |
-| Z08V-2 | P3 | Z08-3 的「构建产物无 `version.json` 引用」是错的：产物 `chunks/DqohD3-m.js` 确实带 `fetch(.../_app/version.json)` 与版本比对逻辑（方向是低估风险） | `docs/audit-7/findings/Z08-frontend-browser.md:133` | OPEN | 更正该事实，并据此给 `_app/version.json` 明确缓存指令；依据 `Z08-VERIFIED.md:26`、`Z08-VERIFIED.md:130-136` |
-| VZ16-1 | P3 | 「可达性」守卫只读文件与 build 注释、从不编译：给它想要的 `-tags` 就能变成永久绿 | `internal/zzprobe/audit7/z16guardtestquality/gates_test.go:211-297` | OPEN | 守卫加真编译步骤（用真工具链取代 grep）（来源：`Z16-VERIFIED.md:92-100`） |
-| VZ16-2 | P3 | 该守卫只认 `//go:build`，旧式 `// +build` 约束被它当成「默认套件」，两侧都兜不住 | `internal/zzprobe/audit7/z16guardtestquality/gates_test.go:260-271` | OPEN | 用 `go list -f '{{.TestGoFiles}}'`（真工具链）取代文本扫描，或同时解析 `// +build`（来源：`Z16-VERIFIED.md:102-110`） |
-| Z17-6 | P3 | openapi 说 audit 的 `cursor` 是「不透明、非签发即拒」，实现是普通行号且接受任意正整数 | `docs/openapi.yaml:1452-1454`、`internal/httpapi/audit_routes.go:82-89` | OPEN | 把描述改成事实，或真做成不透明/签名游标（属裁定：建议只改文档）（来源：`Z17-VERIFIED.md:83-91`） |
-| Z18v-3 | P3 | 被复核夹具 `Limiter=nil`、`MaxInFlight=0`，使 Z18-1 的「限流/在途豁免」断言在结构上不可证 | `internal/zzprobe/audit7/z18gohazardsweep/probes_test.go:63-70` | OPEN | 填上 `Limiter`/`MaxInFlight` 再断言 200，或删掉该句 |
-| Z18v-4 | P3 | `Bulkhead` 绿探针是空守卫：从不触发 `uint(maxConcurrent)` 转换，证不了它要排除的形态 | `internal/zzprobe/audit7/z18gohazardsweep/probes_test.go:325-336` | OPEN | 补 `Bulkhead(next, 2)` 下第 3 个并发 `RoundTrip` 被拒/阻塞的探针 |
-| Z20V-3 | P3 | 被审报告两条「探过没破」守卫偏弱（逃逸断言不命名 400；归一化守卫是单源夹具），假绿风险 | `internal/zzprobe/audit7/z20authzisolationmatrix/scopegate_test.go:92-96,103-125` | OPEN | 逃逸断言命名 400＋零上游调用；归一化守卫至少两条候选源 |
-| Z21V-1 | P3 | `0014` 的 Down 丢弃全部每账号假名密钥（`audit_subject_keys` 是唯一副本）；回退后再 Up 时 `subjectKey` 重铸随机 key，同一账号的审计史被静默劈成两个假名，`?subject=` 此后只回一半，且无错误无标记、`Verify` 全绿 | `internal/store/postgres/migrations/0014_audit_pseudonyms.sql:41-42` | FIXED（17914d4） | 与 Z21-2 同批：0014 Down 改 no-op + 注释；`MigrateDown` 加 `SELECT 1 FROM audit_subject_keys LIMIT 1` 前置拒退。（来源：`Z21-VERIFIED.md:92`） |
-| A-FE-4 | P3 | `web/svelte.config.js` 不存在——kit 配置只活在 `vite.config.ts` 里 | `web/vite.config.ts:46-110`（`web/svelte.config.*` 不存在） | OPEN | 在 `web/README.md` 写明「刻意不用 `svelte.config.js`」，或把配置搬回标准位置并让 `webui_test.go` 改读它；加一条「两份 kit 配置即失败」的守卫 — 来源：`docs/audit-5/findings/frontend.md:109（第 5 轮）` |
-| A-FE-8 | P3 | 未使用的 `web/src/lib/assets/favicon.svg` 仍是 Svelte 官方 logo | `web/src/lib/assets/favicon.svg:1` | OPEN | 删掉该文件或换成真正的品牌标记 — 来源：`docs/audit-5/findings/frontend.md:160（第 5 轮）` |
-| A-FE-10 | P3 | 发布产物里有 6 处 `console.warn`，带 `svelte.dev/e/…` 文档链接 | `internal/webui/dist/_app/immutable/chunks/`（构建产物；具体分块名随构建变化） | OPEN | 在 `web/scripts/` 加一条产物 grep 守卫（与 `check-bundle-size.mjs` 同风格）；确认不可达则在守卫里显式豁免并写理由 — 来源：`docs/audit-5/findings/frontend.md:200（第 5 轮）` |
-| A-FE-11 | P3 | 仓库根有一个名为 `%SC%` 的空目录（未被展开的 Windows 变量） | `%SC%/`（仓库根，空目录，未被 git 跟踪） | OPEN | 直接删掉；真实风险是同类笔误落在有内容的路径上 — 来源：`docs/audit-5/findings/frontend.md:224（第 5 轮）` |
+
+## 已修复
+
+- S01-1 — FIXED（153d910）
+- S01-2 — FIXED（79a767c）
+- S01-3 — FIXED（7c5f515）
+- S01-6 — FIXED（d8de48a）
+- S02-3 — FIXED（284c5be）
+- S02-4 — FIXED（3617ac2）
+- S05-1 — FIXED（1c3f249）
+- S06-3 — FIXED（d4a60f2）
+- S06-4 — FIXED（03c1ae1）
+- S06-5 — FIXED（03c1ae1）
+- S07-2 — FIXED（13e753e）
+- S08-1 — FIXED（dc7400a）
+- S08-4 — FIXED（fceaccd）
+- S09-1 — FIXED（232d162）
+- S09-2 — FIXED（fac6ad7）
+- S10-2 — FIXED（ee3d20b）
+- S11-6 — FIXED（0220f24）
+- S12-1 — FIXED（a8a5122）
+- S13-2 — FIXED（a0487e1）
+- S14-3 — FIXED（c3401b5）
+- S14-5 — FIXED（042d7d0）
+- S01-10 — FIXED（fddbde4）
+- S01-11 — FIXED（c17ce23）
+- S01-12 — FIXED（c17ce23）
+- S01-4 — FIXED（c17ce23）
+- S01-5 — FIXED（c17ce23）
+- S01-7 — FIXED（c17ce23）
+- S01-8 — FIXED（c17ce23）
+- S01-9 — FIXED（c17ce23）
+- S02-10 — FIXED（b6407e1）
+- S02-6 — FIXED（b6407e1）
+- S02-7 — FIXED（b6407e1）
+- S02-8 — FIXED（fddbde4）
+- S02-9 — FIXED（b6407e1）
+- S03-10 — FIXED（6cc3cc2）
+- S03-2 — FIXED（56acd6b）
+- S03-3 — FIXED（511cced）
+- S03-4 — FIXED（511cced）
+- S03-5 — FIXED（b0004c0）
+- S03-6 — FIXED（b0004c0）
+- S03-8 — FIXED（6cc3cc2）
+- S03-9 — FIXED（511cced）
+- S04-2 — FIXED（c17ce23）
+- S04-4 — FIXED（c17ce23）
+- S04-5 — FIXED（fddbde4）
+- S04-6 — FIXED（c17ce23）
+- S04-7 — FIXED（fddbde4）
+- S04-8 — FIXED（c17ce23）
+- S04-9 — FIXED（c17ce23）
+- S05-3 — FIXED（2ab00ee）
+- S05-4 — FIXED（2ab00ee）
+- S05-5 — FIXED（2ab00ee）
+- S05-6 — FIXED（93009b0）
+- S05-7 — FIXED（2ab00ee）
+- S05-8 — FIXED（2ab00ee）
+- S06-10 — FIXED（fddbde4）
+- S06-6 — FIXED（f0f9256）
+- S06-7 — FIXED（a8bca1f）
+- S06-8 — FIXED（a8bca1f）
+- S06-9 — FIXED（2ab00ee）
+- S07-10 — FIXED（53bbe24）
+- S07-3 — FIXED（c3401b5）
+- S07-5 — FIXED（53bbe24）
+- S07-6 — FIXED（53bbe24）
+- S08-5 — FIXED（7a35ac6）
+- S08-6 — FIXED（7a35ac6）
+- S08-7 — FIXED（fddbde4）
+- S08-8 — FIXED（7a35ac6）
+- S08-9 — FIXED（7a35ac6）
+- S09-3 — FIXED（6cc3cc2）
+- S09-5 — FIXED（6cc3cc2）
+- S09-6 — FIXED（6cc3cc2）
+- S09-7 — FIXED（6cc3cc2）
+- S09-8 — FIXED（6cc3cc2）
+- S09-9 — FIXED（6cc3cc2）
+- S10-3 — FIXED（4fd7603）
+- S11-2 — FIXED（be67775）
+- S11-3 — FIXED（be67775）
+- S11-4 — FIXED（be67775）
+- S11-7 — FIXED（6cc3cc2）
+- S11-8 — FIXED（b0004c0）
+- S11-9 — FIXED（fddbde4）
+- S12-10 — FIXED（fddbde4）
+- S12-3 — FIXED（6598fc5）
+- S12-4 — FIXED（6598fc5）
+- S12-5 — FIXED（6598fc5）
+- S12-6 — FIXED（6598fc5）
+- S12-8 — FIXED（93009b0）
+- S13-4 — FIXED（93009b0）
+- S13-6 — FIXED（4fd7603）
+- S13-7 — FIXED（b640434）
+- S13-8 — FIXED（b640434）
+- S13-9 — FIXED（b0004c0）
+- S14-4 — FIXED（2ab00ee）
+- S15-11 — FIXED（95f13f0）
+- S15-2 — FIXED（07f7105）
+- S15-4 — FIXED（95f13f0）
+- S15-5 — FIXED（fddbde4）
+- S15-6 — FIXED（07f7105）
+- S15-7 — FIXED（07f7105）
+- S15-9 — FIXED（07f7105）
+- S01-13 — FIXED（fddbde4）
+- S02-5 — FIXED（b6407e1）
+- S05-10 — FIXED（da9f33a）
+- S05-9 — FIXED（da9f33a）
+- S07-11 — FIXED（fddbde4）
+- S07-4 — FIXED（6527fbe）
+- S07-7 — FIXED（53bbe24）
+- S07-8 — FIXED（53bbe24）
+- S07-9 — FIXED（6527fbe）
+- S09-10 — FIXED（6cc3cc2）
+- S09-4 — FIXED（fddbde4）
+- S10-4 — FIXED（b0004c0）
+- S12-11 — FIXED（e3184bf）
+- S12-9 — FIXED（6598fc5）
+- S14-11 — FIXED（b6407e1）
+- S14-12 — FIXED（da9f33a）
+- S15-13 — FIXED（95f13f0）
+- CONF-1 — FIXED（fddbde4）
+- CONF-2 — FIXED（fddbde4）
+- CONF-3 — FIXED（fddbde4）
+- CONF-4 — FIXED（fddbde4）
+- Z07-4 — FIXED（511cced）
+- Z07-5 — FIXED（b0004c0）
+- Z07-6 — FIXED（b0004c0）
+- Z07-7 — FIXED（b0004c0）
+- Z07-8 — FIXED（fddbde4）
+- Z07-9 — FIXED（fddbde4）
+- Z08-3 — FIXED（e3184bf）
+- Z08-5 — FIXED（93009b0）
+- Z08-7 — FIXED（b0004c0）
+- Z08-8 — FIXED（6598fc5）
+- Z09-2 — FIXED（da9f33a）
+- Z09-3 — FIXED（da9f33a）
+- Z09V-2 — FIXED（da9f33a）
+- Z09V-3 — FIXED（da9f33a）
+- Z10-1 — FIXED（fddbde4）
+- Z10-2 — FIXED（6cc3cc2）
+- Z10-4 — FIXED（cb8b49d）
+- Z10-5 — FIXED（fddbde4）
+- Z10-6 — FIXED（93009b0）
+- Z10-7 — FIXED（93009b0）
+- Z10-8 — FIXED（cb8b49d）
+- Z10-9 — FIXED（93009b0）
+- Z10V-1 — FIXED（be67775）
+- Z10V-2 — FIXED（7a35ac6）
+- Z11-6 — FIXED（15878e2）
+- Z12-5 — FIXED（7a35ac6）
+- Z12-8 — FIXED（7a35ac6）
+- Z12V-1 — FIXED（7a35ac6）
+- Z12V-3 — FIXED（7a35ac6）
+- Z13-2 — FIXED（cb8b49d）
+- Z13-5 — FIXED（f0f9256）
+- Z13-6 — FIXED（461e1d3）
+- Z13-7 — FIXED（95f13f0）
+- Z14-5 — FIXED（a8bca1f）
+- Z14-6 — FIXED（aee682f）
+- Z14-V1 — FIXED（f0f9256）
+- Z15-2 — FIXED（1eda335）
+- Z15-3 — FIXED（64be6b1）
+- Z15-4 — FIXED（4fd7603）
+- Z16-4 — FIXED（f0f9256）
+- Z16-5 — FIXED（b37864e）
+- Z16-6 — FIXED（893c6a3）
+- Z16-7 — FIXED（07f7105）
+- Z17-1 — FIXED（07f7105）
+- Z17-2 — FIXED（95f13f0）
+- Z17-3 — FIXED（95f13f0）
+- Z17-4 — FIXED（fddbde4）
+- Z17-5 — FIXED（07f7105）
+- Z17V-1 — FIXED（07f7105）
+- Z18-2 — FIXED（a8bca1f）
+- Z18-3 — FIXED（c17ce23）
+- Z18v-1 — FIXED（c17ce23）
+- Z19-2 — FIXED（a8bca1f）
+- Z19-3 — FIXED（6527fbe）
+- Z19V-2 — FIXED（7a35ac6）
+- Z20-2 — FIXED（fddbde4）
+- Z20-3 — FIXED（64be6b1）
+- Z20-4 — FIXED（64be6b1）
+- Z20-6 — FIXED（b6407e1）
+- Z20V-1 — FIXED（fddbde4）
+- Z20V-2 — FIXED（fddbde4）
+- 22-1 / G-11 — FIXED（b0004c0）
+- Z21V-2 — FIXED（7feca3f）
+- Z21-1 — FIXED（7feca3f）
+- Z21-4 — FIXED（7feca3f）
+- Z21-3 — FIXED（7feca3f）
+- 22-2 — FIXED（cb8b49d）
+- N-03 — FIXED（c17ce23）
+- G-11 — FIXED（b0004c0）
+- G-14 — FIXED（6cc3cc2）
+- G-15 — FIXED（d4ad025）
+- G-16 — FIXED（64be6b1）
+- G-17 — FIXED（6cc3cc2）
+- G-18 — FIXED（da9f33a）
+- G-19 — FIXED（6527fbe）
+- G-20 — FIXED（fddbde4）
+- G-21 — FIXED（6527fbe）
+- G-22 — FIXED（7a35ac6）
+- 04-7 — FIXED（fddbde4）
+- P-03 — FIXED（b6407e1）
+- k6 — FIXED（511cced）
+- FO-03 — FIXED（93009b0）
+- FO-04 — FIXED（cb8b49d）
+- KIT-8 — FIXED（fddbde4）
+- KIT-9 — FIXED（893c6a3）
+- KIT-10 — FIXED（fddbde4）
+- RP-5 — FIXED（a8bca1f）
+- RP-6 — FIXED（511cced）
+- RP-8 — FIXED（511cced）
+- FO-05 — FIXED（fddbde4）
+- A-FE-1 — FIXED（93009b0）
+- A-FE-2 — FIXED（93009b0）
+- A-FE-3 — FIXED（fddbde4）
+- A-FE-V1 — FIXED（fddbde4）
+- A-FE-6 — FIXED（93009b0）

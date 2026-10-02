@@ -152,7 +152,7 @@ func TestZZProbeRawResponseHeaderShape(t *testing.T) {
 	}
 }
 
-// The media type is echoed unvalidated, which is correct for the contract 鈥?the
+// The media type is echoed unvalidated, which is correct for the contract —the
 // question is whether anything downstream of a *failed* raw call can be made to
 // render source-controlled markup on this origin.
 func TestZZProbeRawErrorPathsCarryNoSourceBody(t *testing.T) {

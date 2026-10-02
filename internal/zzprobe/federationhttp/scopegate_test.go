@@ -1,6 +1,6 @@
 //go:build audit5
 
-// package zzprobe_federationhttp 鈥?adversarial probes for the federation data plane
+// package zzprobe_federationhttp —adversarial probes for the federation data plane
 // and the outbound HTTP surface, written by the federation/outbound audit.
 //
 // This file drives the real HTTP wiring (internal/httpapi.New with a real OP
