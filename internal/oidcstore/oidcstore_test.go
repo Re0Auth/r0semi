@@ -95,6 +95,34 @@ func TestValidateSigner(t *testing.T) {
 	}
 }
 
+// The 2048-bit floor has to cover every key the JWKS publishes, not only the
+// current signing key. A retired key still verifies id_tokens, so accepting a
+// weak one would leave the key set as weak as its smallest member.
+func TestValidateSignerRejectsUndersizedRetiredKey(t *testing.T) {
+	good, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1024 bits is the input under test: a retired key below the floor must be
+	// refused. Generating it is the point, not an accident, so G403 is
+	// annotated rather than the key being made valid.
+	small, err := rsa.GenerateKey(rand.Reader, 1024) //nolint:gosec // G403: the weak key is the case under test
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ValidateSigner(NewSigner("kid", good).WithRetired(RetiredSigningKey{ID: "weak", Public: &small.PublicKey})); err == nil {
+		t.Fatal("a 1024-bit retired signing key was accepted")
+	}
+	if err := ValidateSigner(NewSigner("kid", good).WithRetired(RetiredSigningKey{ID: "old", Public: &retired.PublicKey})); err != nil {
+		t.Fatalf("a 2048-bit retired signing key was refused: %v", err)
+	}
+}
+
 func TestRequireExplicitConsent(t *testing.T) {
 	critical := oauth.Descriptor{
 		Scope: "phigros.score.write", Title: "Write", ExplicitConsent: true,

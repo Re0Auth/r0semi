@@ -80,6 +80,16 @@ func ValidateSigner(s *Signer) error {
 		if seen[r.ID] {
 			return fmt.Errorf("oidcstore: duplicate signing key id %q", r.ID)
 		}
+		// A retired key is published in the JWKS and still verifies id_tokens,
+		// so the same 2048-bit floor applies to it: a weak retired key would
+		// otherwise be the one an attacker forges against.
+		bits := 0
+		if r.Public.N != nil {
+			bits = r.Public.N.BitLen()
+		}
+		if bits < 2048 {
+			return fmt.Errorf("oidcstore: retired signing key %q must be at least 2048 bits, got %d", r.ID, bits)
+		}
 		seen[r.ID] = true
 	}
 	return nil
