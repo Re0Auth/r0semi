@@ -158,6 +158,7 @@ var singleColumnPredicates = []predicate{
 	{"oidc_refresh_tokens", "id_hash", "oidc.go:442 RevokeToken / :456 stranded-half repair"},
 	{"oidc_refresh_tokens", "client_id", "oidc.go:955 revokeMatching with a client-only filter"},
 	{"oidc_devices", "subject", "oidc.go:907 RevokeGrant: WHERE subject = $1 AND client_id = $2"},
+	{"oidc_devices", "client_id", "oidc.go RevokeTokens: revokeMatching with a client-only filter (G-14; migration 0029 adds the leading index)"},
 
 	// --- account / vault / federation ---
 	{"accounts_identities", "provider", "account.go:38 FindByIdentity: WHERE provider = $1 AND subject = $2 (UNIQUE)"},

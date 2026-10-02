@@ -775,6 +775,43 @@ func TestOIDCDeviceDescribeAndDecide(t *testing.T) {
 	}
 }
 
+// TestDeviceDecisionsNameTheClientInTheAuditRow is the runtime half of G-17: the
+// memory backend has always recorded which client a device grant belonged to, and
+// the Postgres event left client_id empty, so the production audit chain could not
+// answer "which client was approved into this grant".
+func TestDeviceDecisionsNameTheClientInTheAuditRow(t *testing.T) {
+	store, logged, ctx := oidcFixture(t)
+	expires := time.Now().Add(5 * time.Minute)
+
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "g17-approve-code", "G17A-0001", expires,
+		[]string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveDevice(ctx, "G17A-0001", "usr_g17", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StoreDeviceAuthorization(ctx, "oidc-device", "g17-deny-code", "G17D-0002", expires,
+		[]string{"account.id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DenyDevice(ctx, "G17D-0002"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Events() is a ring buffer; the actions are distinct, so keep the last of each.
+	recorded := map[string]string{}
+	for _, e := range logged.Events() {
+		if e.Action == "oidc.device.approve" || e.Action == "oidc.device.deny" {
+			recorded[e.Action] = e.Detail["client_id"]
+		}
+	}
+	for _, action := range []string{"oidc.device.approve", "oidc.device.deny"} {
+		if got := recorded[action]; got != "oidc-device" {
+			t.Errorf("%s recorded client_id = %q, want %q (G-17)", action, got, "oidc-device")
+		}
+	}
+}
+
 // A device decision is a state transition rather than an assignment: the UPDATE
 // carries its own conditions, so a decision that lands on a code somebody else
 // already decided is refused instead of overwriting it. Round 3's C3-3 recorded

@@ -55,12 +55,14 @@ func scanDatabaseNow(t *testing.T) []databaseNowOccurrence {
 	var out []databaseNowOccurrence
 
 	// The floor is the number of REVIEWED, deliberate now() uses left in the
-	// shipped code: CompleteLogin's COALESCE(auth_time, now()) display fallback
-	// in oidc.go, and the relative interval comparison in sessions.go. The device
-	// path used to carry three more; they are store-clock parameters now, so a
-	// scanner finding fewer than these two is broken, and finding MORE is the
-	// finding the test below reports.
-	mustHave := map[string]int{"oidc.go": 1, "sessions.go": 1}
+	// shipped code: the relative interval comparison in sessions.go. oidc.go used
+	// to carry CompleteLogin's `COALESCE(auth_time, now())` display fallback, but
+	// that fallback is a Go value now (CompleteLogin stamps auth_time from the
+	// store clock), so requiring it here asserted a statement that no longer
+	// exists. The device path used to carry three more; they are store-clock
+	// parameters now. A scanner finding fewer than these is broken, and finding
+	// MORE is the finding the test below reports.
+	mustHave := map[string]int{"sessions.go": 1}
 	for _, f := range []string{"oidc.go", "oauth.go", "sessions.go"} {
 		body, err := os.ReadFile(filepath.Join(adapterDir, f))
 		if err != nil {
@@ -76,13 +78,21 @@ func scanDatabaseNow(t *testing.T) []databaseNowOccurrence {
 
 	// oauth.go's control: the statement the probe describes must be visible to the
 	// scanner even though it carries no now(). This is what proves the file was
-	// read rather than skipped.
-	body, err := os.ReadFile(filepath.Join(adapterDir, "oauth.go"))
+	// read rather than skipped. oidc.go gets the same control because it now
+	// carries no SQL now() at all.
+	oauthBody, err := os.ReadFile(filepath.Join(adapterDir, "oauth.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stripGoComments(string(body)), "UPDATE oauth_device_authorizations") {
+	if !strings.Contains(stripGoComments(string(oauthBody)), "UPDATE oauth_device_authorizations") {
 		t.Error("oauth.go's poll statement is no longer visible; the scanner is not reading the file")
+	}
+	oidcBody, err := os.ReadFile(filepath.Join(adapterDir, "oidc.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stripGoComments(string(oidcBody)), "INSERT INTO oidc_access_tokens") {
+		t.Error("oidc.go's token statements are no longer visible; the scanner is not reading the file")
 	}
 	return out
 }
@@ -165,17 +175,15 @@ func TestDevicePathsJudgeExpiryWithTheDatabaseClock(t *testing.T) {
 //
 // The reviewed set, and why each is acceptable:
 //
-//	oidc.go  CompleteLogin's `COALESCE(auth_time, now())`  a display-only fallback for
-//	         "when did the human authenticate", written once if the caller did not set it;
-//	         no deadline decision reads it
-//	oauth.go RecordPoll's caller-supplied `at` is a Go value; the legacy table's deadline
-//	         comparisons happen in the service (oauth/device.go:285-293), on the store clock
 //	sessions.go SweepExpired's `now() - $1::interval`  a RELATIVE comparison, so the two
 //	         clocks cancel; the same reasoning the method's own comment gives
 //
-// The device path's three (ApproveDevice's expires_at > now() and auth_time = now(),
-// GetDeviceAuthorizatonState's last_poll) were the finding; they are store-clock
-// parameters now (P2-32), matching internal/store/memory's device path.
+// A `COALESCE(auth_time, now())` display fallback used to sit in oidc.go's
+// CompleteLogin; it is a store-clock value there now, so the branch that used to
+// excuse it is gone. The device path's three (ApproveDevice's expires_at > now()
+// and auth_time = now(), GetDeviceAuthorizatonState's last_poll) were the finding;
+// they are store-clock parameters now (P2-32), matching internal/store/memory's
+// device path.
 func TestOnlyReviewedStatementsUseDatabaseNow(t *testing.T) {
 	occurrences := scanDatabaseNow(t)
 	if len(occurrences) < 2 {

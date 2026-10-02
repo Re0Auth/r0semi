@@ -198,11 +198,18 @@ func (s *Accounts) UnlinkIdentity(ctx context.Context, user account.UserID, iden
 
 	var owner string
 	err = tx.QueryRow(ctx, `SELECT user_id FROM accounts_identities WHERE id = $1`, string(identity)).Scan(&owner)
-	if noRows(err) || account.UserID(owner) != user {
-		return account.ErrNotFound
-	}
 	if err != nil {
+		// The error is classified before ownership: `noRows` is the only answer
+		// that means "not this user's identity". A connection error, a failover
+		// or a cancelled context is a store failure, and reporting it as
+		// ErrNotFound told the caller the identity does not exist (S09-3).
+		if noRows(err) {
+			return account.ErrNotFound
+		}
 		return err
+	}
+	if account.UserID(owner) != user {
+		return account.ErrNotFound
 	}
 
 	var count int
@@ -232,15 +239,14 @@ func (s *Accounts) UnlinkIdentity(ctx context.Context, user account.UserID, iden
 }
 
 // Identities implements account.Store.
+//
+// The rows are read first and the account-existence probe is only consulted when
+// they came back empty. The previous shape ran `SELECT EXISTS (...)` before every
+// read, so the ordinary case (an account with identities) paid two round trips
+// for one answer (S03-8). The fallback keeps the contract exactly: a missing
+// account is ErrNotFound, an existing account with no identities is an empty
+// slice, which is what MemoryStore answers.
 func (s *Accounts) Identities(ctx context.Context, user account.UserID) ([]account.Identity, error) {
-	var exists bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM accounts_users WHERE id = $1)`, string(user)).Scan(&exists); err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, account.ErrNotFound
-	}
-
 	rows, err := s.pool.Query(ctx,
 		`SELECT `+accountIdentityCols+` FROM accounts_identities WHERE user_id = $1 ORDER BY linked_at, id`, string(user))
 	if err != nil {
@@ -254,6 +260,20 @@ func (s *Accounts) Identities(ctx context.Context, user account.UserID) ([]accou
 	var out []account.Identity
 	for _, r := range scanned {
 		out = append(out, r.identity())
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+
+	// No rows: either the account exists with no identities yet, or it does not
+	// exist at all. Only the empty case is worth a second query.
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM accounts_users WHERE id = $1)`, string(user)).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, account.ErrNotFound
 	}
 	return out, nil
 }

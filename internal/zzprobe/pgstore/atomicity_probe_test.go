@@ -113,9 +113,13 @@ func TestTokenTablesHaveNoRowLevelSecurityOrTrigger(t *testing.T) {
 func TestMultiStatementMutationsRunInATransaction(t *testing.T) {
 	// Methods that issue two or more writes and DO open a transaction. If one of
 	// these loses its Begin, the probe fails.
+	//
+	// S03-10 and S09-8 moved the last four out of the unprotected set below:
+	// RevokeAllSessions and RevokeSubjectSessions (the Kill Switch's two halves),
+	// and oauth.go's PurgeLegacySubject and DeleteRefresh.
 	protected := map[string][]string{
-		"sessions.go":   {}, // asserted empty below: see the note
-		"oauth.go":      {"DeleteBySubjectClient", "RevokeTokens"},
+		"sessions.go":   {"RevokeAllSessions", "RevokeSubjectSessions"},
+		"oauth.go":      {"DeleteBySubjectClient", "RevokeTokens", "PurgeLegacySubject", "DeleteRefresh"},
 		"oidc.go":       {"RevokeGrant", "TerminateSession", "PurgeSubject", "RevokeTokens", "revokeInOneTx", "DeleteAuthRequest"},
 		"account.go":    {"CreateWithIdentity", "LinkIdentity", "UnlinkIdentity"},
 		"sweep.go":      {"SweepExpired"},
@@ -138,9 +142,11 @@ func TestMultiStatementMutationsRunInATransaction(t *testing.T) {
 
 	// The unprotected set. Each entry is a method that issues two statements with
 	// no transaction; the report states the interleaving that breaks for each.
+	// sessions.go and oauth.go no longer have one — every multi-write method in
+	// them runs in a transaction — so their entries are empty on purpose.
 	unprotected := map[string][]string{
-		"sessions.go": {"RevokeAllSessions", "RevokeSubjectSessions", "SweepExpired"},
-		"oauth.go":    {"PurgeLegacySubject"},
+		"sessions.go": {},
+		"oauth.go":    {},
 	}
 	for file, methods := range unprotected {
 		src, err := os.ReadFile(filepath.Join(adapterDir, file))

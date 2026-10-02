@@ -337,6 +337,9 @@ func (db *DB) Audit(key []byte) (*AuditLogger, error) {
 		return nil, err
 	}
 	logger.observe = db.auditObserver
+	// The subject-key cache ages entries with the handle's clock, so WithClock
+	// governs its TTL the same way it governs every other deadline here.
+	logger.now = db.now
 	db.closersMu.Lock()
 	db.closers = append(db.closers, logger.Close)
 	db.closersMu.Unlock()
@@ -462,47 +465,70 @@ func MigrateDown(ctx context.Context, dsn string, opts PoolOptions) error {
 		})
 }
 
-// These are the versions whose Down sections are no-ops because rolling them
-// back destroys tamper-evidence rather than undoing a schema change. They are
-// named constants so refuseAuditChainRollback and its guard test cannot drift
-// from one another on the numbers.
+// These are the versions whose Down sections destroy state that re-applying Up
+// cannot reconstruct. They are named constants so refuseAuditChainRollback and
+// its guard test cannot drift from one another on the numbers.
 const (
 	migrationAuditChain      = 13
 	migrationAuditPseudonyms = 14
+	// 0024/0025 add refresh-token families and the tombstones a rotation leaves
+	// behind. Their Down sections drop both, so a rollback silently discards the
+	// only record that a spent refresh token belonged to a family — after which a
+	// replay is an ordinary "unknown token" and the family revocation it should
+	// trigger can never happen again (S09-5).
+	migrationRefreshFamilies      = 24
+	migrationOAuthRefreshFamilies = 25
 )
 
-// refuseAuditChainRollback stops `-migrate-down` from running 0013's or 0014's
-// step while the audit chain holds chained rows.
+// refuseAuditChainRollback stops `-migrate-down` from running a step whose Down
+// destroys state that Up cannot rebuild, while the state is still there.
 //
-// Both Down sections are empty, so this guard is not what prevents the damage;
-// it is what turns a silent, unrecoverable loss into a refusal an operator can
-// act on. 0013 used to drop prev_hash/row_hash/signature and re-seed the chain
-// head to genesis in Up, which made every historical row read back as Legacy
-// while Verify still returned OK=true — a destroyed audit chain that reports
-// healthy. 0014 used to drop audit_subject_keys, the only copy of every
-// per-subject pseudonym key. Neither is reversible by re-applying Up, so the
-// rollback story is restore-from-backup (ADR-0008 §5).
+// Four versions are covered. 0013 and 0014 have empty Down sections, so this
+// guard is not what prevents the damage; it is what turns a silent,
+// unrecoverable loss into a refusal an operator can act on. 0013 used to drop
+// prev_hash/row_hash/signature and re-seed the chain head to genesis in Up, which
+// made every historical row read back as Legacy while Verify still returned
+// OK=true — a destroyed audit chain that reports healthy. 0014 used to drop
+// audit_subject_keys, the only copy of every per-subject pseudonym key. 0024 and
+// 0025 do execute DDL in Down: they drop the refresh-family columns and the
+// tombstone tables the replay detection reads (S09-5).
 //
-// The refusal only fires for versions 13 and 14 and only when a row with a
-// non-NULL row_hash exists: on a fresh or never-chained database there is
-// nothing to protect, so the rollback proceeds and `-migrate-down` keeps
-// working there. The provider drives the version, not the migration file
-// contents, so a future migration stacked on 13 gets its own decision.
+// For 0013/0014 the refusal fires only when a row with a non-NULL row_hash
+// exists, and for 0024/0025 only when the corresponding tombstone table holds a
+// row: on a fresh or never-rotated database there is nothing to protect, so the
+// rollback proceeds and `-migrate-down` keeps working there. The provider drives
+// the version, not the migration file contents, so a future migration stacked on
+// one of these gets its own decision.
 func refuseAuditChainRollback(ctx context.Context, sqlDB *sql.DB, provider *goose.Provider) error {
 	version, err := provider.GetDBVersion(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: migrate: down: read version: %w", err)
 	}
-	if version != migrationAuditChain && version != migrationAuditPseudonyms {
+
+	var (
+		probe string
+		loss  string
+	)
+	switch version {
+	case migrationAuditChain, migrationAuditPseudonyms:
+		probe = `SELECT EXISTS (SELECT 1 FROM audit_events WHERE row_hash IS NOT NULL)`
+		loss = "the audit chain holds chained rows and its rollback is not reversible"
+	case migrationRefreshFamilies:
+		probe = `SELECT EXISTS (SELECT 1 FROM oidc_refresh_token_tombstones LIMIT 1)`
+		loss = "rotated refresh tokens have left replay tombstones, and their rollback is not reversible"
+	case migrationOAuthRefreshFamilies:
+		probe = `SELECT EXISTS (SELECT 1 FROM oauth_refresh_tombstones LIMIT 1)`
+		loss = "rotated refresh tokens have left replay tombstones, and their rollback is not reversible"
+	default:
 		return nil
 	}
-	var chained bool
-	if err := sqlDB.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM audit_events WHERE row_hash IS NOT NULL)`).Scan(&chained); err != nil {
-		return fmt.Errorf("postgres: migrate: down: audit chain probe: %w", err)
+
+	var atRisk bool
+	if err := sqlDB.QueryRowContext(ctx, probe).Scan(&atRisk); err != nil {
+		return fmt.Errorf("postgres: migrate: down: rollback probe: %w", err)
 	}
-	if chained {
-		return fmt.Errorf("postgres: migrate: down: refusing to roll back migration %d: the audit chain holds chained rows and its rollback is not reversible (ADR-0008); restore the last-known-good backup instead", version)
+	if atRisk {
+		return fmt.Errorf("postgres: migrate: down: refusing to roll back migration %d: %s (ADR-0008); restore the last-known-good backup instead", version, loss)
 	}
 	return nil
 }

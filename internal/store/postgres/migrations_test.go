@@ -200,7 +200,7 @@ func TestAuditIntegrityMigrationsCannotBeRolledBack(t *testing.T) {
 	guard := functionBody(t, text, "func refuseAuditChainRollback(")
 	for _, want := range []string{
 		"provider.GetDBVersion(ctx)",
-		"version != migrationAuditChain && version != migrationAuditPseudonyms",
+		"case migrationAuditChain, migrationAuditPseudonyms:",
 		"FROM audit_events WHERE row_hash IS NOT NULL",
 		"refusing to roll back migration %d",
 	} {
@@ -209,12 +209,29 @@ func TestAuditIntegrityMigrationsCannotBeRolledBack(t *testing.T) {
 				"versions 13 and 14 on surviving chained rows", want)
 		}
 	}
-	// The guard is only about 13 and 14 if those constants still say so.
+	// S09-5: 0024/0025 execute DDL in Down and destroy the only record that a
+	// spent refresh token belonged to a family, so the same refusal has to cover
+	// them while a tombstone exists.
+	for _, want := range []string{
+		"case migrationRefreshFamilies:",
+		"FROM oidc_refresh_token_tombstones LIMIT 1",
+		"case migrationOAuthRefreshFamilies:",
+		"FROM oauth_refresh_tombstones LIMIT 1",
+	} {
+		if !strings.Contains(guard, want) {
+			t.Errorf("refuseAuditChainRollback no longer contains %q; rolling back 0024/0025 "+
+				"silently discards the replay tombstones and the family revocation they enable (S09-5)", want)
+		}
+	}
+	// The guard is only about those versions if those constants still say so.
 	flat := strings.Join(strings.Fields(text), " ")
-	for _, want := range []string{"migrationAuditChain = 13", "migrationAuditPseudonyms = 14"} {
+	for _, want := range []string{
+		"migrationAuditChain = 13", "migrationAuditPseudonyms = 14",
+		"migrationRefreshFamilies = 24", "migrationOAuthRefreshFamilies = 25",
+	} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("postgres.go no longer declares %q; the refusal no longer guards the "+
-				"audit-integrity migrations", want)
+				"non-reversible migrations", want)
 		}
 	}
 }

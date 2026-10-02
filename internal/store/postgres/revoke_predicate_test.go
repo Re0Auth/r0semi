@@ -26,15 +26,16 @@ func indexLeadsWith(lists []string, col string) bool {
 // client_id by itself, so it needs its own leading-column index.
 //
 // The list is every table a client_id-only predicate deletes from, not just the
-// OIDC engine's two: revokeMatching reaches the three legacy oauth_* tables and
-// revokePendingAuthorizations reaches oidc_auth_requests, so a fix that only
-// indexed the current engine's token tables (0021) left the rest scanning.
+// OIDC engine's two: revokeMatching reaches the three legacy oauth_* tables,
+// revokePendingAuthorizations reaches oidc_auth_requests, and
+// OIDCStore.RevokeTokens reaches oidc_devices, so a fix that only indexed the
+// current engine's token tables (0021) left the rest scanning (G-14).
 func TestClientScopedRevokeIsIndexed(t *testing.T) {
 	indexed := migrationIndexes(t)
 	for _, table := range []string{
 		"oidc_access_tokens", "oidc_refresh_tokens",
 		"oauth_access_tokens", "oauth_refresh_tokens", "oauth_codes",
-		"oidc_auth_requests",
+		"oidc_auth_requests", "oidc_devices",
 	} {
 		if !indexLeadsWith(indexed[table], "client_id") {
 			t.Errorf("%s has no index with client_id as its leading column: the client-scoped "+

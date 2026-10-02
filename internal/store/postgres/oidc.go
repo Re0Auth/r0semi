@@ -327,7 +327,14 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 	if err := tx.QueryRow(ctx,
 		`DELETE FROM oidc_codes WHERE code_hash = $1 AND expires_at > $2 RETURNING request_id`,
 		hashValue(code), s.now()).Scan(&requestID); err != nil {
-		return nil, errors.New("postgres: authorization code is unknown or expired")
+		// Only "no row" is the protocol answer. A database that did not answer
+		// made no statement about this code, and collapsing the two turned an
+		// outage into invalid_grant — a refusal the client acts on instead of a
+		// failure the operator can see (S09-7).
+		if noRows(err) {
+			return nil, errors.New("postgres: authorization code is unknown or expired")
+		}
+		return nil, fmt.Errorf("postgres: claim authorization code: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, `
@@ -337,11 +344,14 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 		          code_challenge, code_challenge_method, subject, done, auth_time,
 		          prompt, max_age_seconds`, requestID)
 	if err != nil {
-		return nil, errors.New("postgres: auth request not found")
+		return nil, fmt.Errorf("postgres: delete auth request: %w", err)
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[authRequestRow])
 	if err != nil {
-		return nil, errors.New("postgres: auth request not found")
+		if noRows(err) {
+			return nil, errors.New("postgres: auth request not found")
+		}
+		return nil, fmt.Errorf("postgres: auth request: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -425,11 +435,13 @@ func (s *OIDCStore) CreateAccessToken(ctx context.Context, request op.TokenReque
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	expires := s.now().UTC().Add(s.accessTTL)
+	issued := s.now().UTC()
+	expires := issued.Add(s.accessTTL)
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)
-		VALUES ($1,$2,$3,$4,$5)`,
-		hashValue(id), clientIDOf(request), request.GetSubject(), oidcstore.NonNil(oidcstore.WithoutOfflineAccess(request.GetScopes())), expires); err != nil {
+		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, issued_at, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6)`,
+		hashValue(id), clientIDOf(request), request.GetSubject(),
+		oidcstore.NonNil(oidcstore.WithoutOfflineAccess(request.GetScopes())), issued, expires); err != nil {
 		return "", time.Time{}, fmt.Errorf("postgres: create access token: %w", err)
 	}
 	s.record(ctx, "oidc.token", request.GetSubject(), clientIDOf(request), audit.OutcomeOK)
@@ -571,17 +583,17 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 		familyID = id
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, expires_at)
-		VALUES ($1,$2,$3,$4,$5)`,
-		hashValue(accessID), clientIDOf(request), request.GetSubject(), scopes, expires); err != nil {
+		INSERT INTO oidc_access_tokens (id_hash, client_id, subject, scopes, issued_at, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6)`,
+		hashValue(accessID), clientIDOf(request), request.GetSubject(), scopes, now, expires); err != nil {
 		return "", "", time.Time{}, fmt.Errorf("postgres: create access token: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO oidc_refresh_tokens
-			(token_hash, id_hash, client_id, subject, scopes, amr, audience, auth_time, nonce, family_id, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			(token_hash, id_hash, client_id, subject, scopes, amr, audience, auth_time, nonce, family_id, issued_at, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		hashValue(value), hashValue(accessID), clientIDOf(request), request.GetSubject(),
-		scopes, amr, audience, authTime, oidcstore.NonceOf(request), familyID, now.Add(s.refreshTTL),
+		scopes, amr, audience, authTime, oidcstore.NonceOf(request), familyID, now, now.Add(s.refreshTTL),
 	); err != nil {
 		return "", "", time.Time{}, fmt.Errorf("postgres: create refresh token: %w", err)
 	}
@@ -1206,16 +1218,24 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 	return s.deviceState(ctx, `device_code_hash = $1 AND client_id = $2`, hashValue(deviceCode), clientID)
 }
 
+// deviceState reads one oidc_devices row. A missing row is oauth.ErrDeviceNotFound
+// (the protocol answer); any other error is a store failure and is returned with
+// its cause, never folded into "not found" — a device poll answered access_denied
+// during an outage tells the client to give up on a code that is still live
+// (S09-7).
 func (s *OIDCStore) deviceState(ctx context.Context, where string, args ...any) (*op.DeviceAuthorizationState, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT client_id, scopes, expires_at, done, denied, subject, auth_time
 		  FROM oidc_devices WHERE `+where, args...)
 	if err != nil {
-		return nil, errors.New("postgres: device authorization not found")
+		return nil, fmt.Errorf("postgres: device authorization: %w", err)
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[deviceStateRow])
 	if err != nil {
-		return nil, errors.New("postgres: device authorization not found")
+		if noRows(err) {
+			return nil, oauth.ErrDeviceNotFound
+		}
+		return nil, fmt.Errorf("postgres: device authorization: %w", err)
 	}
 	return row.state(), nil
 }
@@ -1325,24 +1345,31 @@ func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string,
 	// remove. The memory backend already uses its store clock on the same two.
 	now := s.now()
 	const pending = `done = false AND denied = false AND expires_at > $3`
+	// RETURNING carries the client the code was issued to out of the write, so the
+	// audit record can name it. The memory backend has always recorded it; the
+	// Postgres event left it empty, so the production chain could not answer
+	// "which client was approved into this device grant" (G-17).
 	q := `UPDATE oidc_devices SET done = true, subject = $2, auth_time = $3
-	       WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending
+	       WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending +
+		` RETURNING client_id`
 	args := []any{userCode, subject, now}
 	if scopes != nil {
 		q = `UPDATE oidc_devices SET done = true, subject = $2, auth_time = $3, scopes = $4
-		      WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending
+		      WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', '')) AND ` + pending +
+			` RETURNING client_id`
 		args = append(args, scopes)
 	}
-	tag, err := s.pool.Exec(ctx, q, args...)
-	if err != nil {
-		return fmt.Errorf("postgres: approve device: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
+	var clientID string
+	err := s.pool.QueryRow(ctx, q, args...).Scan(&clientID)
+	switch {
+	case noRows(err):
 		// An unknown code and one that is no longer pending are the same answer:
 		// this is not a code the caller may decide.
 		return fmt.Errorf("postgres: device authorization is not pending: %w", oauth.ErrDeviceNotFound)
+	case err != nil:
+		return fmt.Errorf("postgres: approve device: %w", err)
 	}
-	s.record(ctx, "oidc.device.approve", subject, "", audit.OutcomeOK)
+	s.record(ctx, "oidc.device.approve", subject, clientID, audit.OutcomeOK)
 	return nil
 }
 
@@ -1353,17 +1380,21 @@ func (s *OIDCStore) ApproveDevice(ctx context.Context, userCode, subject string,
 // That invariant is round 3's C3-3 conclusion and the tests pin it; what this
 // adds is that a second denial is refused rather than recorded twice.
 func (s *OIDCStore) DenyDevice(ctx context.Context, userCode string) error {
-	tag, err := s.pool.Exec(ctx, `
+	var clientID string
+	err := s.pool.QueryRow(ctx, `
 		UPDATE oidc_devices SET denied = true
 		 WHERE upper(replace(user_code, '-', '')) = upper(replace($1, '-', ''))
-		   AND denied = false`, userCode)
-	if err != nil {
+		   AND denied = false
+		RETURNING client_id`, userCode).Scan(&clientID)
+	switch {
+	case noRows(err):
+		return fmt.Errorf("postgres: device authorization is not pending: %w", oauth.ErrDeviceNotFound)
+	case err != nil:
 		return fmt.Errorf("postgres: deny device: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("postgres: device authorization is not pending: %w", oauth.ErrDeviceNotFound)
-	}
-	s.record(ctx, "oidc.device.deny", "", "", audit.OutcomeDenied)
+	// client_id rides out of the write (G-17); the subject is not on this path —
+	// the denying account is the caller's, and recording it is Z20V-1's job.
+	s.record(ctx, "oidc.device.deny", "", clientID, audit.OutcomeDenied)
 	return nil
 }
 
@@ -1620,7 +1651,12 @@ func (s *OIDCStore) PurgeSubject(ctx context.Context, subject string) (int, erro
 // pending device grant (OP-backed counterpart of the same oauth.Service method).
 func (s *OIDCStore) DescribeDeviceAuthorization(ctx context.Context, userCode string) (oauth.DeviceAuthorization, error) {
 	st, err := s.DeviceByUserCode(ctx, userCode)
-	if err != nil || st.Done || st.Denied || s.now().After(st.Expires) {
+	if err != nil {
+		// An unknown code and a store outage are not the same answer: the first is
+		// ErrDeviceNotFound (404), the second must stay a failure (S09-7).
+		return oauth.DeviceAuthorization{}, err
+	}
+	if st.Done || st.Denied || s.now().After(st.Expires) {
 		return oauth.DeviceAuthorization{}, oauth.ErrDeviceNotFound
 	}
 	client, err := s.clients.Get(ctx, st.ClientID)
@@ -1655,7 +1691,12 @@ func (s *OIDCStore) DecideDeviceAuthorization(ctx context.Context, userCode, sub
 		return &oauth.Error{Code: "access_denied", Description: "user is not authenticated"}
 	}
 	st, err := s.DeviceByUserCode(ctx, userCode)
-	if err != nil || st.Done || st.Denied || s.now().After(st.Expires) {
+	if err != nil {
+		// Same distinction as DescribeDeviceAuthorization: an outage is not "this
+		// code is not pending" (S09-7).
+		return err
+	}
+	if st.Done || st.Denied || s.now().After(st.Expires) {
 		return oauth.ErrDeviceNotFound
 	}
 	if !approve {

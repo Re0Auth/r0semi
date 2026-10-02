@@ -31,10 +31,15 @@ type AuditLogger struct {
 	// batch coalesces concurrent appends. It is created with the logger and
 	// stopped by Close.
 	batch *auditBatcher
-	// mu guards cache, which maps a subject to its per-subject key. It is a cache,
-	// not a source of truth: losing it costs one query.
+	// mu guards cache, which maps a subject to its per-subject key AND to the
+	// answer "this subject has no key". It is a cache, not a source of truth:
+	// losing it costs one query.
 	mu    sync.Mutex
-	cache map[string][]byte
+	cache map[string]cachedSubjectKey
+	// now is the clock the cache's entries are aged with. It is the handle's clock
+	// (see DB.now) so the TTL obeys the same single-clock policy as every other
+	// deadline this package writes; set by DB.Audit, never nil.
+	now func() time.Time
 	// observe reports how long one chained append took, wait for the chain-head
 	// lock included. It is a function rather than a metrics handle so this package
 	// keeps no dependency on the instrumentation — the composition root injects it

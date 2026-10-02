@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/alexedwards/scs/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Re0Auth/r0semi/oauth"
@@ -192,34 +193,90 @@ const sessionSweepBatchSize = 1000
 // revocable set.
 const sessionIndexGrace = "1 hour"
 
+// deleteTableBatched removes every row of one table, one bounded statement at a
+// time, on the caller's transaction.
+//
+// The Kill Switch's deletes are unbounded ("every session"), and a single
+// statement over a large table can be cancelled by the pool's statement_timeout
+// halfway through — leaving the operator with an error and the sessions alive
+// (S03-10). Each statement here carries ASC LIMIT, exactly like SweepExpired's,
+// so the sweep of a backlog is a series of statements that each fit the bound.
+// The table name is a compile-time constant at both call sites, never request
+// input.
+func deleteTableBatched(ctx context.Context, tx pgx.Tx, table string) (int64, error) {
+	var removed int64
+	for {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM `+table+` WHERE ctid IN (SELECT ctid FROM `+table+` LIMIT $1)`,
+			sessionSweepBatchSize)
+		if err != nil {
+			return removed, err
+		}
+		n := tag.RowsAffected()
+		removed += n
+		if n < sessionSweepBatchSize {
+			return removed, nil
+		}
+	}
+}
+
 // RevokeAllSessions deletes every session, signing everyone out. It is the session
 // half of the Kill Switch. Returns how many sessions were removed.
+//
+// Both deletes run in one transaction and in bounded batches: the session row and
+// its subject index row are two halves of one revocable session, and a partial
+// application that reported a count is not a state a retry can distinguish from
+// success. The count is zero when any statement fails, because the rollback
+// leaves nothing removed (S03-10, S09-8).
 func (s *Sessions) RevokeAllSessions(ctx context.Context) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM sessions`)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM session_subjects`); err != nil {
-		return tag.RowsAffected(), err
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	removed, err := deleteTableBatched(ctx, tx, "sessions")
+	if err != nil {
+		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	if _, err := deleteTableBatched(ctx, tx, "session_subjects"); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // RevokeSubjectSessions deletes every session belonging to one account. It needs
 // the subject index: a session cookie carries no subject, and the store cannot
 // read the account out of an encoded payload.
+//
+// The two deletes share one transaction for the same reason RevokeAllSessions'
+// do: an index row left behind after its session was removed is an orphan the
+// sweep has to age out, and a session removed without its index row is one the
+// next Kill Switch cannot reach (S09-8).
 func (s *Sessions) RevokeSubjectSessions(ctx context.Context, subject string) (int64, error) {
 	if strings.TrimSpace(subject) == "" {
 		return 0, errors.New("postgres: subject is required")
 	}
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
 		DELETE FROM sessions
 		 WHERE token_hash IN (SELECT token_hash FROM session_subjects WHERE subject = $1)`, subject)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM session_subjects WHERE subject = $1`, subject); err != nil {
-		return tag.RowsAffected(), err
+	if _, err := tx.Exec(ctx, `DELETE FROM session_subjects WHERE subject = $1`, subject); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
 	}
 	return tag.RowsAffected(), nil
 }

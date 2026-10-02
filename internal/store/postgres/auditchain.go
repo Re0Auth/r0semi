@@ -237,7 +237,10 @@ type AuditVerification = audit.Verification
 // for the length of the scan (see verifyStatementTimeout) and have the change
 // revert automatically when the transaction ends. A bare SET would leak the
 // longer bound into every later request on that pooled connection — the hazard
-// postgres.go's migration note spells out.
+// postgres.go's migration note spells out. The transaction is also REPEATABLE READ
+// so the chain head and the rows it is compared against come from one snapshot: a
+// concurrent append must not look like a truncated tail (see the comparison
+// below).
 func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 	tx, err := l.pool.Begin(ctx)
 	if err != nil {
@@ -252,12 +255,32 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 		return audit.Verification{}, fmt.Errorf("postgres: audit: verify timeout: %w", err)
 	}
 
-	// The chain head is read first as a witness that rows were chained at all.
-	// Without it, clearing the chain columns off every row (row_hash = NULL) makes
-	// each row look pre-chain and the walk reports the log intact while a caller
-	// with DB write access rewrote it freely.
-	var head []byte
-	if err := tx.QueryRow(ctx, `SELECT head_hash FROM audit_chain WHERE only_row`).Scan(&head); err != nil {
+	// One snapshot for the head and the walk. Under READ COMMITTED each statement
+	// gets a fresh snapshot, so an append that commits between the head read and
+	// the row scan makes the head point at the appended row while the walk (which
+	// started earlier) stops at the row before it — which the tail comparison
+	// below would report as a truncated chain. The walk is read-only, so
+	// REPEATABLE READ costs nothing and cannot raise a serialization failure.
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL TRANSACTION ISOLATION LEVEL REPEATABLE READ`); err != nil {
+		return audit.Verification{}, fmt.Errorf("postgres: audit: verify isolation: %w", err)
+	}
+
+	// The chain head and the legacy ceiling are read first, as witnesses. The
+	// head is compared against the last chained row the walk finds, which is what
+	// makes a deleted tail detectable (S09-6 / Z10-9); without the comparison,
+	// clearing the chain columns off every row made each row look pre-chain and
+	// the walk reported the log intact while a caller with DB write access rewrote
+	// it freely. The ceiling bounds which NULL-hash rows may be called legacy
+	// (Z10-2): a row with no hash and an id past the ceiling was inserted after
+	// the seal and is not a migration-era row.
+	var (
+		head          []byte
+		legacyCeiling int64
+	)
+	if err := tx.QueryRow(ctx,
+		`SELECT head_hash, legacy_ceiling_id FROM audit_chain WHERE only_row`).
+		Scan(&head, &legacyCeiling); err != nil {
 		return audit.Verification{}, fmt.Errorf("postgres: audit: verify head: %w", err)
 	}
 
@@ -298,7 +321,16 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 		if rowHash == nil {
 			// A pre-chain row. It must not appear after the chain has started: a
 			// chained row whose hash was cleared would otherwise be silently
-			// downgraded to "legacy" and skipped.
+			// downgraded to "legacy" and skipped. It must also not sit past the
+			// ceiling migration 0030 sealed: the serial cannot reuse an id, so a
+			// NULL-hash row with a higher id was inserted after the seal — it is a
+			// forged row, not a migration-era one (Z10-2).
+			if id > legacyCeiling {
+				v.OK = false
+				v.FirstBadID = id
+				v.Reason = "unchained row appears past the legacy ceiling recorded when the chain was sealed"
+				return v, nil
+			}
 			if started {
 				v.OK = false
 				v.FirstBadID = id
@@ -343,6 +375,18 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 	if err := rows.Err(); err != nil {
 		return AuditVerification{}, fmt.Errorf("postgres: audit: verify iterate: %w", err)
 	}
+	// The head is the hash of the last chained row. The walk holds that row's
+	// hash in prev, and it used to throw the comparison away: rows deleted from
+	// the end of the chain left the head pointing at a hash no surviving row
+	// carries, and the walk still answered ok (S09-6 / Z10-9). Comparing the two
+	// costs nothing and is the strongest check available without an external
+	// anchor. An attacker who can also rewrite head_hash is the documented
+	// unanchored boundary, unchanged.
+	if v.Chained > 0 && !bytes.Equal(prev, head) {
+		v.OK = false
+		v.Reason = "the chain head does not match the last chained row: rows were removed from the end of the chain"
+		return v, nil
+	}
 	if v.Chained == 0 && len(head) != 0 {
 		// The head advanced, so rows were chained, yet none of them read as
 		// chained. That is exactly what clearing the chain columns produces, and
@@ -360,8 +404,9 @@ func (l *AuditLogger) Verify(ctx context.Context) (audit.Verification, error) {
 
 // Head returns the chain's current head hash. It is the value an external anchor
 // publishes: handed to a system outside this database, it makes a truncated tail
-// detectable — the one thing Verify cannot see on its own (see the note in
-// migration 0013). A log whose head is still the genesis returns an empty slice.
+// detectable even against an attacker who rewrites head_hash as well — the one
+// thing Verify cannot see on its own (see the note in migration 0013). A log whose
+// head is still the genesis returns an empty slice.
 func (l *AuditLogger) Head(ctx context.Context) ([]byte, error) {
 	var head []byte
 	if err := l.pool.QueryRow(ctx, `SELECT head_hash FROM audit_chain WHERE only_row`).Scan(&head); err != nil {
@@ -386,7 +431,8 @@ func newAuditLogger(pool *pgxpool.Pool, key []byte) (*AuditLogger, error) {
 	l := &AuditLogger{
 		pool:  pool,
 		key:   append([]byte(nil), key...),
-		cache: make(map[string][]byte, 64),
+		now:   time.Now,
+		cache: make(map[string]cachedSubjectKey, 64),
 	}
 	l.batch = newAuditBatcher(l.appendBatch)
 	return l, nil

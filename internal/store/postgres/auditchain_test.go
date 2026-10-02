@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -375,6 +376,16 @@ func TestAuditVerifyCountsLegacyRows(t *testing.T) {
 		VALUES (now(), 'legacy.event', 'usr_old', '', 'ok', '{}')`); err != nil {
 		t.Fatal(err)
 	}
+	// Install the seal migration 0030 computes — the highest id present when the
+	// chain was sealed. A NULL-hash row past it is a FORGED row now (Z10-2), so a
+	// test that means "this row is migration-era" has to record the same bound the
+	// migration would have.
+	if _, err := db.pool.Exec(ctx, `
+		UPDATE audit_chain
+		   SET legacy_ceiling_id = COALESCE((SELECT max(id) FROM audit_events WHERE row_hash IS NULL), 0)
+		 WHERE only_row`); err != nil {
+		t.Fatal(err)
+	}
 	if err := logger.Record(ctx, audit.Event{
 		Action: "oauth.token", Subject: "usr_new", Outcome: audit.OutcomeOK,
 	}); err != nil {
@@ -417,5 +428,79 @@ func TestAuditVerifyRejectsAnUnchainedRowAfterTheChain(t *testing.T) {
 	}
 	if v.OK {
 		t.Fatal("an unchained row inserted after the chain began verified")
+	}
+}
+
+// TestAuditVerifyRejectsAnUnchainedRowPastTheLegacyCeiling: the id ceiling
+// migration 0030 records is what separates a migration-era row (NULL hash, an id
+// that existed when the chain was sealed) from a forged unsigned row inserted
+// later (Z10-2). Without it, "NULL hash" was the only test and any unsigned row
+// passed as legacy.
+func TestAuditVerifyRejectsAnUnchainedRowPastTheLegacyCeiling(t *testing.T) {
+	db := openTestDB(t)
+	logger := openAudit(t, db)
+	ctx := context.Background()
+
+	// A genuine pre-chain row, sealed as such.
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO audit_events (occurred_at, action, subject, provider, outcome, detail)
+		VALUES (now(), 'legacy.event', 'usr_old', '', 'ok', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.pool.Exec(ctx,
+		`UPDATE audit_chain SET legacy_ceiling_id = (SELECT max(id) FROM audit_events) WHERE only_row`); err != nil {
+		t.Fatal(err)
+	}
+	// The forged row: no hash, and an id past the ceiling because the serial keeps
+	// climbing. It is the shape that used to verify as legacy.
+	if _, err := db.pool.Exec(ctx, `
+		INSERT INTO audit_events (occurred_at, action, subject, provider, outcome, detail)
+		VALUES (now(), 'forged.event', 'usr_attacker', '', 'ok', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := logger.Verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.OK {
+		t.Fatal("an unsigned row inserted past the legacy ceiling verified")
+	}
+	if !strings.Contains(v.Reason, "legacy ceiling") {
+		t.Errorf("reason = %q, want the ceiling check to fail", v.Reason)
+	}
+}
+
+// TestAuditVerifyRejectsATruncatedTail is the runtime half of S09-6 and Z10-9:
+// deleting rows from the END of the chain leaves the head pointing at a hash no
+// surviving row carries. Before the comparison the walk answered ok, because the
+// surviving rows still linked to each other.
+func TestAuditVerifyRejectsATruncatedTail(t *testing.T) {
+	db := openTestDB(t)
+	logger := openAudit(t, db)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := logger.Record(ctx, audit.Event{
+			Action: "test.event", Subject: "usr_1", Outcome: audit.OutcomeOK,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.pool.Exec(ctx,
+		`DELETE FROM audit_events WHERE id = (SELECT max(id) FROM audit_events)`); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := logger.Verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.OK {
+		t.Fatal("a truncated tail verified: the chain head points at a hash no surviving row carries " +
+			"(S09-6, Z10-9)")
+	}
+	if !strings.Contains(v.Reason, "chain head") {
+		t.Errorf("reason = %q, want the head comparison to fail", v.Reason)
 	}
 }

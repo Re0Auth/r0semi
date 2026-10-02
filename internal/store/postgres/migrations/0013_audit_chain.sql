@@ -19,9 +19,11 @@
 --   * deleting a row mid-chain -> the next row's prev_hash points at nothing
 --   * reordering rows          -> same, the linkage breaks
 --   * rewriting the whole chain -> the signatures cannot be forged without the key
---   * deleting rows from the END -> NOT caught. Truncation is invisible without
---     an external anchor (shipping the head to a separate system). Noted in
---     docs/architecture.md §4.16.
+--   * deleting rows from the END -> the chain head still names the last row that
+--     was written, so Verify compares the tail it walked to head_hash and fails on
+--     a plain truncation. An attacker who also rewrites head_hash is invisible
+--     without an external anchor (shipping the head to a separate system). Noted
+--     in docs/architecture.md §4.16.
 --
 -- Rows written before this migration have NULL hashes and are outside the chain;
 -- they are counted as "legacy" by verification rather than pretended to be

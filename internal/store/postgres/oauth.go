@@ -287,13 +287,26 @@ func (s *Tokens) ConsumeRefresh(ctx context.Context, value string) (oauth.Refres
 // DeleteRefresh implements oauth.Store. The value's tombstone goes with it: an
 // explicit revocation of a spent token says the replay signal is no longer wanted
 // for that value.
+//
+// The two deletes share one transaction. Apart, a failure between them left the
+// live row removed and the tombstone armed: the value then reads as "already
+// spent", and the reuse path revoked the whole family of a token the caller had
+// just explicitly revoked (S09-8).
 func (s *Tokens) DeleteRefresh(ctx context.Context, value string) error {
 	hash := oauth.TokenHash(value)
-	if _, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tokens WHERE token_hash = $1`, hash); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `DELETE FROM oauth_refresh_tombstones WHERE token_hash = $1`, hash)
-	return err
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM oauth_refresh_tokens WHERE token_hash = $1`, hash); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM oauth_refresh_tombstones WHERE token_hash = $1`, hash); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // RevokeRefreshFamily implements oauth.Store. One transaction removes the whole
@@ -505,20 +518,33 @@ func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, er
 // there, so an erasure cannot leave a subject's family residue behind — the
 // integration guard TestAccountDeletionLeavesNoOrphans sees the table through
 // information_schema and would fail if that step were dropped.
+// The two deletes share one transaction. An erasure that removed the codes but
+// not the device authorizations (or the reverse) leaves a redeemable capability
+// for an account whose data is supposed to be gone; the count is zero when any
+// statement fails, because the rollback leaves nothing removed (S09-8).
 func (s *Tokens) PurgeLegacySubject(ctx context.Context, subject string) (int, error) {
 	if subject == "" {
 		return 0, errors.New("postgres: subject is required")
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	total := 0
 	for _, q := range []string{
 		`DELETE FROM oauth_codes WHERE subject = $1`,
 		`DELETE FROM oauth_device_authorizations WHERE subject = $1`,
 	} {
-		tag, err := s.pool.Exec(ctx, q, subject)
+		tag, err := tx.Exec(ctx, q, subject)
 		if err != nil {
-			return total, err
+			return 0, err
 		}
 		total += int(tag.RowsAffected())
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
 	}
 	return total, nil
 }

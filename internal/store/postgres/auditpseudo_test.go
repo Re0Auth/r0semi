@@ -5,12 +5,17 @@ import (
 	"context"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Re0Auth/r0semi/audit"
 )
 
 func keyWith(fill byte) *AuditLogger {
-	return &AuditLogger{key: bytes.Repeat([]byte{fill}, 32), cache: map[string][]byte{}}
+	return &AuditLogger{
+		key:   bytes.Repeat([]byte{fill}, 32),
+		now:   time.Now,
+		cache: map[string]cachedSubjectKey{},
+	}
 }
 
 // A stored key that is not the length this package mints must fail the read rather
@@ -140,13 +145,78 @@ func TestPseudonymCacheIsBounded(t *testing.T) {
 	if !usable {
 		t.Fatal("dropping the cache left it unusable")
 	}
-	// A hit after the drop still works: correctness never depends on warmth.
+	// A hit after the trim still works: correctness never depends on warmth.
 	l.remember("usr_x", bytes.Repeat([]byte{2}, 32))
 	l.mu.Lock()
-	cached := l.cache["usr_x"]
+	cached, ok := l.cache["usr_x"]
 	l.mu.Unlock()
-	if cached == nil {
+	if !ok || cached.key == nil {
 		t.Fatal("the cache does not return what was just stored")
+	}
+}
+
+// TestPseudonymCacheTrimsRatherThanResets: at the bound the cache must lose a
+// fraction, not everything. A wholesale reset made every subject in the next
+// burst a miss, which is one to three extra queries each on the vault's
+// fail-closed path (S09-9).
+func TestPseudonymCacheTrimsRatherThanResets(t *testing.T) {
+	l := keyWith(0x5a)
+	for i := 0; i < pseudoCacheMax; i++ {
+		l.remember("usr_"+strconv.Itoa(i), bytes.Repeat([]byte{1}, 32))
+	}
+	l.remember("usr_new", bytes.Repeat([]byte{2}, 32))
+
+	l.mu.Lock()
+	size := len(l.cache)
+	l.mu.Unlock()
+	// The previous behaviour left exactly one entry; a quarter-eviction leaves
+	// roughly three quarters. Any floor well above 1 distinguishes them.
+	if size < pseudoCacheMax/2 {
+		t.Fatalf("the cache held %d entries after trimming at the %d bound: it was reset, not trimmed",
+			size, pseudoCacheMax)
+	}
+	if size > pseudoCacheMax {
+		t.Fatalf("the cache held %d entries, past the %d bound", size, pseudoCacheMax)
+	}
+}
+
+// TestPseudonymCacheEntriesExpire: a TTL is what bounds how long a replica that
+// was NOT told about an erasure keeps resolving the erased subject. Without it the
+// stale key is permanent — a steady-state failure of erasure, not a window (Z10-1).
+func TestPseudonymCacheEntriesExpire(t *testing.T) {
+	l := keyWith(0x5a)
+	current := time.Unix(1_700_000_000, 0)
+	l.now = func() time.Time { return current }
+
+	l.remember("usr_a", bytes.Repeat([]byte{1}, 32))
+	if _, ok := l.cached("usr_a"); !ok {
+		t.Fatal("a fresh entry is not cached")
+	}
+
+	current = current.Add(pseudoCacheTTL - time.Second)
+	if _, ok := l.cached("usr_a"); !ok {
+		t.Fatal("an entry inside its TTL is not cached")
+	}
+
+	current = current.Add(2 * time.Second)
+	if _, ok := l.cached("usr_a"); ok {
+		t.Fatal("a cache entry outlived its TTL: an erasure on another replica would never be observed")
+	}
+}
+
+// TestPseudonymCacheCachesAMiss: the negative answer is cached too, so a subject
+// with no key row is not a database round trip on every call — which is both the
+// per-request query and the "has a pseudonym key" timing difference S11-7 reports.
+func TestPseudonymCacheCachesAMiss(t *testing.T) {
+	l := keyWith(0x5a)
+	l.remember("usr_absent", nil)
+
+	key, ok := l.cached("usr_absent")
+	if !ok {
+		t.Fatal("a cached miss is not reported as cached")
+	}
+	if key != nil {
+		t.Fatalf("a cached miss returned a %d-byte key", len(key))
 	}
 }
 
