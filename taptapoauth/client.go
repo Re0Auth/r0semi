@@ -44,7 +44,7 @@ func newClient(cfg Config, doer httpclient.Doer) *client {
 		tokenEndpoint:      cfg.TokenEndpoint,
 		userInfoEndpoint:   cfg.UserInfoEndpoint,
 		clientID:           cfg.ClientID,
-		doer:               doer,
+		doer:               httpclient.RedirectGuard(doer),
 		now:                time.Now,
 	}
 }

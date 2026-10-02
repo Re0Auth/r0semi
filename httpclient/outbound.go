@@ -359,6 +359,50 @@ func NoCrossHostRedirects(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// RedirectGuard returns d with NoCrossHostRedirects enforced, on top of whatever
+// redirect policy d already had.
+//
+// Adapters that send credentials through an injected Doer cannot trust that
+// Doer's policy: a bare *http.Client follows redirects, and net/http copies every
+// header outside its fixed sensitive set to the new origin, so the custom
+// X-LC-Key / X-LC-Session reach a host the operator never configured, and a
+// 307/308 replays the form body verbatim (S07-1). This wraps the Doer so the
+// refusal happens even when the injected value is not an *http.Client; a policy
+// already on d is still consulted, so the guard only ever adds a refusal.
+func RedirectGuard(d Doer) Doer {
+	if d == nil {
+		return nil
+	}
+	if hc, ok := d.(*http.Client); ok {
+		clone := *hc
+		inner := clone.CheckRedirect
+		clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if err := NoCrossHostRedirects(req, via); err != nil {
+				return err
+			}
+			if inner != nil {
+				return inner(req, via)
+			}
+			return nil
+		}
+		return &clone
+	}
+	// A Doer is a single round trip, so it can be driven by a client whose own
+	// policy then applies to every hop.
+	return &http.Client{
+		Transport:     doerTransport{next: d},
+		CheckRedirect: NoCrossHostRedirects,
+	}
+}
+
+// doerTransport drives a Doer from an *http.Client, so redirects a non-client
+// Doer reports are still judged by that client's policy.
+type doerTransport struct{ next Doer }
+
+func (t doerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.next.Do(req)
+}
+
 // NewOutboundClient builds the hardened client the data plane uses: a pooled
 // transport, a per-request deadline, and a global in-flight cap. It is a plain
 // *http.Client, so it satisfies Doer and can also be handed to code that wants a

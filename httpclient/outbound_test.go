@@ -398,3 +398,35 @@ func TestDenyPrivateTargetJudgesTheTargetAddress(t *testing.T) {
 		}
 	}
 }
+
+// RedirectGuard must add the cross-host refusal to a Doer that has none (S07-1),
+// so the credential headers never reach the hop.
+func TestRedirectGuardRefusesCrossHostRedirects(t *testing.T) {
+	var leaked atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-LC-Session") != "" {
+			leaked.Store(true)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	bare := &http.Client{} // CheckRedirect nil: the stdlib default policy
+	guarded := RedirectGuard(bare)
+	req, err := http.NewRequest(http.MethodPost, origin.URL, strings.NewReader("secret-body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-LC-Session", "tok")
+	if resp, err := guarded.Do(req); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("the guard followed a cross-host redirect")
+	}
+	if leaked.Load() {
+		t.Fatal("a credential header reached the redirect target")
+	}
+}

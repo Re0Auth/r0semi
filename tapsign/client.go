@@ -32,7 +32,7 @@ func newClient(cfg Config, doer httpclient.Doer, logger audit.Logger) *client {
 		base:   strings.TrimRight(cfg.BaseURL, "/"),
 		appID:  cfg.AppID,
 		appKey: cfg.AppKey,
-		doer:   doer,
+		doer:   httpclient.RedirectGuard(doer),
 		audit:  logger,
 	}
 }
