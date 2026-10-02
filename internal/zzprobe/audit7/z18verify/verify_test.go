@@ -9,7 +9,7 @@
 //   - TestZ18vTokenStoreHandsOutTheStoredScopeSlice          (indep. of Z18-3)
 //   - TestZ18vGrantsViewSharesTheStoredScopeSlice            (new, same family)
 //   - TestZ18vZeroRateLimiterNeverRefills                   (Z18 判断 1, runtime)
-//   - TestZ18vDiscoveryFailureKeepsServingTheStaleProvider   (new)
+//   - TestZ18vDiscoveryFailureKeepsServingTheStaleProvider   (Z18v-2 = Z14-4 guard)
 //   - TestZ18vZeroRateLimiterFixtureCannotBeReclaimed        (fixture honesty)
 package zzprobe_z18verify
 
@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -336,29 +337,39 @@ func TestZ18vZeroRateLimiterFixtureCannotBeReclaimed(t *testing.T) {
 
 // ------------------------------------------------------------------ probe 5
 
-// TestZ18vDiscoveryFailureKeepsServingTheStaleProvider is a new hazard in the
-// same function Z18-2 reports (idp.Client.oidcProvider).
+// TestZ18vDiscoveryFailureKeepsServingTheStaleProvider guards the stale-cache
+// ceiling Z14-4 added to idp.Client.oidcProvider.
 //
-// The cache is documented as "at most providerTTL" (idp.go:606-618). That is
-// true only while discovery SUCCEEDS: when a re-discovery fails after a
-// successful one, the failing branch returns the cached provider and does not
-// touch discoveredAt (idp.go:626-633). So a retired/rotated JWKS keeps verifying
-// id_tokens indefinitely — the TTL stops applying exactly when the upstream is
-// telling this client its key set is gone.
+// 【原为发现演示，现为回归守卫】The finding (Z18v-2, the same mechanism as Z14-4:
+// `docs/issues/not-doing.md:52,:133`) was that a failing re-discovery kept
+// serving the cached provider without advancing discoveredAt, so the documented
+// "at most providerTTL" bound stopped applying exactly when the issuer said its
+// key set was gone. It is FIXED: retainOnDiscoveryFailure (idp.go:873-901) keeps
+// the cached provider only while it is younger than providerStaleCeiling*TTL
+// (providerStaleCeiling = 2, idp.go:55) and refuses it — naming the age and the
+// ceiling — past that (docs/issues/fixed.md:50, `4dff4a3`). This probe now
+// guards BOTH halves of that contract against a real discovery endpoint:
 //
-// The probe drives a real idp.Client against a real discovery endpoint: first
-// discovery succeeds and is cached; every later discovery answers non-JSON so
-// oidc.NewProvider fails; a call the TTL would force to re-discover still
-// succeeds from the stale cache. The positive control is the first (successful)
-// login, which proves the fixture reaches discovery at all; a second control
-// (a fresh client against the broken issuer, never cached) must FAIL, which
-// proves the failure is real and not the fixture answering from somewhere else.
+//  1. inside the ceiling, a failing re-discovery still serves the cache, and it
+//     really did re-discover (the request counter moves) rather than taking the
+//     cache-hit branch;
+//  2. past the ceiling, the same failing re-discovery is refused, and the error
+//     is the ceiling refusal rather than some other failure.
+//
+// The fixture used to run with a 1ns TTL so every later call "must" re-discover.
+// That is a bet on the host's monotonic clock, and this Windows host loses it:
+// its minimum non-zero `time.Since` is ~0.53ms, so `time.Since(discoveredAt) <
+// 1ns` measured 0 across the fast path, the call took the cache-hit branch, and
+// the probe reported the fixed behaviour as still broken. The fixture now waits
+// until the clock it is asking about has actually advanced past the boundary.
 func TestZ18vDiscoveryFailureKeepsServingTheStaleProvider(t *testing.T) {
 	var broken atomic.Bool
+	var discoveryCalls atomic.Int64
 	var base string
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		discoveryCalls.Add(1)
 		if broken.Load() {
 			// A discovery document that is not one: the upstream has retired the
 			// key set, or is answering an error page.
@@ -382,6 +393,10 @@ func TestZ18vDiscoveryFailureKeepsServingTheStaleProvider(t *testing.T) {
 	defer issuer.Close()
 	base = issuer.URL
 
+	// providerStaleCeiling is 2 x providerTTL, so this fixture has a 100ms ceiling.
+	const ttl = 50 * time.Millisecond
+	const ceiling = 2 * ttl
+
 	newClient := func(ttl time.Duration) *idp.Client {
 		t.Helper()
 		reg, err := idp.NewRegistry(idp.RegistryConfig{
@@ -404,28 +419,73 @@ func TestZ18vDiscoveryFailureKeepsServingTheStaleProvider(t *testing.T) {
 	}
 
 	// Control A: a never-cached client against the broken issuer must fail. If
-	// it did not, the stale-cache result below would prove nothing.
+	// it did not, the stale-cache results below would prove nothing.
 	broken.Store(true)
-	fresh := newClient(time.Nanosecond)
+	fresh := newClient(ttl)
 	if _, err := fresh.AuthCodeURL(context.Background(), "s", fresh.NewVerifier(), "n"); err == nil {
 		t.Fatal("control failed: discovery against a broken issuer succeeded on a cold cache")
 	}
 	broken.Store(false)
 
-	// A one-nanosecond TTL means every later call must re-discover.
-	c := newClient(time.Nanosecond)
+	// The first login caches the provider. cachedAt is the instant the age below is
+	// measured from; discoveredAt is set just before it, so every age this probe
+	// waits for is a lower bound on what oidcProvider sees.
+	c := newClient(ttl)
 	if _, err := c.AuthCodeURL(context.Background(), "s1", c.NewVerifier(), "n1"); err != nil {
 		t.Fatalf("control failed: the first login could not discover: %v", err)
 	}
+	cachedAt := time.Now()
 
+	// 1. Inside the ceiling: a failing re-discovery must keep serving the cached
+	// provider, and it must really have re-discovered.
 	broken.Store(true)
-	_, err := c.AuthCodeURL(context.Background(), "s2", c.NewVerifier(), "n2")
-	if err != nil {
-		return // re-discovery failed and the call failed: the TTL bound held
+	waitPastClock(t, cachedAt, ttl+20*time.Millisecond)
+	before := discoveryCalls.Load()
+	if _, err := c.AuthCodeURL(context.Background(), "s2", c.NewVerifier(), "n2"); err != nil {
+		t.Fatalf("inside the %s ceiling (ttl=%s) a failing re-discovery must keep serving the cached "+
+			"provider — that retention is half of the Z14-4 fix — got: %v", ceiling, ttl, err)
 	}
-	t.Errorf("NEW: with a 1ns provider TTL and the issuer's discovery answering 500, a call that must " +
-		"re-discover still succeeded. idp.go:626-633 returns the cached provider and does not update " +
-		"discoveredAt on failure, so the documented `at most providerTTL` bound (idp.go:606-613) does " +
-		"not hold once discovery starts failing: the cached keys — and the endpoints pinned from them — " +
-		"are trusted for the life of the process.")
+	if got := discoveryCalls.Load(); got == before {
+		t.Fatalf("the call served the cache without re-discovering (%d -> %d discovery requests), so the "+
+			"retention above is a cache hit and guards nothing", before, got)
+	}
+	t.Logf("inside the ceiling: re-discovery attempted (%d discovery requests) and the cached provider "+
+		"was still served", discoveryCalls.Load())
+
+	// 2. Past the ceiling: the same failing re-discovery must be refused, and the
+	// refusal must be the ceiling, not an unrelated error.
+	waitPastClock(t, cachedAt, ceiling+20*time.Millisecond)
+	before = discoveryCalls.Load()
+	_, err := c.AuthCodeURL(context.Background(), "s3", c.NewVerifier(), "n3")
+	if err != nil {
+		if got := discoveryCalls.Load(); got == before {
+			t.Fatalf("the call failed without re-discovering (%d -> %d discovery requests); the ceiling "+
+				"was not what refused it: %v", before, got, err)
+		}
+		if !strings.Contains(err.Error(), "ceiling") || !strings.Contains(err.Error(), "refusing the stale key set") {
+			t.Fatalf("the stale provider was refused for some other reason than the ceiling: %v", err)
+		}
+		t.Logf("past the ceiling (%s): refused — %v", ceiling, err)
+		return
+	}
+	t.Errorf("NEW: with a %s provider TTL and the issuer's discovery answering 500, a call past the %s "+
+		"ceiling still succeeded. retainOnDiscoveryFailure (idp.go:883-901) must refuse the cached "+
+		"provider once its age reaches providerStaleCeiling*providerTTL (idp.go:55), or the cached keys — "+
+		"and the endpoints pinned from them — are trusted for as long as the outage lasts.", ttl, ceiling)
+}
+
+// waitPastClock blocks until time.Since(since) is at least target, measured by the
+// same monotonic clock idp uses. A plain time.Sleep would be a bet on that clock's
+// resolution; this reads it. The deadline is a net so a frozen clock fails the
+// probe instead of hanging it.
+func waitPastClock(t *testing.T, since time.Time, target time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(target + 10*time.Second)
+	for time.Since(since) < target {
+		if time.Now().After(deadline) {
+			t.Fatalf("the clock did not advance %s within %s; this host cannot time the ceiling probe",
+				target, 10*time.Second)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }

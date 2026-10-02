@@ -10,17 +10,21 @@ import (
 	"testing"
 )
 
-// Z12-9: the pool sizes read from the file are cast to int32 without a range
-// check, so a number the operator typed can become a different number.
+// Z12-9 / Z12V-3 — 原为发现演示，现为回归守卫.
 //
-// cmd/re0auth/config.go:1062-1067 does `out.MaxConns = int32(*section.MaxConns)`
-// (and the same for MinConns). On a 64-bit build `int` holds 2^63-1, so every
-// value above 2^31-1 is silently truncated — the environment path next to it uses
-// strconv.ParseInt(raw, 10, 32) and refuses what does not fit, so the two spellings
-// of the same setting disagree.
+// The finding was that the pool sizes read from the file were cast to int32
+// without a range check (`out.MaxConns = int32(*section.MaxConns)`), so 2^32
+// truncated to 0 and 2^32+1 truncated to 1 and was accepted, while the
+// environment spelling next to it used strconv.ParseInt(..., 32) and refused what
+// did not fit. cmd/re0auth/config.go:1488-1493 now routes both spellings through
+// poolSize, which refuses anything outside int32 by name, and envInt32
+// (config.go:1502-1514) separates "a number that does not fit" (strconv.ErrRange)
+// from "not a number", so the two spellings no longer disagree and the message
+// points at the right problem (Z12V-3).
 //
-// The truncation is invisible in the process: resolvePool validates the truncated
-// value, and a pool of 1 (from 2^32+1) passes "must be at least 1" and starts.
+// The guard asserts both: a file value outside int32 is refused at stage=config
+// with an "out of range" message (not silently truncated), and the environment
+// spelling distinguishes a magnitude error from a syntax error.
 //
 // Proven without a database: the connect step is aimed at 127.0.0.1:1, so a value
 // that survives validation dies at stage=storage (a connection refusal) while a
@@ -36,10 +40,17 @@ func TestZ12PoolSizesAreTruncatedToInt32(t *testing.T) {
 		"DATABASE_URL":                    "postgres://z12u:z12p@127.0.0.1:1/z12db?sslmode=disable",
 	}
 
-	run := func(t *testing.T, body string) runResult {
+	run := func(t *testing.T, extra map[string]string, body string) runResult {
 		t.Helper()
+		env := map[string]string{}
+		for k, v := range base {
+			env[k] = v
+		}
+		for k, v := range extra {
+			env[k] = v
+		}
 		path := writeConfig(t, "pool.toml", serverOnly+body)
-		return runBinary(t, base, "-config", path)
+		return runBinary(t, env, "-config", path)
 	}
 	// min_conns = 0 throughout, so the default min_conns (2) cannot be what
 	// refuses a max_conns that truncates to a small number: the two checks have to
@@ -53,39 +64,55 @@ func TestZ12PoolSizesAreTruncatedToInt32(t *testing.T) {
 
 	// Controls. 0 is refused (the validation runs at all), 16 is accepted and the
 	// run moves on to the connection attempt.
-	if got := run(t, maxConns(0)); !strings.Contains(got.out, "stage=config") ||
+	if got := run(t, nil, maxConns(0)); !strings.Contains(got.out, "stage=config") ||
 		!strings.Contains(got.out, "max_conns") {
 		t.Fatalf("control failed: max_conns = 0 was not refused at the config stage:\n%s", got.out)
 	}
-	if got := run(t, maxConns(16)); !strings.Contains(got.out, "stage=storage") {
+	if got := run(t, nil, maxConns(16)); !strings.Contains(got.out, "stage=storage") {
 		t.Fatalf("control failed: max_conns = 16 did not reach the storage stage:\n%s", got.out)
 	}
 
-	// Mechanism: 2^32 truncates to 0 and is refused as if the operator had typed
-	// 0, which is the truncation made visible.
-	if got := run(t, maxConns(1<<32)); !strings.Contains(got.out, "stage=config") ||
-		!strings.Contains(got.out, "max_conns must be at least 1") {
-		t.Fatalf("2^32 in max_conns was not reported as 0, so the truncation premise is wrong:\n%s", got.out)
+	// Subject (file path): every value outside int32 is refused by name at the
+	// config stage. 2^32 used to truncate to 0 and 2^32+1 to 1 (the latter was
+	// accepted silently); both must now be "out of range".
+	for _, tc := range []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"max_conns = 2^32", maxConns(1 << 32), "max_conns"},
+		{"max_conns = 2^32+1", maxConns(1<<32 + 1), "max_conns"},
+		{"min_conns = 2^32", minConns(1 << 32), "min_conns"},
+		{"min_conns = 2^32+1", minConns(1<<32 + 1), "min_conns"},
+	} {
+		got := run(t, nil, tc.body)
+		if !strings.Contains(got.out, "stage=config") {
+			t.Errorf("%s was accepted (reached %s) instead of being refused at the config stage: "+
+				"the truncation is back, or the range check stopped running:\n%s",
+				tc.name, stageOf(got.out), got.out)
+			continue
+		}
+		if !strings.Contains(got.out, "out of range") || !strings.Contains(got.out, tc.field) {
+			t.Errorf("%s was refused, but not with an %q message naming %s:\n%s",
+				tc.name, "out of range", tc.field, oneLine(got.out))
+			continue
+		}
+		t.Logf("%s refused at the config stage: %s", tc.name, oneLine(got.out))
 	}
 
-	// The finding: 2^32+1 truncates to 1 and is accepted. The operator asked for
-	// 4294967297 connections and got one, with nothing said.
-	got := run(t, maxConns(1<<32+1))
-	if !strings.Contains(got.out, "stage=config") {
-		t.Errorf("max_conns = 4294967297 was accepted (it reached stage=storage, i.e. it was read as 1) "+
-			"instead of being refused as out of range:\n%s", got.out)
+	// Subject (environment path, Z12V-3): a magnitude error must not be reported
+	// as "not an integer" — that sends the operator looking for a typo.
+	envBody := maxConns(16)
+	if got := run(t, map[string]string{"RE0AUTH_STORAGE_MAX_CONNS": "4294967296"}, envBody); !strings.Contains(got.out, "out of range") {
+		t.Errorf("RE0AUTH_STORAGE_MAX_CONNS=4294967296 was not refused as out of range (Z12V-3); "+
+			"a magnitude error must not read like a syntax error:\n%s", got.out)
 	} else {
-		t.Logf("max_conns = 4294967297 was refused: %s", oneLine(got.out))
+		t.Logf("RE0AUTH_STORAGE_MAX_CONNS=4294967296: %s", oneLine(got.out))
 	}
-
-	// min_conns shows the other direction: 2^32 truncates to 0, which is a legal
-	// value, so it is silently accepted as "no warm connections".
-	gotMin := run(t, minConns(1<<32))
-	if strings.Contains(gotMin.out, "stage=config") {
-		t.Logf("min_conns = 2^32 was refused")
+	if got := run(t, map[string]string{"RE0AUTH_STORAGE_MAX_CONNS": "not-a-number"}, envBody); !strings.Contains(got.out, "not an integer") {
+		t.Errorf("RE0AUTH_STORAGE_MAX_CONNS=not-a-number was not refused as a syntax error:\n%s", got.out)
 	} else {
-		t.Errorf("min_conns = 4294967296 was accepted as 0 warm connections instead of being refused "+
-			"as out of range (reached stage=storage):\n%s", gotMin.out)
+		t.Logf("RE0AUTH_STORAGE_MAX_CONNS=not-a-number: %s", oneLine(got.out))
 	}
 }
 

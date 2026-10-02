@@ -393,11 +393,13 @@ jobs:
             exit 1
           }
 
-      # One pass over every tagged file: it compiles all three tag sets at once,
-      # so a probe that no longer builds fails here even when its package is not
-      # (yet) on an allowlist below.
+      # One pass over every tagged file: it compiles every tag set at once, so a
+      # probe that no longer builds fails here even when its package is not (yet)
+      # on an allowlist below. `audit` and `protocolaudit` are included because
+      # z16guardtestquality checks that no tagged test file is unreachable from
+      # CI; without them the oidchttp protocol-audit files are orphans.
       - name: go vet (tagged probes)
-        run: go vet -tags audit5,audit6,audit7,conformance ./...
+        run: go vet -tags audit5,audit6,audit7,conformance,audit,protocolaudit ./...
 
       - name: go test -tags audit5
         run: |

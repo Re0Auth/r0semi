@@ -110,13 +110,19 @@ func TestZ07SessionCookieShapeOverARealServer(t *testing.T) {
 	}
 }
 
-// TestZ07SignOutAnswersForbiddenToARequestThatHasNoSession records an
-// inconsistency the plane's own contract makes visible: every other write on the
-// account answers 401 "unauthenticated" to a caller with no session, while
-// POST /v1/sessions/sign_out answers 403 "missing or invalid CSRF token" —
-// because it checks CSRF before it checks the session. No CSRF token can exist
-// without a session, so the 403 branch is the only one an anonymous caller can
-// reach.
+// TestZ07SignOutAnswersForbiddenToARequestThatHasNoSession — 原为发现演示，现为回归守卫.
+//
+// It used to record an inconsistency the plane's own contract made visible: every
+// other write on the account answered 401 "unauthenticated" to a caller with no
+// session, while POST /v1/sessions/sign_out answered 403 "missing or invalid CSRF
+// token", because it checked CSRF before the session. No CSRF token can exist
+// without a session, so the 403 branch was the only one an anonymous caller could
+// reach (Z07-6).
+//
+// The endpoint now checks the session first and answers 401 like every other
+// unauthenticated write. This probe is the regression guard for that ordering: an
+// anonymous sign_out is refused as unauthenticated and must NOT be answered 403
+// for a CSRF token the caller could never have obtained.
 func TestZ07SignOutAnswersForbiddenToARequestThatHasNoSession(t *testing.T) {
 	env := newProbeEnv(t, probeOptions{})
 	b := env.newBrowser()
@@ -128,16 +134,15 @@ func TestZ07SignOutAnswersForbiddenToARequestThatHasNoSession(t *testing.T) {
 	jsonHdr := map[string]string{"Content-Type": "application/json"}
 
 	cases := []struct {
-		name  string
-		p     probe
-		want  int
-		note  string
-		other bool
+		name string
+		p    probe
+		want int
+		note string
 	}{
 		{
-			name: "sign_out", want: http.StatusForbidden, other: true,
+			name: "sign_out", want: http.StatusUnauthorized,
 			p:    probe{http.MethodPost, "/v1/sessions/sign_out", "", nil},
-			note: "CSRF is checked before the session",
+			note: "the session is checked before CSRF (Z07-6)",
 		},
 		{
 			name: "delete_account", want: http.StatusUnauthorized,
@@ -175,8 +180,11 @@ func TestZ07SignOutAnswersForbiddenToARequestThatHasNoSession(t *testing.T) {
 		t.Logf("%s = %d as expected", tc.name, got)
 	}
 	if signOutStatus == http.StatusForbidden {
-		t.Errorf("POST /v1/sessions/sign_out with no session at all = 403 (CSRF), while every other " +
-			"account write = 401 (unauthenticated): the endpoint's refusal is ordered the other way round")
+		t.Errorf("POST /v1/sessions/sign_out with no session at all = 403 (CSRF): the endpoint must " +
+			"refuse an anonymous caller as unauthenticated, because no CSRF token can exist without a session")
+	}
+	if signOutStatus != http.StatusUnauthorized {
+		t.Errorf("POST /v1/sessions/sign_out with no session = %d, want 401 unauthenticated", signOutStatus)
 	}
 }
 

@@ -2,10 +2,13 @@ package federation
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -159,6 +162,135 @@ func TestRawPathIsNormalizedBeforeItIsSent(t *testing.T) {
 	if res.Status != http.StatusOK {
 		t.Fatalf("status = %d, want 200: the path was not normalized", res.Status)
 	}
+}
+
+// rawCodingSource answers every raw path with body under the given
+// Content-Encoding (empty for identity) and records the Accept-Encoding the
+// request carried, so a probe can see what the source was actually asked for.
+func rawCodingSource(t *testing.T, coding string, body []byte) (*httptest.Server, func() string) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = r.Header.Get("Accept-Encoding")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if coding != "" {
+			w.Header().Set("Content-Encoding", coding)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return seen
+	}
+}
+
+// TestRawAsksTheSourceForIdentity (W4 regression guard): the passthrough must
+// pick Accept-Encoding itself. Left unset, net/http's transport adds
+// `Accept-Encoding: gzip` and then transparently decodes a gzip response,
+// deleting its Content-Encoding — so RawResult.Body would stop being the
+// source's bytes, silently. Asking for identity is what keeps the transport
+// from rewriting the representation behind this package's back.
+func TestRawAsksTheSourceForIdentity(t *testing.T) {
+	srv, seen := rawCodingSource(t, "", []byte(`{"native":true}`))
+	svc, _ := rawService(t, srv, srv.URL, StatusActive)
+
+	res, err := svc.Raw(context.Background(), RawRequest{
+		User: "usr_1", Game: game, Source: sourceName, Path: "x",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Body) != `{"native":true}` {
+		t.Fatalf("body = %q", res.Body)
+	}
+	if got := seen(); got != "identity" {
+		t.Fatalf("the source was asked for Accept-Encoding %q, want identity: the transport would negotiate "+
+			"a coding and decode it transparently", got)
+	}
+}
+
+// TestRawCarriesTheSourceContentEncoding (W4 regression guard): the source's
+// content coding is part of the representation the bytes belong to, so
+// RawResult must carry both together. A caller that writes Body without the
+// coding hands the client an undecodable response; a compressor in front of it
+// reads the coding to know a >1 KiB body is already encoded.
+func TestRawCarriesTheSourceContentEncoding(t *testing.T) {
+	fetch := func(t *testing.T, coding string, body []byte) RawResult {
+		t.Helper()
+		srv, _ := rawCodingSource(t, coding, body)
+		svc, _ := rawService(t, srv, srv.URL, StatusActive)
+		res, err := svc.Raw(context.Background(), RawRequest{
+			User: "usr_1", Game: game, Source: sourceName, Path: "x",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	t.Run("gzip is forwarded still encoded", func(t *testing.T) {
+		payload := []byte(`{"native":true,"field":1}`)
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		gz := buf.Bytes()
+
+		res := fetch(t, "gzip", gz)
+		if res.ContentEncoding != "gzip" {
+			t.Fatalf("ContentEncoding = %q, want gzip", res.ContentEncoding)
+		}
+		// The transport must not have decoded the body behind the label.
+		if !bytes.Equal(res.Body, gz) {
+			t.Fatalf("body = %d bytes, want the source's %d gzip bytes", len(res.Body), len(gz))
+		}
+		zr, err := gzip.NewReader(bytes.NewReader(res.Body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer zr.Close()
+		out, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(out, payload) {
+			t.Fatalf("one gunzip = %q, want %q", out, payload)
+		}
+	})
+
+	t.Run("an opaque coding is forwarded unlabelled", func(t *testing.T) {
+		// zstd stands in for a coding net/http's transport does not decode; the
+		// bytes only have to survive the trip, which is the point — before the
+		// fix the header was dropped while these bytes went out as identity.
+		raw := []byte("28 b5 2f fd opaque zstd bytes")
+		res := fetch(t, "zstd", raw)
+		if res.ContentEncoding != "zstd" {
+			t.Fatalf("ContentEncoding = %q, want zstd", res.ContentEncoding)
+		}
+		if !bytes.Equal(res.Body, raw) {
+			t.Fatalf("body = %q, want the source's bytes %q", res.Body, raw)
+		}
+	})
+
+	t.Run("an identity source carries no coding", func(t *testing.T) {
+		res := fetch(t, "", []byte("plain text"))
+		if res.ContentEncoding != "" {
+			t.Fatalf("ContentEncoding = %q, want empty for an identity source", res.ContentEncoding)
+		}
+		if string(res.Body) != "plain text" {
+			t.Fatalf("body = %q", res.Body)
+		}
+	})
 }
 
 func TestCleanRawPath(t *testing.T) {

@@ -289,8 +289,15 @@ func TestZ06GameAndSourceParamsCannotSmuggleARoute(t *testing.T) {
 // This is filed; the probes here pin the two SAFE halves — the spelling is
 // never admitted as a fresh request, and every refusal stays in the plane of
 // the path as sent.
+//
+// The protocol-plane half needs the REAL provider: the stub OIDC handler answers
+// every method with 200, so it cannot show the verb matrix's 405 that proves the
+// request was admitted rather than throttled.
 func TestZ06LimiterKeyStaysOnThePlaneOfThePathAsSent(t *testing.T) {
+	clients := oauth.NewMemoryClientRegistry()
+	op, _ := newRealOP(t, clients)
 	h := edgeServer(t, func(c *httpapi.Config) {
+		c.OIDC = op
 		c.Limiter = ratelimit.New(noRefill, 1)
 	}).Handler()
 
@@ -328,7 +335,9 @@ func TestZ06LimiterKeyStaysOnThePlaneOfThePathAsSent(t *testing.T) {
 	}
 	assertPlaneShape(t, "business", rec)
 
-	// And the protocol plane has its own bucket (documented design).
+	// And the protocol plane has its own bucket (documented design): the same
+	// spent address is still admitted here and answered by the protocol plane's
+	// own verb matrix, not by the limiter.
 	if rec := get(fresh, "/oauth/token"); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("first /oauth/token GET = %d, want 405 (own bucket, still admitted)", rec.Code)
 	}

@@ -198,37 +198,80 @@ func TestA1_EmptyOrWrongSecretRefused(t *testing.T) {
 	}
 }
 
-// KIT finding: HTTP Basic and the form body can declare two different client
-// identities at once, and neither is cross-checked.
+// KIT-2 (FIXED): HTTP Basic and the form body could declare two different client
+// identities at once, and neither was cross-checked. RFC 6749 §2.3 permits
+// exactly one.
+//
+// 【原为发现演示，现为回归守卫】The probe used to drive the vulnerable shape and
+// fail on the 200 it produced. oauth.ClientCredentials now implements "one
+// request, one identity": when Basic and the form disagree it returns empty
+// credentials, which every caller treats as unauthenticated
+// (oauth/http.go:37-58; docs/issues/P2-medium.md KIT-2, guard
+// oauth/http_test.go:TestClientCredentialsRefusesTwoDisagreeingIdentities). The
+// probe now asserts that refusal and keeps the success path as its vacuity
+// control.
 func TestA2_FormAndBasicMayDisagree(t *testing.T) {
 	base, svc, _, _ := newKit(t, true)
+
+	exchange := func(code, basicID, basicSecret, formID, formSecret string) (int, string) {
+		t.Helper()
+		form := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {code},
+			"redirect_uri":  {confRedirect},
+			"code_verifier": {probeVerifier},
+		}
+		if formID != "" {
+			form.Set("client_id", formID)
+		}
+		if formSecret != "" {
+			form.Set("client_secret", formSecret)
+		}
+		req, _ := http.NewRequest(http.MethodPost, base+"/oauth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if basicID != "" {
+			req.SetBasicAuth(basicID, basicSecret)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, strings.TrimSpace(string(body))
+	}
+
+	// The disagreement: Basic identifies conf; the form claims pub (a public
+	// client, so its "secret" is not checkable) with the WRONG secret.
 	code := issueCode(t, svc, confClientID, confRedirect, probeVerifier, accountScope)
+	status, body := exchange(code, confClientID, confSecret, pubClientID, "not-the-secret")
+	t.Logf("Basic=conf + form=pub(wrong secret) -> %d %s", status, body)
+	if status == http.StatusOK {
+		t.Errorf("two client identities in one request were accepted; RFC 6749 §2.3 permits exactly one")
+	}
+	if !strings.Contains(body, "invalid_client") {
+		t.Errorf("the two-identity refusal does not read as invalid_client: %s", body)
+	}
 
-	// Basic identifies conf; the form claims pub and hands over the WRONG
-	// secret. The public client has no secret hash, so nothing is checked.
-	form := url.Values{
-		"grant_type":    {"authorization_code"},
-		"code":          {code},
-		"redirect_uri":  {confRedirect},
-		"code_verifier": {probeVerifier},
-		"client_id":     {pubClientID},
-		"client_secret": {"not-the-secret"},
+	// Anti-vacuity controls, on the same surface: ONE identity still works, both
+	// as Basic alone and as a Basic+form pair that agrees. That is what makes the
+	// refusal above about the disagreement rather than a broken endpoint.
+	controls := []struct {
+		name                 string
+		basicID, basicSecret string
+		formID, formSecret   string
+	}{
+		{"Basic only", confClientID, confSecret, "", ""},
+		{"Basic and an agreeing form", confClientID, confSecret, confClientID, confSecret},
 	}
-	req, _ := http.NewRequest(http.MethodPost, base+"/oauth/token", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(confClientID, confSecret)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range controls {
+		control := issueCode(t, svc, confClientID, confRedirect, probeVerifier, accountScope)
+		status, body := exchange(control, tc.basicID, tc.basicSecret, tc.formID, tc.formSecret)
+		t.Logf("control %s -> %d %s", tc.name, status, truncate(body, 120))
+		if status != http.StatusOK {
+			t.Errorf("control %q did not reach the success path (%d): %s", tc.name, status, body)
+		}
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	t.Logf("Basic=conf + form=pub(wrong secret) -> %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("vacuity: the request never reached the success path (%d)", resp.StatusCode)
-	}
-	t.Errorf("two client identities in one request were accepted; RFC 6749 §2.3 permits exactly one")
 }
 
 // A public client may present any client_secret and it is ignored rather than a
@@ -1084,6 +1127,19 @@ func TestE6b_BodyLimitHasNoBypass(t *testing.T) {
 }
 
 // The discovery documents carry no cache directive.
+//
+// STILL-OPEN (KIT-9) — real, unfixed, and deliberately left red as the evidence.
+// Mechanism: upstreamkit's two well-known handlers
+// (upstreamkit/server.go:144-145) write no Cache-Control at all; the only
+// Cache-Control writes in that package are on other endpoints
+// (upstreamkit/server.go:284, :305, :477 all set no-store). The gap is recorded
+// as KIT-9 (docs/audit-5/findings/_fragment_kit.md:354), was re-attributed as an
+// existing KNOWN-OPEN rather than a new finding
+// (docs/audit-7/findings/22-audit5-red-reconciliation.md:56), and appears in the
+// "do not re-report" ledger (docs/issues/not-doing.md:145).
+//
+// Do NOT delete or soften the assertion to make the suite green: the fix belongs
+// in upstreamkit, which is out of this pass's scope (production code).
 func TestE7_DiscoveryCacheHeaders(t *testing.T) {
 	base, _, _, _ := newKit(t, false)
 	for _, path := range []string{
@@ -1585,13 +1641,25 @@ func TestF3_ConformanceFailsAnUnauthenticatedCascade(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Revocation: an unknown token is idempotent success, somebody else's token is
-// refused, and the owner can revoke. The controls come first.
+// also answered success but is not deleted, and the owner can revoke. The
+// controls come first.
+//
+// 【原为发现演示，现为回归守卫】G-8 (4dff4a3) removed the liveliness oracle: the
+// response must not distinguish "someone else's live token" from "an unknown
+// string" (docs/issues/P2-medium.md G-8, docs/issues/fixed.md:79). RFC 7009 §2.2
+// says a successful revocation response is 200 even for an invalid token, so both
+// cases now return nil. Ownership is enforced by SILENCE — the other client's
+// token is simply not deleted — which the introspect assertions below pin. Client
+// authentication is still enforced, pinned by the wrong-secret case.
 func TestG1_RevocationOwnership(t *testing.T) {
 	svc, _, _, _ := newAS(t)
 	ctx := context.Background()
-	tok := mint(t, svc, confClientID, confSecret, confRedirect, accountScope)
-	pub := mint(t, svc, pubClientID, "", pubRedirect, accountScope)
+	confTok := mint(t, svc, confClientID, confSecret, confRedirect, accountScope)
+	pubTok := mint(t, svc, pubClientID, "", pubRedirect, accountScope)
 
+	// The response shape must not distinguish an unknown string from another
+	// client's live token; the only case that may still error is a failed CLIENT
+	// authentication (wrong secret), so client auth is shown to be live.
 	cases := []struct {
 		name        string
 		clientID    string
@@ -1600,11 +1668,10 @@ func TestG1_RevocationOwnership(t *testing.T) {
 		wantErrCode string
 	}{
 		{"unknown token", confClientID, confSecret, "no-such-token", ""},
-		{"other client's access token", pubClientID, "", tok.AccessToken, "invalid_client"},
-		{"other client's refresh token", pubClientID, "", tok.RefreshToken, "invalid_client"},
-		{"own access token", confClientID, confSecret, tok.AccessToken, ""},
-		{"own refresh token", confClientID, confSecret, tok.RefreshToken, ""},
-		{"wrong secret", confClientID, "bad", tok.AccessToken, "invalid_client"},
+		{"other client's token (public actor)", pubClientID, "", confTok.AccessToken, ""},
+		{"other client's refresh token (public actor)", pubClientID, "", confTok.RefreshToken, ""},
+		{"other client's token (confidential actor)", confClientID, confSecret, pubTok.AccessToken, ""},
+		{"wrong secret", confClientID, "bad", confTok.AccessToken, "invalid_client"},
 	}
 	for _, tc := range cases {
 		err := svc.Revoke(ctx, oauth.RevokeRequest{ClientID: tc.clientID, ClientSecret: tc.secret, Token: tc.token})
@@ -1615,27 +1682,45 @@ func TestG1_RevocationOwnership(t *testing.T) {
 		if got != tc.wantErrCode {
 			t.Errorf("%s: revoke returned %q, want %q", tc.name, got, tc.wantErrCode)
 		}
-		t.Logf("%-28s -> %q", tc.name, got)
+		t.Logf("%-46s -> %q", tc.name, got)
 	}
 
-	// After its owner revoked it, the access token must be dead.
-	info, err := svc.Introspect(ctx, tok.AccessToken)
+	// Ownership is enforced by silence, in BOTH directions: the cross-client
+	// attempts above returned success but must not have deleted anything. This is
+	// the half the old probe left vacuous — it only ever introspected a token that
+	// no case had targeted.
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"conf's token after a public client tried to revoke it", confTok.AccessToken},
+		{"pub's token after the confidential client tried to revoke it", pubTok.AccessToken},
+	} {
+		info, err := svc.Introspect(ctx, tc.token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("introspect %s: active=%v", tc.name, info.Active)
+		if !info.Active {
+			t.Errorf("%s: the revoke attempt killed the token anyway", tc.name)
+		}
+	}
+
+	// And the owner can still revoke its own token.
+	for _, token := range []string{confTok.AccessToken, confTok.RefreshToken} {
+		if err := svc.Revoke(ctx, oauth.RevokeRequest{
+			ClientID: confClientID, ClientSecret: confSecret, Token: token,
+		}); err != nil {
+			t.Fatalf("owner revoke: %v", err)
+		}
+	}
+	info, err := svc.Introspect(ctx, confTok.AccessToken)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("introspect of the revoked access token: active=%v", info.Active)
+	t.Logf("introspect of conf's own revoked access token: active=%v", info.Active)
 	if info.Active {
 		t.Errorf("a revoked access token still introspects as Active")
-	}
-	// And the public client's token, which the confidential client tried to
-	// revoke, must still be alive.
-	info, err = svc.Introspect(ctx, pub.AccessToken)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("introspect of the OTHER client's token after the failed revoke: active=%v", info.Active)
-	if !info.Active {
-		t.Errorf("another client's failed revoke attempt killed the token anyway")
 	}
 }
 

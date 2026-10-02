@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -48,6 +49,28 @@ func asExitError(err error, target **exec.ExitError) bool {
 		*target = ee
 	}
 	return ok
+}
+
+// loadLiveSeconds / loadLiveWorkers drive the live capacity profile both Z16
+// probes below execute. They have to clear TestLoadProfile's own floor
+// (`total < 100`, internal/httpapi/load_test.go:161): these probes are about the
+// `-run` mechanism and the anti-vacuity marker, and a fixture that trips the
+// harness's floor turns the marker control into a false red. The previous
+// fixture (1s x 1 worker) measured 72-74 requests on this Windows host — under
+// the floor — while the profile itself is healthy (2s x 4 workers measured 624,
+// 312 req/s); 3s x 4 workers expects ~900, a >4x margin against a runner several
+// times slower than this one.
+const (
+	loadLiveSeconds = 3
+	loadLiveWorkers = 4
+)
+
+func loadLiveEnv() []string {
+	return []string{
+		"RE0AUTH_LOAD_PROFILE=1",
+		"RE0AUTH_LOAD_SECONDS=" + strconv.Itoa(loadLiveSeconds),
+		"RE0AUTH_LOAD_WORKERS=" + strconv.Itoa(loadLiveWorkers),
+	}
 }
 
 // TestTaggedTypeErrorsAreInvisibleToTheDefaultGates is the positive control for
@@ -124,8 +147,14 @@ func splitJob(t *testing.T, workflow, name string) string {
 // TestLoadJobMechanismIsLiveAndTheGapIsReal re-derives Z16-1 end to end without
 // trusting the package under review: the command the job runs is executed, both
 // with the real test name and with a name that matches nothing, and the
-// anti-vacuity marker the neighbouring workflow greps for is checked against the
-// two outputs. The last step is the positive control for `grep -q`.
+// anti-vacuity marker the job greps for is checked against the two outputs. The
+// last step is the positive control for `grep -q`.
+//
+// 【原为发现演示，现为回归守卫】Z16-1 is FIXED — ci.yml's `load` job now pipes
+// `make load` through `tee load.txt` and greps `capacity profile:` out of it
+// (docs/issues/fixed.md:14, docs/issues/P2-medium.md:58; ci.yml:624-632). The
+// mechanism below is what that one line defends, so the probe now also asserts
+// the line is still there: without it the job is green having measured nothing.
 func TestLoadJobMechanismIsLiveAndTheGapIsReal(t *testing.T) {
 	root := repoRoot(t)
 
@@ -136,6 +165,14 @@ func TestLoadJobMechanismIsLiveAndTheGapIsReal(t *testing.T) {
 	load := splitJob(t, string(ci), "load")
 	if !strings.Contains(load, "make load") {
 		t.Fatalf("ci.yml's load job no longer runs `make load`; the finding moved:\n%s", load)
+	}
+	// The regression guard for Z16-1 itself: the job must read a failure signal
+	// out of the command's output. A `-run` that matches nothing is exit 0 with
+	// `no tests to run` (proved below), so the grep is the only thing that makes
+	// "the harness ran" a checked fact.
+	if !strings.Contains(load, "grep -q 'capacity profile:'") {
+		t.Errorf("REGRESSION (Z16-1): ci.yml's `load` job no longer greps the profile line out of "+
+			"`make load`'s output, so it is green with zero measurement again:\n%s", load)
 	}
 
 	mk, err := os.ReadFile(filepath.Join(root, "Makefile"))
@@ -158,8 +195,9 @@ func TestLoadJobMechanismIsLiveAndTheGapIsReal(t *testing.T) {
 		t.Fatalf("the recipe no longer uses `-run TestLoadProfile`; update this probe")
 	}
 	// Strip the env prefix so this can run in-process-ish: go test itself is the
-	// child either way.
-	code, out := run(t, root, []string{"RE0AUTH_LOAD_PROFILE=1", "RE0AUTH_LOAD_SECONDS=1", "RE0AUTH_LOAD_WORKERS=1"},
+	// child either way. The env is the live fixture's, not the Makefile's 10s x 8
+	// defaults: see loadLiveSeconds/loadLiveWorkers.
+	code, out := run(t, root, loadLiveEnv(),
 		"go", "test", "-count=1", "-run", "^TestLoadProfileRenamedAway$", "./internal/httpapi/")
 	if code != 0 {
 		t.Fatalf("control: a -run that matches nothing must exit 0; got %d:\n%s", code, out)
@@ -171,10 +209,10 @@ func TestLoadJobMechanismIsLiveAndTheGapIsReal(t *testing.T) {
 		t.Fatalf("the zero-match run printed the marker, so the grep in perf.yml would not catch it either")
 	}
 
-	// Positive control for the proposed one-line fix: the marker really is on
+	// Positive control for the one-line fix that landed: the marker really is on
 	// stdout of the real invocation, so `grep -q 'capacity profile:'` would pass
 	// there and fail on the zero-match run above.
-	code, out = run(t, root, []string{"RE0AUTH_LOAD_PROFILE=1", "RE0AUTH_LOAD_SECONDS=1", "RE0AUTH_LOAD_WORKERS=1"},
+	code, out = run(t, root, loadLiveEnv(),
 		"go", "test", "-count=1", "-v", "-run", "^TestLoadProfile$", "./internal/httpapi/")
 	if code != 0 {
 		t.Fatalf("the live capacity profile failed, so the marker control is void:\n%s", out)

@@ -209,18 +209,35 @@ func TestZ08RealProcessServesTheShellWithItsOwnPolicy(t *testing.T) {
 	}
 }
 
-// TestZ08RealProcessAnswersAMissingAssetWithTheShell is the same defect as the
-// handler-level probe, observed on the composed binary: a URL under the
-// hashed-asset namespace that names no file is answered with the document, 200.
+// TestZ08RealProcessAnswersAMissingAssetWithTheShell — 原为发现演示，现为回归守卫（按裁定）.
+//
+// The same ruled property as the handler-level probe, observed on the composed
+// binary and recorded at docs/security-audit-7.md:302 and
+// docs/issues/not-doing.md:48 (A-FE-V2): a URL under the hashed-asset namespace
+// naming no file is answered 200 with the document, deliberately.
 func TestZ08RealProcessAnswersAMissingAssetWithTheShell(t *testing.T) {
+	shellResp, shellBody := z08ProcGet(t, http.MethodGet, "/app/", nil)
+	if shellResp.StatusCode != http.StatusOK ||
+		!strings.Contains(shellResp.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("anti-vacuity: the composed binary does not serve the shell as 200 text/html (%d %q)",
+			shellResp.StatusCode, shellResp.Header.Get("Content-Type"))
+	}
+
 	resp, body := z08ProcGet(t, http.MethodGet, "/app/_app/immutable/entry/start.ZZZZZZZZ.js", nil)
 	t.Logf("GET a missing immutable asset -> %d ct=%q cc=%q vary=%q len=%d",
 		resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Cache-Control"),
 		resp.Header.Get("Vary"), len(body))
-	if resp.StatusCode == http.StatusOK {
-		t.Errorf("the composed binary answers a missing hashed asset with %d %q: a deployment whose "+
-			"assets did not ship reports success to every status-code monitor and a MIME error to the browser",
-			resp.StatusCode, resp.Header.Get("Content-Type"))
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("the composed binary answered a missing hashed asset %d, want the ruled 200 shell "+
+			"fallback (docs/security-audit-7.md:302, docs/issues/not-doing.md:48)", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Errorf("the composed binary answered a missing hashed asset %q, want the ruled text/html "+
+			"shell fallback", ct)
+	}
+	if body != shellBody {
+		t.Errorf("the composed binary's answer to a missing hashed asset is not the shell byte-for-byte "+
+			"(missing=%d bytes, shell=%d bytes)", len(body), len(shellBody))
 	}
 }
 

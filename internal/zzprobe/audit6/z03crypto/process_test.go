@@ -40,16 +40,30 @@ func TestProbeKEKEncodingVariantsEachStartTheServer(t *testing.T) {
 }
 
 // TestProbeKEKMalformedValuesRefuseStartup pins the fail-closed side: a KEK
-// with a trailing space, a URL-safe-base64 key, and a short key must each
-// refuse to start, with an error that names the key.
+// with a trailing space, a URL-safe-only base64 key (one whose spelling leaves
+// the standard alphabet), and a short key must each refuse to start, with an
+// error that names the key.
 func TestProbeKEKMalformedValuesRefuseStartup(t *testing.T) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		t.Fatal(err)
 	}
+	// A URL-safe spelling that is genuinely URL-SAFE-ONLY: forcing the first
+	// six-bit group to 111110 makes the first output character '-' in the
+	// URL-safe alphabet ('+' in the standard one), so no standard decoder can
+	// accept it.
+	//
+	// The wider claim — "any RawURLEncoding of 32 bytes must be refused" — is not
+	// a real invariant: when the encoding happens to stay inside the standard
+	// alphabet, it is byte-for-byte a valid RawStdEncoding value of 32 bytes, and
+	// decodeKey32 accepts exactly that. The probe was therefore flaky (about a
+	// quarter of random keys contain no '-' or '_'), and it now pins the
+	// distinguishable shape instead.
+	urlSafeOnly := append([]byte(nil), raw...)
+	urlSafeOnly[0] = 0xFB
 	cases := map[string]string{
 		"trailing space":  base64.StdEncoding.EncodeToString(raw) + " ",
-		"url-safe base64": base64.RawURLEncoding.EncodeToString(raw),
+		"url-safe base64": base64.RawURLEncoding.EncodeToString(urlSafeOnly),
 		"31 bytes":        base64.StdEncoding.EncodeToString(raw[:31]),
 	}
 	for name, encoded := range cases {

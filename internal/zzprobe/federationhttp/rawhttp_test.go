@@ -17,6 +17,15 @@ import (
 
 // zzOneSourceHTTP wires the real HTTP surface with one source that has a raw base
 // and echoes whatever Content-Type it is told to.
+//
+// The scope catalog and the client both carry `<game>.raw.read`, because Z20-2
+// closed the raw asymmetry: a token minted for a resource scope
+// (`phigros.profile.read`) no longer opens the raw passthrough at all — it is
+// refused 403 `scope_not_granted` for `phigros.raw.read` before the raw handler
+// runs (internal/httpapi/federation_routes.go:230-275). The old fixture minted
+// the resource scope only, so this probe was aiming at the scope gate and never
+// reached the success path it claims to inspect. The production composition root
+// registers the raw scope next to the resource scopes; this fixture now does too.
 func zzOneSourceHTTP(t *testing.T, contentType, body string, status int) (base, token string) {
 	t.Helper()
 	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,16 +65,22 @@ func zzOneSourceHTTP(t *testing.T, contentType, body string, status int) (base, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	scopes := oauth.DefaultRegistry()
+	if err := scopes.Register(oauth.Descriptor{
+		Scope: oauth.Scope(oauth.RawScope("phigros")), Title: "raw", Risk: oauth.RiskMedium,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	clients := oauth.NewMemoryClientRegistry()
 	client, err := oauth.NewClient("cli", "CLI", oauth.ClientPublic, "", []string{zzRedirect},
-		[]oauth.Scope{"phigros.profile.read"})
+		[]oauth.Scope{"phigros.profile.read", oauth.Scope(oauth.RawScope("phigros"))})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	opHandler, store := zzOPBackend(t, "https://re0auth.test", clients)
+	opHandler, store := zzOPBackend(t, "https://re0auth.test", clients, scopes)
 	api, err := httpapi.New(httpapi.Config{
 		Issuer: "https://re0auth.test", OIDC: opHandler,
 		TokenIntrospector: opHandler, GrantStore: store, DeviceStore: store,
@@ -76,7 +91,8 @@ func zzOneSourceHTTP(t *testing.T, contentType, body string, status int) (base, 
 	}
 	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(srv.Close)
-	return srv.URL, zzMintToken(t, api.Handler(), store, "cli", "usr_test", "phigros.profile.read")
+	return srv.URL, zzMintToken(t, api.Handler(), store, "cli", "usr_test",
+		"phigros.profile.read", oauth.RawScope("phigros"))
 }
 
 func zzGet(t *testing.T, target, token string) *http.Response {
@@ -98,6 +114,13 @@ func zzGet(t *testing.T, target, token string) *http.Response {
 // source's, and the response is made undangerous with a route-level CSP plus
 // Content-Disposition. This checks the promise holds on the success path and
 // asks what happens on the paths that do not go through the raw handler at all.
+//
+// 【原为发现演示，现为回归守卫】It was red because the fixture minted a resource
+// scope and Z20-2 then made raw require `<game>.raw.read`; the fixture now mints
+// that scope, so the assertions below observe the raw success path instead of the
+// scope gate. What they guard is unchanged: Z20-2 must keep the raw refusal (the
+// sibling probe pins it) and must not cost the raw success path its CSP / nosniff /
+// attachment disposition.
 func TestZZProbeRawResponseHeaderShape(t *testing.T) {
 	base, at := zzOneSourceHTTP(t, "text/html", `<html><body><script>alert(1)</script></body></html>`, http.StatusOK)
 
@@ -151,12 +174,20 @@ func TestZZProbeRawErrorPathsCarryNoSourceBody(t *testing.T) {
 
 // A source that answers 401 makes the data plane return 503; the 401 body must
 // not be forwarded.
+//
+// The body check is unconditional: the old shape only looked at the body when the
+// caller itself got 401, which the data plane never returns here, so the probe
+// passed without ever examining the answer. The status comparison below is what
+// makes it non-vacuous.
 func TestZZProbeRawUpstream401BodyIsNotForwarded(t *testing.T) {
 	base, at := zzOneSourceHTTP(t, "text/html", "<script>alert('401')</script>", http.StatusUnauthorized)
 	resp := zzGet(t, base+"/v1/games/phigros/sources/src/raw/x", at)
 	body, _ := io.ReadAll(resp.Body)
 	t.Logf("upstream 401: status=%d ct=%q body=%s", resp.StatusCode, resp.Header.Get("Content-Type"), body)
-	if resp.StatusCode == http.StatusUnauthorized && strings.Contains(string(body), "alert(") {
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Errorf("the source's 401 status was passed through to the caller on the raw path")
+	}
+	if strings.Contains(string(body), "alert(") {
 		t.Errorf("the source's 401 body reached the caller verbatim on the raw path")
 	}
 }

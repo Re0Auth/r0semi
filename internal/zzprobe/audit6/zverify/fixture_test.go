@@ -345,19 +345,24 @@ func authRequestID(t *testing.T, resp *http.Response) string {
 	return id
 }
 
-// approveAndCallback runs the consent decision's store call and completes the
-// callback, with an optional auth_time recorded the way the production login
-// hook does (SetAuthTime, before the consent page is shown).
-func (e *vEnv) approveAndCallback(t *testing.T, id, subject string, scopes []string, authTime time.Time) string {
+// completeLogin records an auth_time the way the production login hook does
+// (SetAuthTime, before the consent page is shown) and completes the pending
+// request. It RETURNS the store's error instead of failing, so a probe can
+// assert the S02-1 refusal (oidcstore.ErrReauthenticationRequired) rather than
+// treat it as a fixture problem.
+func (e *vEnv) completeLogin(t *testing.T, id, subject string, scopes []string, authTime time.Time) error {
 	t.Helper()
 	if !authTime.IsZero() {
 		if err := e.store.SetAuthTime(context.Background(), id, authTime); err != nil {
 			t.Fatalf("SetAuthTime: %v", err)
 		}
 	}
-	if err := e.store.CompleteLogin(context.Background(), id, subject, scopes); err != nil {
-		t.Fatalf("CompleteLogin: %v", err)
-	}
+	return e.store.CompleteLogin(context.Background(), id, subject, scopes)
+}
+
+// finishCallback drives the OP callback leg and returns the authorization code.
+func (e *vEnv) finishCallback(t *testing.T, id string) string {
+	t.Helper()
 	resp, raw := e.get(t, "/oauth/authorize/callback?id="+id)
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("callback = %d: %s", resp.StatusCode, raw)
@@ -372,6 +377,38 @@ func (e *vEnv) approveAndCallback(t *testing.T, id, subject string, scopes []str
 		code = code[:j]
 	}
 	return code
+}
+
+// approveAndExchange completes the request and exchanges the code, so a probe
+// can inspect the id_token the completion produced.
+func (e *vEnv) approveAndExchange(t *testing.T, id, subject, clientID, secret string, scopes []string, authTime time.Time) vTokenFields {
+	t.Helper()
+	if err := e.completeLogin(t, id, subject, scopes, authTime); err != nil {
+		t.Fatalf("CompleteLogin: %v", err)
+	}
+	code := e.finishCallback(t, id)
+	verifier, _ := vPKCE()
+	resp, raw := e.post(t, "/oauth/token", map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          code,
+		"redirect_uri":  vRedirect,
+		"code_verifier": verifier,
+	}, clientID, secret)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("token exchange = %d: %s", resp.StatusCode, raw)
+	}
+	return vTokens(t, raw)
+}
+
+// approveAndCallback runs the consent decision's store call and completes the
+// callback, with an optional auth_time recorded the way the production login
+// hook does (SetAuthTime, before the consent page is shown).
+func (e *vEnv) approveAndCallback(t *testing.T, id, subject string, scopes []string, authTime time.Time) string {
+	t.Helper()
+	if err := e.completeLogin(t, id, subject, scopes, authTime); err != nil {
+		t.Fatalf("CompleteLogin: %v", err)
+	}
+	return e.finishCallback(t, id)
 }
 
 // codeFlow drives one full authorization-code exchange.

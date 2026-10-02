@@ -2,42 +2,49 @@
 
 // Adversarial verification of the z01/z02 high-severity claims 1–5:
 //
-//  1. prompt=login / max_age are ignored (no re-authentication, stale auth_time).
+//  1. prompt=login / max_age are ignored (no re-authentication, stale auth_time)
+//     — FALSIFIED by S02-1; the probes are regression guards now.
 //  2. an approved device_code past expires_at is still redeemable.
 //  3. an anonymous request can start a device flow as a confidential client.
 //  4. the device grant's poll refuses the advertised client_secret_post while
 //     the same endpoint accepts it for authorization_code / refresh_token.
 //  5. a refreshed id_token drops the nonce.
+//
+// Claims 6–8 (refresh replay, the revocation liveness oracle, the
+// percent-encoded introspection guard bypass) live in z02_probe_test.go; the
+// last is also FALSIFIED and kept as a guard.
 package zverify
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 )
 
 // ---------------------------------------------------------------------------
 // 1 · prompt=login / max_age
 // ---------------------------------------------------------------------------
 
-// TestV01PromptLoginCompletesOnTheStaleSession is the falsification attempt for
+// TestV01PromptLoginCompletesOnTheStaleSession was the falsification attempt for
 // "prompt=login and max_age are silently ignored, no re-authentication, stale
-// auth_time".
+// auth_time". S02-1 fixed it, so the attempt now comes out FALSIFIED and the
+// test stands as a regression guard under its original name.
 //
-// The honest observable is measured first: the OP's answer to the request.
-//   - If it answers through the redirect with login_required, the claim is false.
-//   - If it sends the browser to the interactive consent plane while a live
-//     session exists, the request was NOT answered by re-authentication.
-//
-// When the OP does send the browser to the login plane (which is what a
-// prompt=login request must do), the login plane's own behaviour decides: the
-// deployment's login hook builds that URL and the SPA behind it re-authenticates
-// only when /v1/session answers 401. So the probe measures, after the redirect,
-// whether a fresh authentication is even possible: the pending request carries
-// no freshness requirement at all (see TestV01MaxAgeIsNotStoredAnywhere) and the
-// consent page's own API call succeeds for the old session.
+// What it measures:
+//   - the OP accepts the request (or answers login_required through the
+//     redirect, the other permitted way);
+//   - a two-hour-old authentication cannot complete it:
+//     CompleteLogin returns oidcstore.ErrReauthenticationRequired and leaves the
+//     request undecided, so no id_token can advertise the old session (or a
+//     fabricated decision clock) as a fresh authentication;
+//   - a real re-authentication completes it, and the id_token carries exactly
+//     that recorded time.
 func TestV01PromptLoginCompletesOnTheStaleSession(t *testing.T) {
 	clock := newVClock()
 	e := newVEnv(t, clock, nil)
@@ -64,27 +71,23 @@ func TestV01PromptLoginCompletesOnTheStaleSession(t *testing.T) {
 			if id == "" {
 				t.Fatalf("%s did not start the interactive flow: %s", name, loc)
 			}
-			// The OP handed the browser to the interactive plane. Whether that
-			// plane re-authenticates is what the claim is about.
-			if !strings.Contains(loc, "consent") && !strings.Contains(loc, "login") {
-				t.Fatalf("%s redirected somewhere the probe does not model: %s", name, loc)
+
+			// The stale session must not complete the request.
+			if err := e.completeLogin(t, id, "usr_vfy", []string{"openid", "account.id"}, signedInAt); !errors.Is(err, oidcstore.ErrReauthenticationRequired) {
+				t.Fatalf("%s: completing on a %.0f-minute-old session = %v, want "+
+					"oidcstore.ErrReauthenticationRequired; the freshness request was ignored",
+					name, time.Since(signedInAt).Minutes(), err)
+			}
+			if req, err := e.store.AuthRequestByID(context.Background(), id); err != nil || req.Done() {
+				t.Fatalf("%s: the refused completion left the request decided: done=%v err=%v",
+					name, req != nil && req.Done(), err)
 			}
 
-			// The consent plane's own load call, for the SAME session, succeeds:
-			// the exchange below is driven through the store exactly as the
-			// consent page's approve button does, with the OLD auth_time.
-			code := e.approveAndCallback(t, id, "usr_vfy", []string{"openid", "account.id"}, signedInAt)
-			verifier, _ := vPKCE()
-			resp, raw = e.post(t, "/oauth/token", map[string]string{
-				"grant_type":    "authorization_code",
-				"code":          code,
-				"redirect_uri":  vRedirect,
-				"code_verifier": verifier,
-			}, e.webID, e.webSec)
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("%s exchange = %d: %s", name, resp.StatusCode, raw)
-			}
-			tokens := vTokens(t, raw)
+			// A real re-authentication satisfies it, and the id_token carries that
+			// recorded time rather than the decision clock.
+			fresh := clock.Now().Add(-5 * time.Second)
+			tokens := e.approveAndExchange(t, id, "usr_vfy", e.webID, e.webSec,
+				[]string{"openid", "account.id"}, fresh)
 			if tokens.IDToken == "" {
 				t.Fatalf("%s issued no id_token", name)
 			}
@@ -93,19 +96,21 @@ func TestV01PromptLoginCompletesOnTheStaleSession(t *testing.T) {
 			if !ok {
 				t.Fatalf("%s: id_token carries no numeric auth_time: %v", name, claims)
 			}
-			age := clock.Now().Sub(time.Unix(int64(authTime), 0))
-			t.Logf("%s: OP redirected to the interactive plane at %q; the session's auth_time is %.0f "+
-				"minutes old and the exchange completed", name, loc, age.Minutes())
-			if age < time.Minute {
-				t.Logf("FALSIFIED for %s: the resulting id_token has a FRESH auth_time", name)
+			got := time.Unix(int64(authTime), 0).UTC()
+			if got.Sub(fresh) < -time.Minute || got.Sub(fresh) > time.Minute {
+				t.Errorf("%s: id_token auth_time = %s, want the recorded re-authentication %s", name, got, fresh)
 			}
+			t.Logf("%s: the two-hour-old session was refused and the fresh authentication produced auth_time=%s",
+				name, got)
 		})
 	}
 }
 
-// TestV01MaxAgeIsNotStoredAnywhere shows WHY, at the storage boundary the claim
-// names: nothing on the auth request can carry the freshness requirement
-// forward. It is a source assertion, deliberately narrow.
+// TestV01MaxAgeIsNotStoredAnywhere was written for WHY the claim held at the
+// storage boundary: nothing on the auth request could carry the freshness
+// requirement forward. S02-1 reversed that — oidcstore.AuthRequest now carries
+// Prompt and MaxAge across the boundary — so the test now pins the requirement
+// being stored, under its original name.
 func TestV01MaxAgeIsNotStoredAnywhere(t *testing.T) {
 	clock := newVClock()
 	e := newVEnv(t, clock, nil)
@@ -120,16 +125,26 @@ func TestV01MaxAgeIsNotStoredAnywhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AuthRequestByID: %v", err)
 	}
-	// The op.AuthRequest interface the library hands back has no MaxAge/Prompt
-	// accessor, so the requirement cannot reach the login hook or the id_token.
-	// Assert the observable half: the recorded auth_time is whatever the hook
-	// writes, not "now", even though max_age=0/prompt=login asked for a fresh one.
-	got := req.GetAuthTime()
-	if !got.IsZero() {
+	// The login hook records the session's auth_time later, so at this point the
+	// request has no recorded authentication — that is what lets the boundary
+	// judge whether the session must be sent through the provider.
+	if got := req.GetAuthTime(); !got.IsZero() {
 		t.Fatalf("a fresh request already carries auth_time %v; the probe's premise is stale", got)
 	}
-	t.Logf("pending request after prompt=login&max_age=0: AuthTime=%v (unset), storage type %T has no MaxAge/Prompt field",
-		got, req)
+	// The requirement itself IS carried now: the library normalized
+	// prompt=login to max_age=0 (ValidateAuthReqPrompt), and the store keeps the
+	// bound so CompleteLogin can refuse a session that does not satisfy it.
+	ar, ok := req.(*oidcstore.AuthRequest)
+	if !ok {
+		t.Fatalf("the store returned %T, not *oidcstore.AuthRequest; the storage shape changed", req)
+	}
+	if ar.MaxAge == nil || *ar.MaxAge != 0 {
+		t.Errorf("stored MaxAge = %v, want the normalized 0 (prompt=login ⇒ max_age=0)", ar.MaxAge)
+	}
+	if !slices.Contains(ar.Prompt, "login") {
+		t.Errorf("stored Prompt = %v, want it to contain login", ar.Prompt)
+	}
+	t.Logf("pending request after prompt=login&max_age=0 carries MaxAge=%d, Prompt=%v (S02-1)", *ar.MaxAge, ar.Prompt)
 }
 
 // ---------------------------------------------------------------------------

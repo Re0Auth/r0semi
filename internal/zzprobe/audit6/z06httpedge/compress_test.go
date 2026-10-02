@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 
+	"github.com/Re0Auth/r0semi/internal/compress"
 	"github.com/Re0Auth/r0semi/internal/httpapi"
 	"github.com/Re0Auth/r0semi/internal/webui"
 	"github.com/klauspost/compress/zstd"
@@ -240,11 +242,11 @@ func TestZ06BusinessPlaneNoStoreSurvivesCompression(t *testing.T) {
 }
 
 // TestZ06AlreadyEncodedBodyIsNotRecompressed pins the CPU-amplification guard:
-// a handler that already set Content-Encoding must never be compressed again.
-// The reachable instance in production is the raw passthrough: a source that
-// answers application/json with its own Content-Encoding. The double-encoded
-// bytes would be unusable to every client, and the CPU spent re-compressing
-// them is pure amplification.
+// a response whose handler already set Content-Encoding must never be
+// compressed again. It is measured twice: on the production middleware itself,
+// where the rule lives (internal/compress/compress.go:352-355), and end to end
+// through the raw passthrough, which now carries the source's coding so the
+// guard is actually reachable for the reason it exists.
 func TestZ06AlreadyEncodedBodyIsNotRecompressed(t *testing.T) {
 	var gzipped bytes.Buffer
 	zw := gzip.NewWriter(&gzipped)
@@ -257,31 +259,159 @@ func TestZ06AlreadyEncodedBodyIsNotRecompressed(t *testing.T) {
 	}
 	raw := gzipped.Bytes()
 
-	h, token, _ := rawEnv(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Encoding", "gzip")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(raw)
+	t.Run("middleware never re-encodes", func(t *testing.T) {
+		c, err := compress.New(compress.Config{Encodings: compress.Default()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := c.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(raw)
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/v1/games/phigros/sources/src/raw/x", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("Content-Encoding = %q, want the handler's own gzip, not a second layer", got)
+		}
+		// The bytes must be untouched: a second pass would make one
+		// decompression yield the gzipped bytes instead of the payload.
+		if !bytes.Equal(rec.Body.Bytes(), raw) {
+			t.Fatalf("the already-encoded body was transformed: %d bytes on the wire, want the %d "+
+				"bytes the handler wrote", rec.Body.Len(), len(raw))
+		}
+		if out := gunzip(t, rec.Body.Bytes()); !bytes.Equal(out, payload) {
+			t.Fatalf("one decompression yielded %d bytes, want the %d-byte payload", len(out), len(payload))
+		}
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/games/phigros/sources/src/raw/x", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept-Encoding", "gzip")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("raw = %d: %s", rec.Code, rec.Body.String())
-	}
-	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
-		t.Fatalf("Content-Encoding = %q, want the source's own gzip, not a second layer", got)
-	}
-	// One decompression must yield the source's payload. If the proxy had
-	// re-compressed the already-gzipped body, one decompression would yield
-	// the gzipped bytes instead.
-	out := gunzip(t, rec.Body.Bytes())
-	if !bytes.Equal(out, payload) {
-		t.Fatalf("the body was double-encoded: %d bytes after one decompression, want the %d-byte payload", len(out), len(payload))
-	}
+	// Regression guard for the filed residual (fixed in W4): the raw passthrough
+	// must hand the caller the source's coding AND the source's bytes. Before the
+	// fix, federation's RawResult carried no Content-Encoding and rawFetch let
+	// net/http negotiate one on its own, so a gzip source was silently decoded
+	// (header and body both lost) and a zstd source was forwarded as identity —
+	// below the threshold as mislabelled bytes, at or above it wrapped in the
+	// server's own gzip so one gunzip yielded zstd. Both halves are asserted here:
+	// the header the client sees and the bytes it receives. The bodies are past
+	// the compressor's 1 KiB threshold, which is the case that used to grow a
+	// second layer.
+	t.Run("raw passthrough preserves the source coding", func(t *testing.T) {
+		plain := []byte(strings.Repeat(`{"k":"v"}`, 400)) // 3.2 KiB: over the threshold
+
+		var zstded bytes.Buffer
+		ze, err := zstd.NewWriter(&zstded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ze.Write(plain); err != nil {
+			t.Fatal(err)
+		}
+		_ = ze.Close()
+		zraw := zstded.Bytes()
+
+		var gzipped bytes.Buffer
+		gw := gzip.NewWriter(&gzipped)
+		if _, err := gw.Write(plain); err != nil {
+			t.Fatal(err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		graw := gzipped.Bytes()
+
+		cases := []struct {
+			name   string
+			coding string
+			body   []byte
+			decode func(*testing.T, []byte) []byte
+		}{
+			{"zstd is forwarded, not relabelled", "zstd", zraw, unzstd},
+			{"gzip survives the transport", "gzip", graw, gunzip},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				// The source stub answers its coding whether or not it was asked
+				// for it. The probe also records what it was asked for: an
+				// explicit identity request is what stops net/http from
+				// negotiating a coding it then decodes transparently.
+				var mu sync.Mutex
+				var seenAcceptEncoding string
+				h, token, _ := rawEnv(t, func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					seenAcceptEncoding = r.Header.Get("Accept-Encoding")
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("Content-Encoding", tc.coding)
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(tc.body)
+				})
+				req := httptest.NewRequest(http.MethodGet, "/v1/games/phigros/sources/src/raw/x", nil)
+				req.Header.Set("Authorization", "Bearer "+token)
+				// The caller would happily take gzip. Because the source's body is
+				// already encoded, the compressor must not accept that offer.
+				req.Header.Set("Accept-Encoding", "gzip")
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("raw = %d: %s", rec.Code, rec.Body.String())
+				}
+				mu.Lock()
+				gotAE := seenAcceptEncoding
+				mu.Unlock()
+				if gotAE != "identity" {
+					t.Errorf("the passthrough asked the source for Accept-Encoding %q, want identity: "+
+						"net/http would otherwise negotiate a coding it decodes behind our back (gzip) or "+
+						"one we would forward unlabelled", gotAE)
+				}
+				if got := rec.Header().Get("Content-Encoding"); got != tc.coding {
+					t.Fatalf("the source answered Content-Encoding: %q and the raw route forwarded %q: the "+
+						"client cannot decode the body", tc.coding, got)
+				}
+				// The bytes must be the source's, untouched. A second layer would
+				// make the wire body differ from what the source sent, and would
+				// make one decode yield the coding's own bytes instead of the text.
+				if !bytes.Equal(rec.Body.Bytes(), tc.body) {
+					t.Fatalf("the raw passthrough changed the source's bytes: %d on the wire, want %d "+
+						"(a second encoding layer?)", rec.Body.Len(), len(tc.body))
+				}
+				if out := tc.decode(t, rec.Body.Bytes()); !bytes.Equal(out, plain) {
+					t.Fatalf("one %s decode yielded %d bytes, want the %d-byte payload",
+						tc.coding, len(out), len(plain))
+				}
+			})
+		}
+	})
+
+	// The control: with no source coding to preserve, the raw route is still an
+	// ordinary compressible business response. Without it, the skips above could
+	// read as "this route is excluded from compression" rather than "the coding
+	// was already chosen by the source".
+	t.Run("identity source still compresses", func(t *testing.T) {
+		plain := []byte(strings.Repeat(`{"k":"v"}`, 400))
+		h, token, _ := rawEnv(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(plain)
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1/games/phigros/sources/src/raw/x", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("raw = %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("an unencoded %d-byte source body came back Content-Encoding %q, want the "+
+				"compressor's gzip", len(plain), got)
+		}
+		if out := gunzip(t, rec.Body.Bytes()); !bytes.Equal(out, plain) {
+			t.Fatalf("one gunzip yielded %d bytes, want the %d-byte payload", len(out), len(plain))
+		}
+	})
 }
 
 // TestZ06CompressionRefusalOnEachPlane pins that the 406 the compressor writes

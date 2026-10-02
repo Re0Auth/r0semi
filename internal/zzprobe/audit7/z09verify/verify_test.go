@@ -10,9 +10,11 @@
 //     outbound client — the per-HOST circuit breaker. One account's dead
 //     credential is classified as host-unhealthy, so five of that account's reads
 //     shed every OTHER account's read of the same source for the cooldown.
-//  2. A fail-dangerous branch in refreshRejected: a store read that FAILS is
-//     treated as "the version did not move", which is the branch that shreds the
-//     secret and deletes the binding.
+//  2. refreshRejected's confirmatory re-read: it used to treat a FAILED store
+//     read as "the version did not move", the branch that shreds the secret and
+//     deletes the binding. It is now a regression guard (subtest A) with an
+//     ErrNotBound control (subtest C): only ErrNotBound reaches the destructive
+//     branch and every other read error is returned upward.
 //  3. A positive control for the reviewed report's CRLF guard, whose green it
 //     never proved was not "the request never left".
 package zzprobe_z09verify
@@ -308,28 +310,45 @@ func TestZ09VerifyAnInterleavedSuccessKeepsTheSharedBreakerClosed(t *testing.T) 
 // re-read fails.
 // ---------------------------------------------------------------------------
 
-// fsStore fails Get while fail is set, delegating otherwise.
+// fsStore fails Get while fail is set, reports ErrNotBound while gone is set, and
+// delegates otherwise.
 type fsStore struct {
 	*federation.MemoryBindingStore
 	fail atomic.Bool
+	gone atomic.Bool
 }
 
 func (s *fsStore) Get(ctx context.Context, user account.UserID, game, source string) (federation.Binding, error) {
 	if s.fail.Load() {
 		return federation.Binding{}, errors.New("verify: injected store read failure")
 	}
+	if s.gone.Load() {
+		return federation.Binding{}, federation.ErrNotBound
+	}
 	return s.MemoryBindingStore.Get(ctx, user, game, source)
 }
 
-// Subtest A (the finding): the upstream rejects the refresh, and the re-read that
-// is supposed to prove "nobody else rotated this" fails. The store failure is not
-// distinguished from "the version did not move", so the binding row is deleted and
-// the vault secret shredded.
+// TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead — 原为发现演示，现为回归守卫.
 //
-// Subtest B (the control): the identical rejection, but the re-read WORKS and
-// shows a version that moved (another writer rotated the grant while this call was
-// at the source). The binding survives and the read is retried. The two subtests
-// differ only in the re-read's outcome — exactly the branch under review.
+// Z09V-2: refreshRejected used to treat ANY failed confirmatory re-read as "the
+// version did not move", the branch that deletes the binding row and crypto-shreds
+// its vault secret. refresh.go:143-159 now distinguishes the outcomes: only
+// ErrNotBound (the row is already gone) shares the destructive branch's meaning;
+// every other read error is a store fault and is returned upward, so the caller
+// retries and nothing destructive happens on a read that told us nothing.
+//
+// Subtest A (the guard) is the same injected store fault that used to be the
+// finding: the fetch must fail with the store error (NOT ErrNotBound), and both the
+// binding row and the vault secret must SURVIVE.
+//
+// Subtest B (control): the identical rejection, but the re-read WORKS and shows a
+// version that moved (another writer rotated the grant while this call was at the
+// source). The binding survives and the read is retried.
+//
+// Subtest C (the other control, so the guard is not vacuous): the re-read really
+// reports ErrNotBound — the one outcome that legitimately means "the grant is
+// gone" — and the destructive branch does run. This is what proves A's survival is
+// the ErrNotBound exemption and not a dead code path.
 func TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead(t *testing.T) {
 	const user = account.UserID("usr_1")
 
@@ -338,7 +357,15 @@ func TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead(t *testing.T)
 		v     vault.Service
 		svc   federation.Service
 	}
-	setup := func(t *testing.T, otherWriterRotated bool) rig {
+	// reRead selects what the confirmatory re-read inside refreshRejected does:
+	// "fail" injects a store fault, "rotate" makes another writer commit a newer
+	// version, "gone" reports ErrNotBound (the row is already gone).
+	const (
+		reReadFail   = "fail"
+		reReadRotate = "rotate"
+		reReadGone   = "gone"
+	)
+	setup := func(t *testing.T, reRead string) rig {
 		t.Helper()
 		store := &fsStore{MemoryBindingStore: federation.NewMemoryBindingStore()}
 		v := newVault(t)
@@ -373,7 +400,8 @@ func TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead(t *testing.T)
 		// The token endpoint answers 400 invalid_grant, the one condition that
 		// reaches refreshRejected.
 		tok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			if otherWriterRotated {
+			switch reRead {
+			case reReadRotate:
 				// Another writer commits a rotation while this call is at the source.
 				if err := store.MemoryBindingStore.Put(context.Background(), v2); err != nil {
 					t.Errorf("commit rotation: %v", err)
@@ -382,7 +410,9 @@ func TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead(t *testing.T)
 					secretPayload(t, "new-token", "rt-2"), nil); err != nil {
 					t.Errorf("enroll rotation: %v", err)
 				}
-			} else {
+			case reReadGone:
+				store.gone.Store(true) // the confirmatory re-read reports the row gone
+			default:
 				store.fail.Store(true) // the confirmatory re-read will fail
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -411,8 +441,8 @@ func TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead(t *testing.T)
 		return rig{store: store, v: v, svc: svc}
 	}
 
-	t.Run("A_the_re_read_fails_and_the_binding_is_destroyed", func(t *testing.T) {
-		r := setup(t, false)
+	t.Run("A_the_re_read_fails_and_the_binding_survives", func(t *testing.T) {
+		r := setup(t, reReadFail)
 		ctx := context.Background()
 		_, err := fetch(t, r.svc, user)
 		r.store.(*fsStore).fail.Store(false)
@@ -422,24 +452,30 @@ func TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead(t *testing.T)
 		}), func([]byte) error { return nil })
 		t.Logf("fetch err=%v; binding row after the failed re-read: err=%v; vault secret: err=%v", err, getErr, secretErr)
 
-		if !errors.Is(err, federation.ErrNotBound) {
-			t.Fatalf("fetch = %v, want ErrNotBound on this path", err)
+		// The store fault must be surfaced upward, not swallowed and not turned
+		// into "the grant is gone".
+		if err == nil {
+			t.Errorf("fetch returned no error: an unreadable confirmatory re-read must not be reported as a success")
+		} else {
+			if errors.Is(err, federation.ErrNotBound) {
+				t.Errorf("fetch = %v (ErrNotBound): a STORE FAULT must not be presented as 'the grant is gone'", err)
+			}
+			if !strings.Contains(err.Error(), "injected store read failure") {
+				t.Errorf("fetch = %v, want the injected store read failure surfaced to the caller", err)
+			}
 		}
-		if getErr == nil {
-			t.Fatalf("the binding row SURVIVED; this probe does not reproduce the destructive branch")
+		if getErr != nil {
+			t.Errorf("the binding row did NOT survive the failed re-read (Get: %v); the destructive branch "+
+				"must be unreachable on a read error other than ErrNotBound (refresh.go:143-159)", getErr)
 		}
-		if secretErr == nil {
-			t.Fatalf("the vault secret survived; the branch under test shreds it")
+		if secretErr != nil {
+			t.Errorf("the vault secret did NOT survive the failed re-read (Use: %v); refresh.go:143-159 "+
+				"returns the store fault upward before Revoke/Delete", secretErr)
 		}
-		t.Errorf("an INJECTED STORE READ FAILURE was treated as 'the version did not move': the binding row is gone "+
-			"(Get: %v) and its vault secret was shredded (Use: %v). refresh.go:143 spares the binding only when "+
-			"err==nil && the version moved; every other outcome — including 'I could not read' — falls through to "+
-			"vault.Revoke+Delete. An unreadable version is not evidence that the version did not move, and the branch it "+
-			"falls into is the destructive one.", getErr, secretErr)
 	})
 
 	t.Run("B_control_a_successful_re_read_showing_a_rotation_preserves_it", func(t *testing.T) {
-		r := setup(t, true)
+		r := setup(t, reReadRotate)
 		ctx := context.Background()
 		res, err := fetch(t, r.svc, user)
 		_, getErr := r.store.Get(ctx, user, zzGame, zzSource)
@@ -449,6 +485,31 @@ func TestZ09VerifyAStoreReadFailureIsDestroyedAsIfTheGrantWereDead(t *testing.T)
 		}
 		if getErr != nil {
 			t.Fatalf("the control expected the binding to survive, got %v", getErr)
+		}
+	})
+
+	t.Run("C_control_a_genuine_ErrNotBound_still_destroys_the_binding", func(t *testing.T) {
+		r := setup(t, reReadGone)
+		ctx := context.Background()
+		// The re-read reports ErrNotBound: the row is already gone, which is the
+		// one read outcome that legitimately shares the destructive branch.
+		_, err := fetch(t, r.svc, user)
+		r.store.(*fsStore).gone.Store(false)
+		_, getErr := r.store.Get(ctx, user, zzGame, zzSource)
+		secretErr := r.v.Use(ctx, federation.BindingIdentity(federation.Binding{
+			User: user, Game: zzGame, Source: zzSource,
+		}), func([]byte) error { return nil })
+		t.Logf("control C: fetch err=%v; binding row: err=%v; vault secret: err=%v", err, getErr, secretErr)
+
+		if !errors.Is(err, federation.ErrNotBound) {
+			t.Fatalf("control C: fetch = %v, want ErrNotBound when the re-read reports the row is gone", err)
+		}
+		if !errors.Is(getErr, federation.ErrNotBound) {
+			t.Errorf("control C: the binding row survived (Get: %v); an ErrNotBound re-read must reach the "+
+				"destructive branch, otherwise subtest A's survival proves nothing", getErr)
+		}
+		if secretErr == nil {
+			t.Errorf("control C: the vault secret survived; the ErrNotBound branch must shred it")
 		}
 	})
 }

@@ -38,7 +38,13 @@ func zzCryptoKey() [32]byte {
 // zzOPBackend is the composition root's OP wiring, reconstructed here because the
 // httpapi package's own test helpers live in a package another agent's in-flight
 // probe file currently fails to compile.
-func zzOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry) (*oidchttp.Handler, *memory.OIDCStore) {
+//
+// `scopes` is the catalog the OP resolves against. The production composition root
+// registers the game's `<game>.raw.read` scope (oauth.RawScope,
+// cmd/re0auth/main.go:1416) next to the resource scopes; a probe that mints a
+// raw-gated token must do the same, or the OP rejects the request with invalid_scope
+// before the data plane is ever reached.
+func zzOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry, scopes *oauth.Registry) (*oidchttp.Handler, *memory.OIDCStore) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -46,7 +52,7 @@ func zzOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry) (*oi
 	}
 	store, err := memory.NewOIDCStore(memory.OIDCOptions{
 		Clients:  clients,
-		Registry: oauth.DefaultRegistry(),
+		Registry: scopes,
 		Signer:   oidcstore.NewSigner("test", key),
 		Login: func(_ context.Context, id string) string {
 			return "/login?authRequestID=" + url.QueryEscape(id)
@@ -62,7 +68,7 @@ func zzOPBackend(t *testing.T, issuer string, clients oauth.ClientRegistry) (*oi
 		CryptoKeyID:   "test",
 		AllowInsecure: true,
 		Clients:       clients,
-		Registry:      oauth.DefaultRegistry(),
+		Registry:      scopes,
 		Consent:       store,
 	})
 	if err != nil {
@@ -215,7 +221,7 @@ func zzTwoSourceHTTP(t *testing.T) (base, token string, askedIn *[]string, mint 
 	if err := clients.Create(context.Background(), client); err != nil {
 		t.Fatal(err)
 	}
-	opHandler, store := zzOPBackend(t, "https://re0auth.test", clients)
+	opHandler, store := zzOPBackend(t, "https://re0auth.test", clients, oauth.DefaultRegistry())
 	api, err := httpapi.New(httpapi.Config{
 		Issuer:            "https://re0auth.test",
 		OIDC:              opHandler,

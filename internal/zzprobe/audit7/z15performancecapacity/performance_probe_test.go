@@ -303,22 +303,22 @@ func readFile(tb testing.TB, path string) string {
 
 // --- Z15-2: a benchmark whose janitor guard cannot run -------------------------
 
-// TestZ15JanitorBenchmarkGuardIsVacuousAtSmallIterationCounts
+// TestZ15JanitorBenchmarkGuardIsVacuousAtSmallIterationCounts — 原为发现演示，现为回归守卫.
 //
-// BenchmarkTokenLifecycleWithJanitor reports `peak_records` as its evidence that a
-// live deployment's store population stays bounded, and fails the run if the
-// janitor finds nothing to remove. Both live inside
-// `if i%sweepEvery == sweepEvery-1` with sweepEvery = 1024
-// (internal/store/memory/oidc_bench_test.go:81-91).
+// Z15-2: BenchmarkTokenLifecycleWithJanitor put its sampling, its janitor call and
+// its `janitor found nothing` guard behind `i%sweepEvery == sweepEvery-1` with
+// sweepEvery = 1024, so a fixed iteration count below 1024 never reached them: the
+// benchmark reported `peak_records 0` and exited 0.
 //
-// With a fixed iteration count below 1024 the branch is unreachable: the janitor
-// is never called, the guard never runs, the benchmark reports `peak_records 0`
-// and exits 0 — a green line whose number looks like "the population was zero"
-// rather than "this benchmark measured nothing". `make bench` (default -benchtime=1s)
-// does reach it on a fast machine; any fixed-count run (`-benchtime=Nx`, the form
-// this project's own probe commands use) silently does not.
+// It is fixed at internal/store/memory/oidc_bench_test.go:108-113: after the loop,
+// if the janitor never ran, the same pass runs once, and a zero peak is itself a
+// b.Fatalf. The reported high-water mark is therefore reachable at every count.
 //
-// Positive control: at 2000x the same benchmark must report a non-zero peak.
+// The guard is deterministic: -benchtime=Nx pins the iteration count, so no
+// wall-clock threshold is involved. At 200x and 2000x the run must exit 0 and
+// report a NONZERO peak_records, the number must stay bounded by the sweep
+// interval (two records per iteration, sampled before the sweep), and it must not
+// grow with the run length.
 func TestZ15JanitorBenchmarkGuardIsVacuousAtSmallIterationCounts(t *testing.T) {
 	root := repoRoot(t)
 
@@ -347,36 +347,52 @@ func TestZ15JanitorBenchmarkGuardIsVacuousAtSmallIterationCounts(t *testing.T) {
 		fields := strings.Fields(line)
 		for i, f := range fields {
 			if f == "peak_records" && i > 0 {
-				n, perr := strconv.Atoi(fields[i-1])
+				// go's benchmark metric formatter uses four significant digits,
+				// so a small count prints as "400.0" and a larger one as "2048".
+				n, perr := strconv.ParseFloat(fields[i-1], 64)
 				if perr != nil {
 					return 0, false, out
 				}
-				return n, true, out
+				return int(n), true, out
 			}
 		}
 		return 0, false, out
 	}
+
+	// The benchmark mints two records per iteration and samples the high-water
+	// mark before the sweep, so a bounded population cannot exceed 2*sweepEvery.
+	const sweepEvery = 1024
+	const peakBound = 2 * sweepEvery
 
 	largePeak, largeOK, largeOut := run("2000x")
 	if !largeOK {
 		t.Fatalf("harness broken: the 2000x run produced no parsable result:\n%s", tail(largeOut, 20))
 	}
 	if largePeak <= 0 {
-		t.Fatalf("harness broken: the 2000x run reported peak_records=%d, so the guard is "+
+		t.Fatalf("positive control failed: the 2000x run reported peak_records=%d, so the guard is "+
 			"unreachable at every count and this probe cannot attribute the cause", largePeak)
+	}
+	if largePeak > peakBound {
+		t.Errorf("the 2000x run reported peak_records=%d, above the %d the sweep interval bounds: the "+
+			"population no longer looks bounded", largePeak, peakBound)
 	}
 
 	smallPeak, smallOK, smallOut := run("200x")
 	if !smallOK {
-		t.Fatalf("the 200x run did not report a parsable result (exit != 0 or no line):\n%s", tail(smallOut, 20))
+		t.Fatalf("REGRESSION: the 200x run produced no parsable result (exit != 0 or no line):\n%s",
+			tail(smallOut, 20))
 	}
 
 	t.Logf("peak_records: 2000x -> %d ; 200x -> %d", largePeak, smallPeak)
-	if smallPeak == 0 {
-		t.Errorf("CONFIRMED: at -benchtime=200x the janitor benchmark reports peak_records=0 and "+
-			"exits 0: the sweep, the sampling and the `janitor found nothing` guard are all behind "+
-			"i%%1024==1023, so the benchmark reports a population bound it never measured "+
-			"(2000x reports %d, which is the positive control)", largePeak)
+	if smallPeak <= 0 {
+		t.Errorf("REGRESSION: at -benchtime=200x the janitor benchmark reports peak_records=%d and exits 0; "+
+			"the post-loop pass at oidc_bench_test.go:108-113 must make the sweep, the sampling and the "+
+			"`janitor found nothing` guard reachable at every iteration count (2000x reports %d)",
+			smallPeak, largePeak)
+	}
+	if smallPeak > largePeak {
+		t.Errorf("the reported population grew with the run length (200x=%d > 2000x=%d), so peak_records "+
+			"no longer shows the sweep interval bounding it", smallPeak, largePeak)
 	}
 }
 
@@ -491,20 +507,22 @@ func TestZ15RateLimiterCheckAllocatesNothing(t *testing.T) {
 
 // --- Z15-5: negotiation allocates once per configured coding ------------------
 
-// TestZ15CompressionNegotiationAllocatesPerConfiguredCoding
+// TestZ15CompressionNegotiationAllocatesPerConfiguredCoding — 原为发现演示，现为回归守卫.
 //
-// negotiate's fast path (`Accept-Encoding` with no `;` or `*`) asks
+// Z15-4: negotiate's fast path (`Accept-Encoding` with no `;` or `*`) asked
 // `offered(name)` for each configured coding in server-preference order, and each
-// call runs its own `strings.Split(header, ",")`
-// (internal/compress/compress.go:180-193) — so a client whose header matches only
-// the last preferred coding pays one slice allocation per configured coding ahead
-// of it. The header is parsed once by the general path
-// (parseAcceptEncoding), so the difference is observable as a pure allocation
-// delta between two configurations.
+// call ran its own `strings.Split(header, ",")`, so a client whose header matched
+// only the last preferred coding paid one slice allocation per configured coding
+// ahead of it.
 //
-// Positive control: the single-coding configuration must allocate exactly one
-// fewer unit than the two-coding one. If it does not, the delta is not attributable
-// to the per-coding split and this probe says nothing.
+// It is fixed at internal/compress/compress.go:192-205: the fast path splits the
+// header once, outside the per-coding loop, so its cost no longer grows with the
+// server's own configuration.
+//
+// The guard measures a full request through the compressor and requires the
+// allocation count not to grow when a leading, non-matching coding is added. The
+// general path (`;`) is the anti-vacuity control: it must still allocate measurably
+// more, otherwise allocations are not what the probe is measuring.
 func TestZ15CompressionNegotiationAllocatesPerConfiguredCoding(t *testing.T) {
 	coding := func(name string) compress.Encoding {
 		return compress.Encoding{Name: name, New: func() compress.WriteCloser {
@@ -530,20 +548,23 @@ func TestZ15CompressionNegotiationAllocatesPerConfiguredCoding(t *testing.T) {
 	}
 
 	// The header names only the second preferred coding, so the fast path must
-	// evaluate (and split for) the first one before it matches.
+	// evaluate (but not re-split for) the first one before it matches.
 	one := measure([]compress.Encoding{coding("gzip")}, "gzip")
 	two := measure([]compress.Encoding{coding("zstd"), coding("gzip")}, "gzip")
+	general := measure([]compress.Encoding{coding("zstd"), coding("gzip")}, "gzip;q=1.0")
 
-	t.Logf("allocs/request through the compressor: 1 coding=%.1f, 2 codings=%.1f (delta %.1f)",
-		one, two, two-one)
+	t.Logf("allocs/request through the compressor: 1 coding=%.1f, 2 codings=%.1f (delta %.1f); "+
+		"general path=%.1f", one, two, two-one, general)
 
-	if delta := two - one; delta < 1 {
-		t.Fatalf("harness broken: adding a leading, non-matching coding did not add a Split allocation "+
-			"(delta=%.1f); the probe is not measuring what it claims", delta)
+	// Anti-vacuity: a header with `;` takes the general path, which parses the
+	// header into a map, so it must cost measurably more. If it does not, the
+	// allocation counts below are not attributable to negotiation at all.
+	if general <= two {
+		t.Fatalf("harness broken: a header with `;` did not allocate measurably more than the fast path "+
+			"(fast=%.1f general=%.1f); the probe is not measuring the negotiation path", two, general)
 	}
 	if delta := two - one; delta >= 1 {
-		t.Errorf("CONFIRMED: one request pays %.0f extra allocation(s) per configured coding ahead of the "+
-			"matching one in the fast path (compress.go:180-193 splits the header once per server-preference "+
-			"entry); the common `Accept-Encoding: gzip` header should be parsed once", delta)
+		t.Errorf("REGRESSION: adding a leading, non-matching coding added %.1f allocation(s) per request "+
+			"(compress.go:192-205 must `strings.Split` the header once, outside the per-coding loop)", delta)
 	}
 }

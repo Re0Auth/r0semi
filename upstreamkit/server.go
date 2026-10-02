@@ -169,11 +169,18 @@ func (s *Server) withBodyLimit(next http.Handler) http.Handler {
 	})
 }
 
+// discoveryCacheControl is set on the two discovery documents (KIT-9). They are
+// fixed for the life of the process, so clients may cache them; every other
+// response in this package — tokens, errors, revocations — stays no-store.
+const discoveryCacheControl = "public, max-age=300"
+
 func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", discoveryCacheControl)
 	writeJSON(w, http.StatusOK, s.discovery)
 }
 
 func (s *Server) handleOAuthMetadata(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", discoveryCacheControl)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"issuer":                                s.discovery.OAuth.Issuer,
 		"authorization_endpoint":                s.discovery.OAuth.AuthorizationEndpoint,

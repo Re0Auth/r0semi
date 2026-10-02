@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/Re0Auth/r0semi/audit"
@@ -72,30 +73,55 @@ func completeBind(t *testing.T, svc federation.Service, user, game, source strin
 	return err
 }
 
-// TestProbeBindingProviderNamespaceCollides is the red probe for the finding:
-// BindingIdentity joins game and source with a bare dot and nothing validates
-// the characters of either, so two distinct (game, source) pairs map to ONE
-// vault identity. Binding the second overwrites the first's credential, reads
-// through the first present the second's upstream token, and unbinding either
-// shreds the other's credential.
+// TestProbeBindingProviderNamespaceCollides is G-18's regression guard (name
+// kept; it was the finding's demonstration probe). BindingIdentity joins game
+// and source with a bare dot, and the finding was that nothing validated either
+// half: ("phigros", "official.beta") and ("phigros.official", "beta") mapped to
+// ONE vault identity, so binding the second overwrote the first's credential and
+// unbinding either crypto-shredded the other.
+//
+// The join separator cannot change (existing ciphertext is bound to it as AAD),
+// so the fix is upstream of it: NewRegistry refuses a '.' inside either half.
+// The probe now measures that the colliding pairs cannot both exist, and keeps
+// the isolation control.
 func TestProbeBindingProviderNamespaceCollides(t *testing.T) {
-	ctx := context.Background()
 	up := newFakeUpstream(t)
-	repo := vault.NewMemoryRepo()
-	v := mustService(t, repo, mustWrapper(t, "kek-1", 0xA1), audit.NewMemoryLogger())
 
-	// Control 1: the registry rejects the same join collision when the
-	// separator is "/" (sourceKey is deduplicated), which is what makes the
-	// vault's dotted join the unguarded one.
-	if _, err := federation.NewRegistry(
-		federation.Source{Game: "a/b", Name: "c", Issuer: up.URL},
-		federation.Source{Game: "a", Name: "b/c", Issuer: up.URL},
-	); err == nil {
-		t.Fatal("control: the registry accepted a '/'-join collision; the dedup premise of this probe is wrong")
+	// Control: the join really is still a bare dot, so the pairs below are the
+	// ones the registry has to refuse. If this ever stops holding, the guard is
+	// measuring nothing and must be revisited rather than deleted.
+	bindingA := federation.BindingIdentity(federation.Binding{User: userID("usr_1"), Game: "phigros", Source: "official.beta"})
+	bindingB := federation.BindingIdentity(federation.Binding{User: userID("usr_1"), Game: "phigros.official", Source: "beta"})
+	if bindingA != bindingB {
+		t.Fatalf("control: the dotted join no longer collides (%v vs %v); the guard below has no target", bindingA, bindingB)
 	}
 
-	// Control 2: with names that do not collide, two bindings hold distinct
-	// credentials — the isolation this probe asserts.
+	// The fix: the registry refuses the separator inside either half, so the
+	// colliding configuration is rejected at startup rather than sharing a row.
+	if _, err := federation.NewRegistry(
+		federation.Source{Game: "phigros", Name: "official.beta", Issuer: up.URL},
+		federation.Source{Game: "phigros.official", Name: "beta", Issuer: up.URL},
+	); err == nil {
+		t.Fatalf("the registry accepted game/source names carrying the '.' join separator: two distinct " +
+			"sources can still map to one vault identity (G-18)")
+	} else if !strings.Contains(err.Error(), "no '.'") {
+		t.Fatalf("the refusal does not name the separator rule it enforces: %v", err)
+	}
+	for _, bad := range []federation.Source{
+		{Game: "phigros", Name: "official.beta", Issuer: up.URL},
+		{Game: "phigros.official", Name: "beta", Issuer: up.URL},
+		{Game: "phigros.beta", Name: "official", Issuer: up.URL},
+	} {
+		if _, err := federation.NewRegistry(bad); err == nil {
+			t.Errorf("the registry accepted game=%q source=%q, which the vault's dotted join cannot "+
+				"keep injective (G-18)", bad.Game, bad.Name)
+		}
+	}
+
+	// Control: separator-free counterparts are accepted and two bindings hold
+	// distinct credentials — the isolation the guard protects.
+	repo := vault.NewMemoryRepo()
+	v := mustService(t, repo, mustWrapper(t, "kek-1", 0xA1), audit.NewMemoryLogger())
 	distinct, _ := bindService(t, v, up.URL, [2]string{"gamea", "src-x"}, [2]string{"gamea", "src-y"})
 	if err := completeBind(t, distinct, "usr_ctrl", "gamea", "src-x"); err != nil {
 		t.Fatal(err)
@@ -108,56 +134,18 @@ func TestProbeBindingProviderNamespaceCollides(t *testing.T) {
 	if err != nil || accessTokenOf(t, []byte(got)) != "token-for-cid-A" {
 		t.Fatalf("control: src-x reads %q, %v; the fixture is not isolating credentials", accessTokenOf(t, []byte(got)), err)
 	}
-
-	// The probe: two sources whose (game, source) joins are the same string,
-	// which the registry accepts because sourceKey's separator is "/".
-	svc, bindings := bindService(t, v, up.URL, [2]string{"phigros", "official.beta"}, [2]string{"phigros.official", "beta"})
-	if err := completeBind(t, svc, "usr_1", "phigros", "official.beta"); err != nil {
-		t.Fatal(err)
-	}
-	if err := completeBind(t, svc, "usr_1", "phigros.official", "beta"); err != nil {
-		t.Fatal(err)
-	}
-	bindingA := federation.BindingIdentity(federation.Binding{User: userID("usr_1"), Game: "phigros", Source: "official.beta"})
-	bindingB := federation.BindingIdentity(federation.Binding{User: userID("usr_1"), Game: "phigros.official", Source: "beta"})
-	if bindingA != bindingB {
-		t.Fatalf("control: the two bindings do not share a vault identity (%v vs %v)", bindingA, bindingB)
-	}
-	// Both binding rows exist, each believing it holds its own credential.
-	if rows, err := bindings.List(ctx, userID("usr_1")); err != nil || len(rows) != 2 {
-		t.Fatalf("binding rows = %d, %v; want two", len(rows), err)
-	}
-
-	got, err = useSecret(t, v, bindingA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok := accessTokenOf(t, []byte(got)); tok != "token-for-cid-A" {
-		t.Errorf("CONFIRMED: the credential of (phigros, official.beta) reads %q — the token bound to the "+
-			"OTHER source is served under this binding: two distinct sources share one vault row", tok)
-	}
-
-	// Unbinding the other source shreds this one's credential: the same row.
-	if _, err := svc.Unbind(ctx, userID("usr_1"), "phigros.official", "beta"); err != nil {
-		t.Fatal(err)
-	}
-	if exists, err := v.Exists(ctx, bindingA); err != nil || !exists {
-		t.Errorf("CONFIRMED: after unbinding (phigros.official, beta) the credential of (phigros, "+
-			"official.beta) no longer opens (exists=%v, %v): one source's unbind crypto-shredded "+
-			"another source's credential — they share one vault row", exists, err)
-	}
-	// ...while the first binding's row still points at the now-missing secret.
-	if rows, err := bindings.List(ctx, userID("usr_1")); err != nil || len(rows) != 1 || rows[0].Game != "phigros" {
-		t.Fatalf("binding rows after the cross-shred = %d, %v; want the phigros row to survive", len(rows), err)
-	}
 }
 
-// TestProbeBindAuditFailureStrandsTheUpstreamToken is the red probe for the
-// finding: Enroll persists the credential and only then writes its audit
-// record, so a failing audit sink returns an error while the credential is
-// already stored. On the bind path there is no rollback and no operator log —
-// the residue class the sibling failure (bindings.Put) rolls back and joins
-// into the error.
+// TestProbeBindAuditFailureStrandsTheUpstreamToken is G-20's regression guard
+// (name kept; it was the finding's demonstration probe). Enroll used to persist
+// the credential and only then write its audit record, so a failing audit sink
+// returned an error while the credential was already stored — and the bind path
+// neither rolled back nor logged, leaving an orphan upstream token.
+//
+// The fix is fail-closed on both sides: Enroll audits BEFORE it persists
+// (vault/service.go:244-257), and CompleteBind rolls the vault back when the
+// write fails after its claim (bind.go:285-304). The probe now asserts that no
+// decryptable token survives, which is the residue the finding named.
 func TestProbeBindAuditFailureStrandsTheUpstreamToken(t *testing.T) {
 	ctx := context.Background()
 	up := newFakeUpstream(t)
@@ -193,23 +181,39 @@ func TestProbeBindAuditFailureStrandsTheUpstreamToken(t *testing.T) {
 		t.Fatal("control: the bind succeeded although the audit sink is failing; the fixture is not failing")
 	}
 
-	// No binding row points at the credential the exchange produced.
-	if rows, berr := bindings.List(ctx, userID("usr_1")); berr != nil || len(rows) != 0 {
-		t.Fatalf("binding rows after the failed bind = %d, %v; want none", len(rows), berr)
-	}
-
-	// The residue: present and decryptable, reachable by no endpoint.
+	// No decryptable upstream token survives the failed bind. This is the
+	// residue the finding named: a secret no binding row points at and only an
+	// account erasure clears.
 	blob, uerr := useSecret(t, goodVault, strandedID)
 	switch {
 	case uerr == nil:
 		t.Fatalf("CONFIRMED: the bind reported failure (%v) yet stored a decryptable upstream token "+
-			"(%q) that no binding row points at and only an account erasure clears; the sibling failure "+
-			"path rolls the secret back and joins the residue into the error, this path does neither. "+
-			"Operator log at the time: %q",
-			err, accessTokenOf(t, []byte(blob)), logged.String())
+			"(%q) that no binding row points at and only an account erasure clears; Enroll must audit "+
+			"before persisting and CompleteBind must roll the vault back when its write fails. "+
+			"Operator log at the time: %q", err, accessTokenOf(t, []byte(blob)), logged.String())
 	case errors.Is(uerr, vault.ErrNotFound):
-		t.Log("the failed bind left no credential behind — the residue is gone")
+		t.Log("the failed bind left no decryptable credential behind — the residue is gone")
 	default:
 		t.Fatalf("unexpected: the record exists but does not open: %v", uerr)
+	}
+	if exists, xerr := goodVault.Exists(ctx, strandedID); xerr != nil || exists {
+		t.Errorf("the failed bind still has a vault record for %v (exists=%v, err=%v)", strandedID, exists, xerr)
+	}
+
+	// CompleteBind claims the binding row BEFORE the vault write, on purpose: a
+	// writer that fails the claim must not have touched the vault, and a failed
+	// write must not strand a secret with no row (bind.go:261-284). A metadata
+	// row may therefore remain after the refusal — what must not remain is a
+	// credential behind it, which the assertions above prove.
+	rows, berr := bindings.List(ctx, userID("usr_1"))
+	if berr != nil {
+		t.Fatalf("listing binding rows after the failed bind: %v", berr)
+	}
+	t.Logf("binding metadata rows after the failed bind = %d (claim-first; the credential itself is gone)", len(rows))
+	for _, row := range rows {
+		id := federation.BindingIdentity(row)
+		if _, err := useSecret(t, goodVault, id); !errors.Is(err, vault.ErrNotFound) {
+			t.Errorf("the surviving binding row %v/%v resolves to a live credential: %v", row.Game, row.Source, err)
+		}
 	}
 }

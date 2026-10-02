@@ -398,8 +398,15 @@ func TestV_RealProcessRefusesATrustEverythingProxyList(t *testing.T) {
 		"cookie_secure = false\ntrusted_proxies = [\"0.0.0.0/0\", \"::/0\"]\n", port, port)
 	path := writeConfig(t, dir, cfg)
 
+	// baseEnv sets RE0AUTH_TRUSTED_PROXIES="", and an explicitly empty env value
+	// clears the file's list (config.List). Left in place that would make this
+	// probe vacuous — the loader would see zero proxies and never the universal
+	// prefix under test — so the key is removed here.
+	env := baseEnv()
+	delete(env, "RE0AUTH_TRUSTED_PROXIES")
+
 	// Without the acknowledgement the process exits non-zero and names the reason.
-	code, out := runToExit(t, dir, baseEnv(), "-config", path)
+	code, out := runToExit(t, dir, env, "-config", path)
 	t.Logf("without the acknowledgement: exit %d: %s", code, strings.TrimSpace(out))
 	if code == 0 {
 		t.Errorf("trusted_proxies=[0.0.0.0/0, ::/0] was accepted with no acknowledgement; " +
@@ -410,7 +417,6 @@ func TestV_RealProcessRefusesATrustEverythingProxyList(t *testing.T) {
 	}
 
 	// Acknowledgement is the escape hatch, and it is what the control proves works.
-	env := baseEnv()
 	env["RE0AUTH_TRUSTED_PROXIES_ANY"] = "true"
 	p := startServer(t, dir, env, "-config", path)
 	p.waitServing(fmt.Sprintf("http://127.0.0.1:%d", port))

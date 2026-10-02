@@ -99,15 +99,20 @@ func (c *vClock) advance(d time.Duration) {
 
 // --- FALSIFICATION 1: is the fast path really split once per configured coding?-
 
-// TestZ15VCompressionSplitScalesPerConfiguredCoding re-derives the Z15-4 delta.
+// TestZ15VCompressionSplitScalesPerConfiguredCoding — 原为发现演示，现为回归守卫.
 //
-// Z15-4 claims the header is re-split once for every server-preferred coding
+// Z15-4 claimed the header was re-split once for every server-preferred coding
 // ahead of the client's match, so the allocation delta over a one-coding
-// configuration must be exactly (number of codings ahead). The reviewed probe
-// only compared 1 vs 2 codings — a single +1 could equally come from any one-off
-// in the two-element configuration. This probe measures 1, 2, 3 and 4 codings
-// where the client's `gzip` is always last: if the delta is not (n-1) the
-// mechanism is mis-attributed and the report's explanation is wrong.
+// configuration would be (number of codings ahead). The finding was fixed at
+// internal/compress/compress.go:192-205 (split once, outside the per-coding loop),
+// so the guard now requires the opposite: the fast path's cost must be FLAT in the
+// number of configured codings — the delta is zero for 1, 2, 3 and 4 codings.
+//
+// This probe measures all four widths rather than just 1 vs 2, so a one-off
+// allocation that merely happens to appear in a two-element configuration cannot
+// hide here. The general path (`;`) remains the instrument control: it parses the
+// header into a map and must stay measurably more expensive, otherwise
+// "allocations" are not what is being measured.
 func TestZ15VCompressionSplitScalesPerConfiguredCoding(t *testing.T) {
 	coding := func(name string) compress.Encoding {
 		return compress.Encoding{Name: name, New: func() compress.WriteCloser {
@@ -142,8 +147,8 @@ func TestZ15VCompressionSplitScalesPerConfiguredCoding(t *testing.T) {
 		names := append(append([]string(nil), preceding[:n-1]...), "gzip")
 		got := measure(names, "gzip")
 		deltas[n-1] = got - base
-		t.Logf("%d codings (matching one last): allocs/req=%.1f, delta vs 1 coding=%.1f (want %.1f)",
-			n, got, got-base, float64(n-1))
+		t.Logf("%d codings (matching one last): allocs/req=%.1f, delta vs 1 coding=%.1f (want 0)",
+			n, got, got-base)
 	}
 
 	// Instrument control: the general path (`;`) must be a genuinely different
@@ -158,9 +163,10 @@ func TestZ15VCompressionSplitScalesPerConfiguredCoding(t *testing.T) {
 	t.Logf("route control: fast path=%.1f allocs/req, general path (gzip;q=1.0)=%.1f", fast, general)
 
 	for n := 2; n <= 4; n++ {
-		if deltas[n-1] != float64(n-1) {
-			t.Errorf("REPORT MECHANISM REFUTED: with %d configured codings the delta over one coding is "+
-				"%.1f, not %d; Z15-4's per-coding `strings.Split` attribution does not hold",
+		if deltas[n-1] >= 1 {
+			t.Errorf("REGRESSION: with %d configured codings the fast path allocates %.1f more than with "+
+				"one (%d more than 1 coding); compress.go:192-205 must split the header once, outside the "+
+				"per-coding loop, so the cost must not grow with the server's own configuration",
 				n, deltas[n-1], n-1)
 		}
 	}
@@ -168,11 +174,18 @@ func TestZ15VCompressionSplitScalesPerConfiguredCoding(t *testing.T) {
 
 // --- FALSIFICATION 2: does the janitor benchmark's guard really never run? ----
 
-// TestZ15VJanitorGuardUnreachableBelow1024 independently reproduces Z15-2's
-// number without the reviewed probe's output parser: it runs the benchmark at
-// 200x and greps the raw line, requiring the run to exit 0 (i.e. no b.Fatal
-// fired) while reporting peak_records 0. If the benchmark fails or reports a
-// non-zero peak, Z15-2 is refuted.
+// TestZ15VJanitorGuardUnreachableBelow1024 — 原为发现演示，现为回归守卫.
+//
+// Z15-2 claimed the janitor benchmark's sampling, sweep and `janitor found
+// nothing` guard were all behind `i%1024==1023` and therefore unreachable at
+// -benchtime=200x, so the run exited 0 reporting peak_records 0. It was fixed at
+// internal/store/memory/oidc_bench_test.go:108-113: if the loop ended before the
+// janitor ran, the same pass runs once, and a zero peak is itself a b.Fatalf.
+//
+// The guard therefore requires the opposite: a 200x run must exit 0 AND report a
+// NONZERO peak_records. The 2000x run remains the positive control, and the raw
+// benchmark line is parsed here without the reviewed probe's output parser, so a
+// bug in that parser cannot hide the regression.
 func TestZ15VJanitorGuardUnreachableBelow1024(t *testing.T) {
 	root := vRepoRoot(t)
 
@@ -216,9 +229,10 @@ func TestZ15VJanitorGuardUnreachableBelow1024(t *testing.T) {
 	if peak(big) == "0" {
 		t.Fatalf("harness broken: the positive control (2000x) reported peak 0")
 	}
-	if peak(small) != "0" {
-		t.Errorf("Z15-2 REFUTED: at -benchtime=200x the benchmark reports peak_records=%s and exits 0; "+
-			"the reviewed finding claims it reports 0", peak(small))
+	if peak(small) == "0" {
+		t.Errorf("REGRESSION: at -benchtime=200x the benchmark reports peak_records=0 and exits 0; the " +
+			"post-loop pass at oidc_bench_test.go:108-113 must make the sweep, the sampling and the " +
+			"`janitor found nothing` guard reachable below 1024 iterations")
 	}
 }
 

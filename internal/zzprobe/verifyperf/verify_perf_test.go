@@ -152,6 +152,31 @@ func (d *gatedDoer) Do(req *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: http.StatusOK, Header: h, Body: b, Request: req}, nil
 }
 
+// collectParked waits until n requests have reached the gated upstream and are
+// parked holding their body. It fails instead of blocking forever when a request
+// was refused before the proxy ever called the upstream: the old bare
+// `<-gated.bodies` turned one missing fixture scope into a package-level timeout
+// with no output at all (Z20-2's `<game>.raw.read` gate did exactly that, and the
+// four raw probes below all need that scope in their token).
+func collectParked(t *testing.T, gated *gatedDoer, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case b := <-gated.bodies:
+			select {
+			case <-b.reached:
+			case <-time.After(30 * time.Second):
+				t.Fatalf("request %d reached the upstream but never finished reading its body", i)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("only %d of %d requests reached the upstream; the handler is refusing or failing them "+
+				"before the proxy calls the gated Doer (check the token's scopes — since Z20-2 the raw path "+
+				"needs `<game>.raw.read`). Without this bound the probe blocks until the package-level timeout.",
+				i, n)
+		}
+	}
+}
+
 // stubDoer answers immediately with the whole body, so a request's upstream read
 // completes before the response is written.
 type stubDoer struct {
@@ -195,6 +220,28 @@ type env struct {
 	fed     federation.Service
 }
 
+// verifyScopeRegistry is the shipped catalogue plus the game's explicit raw
+// passthrough scope.
+//
+// Since Z20-2 the raw passthrough is gated on `<game>.raw.read` and nothing else
+// (internal/httpapi/federation_routes.go:230-275); the production composition
+// root registers one descriptor per game with a raw_base. Without it the OP
+// refuses the scope at authorize time, every raw probe below reads a 403 scope
+// gate instead of the proxy, and the gated ones block forever waiting for an
+// upstream body that is never requested — which is how this package hung until
+// go test's timeout. internal/zzprobe/federationhttp and audit7/z09 fixed their
+// fixtures the same way when Z20-2 landed.
+func verifyScopeRegistry(tb testing.TB) *oauth.Registry {
+	tb.Helper()
+	reg := oauth.DefaultRegistry()
+	if err := reg.Register(oauth.Descriptor{
+		Scope: oauth.Scope(oauth.RawScope(verifyGame)), Title: "raw passthrough", Risk: oauth.RiskHigh,
+	}); err != nil {
+		tb.Fatal(err)
+	}
+	return reg
+}
+
 func newEnv(tb testing.TB, cfg envConfig) *env {
 	tb.Helper()
 	// The access log writes a line per request and has its own test.
@@ -202,10 +249,11 @@ func newEnv(tb testing.TB, cfg envConfig) *env {
 	ctx := context.Background()
 
 	metrics := observability.New()
+	scopes := verifyScopeRegistry(tb)
 	clients := oauth.NewMemoryClientRegistry()
 	client, err := oauth.NewClient(verifyClientID, "Probe", oauth.ClientConfidential, verifySecret,
 		[]string{verifyRedirect},
-		[]oauth.Scope{oauth.ScopeAccountID, oauth.ScopePhigrosScore})
+		[]oauth.Scope{oauth.ScopeAccountID, oauth.ScopePhigrosScore, oauth.Scope(oauth.RawScope(verifyGame))})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -219,7 +267,7 @@ func newEnv(tb testing.TB, cfg envConfig) *env {
 	}
 	store, err := memory.NewOIDCStore(memory.OIDCOptions{
 		Clients:  clients,
-		Registry: oauth.DefaultRegistry(),
+		Registry: scopes,
 		Signer:   oidcstore.NewSigner("probe", key),
 		Login: func(_ context.Context, id string) string {
 			return "/login?authRequestID=" + url.QueryEscape(id)
@@ -235,7 +283,7 @@ func newEnv(tb testing.TB, cfg envConfig) *env {
 		CryptoKeyID:   "probe",
 		AllowInsecure: false,
 		Clients:       clients,
-		Registry:      oauth.DefaultRegistry(),
+		Registry:      scopes,
 		Consent:       store,
 		Metrics:       metrics,
 	})
@@ -399,6 +447,15 @@ func rawRequest() *http.Request {
 		"/v1/games/"+verifyGame+"/sources/"+verifySource+"/raw/big", nil)
 }
 
+// rawTokenScopes is what the raw probes' token asks for: the resource scope plus
+// the game's explicit raw passthrough scope. Since Z20-2 the raw handler is gated
+// on `<game>.raw.read` alone, so a token minted for the resource scope is refused
+// 403 at the gate before the proxy runs (rawSource/verifyScope above are not
+// enough).
+func rawTokenScopes() []string {
+	return []string{oauth.ScopeAccountID.String(), verifyScope, oauth.RawScope(verifyGame)}
+}
+
 // --- PERF-1: is the in-flight number attributable to the request? ----------
 
 // TestVerifyInFlightAttribution re-runs PERF-1's measurement, but varies the
@@ -438,7 +495,7 @@ func TestVerifyInFlightAttribution(t *testing.T) {
 			secret:  `{"access_token":"upstream-access-token","refresh_token":""}`,
 			binding: bearerBinding(),
 			doer:    gated,
-			scopes:  []string{oauth.ScopeAccountID.String(), verifyScope},
+			scopes:  rawTokenScopes(),
 			// Headroom for the sweep's worst point (32 x 4 MiB = 128 MiB): this
 			// probe is about what io.ReadAll holds, so the budget under test must
 			// not be what ends the measurement. The gated Doer below declares no
@@ -466,10 +523,7 @@ func TestVerifyInFlightAttribution(t *testing.T) {
 				statuses[i] = w.status
 			}(i)
 		}
-		for i := 0; i < n; i++ {
-			b := <-gated.bodies
-			<-b.reached
-		}
+		collectParked(t, gated, n)
 		// Two GCs: the first moves sync.Pool contents to the victim cache, the
 		// second drops it. One GC leaves pooled buffers counted as live.
 		runtime.GC()
@@ -571,7 +625,7 @@ func TestVerifyInFlightWhoHoldsTheBytes(t *testing.T) {
 		secret:  `{"access_token":"upstream-access-token","refresh_token":""}`,
 		binding: bearerBinding(),
 		doer:    gated,
-		scopes:  []string{oauth.ScopeAccountID.String(), verifyScope},
+		scopes:  rawTokenScopes(),
 		// 1 GiB, not the 64 MiB default: Z09-4 gives each caller a share of
 		// max(2*maxBody, limit/4), and all 8 parked bodies belong to one caller,
 		// so the share (256 MiB here) has to exceed 8 x (4 MiB + 1).
@@ -592,10 +646,7 @@ func TestVerifyInFlightWhoHoldsTheBytes(t *testing.T) {
 			env.handler.ServeHTTP(newDiscardWriter(), req)
 		}()
 	}
-	for i := 0; i < n; i++ {
-		b := <-gated.bodies
-		<-b.reached
-	}
+	collectParked(t, gated, n)
 	runtime.GC()
 	runtime.GC()
 	var during runtime.MemStats
@@ -671,7 +722,7 @@ func TestVerifyInFlightAfterTheReadIsTheSameQuestion(t *testing.T) {
 		secret:  `{"access_token":"upstream-access-token","refresh_token":""}`,
 		binding: bearerBinding(),
 		doer:    doer,
-		scopes:  []string{oauth.ScopeAccountID.String(), verifyScope},
+		scopes:  rawTokenScopes(),
 	})
 	req := rawRequest()
 	req.Header.Set("Authorization", "Bearer "+env.token)
@@ -764,7 +815,7 @@ func TestVerifyRawPathRefreshAmplification(t *testing.T) {
 		binding:    binding,
 		doer:       doer,
 		httpClient: doer,
-		scopes:     []string{oauth.ScopeAccountID.String(), verifyScope},
+		scopes:     rawTokenScopes(),
 	})
 
 	req := rawRequest()

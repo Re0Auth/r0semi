@@ -135,18 +135,44 @@ func TestZ08TraversalMatrixSurvey(t *testing.T) {
 	}
 }
 
-// TestZ08MissingImmutableAssetIsNotASilentShell asserts the invariant a build
-// pipeline needs: a URL under the hashed-asset namespace that names no file is
-// NOT answered with the shell. It is expected to fail while the handler falls
-// back to index.html for everything; the failure is the finding.
+// TestZ08MissingImmutableAssetIsNotASilentShell — 原为发现演示，现为回归守卫（按裁定）.
+//
+// The probe used to assert the opposite: that a URL under the hashed-asset
+// namespace naming no file is NOT answered with the shell. That behaviour is a
+// ruled-with-intent property, not a defect: a missing hashed asset is answered
+// 200 with the SPA shell. The ruling is recorded at
+// docs/security-audit-7.md:302 (Z08-1 is NOT-A-FINDING — round 5's V-2 already
+// pinned "缺失散列资产回 200 shell 而非 404") and docs/issues/not-doing.md:48
+// (A-FE-V2: 缺失的散列资产回 200 shell 而非 404 —— 已被钉成性质，不要再作为缺陷上报).
+//
+// The guard asserts the ruled shape directly: the fallback is 200 + text/html and
+// its body IS the shell, by decision. The anti-vacuity control compares the body
+// with the shell served at /app/, so a bodyless or 404 answer fails here instead
+// of passing as "not a silent shell".
 func TestZ08MissingImmutableAssetIsNotASilentShell(t *testing.T) {
 	h := z08Mounted(t, z08FS())
+
+	shell := doRec(t, h, http.MethodGet, "/app/", nil)
+	if shell.code != http.StatusOK || !strings.Contains(shell.header.Get("Content-Type"), "text/html") {
+		t.Fatalf("anti-vacuity: the shell itself is not served as 200 text/html (%d %q)",
+			shell.code, shell.header.Get("Content-Type"))
+	}
+	if len(shell.body) == 0 {
+		t.Fatalf("anti-vacuity: the shell body is empty, so the comparison below proves nothing")
+	}
+
 	r := doRec(t, h, http.MethodGet, "/app/_app/immutable/entry/start.DEADBEEF.js", nil)
-	if r.code == http.StatusOK {
-		t.Errorf("GET a hashed asset URL that names no file answered %d %q with %d bytes of the shell: "+
-			"a half-deployed or stale build is indistinguishable from a working one at the HTTP layer, "+
-			"and every monitor watching status codes sees success",
-			r.code, r.header.Get("Content-Type"), len(r.body))
+	t.Logf("missing immutable asset -> %d ct=%q len=%d", r.code, r.header.Get("Content-Type"), len(r.body))
+	if r.code != http.StatusOK {
+		t.Errorf("a missing hashed asset answered %d, want the ruled 200 shell fallback "+
+			"(docs/security-audit-7.md:302, docs/issues/not-doing.md:48)", r.code)
+	}
+	if ct := r.header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Errorf("a missing hashed asset answered %q, want the ruled text/html shell fallback", ct)
+	}
+	if r.body != shell.body {
+		t.Errorf("the answer to a missing hashed asset is not the shell byte-for-byte "+
+			"(missing=%d bytes, shell=%d bytes)", len(r.body), len(shell.body))
 	}
 }
 

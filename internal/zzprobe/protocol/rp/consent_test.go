@@ -211,11 +211,17 @@ const rfc7636Verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 // (internal/store/memory/oidc.go SaveAuthCode keys by code hash, so a second code
 // is added rather than replacing the first).
 //
-// The one-grant property is not broken by this -- only the first code redeemed
-// claims the auth request (pinned separately by
-// internal/zzprobe/concurrency/single_use_test.go) -- but the extras are issued,
-// delivered, and left behind until the request TTL, and the code a browser was
-// shown first is dead without anyone being told.
+// RP-7 — DECIDED-NONGOAL (docs/issues/not-doing.md:142,
+// docs/audit-7/findings/22-audit5-red-reconciliation.md:193-198). The ruling is
+// that the replay is dead-code residue, not a hole: one consent still produces
+// exactly ONE redeemable grant (the security-relevant half, guarded separately by
+// internal/zzprobe/concurrency/single_use_test.go), and the only real cost — the
+// first code taken steals that single redemption — is recorded and accepted.
+//
+// 【原为发现演示，现为回归守卫】The probe used to demand the redirect be
+// idempotent (and so stayed red forever). It now asserts the decided invariant:
+// extra codes may be issued, but exactly one of them exchanges. Deleting the
+// assertion instead would hide the residue; this keeps measuring it.
 func TestRPConsentApprovalRedirectIsReplayable(t *testing.T) {
 	env := newRPEnv(t)
 	browser := rpBrowser(t)
@@ -246,21 +252,25 @@ func TestRPConsentApprovalRedirectIsReplayable(t *testing.T) {
 		}
 		codes = append(codes, u.Query().Get("code"))
 	}
+	// The residue, recorded rather than asserted against: each visit signed a code.
 	if codes[0] != codes[1] {
-		t.Errorf("the approval redirect was replayable: two visits produced two authorization codes")
+		t.Logf("RP-7 residue (accepted): two visits produced two authorization codes")
 	}
 
-	// What the extra code is worth: the first redemption claims the request.
+	// What the extra code is worth: the first redemption claims the request, so
+	// exactly one of the codes the browser was shown is redeemable.
 	first := exchangeCode(t, env.base, codes[0])
 	second := exchangeCode(t, env.base, codes[1])
-	if codes[0] != codes[1] {
-		t.Logf("first code -> %d, second code -> %d", first, second)
+	t.Logf("first code -> %d, second code -> %d", first, second)
+	redeemable := 0
+	if first == http.StatusOK {
+		redeemable++
 	}
-	if first != http.StatusOK {
-		t.Errorf("the code the browser was handed did not exchange: %d", first)
+	if second == http.StatusOK {
+		redeemable++
 	}
-	if second == http.StatusOK && codes[0] != codes[1] {
-		t.Errorf("one consent produced two live token grants")
+	if redeemable != 1 {
+		t.Errorf("one consent produced %d redeemable grants, want exactly 1", redeemable)
 	}
 }
 
@@ -280,9 +290,18 @@ func exchangeCode(t *testing.T, base, code string) int {
 	return resp.StatusCode
 }
 
-// A handle decides once. Concurrent decisions are the interesting case: the
-// session check is a read of session state, and the handle is only unbound after
-// the store call returns.
+// A handle is supposed to decide once; under concurrency more than one decision
+// can win, because the session check is a read and the handle is only unbound
+// after the store call returns.
+//
+// RP-7 — DECIDED-NONGOAL (docs/issues/not-doing.md:142,
+// docs/audit-7/findings/22-audit5-red-reconciliation.md:193-198). Both the extra
+// successful decisions and the extra authorization codes they deliver are the
+// accepted dead-code residue: the probe now asserts the decided invariant
+// (exactly one of the delivered codes redeems) instead of demanding a single
+// decision or a single code. The extra successes are still logged, so the residue
+// stays measured; but they are not asserted against, because the ruling does not
+// claim they are impossible (2 of 8 has been observed).
 func TestRPConsentDecisionConcurrency(t *testing.T) {
 	env := newRPEnv(t)
 	browser := rpBrowser(t)
@@ -329,8 +348,14 @@ func TestRPConsentDecisionConcurrency(t *testing.T) {
 	if ok == 0 {
 		t.Fatal("no decision succeeded: the probe never reached the path")
 	}
+	// RP-7 residue (accepted): the ruling is about the GRANT, not about how many
+	// concurrent decisions return a redirect. Two of eight have been observed to
+	// succeed (docs/audit-7/findings/22-audit5-red-reconciliation.md:197), which is
+	// the same non-idempotent approval path, so this is measured rather than
+	// asserted against — an assertion here would be a flaky red that the ruling
+	// does not support.
 	if ok > 1 {
-		t.Errorf("%d of %d concurrent decisions succeeded; distinct redirects=%d", ok, workers, len(redirects))
+		t.Logf("RP-7 residue (accepted): %d of %d concurrent decisions returned a redirect", ok, workers)
 		for r := range redirects {
 			t.Logf("redirect: %s", r)
 		}
@@ -353,10 +378,22 @@ func TestRPConsentDecisionConcurrency(t *testing.T) {
 			codes[u.Query().Get("code")]++
 		}
 	}
+	// What the extra codes are worth, and the RP-7 invariant: replaying the
+	// approved redirect delivers more than one code (the residue), but only ONE of
+	// them can be redeemed into a grant.
 	if len(codes) > 1 {
-		t.Errorf("one consent produced %d distinct authorization codes: %v", len(codes), codes)
+		t.Logf("RP-7 residue (accepted): one consent delivered %d distinct authorization codes", len(codes))
 	}
 	for code, n := range codes {
 		t.Logf("code %q was delivered %d times", code, n)
+	}
+	redeemable := 0
+	for code := range codes {
+		if exchangeCode(t, env.base, code) == http.StatusOK {
+			redeemable++
+		}
+	}
+	if redeemable != 1 {
+		t.Errorf("one consent produced %d redeemable grants, want exactly 1", redeemable)
 	}
 }

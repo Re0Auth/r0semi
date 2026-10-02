@@ -253,9 +253,9 @@ func (s *Server) rawGate(game, source string) (oauth.Scope, bool) {
 	return "", false
 }
 
-// handleGameRaw proxies a source's native API verbatim. The body, status and
-// content type are passed through untouched, for consumers that need the
-// upstream's own dialect.
+// handleGameRaw proxies a source's native API verbatim. The body, status,
+// content type and content coding are passed through untouched, for consumers
+// that need the upstream's own dialect.
 func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oauth.TokenInfo) {
 	game := r.PathValue("game")
 	source := r.PathValue("source")
@@ -291,6 +291,16 @@ func (s *Server) handleGameRaw(w http.ResponseWriter, r *http.Request, info oaut
 		w.Header().Set("Content-Type", result.ContentType)
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	// The source's content coding travels with the source's bytes. Without this
+	// header the body is undecodable (rawFetch forwards the bytes still encoded
+	// — see the Accept-Encoding note there), and the compressor in front of this
+	// handler would read an empty Content-Encoding, treat a >1 KiB body as
+	// identity, and wrap it a second time. Set before WriteHeader so the
+	// compressor's already-encoded guard (internal/compress/compress.go:352)
+	// sees it.
+	if result.ContentEncoding != "" {
+		w.Header().Set("Content-Encoding", result.ContentEncoding)
 	}
 	// The body, the status and the media type stay the source's, verbatim: that
 	// is this endpoint's contract. What is not left to the source is what a

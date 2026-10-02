@@ -4,6 +4,7 @@ package z16guardtestquality
 
 import (
 	"errors"
+	"go/build/constraint"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -245,27 +246,50 @@ func firstLines(s string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
-// tagConstraint extracts the tag list from a `//go:build` line: `a && b` and
-// `a || b` both name tags the file needs; `!x` is a negation, not a tag.
-func tagConstraint(line string) []string {
-	expr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "//go:build"))
-	var out []string
-	for _, tok := range strings.FieldsFunc(expr, func(r rune) bool {
-		return r == ' ' || r == '&' || r == '|' || r == '(' || r == ')' || r == '\t'
-	}) {
-		tok = strings.TrimPrefix(tok, "!")
-		if tok == "" || tok == "true" || tok == "false" {
-			continue
-		}
-		out = append(out, tok)
+// intentionalTag names a build tag that no workflow sets ON PURPOSE, with the
+// document that made the call. A file reachable only through one of these is a
+// reviewed decision rather than a CI gap.
+//
+// Z16's invariant is "a tagged test file must be reachable from some gate"; the
+// gzhttp spike is the one file the repository deliberately keeps outside every
+// gate, and it says so: `docs/dependencies.md:48-49` calls it "随取随用的判定记录，
+// 不是一道门禁" and names the manual command that runs it.
+var intentionalTag = map[string]string{
+	"gzhttpspike": "docs/dependencies.md:48-49 — the gzhttp spike is a decision record run by hand " +
+		"(`RE0AUTH_GZHTTP_SPIKE=1 go test -tags gzhttpspike -count=1 -v ./internal/compress/`), not a gate",
+}
+
+// taggedFile is one tracked test file with a `//go:build` constraint.
+type taggedFile struct {
+	name string
+	expr constraint.Expr
+}
+
+// satisfiable reports whether some assignment drawn from tags satisfies the
+// build expression. A file is reachable when the tags a workflow sets can
+// compile it; `a || b` is reachable when EITHER tag is set, which is exactly the
+// case the per-tag census used to get wrong (13 `audit || audit6` files were
+// reported as orphaned although `-tags audit6` compiles them).
+func satisfiable(e constraint.Expr, tags map[string]bool) bool {
+	if e == nil {
+		return true
 	}
-	return out
+	return e.Eval(func(tag string) bool { return tags[tag] })
+}
+
+// newExprSet is satisfiable's tag-set argument.
+func newExprSet(tags ...string) map[string]bool {
+	set := make(map[string]bool, len(tags))
+	for _, t := range tags {
+		set[t] = true
+	}
+	return set
 }
 
 // TestEveryTaggedTestFileIsReachableFromCI is the guard N-04 asks for, stated as
 // an invariant rather than as a count: a test file behind a build tag must have
-// some workflow that sets that tag, or the file is outside every gate the
-// repository has.
+// some workflow that can satisfy that tag constraint, or the file is outside
+// every gate the repository has.
 //
 // It is strictly stronger than "the probes do not run": because `go build`,
 // `go vet`, `go test ./...` and `golangci-lint run ./...` all honour build
@@ -278,13 +302,22 @@ func tagConstraint(line string) []string {
 func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 	root := repoRoot(t)
 
-	// Tags any workflow sets.
+	// The tag sets CI actually passes, one per `-tags` occurrence, plus the empty
+	// set: the ordinary `go test ./...` / `go vet ./...` gates run with no tags,
+	// and that is the invocation that compiles a `//go:build !x` file. A file is
+	// reachable when some one of these sets satisfies its expression. (The old
+	// census unioned every tag into one set and then looked at tags one at a time,
+	// which both over-reported `a || b` files and could not express `!x`.)
+	//
+	// `-tags` is matched only as a Go flag: the previous pattern matched the
+	// `-tags` inside git's `--no-tags --quiet` and recorded `--quiet` as a tag.
+	tagSets := []map[string]bool{newExprSet()}
 	workflowTags := map[string]bool{}
 	workflows, err := os.ReadDir(filepath.Join(root, ".github", "workflows"))
 	if err != nil {
 		t.Fatalf("read workflows: %v", err)
 	}
-	tagFlag := regexp.MustCompile(`-tags[= ]+("[^"]*"|'[^']*'|\S+)`)
+	tagFlag := regexp.MustCompile(`(?:^|\s)-tags[= ]+("[^"]*"|'[^']*'|\S+)`)
 	for _, e := range workflows {
 		if e.IsDir() || (!strings.HasSuffix(e.Name(), ".yml") && !strings.HasSuffix(e.Name(), ".yaml")) {
 			continue
@@ -294,13 +327,16 @@ func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
 		for _, m := range tagFlag.FindAllStringSubmatch(string(raw), -1) {
+			set := newExprSet()
 			for _, tag := range strings.FieldsFunc(strings.Trim(m[1], `"'`), func(r rune) bool {
 				return r == ',' || r == ' '
 			}) {
 				if tag != "" {
+					set[tag] = true
 					workflowTags[tag] = true
 				}
 			}
+			tagSets = append(tagSets, set)
 		}
 	}
 	t.Logf("workflows set these build tags: %v", sortedKeys(workflowTags))
@@ -313,7 +349,7 @@ func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("git ls-files: %v", err)
 	}
-	tagged := map[string][]string{} // tag -> files
+	var constrained []taggedFile
 	total := 0
 	for _, name := range strings.Split(string(out), "\x00") {
 		if name == "" {
@@ -326,9 +362,11 @@ func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 		}
 		for _, line := range strings.Split(string(raw), "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "//go:build") {
-				for _, tag := range tagConstraint(line) {
-					tagged[tag] = append(tagged[tag], name)
+				expr, err := constraint.Parse(strings.TrimSpace(line))
+				if err != nil {
+					t.Fatalf("parse build constraint of %s (%q): %v", name, strings.TrimSpace(line), err)
 				}
+				constrained = append(constrained, taggedFile{name: name, expr: expr})
 				break
 			}
 			trimmed := strings.TrimSpace(line)
@@ -340,26 +378,64 @@ func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 	if total < 200 {
 		t.Fatalf("only %d tracked test files were listed; the walk is not reading the repository", total)
 	}
-	if len(tagged) == 0 {
+	if len(constrained) == 0 {
 		t.Fatal("no tagged test file was found, so this probe would pass vacuously")
 	}
 
-	var orphaned int
-	reasons := []string{}
-	for tag, files := range tagged {
-		if workflowTags[tag] {
+	// A file is reachable when one of CI's tag sets satisfies its expression. A
+	// file that only an intentionally-manual tag reaches is a reviewed decision,
+	// not a gap (the gzhttp spike, docs/dependencies.md:48-49).
+	documentedSets := make([]map[string]bool, 0, len(tagSets))
+	for _, set := range tagSets {
+		with := newExprSet()
+		for tag := range set {
+			with[tag] = true
+		}
+		for tag := range intentionalTag {
+			with[tag] = true
+		}
+		documentedSets = append(documentedSets, with)
+	}
+	reachableBy := func(expr constraint.Expr, sets []map[string]bool) bool {
+		for _, set := range sets {
+			if satisfiable(expr, set) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var orphaned, documented []string
+	for _, f := range constrained {
+		if reachableBy(f.expr, tagSets) {
 			continue
 		}
-		orphaned += len(files)
-		reasons = append(reasons, tag+": "+strings.Join(files, ", "))
+		label := f.name + " (//go:build " + f.expr.String() + ")"
+		if reachableBy(f.expr, documentedSets) {
+			documented = append(documented, label)
+			continue
+		}
+		orphaned = append(orphaned, label)
 	}
-	sort.Strings(reasons)
-	t.Logf("%d of %d tracked test files are behind a tag no workflow sets", orphaned, total)
-	if orphaned > 0 {
-		t.Errorf("%d tracked test files (%d tags) are excluded from every CI gate: no workflow passes "+
-			"-tags. They are not run by `go test ./...` and not even compiled by `go build`, `go vet` or "+
-			"golangci-lint, so a probe that stops compiling or grows a lint error fails nothing.\n%s",
-			orphaned, len(reasons), strings.Join(reasons, "\n"))
+	sort.Strings(orphaned)
+	sort.Strings(documented)
+	t.Logf("%d of %d tracked test files are behind a constraint no workflow can satisfy; %d are behind a "+
+		"deliberately-manual tag", len(orphaned), total, len(documented))
+	for _, d := range documented {
+		t.Logf("  documented as not-a-gate: %s — %s", d, intentionalTag["gzhttpspike"])
+	}
+	if len(orphaned) > 0 {
+		t.Errorf("STILL-OPEN (CI configuration — this probe cannot fix itself): %d tracked test files are "+
+			"behind a build constraint no workflow can satisfy. They are not run by `go test ./...` and not "+
+			"even compiled by `go build`, `go vet` or golangci-lint, so a probe that stops compiling or grows "+
+			"a lint error fails nothing.\n%s\n"+
+			"Fix (Lead, in .github/workflows/ci.yml:400): the repo-wide vet step already compiles every "+
+			"tag-gated file — `go vet -tags audit5,audit6,audit7,conformance ./...` — except this pair. Add "+
+			"`protocolaudit` (and `audit`, for the legacy spelling) to that -tags list, or add a "+
+			"`go vet -tags protocolaudit ./...` step. Nothing else is needed: the pair is `audit || protocolaudit`, "+
+			"and every `audit || audit6` file is already compiled by the audit6 tag. This probe stays red until "+
+			"that CI change lands.",
+			len(orphaned), strings.Join(orphaned, "\n"))
 	}
 }
 

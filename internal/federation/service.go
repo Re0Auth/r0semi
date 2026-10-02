@@ -683,7 +683,14 @@ type RawResult struct {
 	Source      string
 	Status      int
 	ContentType string
-	Body        []byte
+	// ContentEncoding is the source's own Content-Encoding, when it sent one,
+	// and the empty string for an identity body. It travels with Body because
+	// Body is the source's bytes, not a decoded form: a caller that writes the
+	// bytes without this header hands the client a body it cannot decode, and a
+	// compressor in front of the caller reads the header to know the body is
+	// already encoded. See rawFetch for why the request asks for identity.
+	ContentEncoding string
+	Body            []byte
 	// Release returns this result's upstream-body reservation to the joint byte
 	// budget (Config.MaxBufferedBytes). The reservation admits the READ, but the
 	// bytes stay held until the body has been written out, so ownership transfers
@@ -696,7 +703,7 @@ type RawResult struct {
 }
 
 // Raw proxies a source's native API without modifying the body, preserving the
-// upstream status and content type.
+// upstream status, content type and content coding.
 func (s *service) Raw(ctx context.Context, req RawRequest) (RawResult, error) {
 	ctx, cancel := s.withinTotalTimeout(ctx)
 	defer cancel()
@@ -865,6 +872,31 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "*/*")
+	// Ask for identity, explicitly. Two things go wrong without this line, and
+	// both are only visible at this endpoint, whose contract is "the source's
+	// bytes verbatim":
+	//
+	//   - net/http's transport adds `Accept-Encoding: gzip` when the caller has
+	//     not chosen one, and then transparently DECODES a gzip response and
+	//     deletes its Content-Encoding. The result is a body that no longer
+	//     matches the source's representation, with nothing recording that a
+	//     decode happened;
+	//   - a coding the transport does not decode (zstd, br) stayed encoded in
+	//     Body while its Content-Encoding was dropped, so the caller forwarded
+	//     undecodable bytes labelled as identity.
+	//
+	// The fix is to FORWARD the source's coding rather than decode it here. That
+	// choice is the smaller and safer one: decoding would mean running a
+	// decompressor over attacker-influenced upstream bytes (a zip bomb amplifies
+	// inside the process, against the MaxBufferedBytes budget that was sized for
+	// the encoded length), and it would have to grow a decoder per coding or
+	// silently pass through the ones it does not know. Forwarding runs no
+	// decoder, preserves the byte-for-byte contract, and lets the caller's HTTP
+	// layer — which speaks the client's Accept-Encoding — decide.
+	//
+	// A source is of course free to ignore the header; ContentEncoding below is
+	// what carries its answer either way.
+	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := s.doer.Do(req)
 	if err != nil {
@@ -914,8 +946,13 @@ func (s *service) rawFetch(ctx context.Context, src Source, path string, query u
 	return RawResult{
 		Status:      resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
-		Body:        body,
-		Release:     release,
+		// Whatever the source answered, read from the response the transport
+		// actually produced: had the transport negotiated and decoded a coding
+		// itself it would have deleted this header, and the identity request
+		// above is what stops that from happening silently.
+		ContentEncoding: resp.Header.Get("Content-Encoding"),
+		Body:            body,
+		Release:         release,
 	}, nil
 }
 

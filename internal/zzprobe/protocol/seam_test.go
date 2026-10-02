@@ -232,21 +232,37 @@ func TestProbeUserinfoAnswersWithoutOpenIDScope(t *testing.T) {
 	t.Logf("a token whose scope is %q yields userinfo %v", tokens.Scope, claims)
 }
 
-// PROBE 5 — the discovery document is rendered once, from whichever Host asked
-// first, and then served to everybody.
+// PROBE 5 — discovery is rendered per request Host, and a forged Host cannot fix
+// the document another Host is served.
 //
-// internal/oidchttp/oidchttp.go serveDiscovery caches by request path for the
-// life of the handler, and New() falls back to op.IssuerFromHost when Config.Issuer
-// is empty — the "dynamic deployments" the Config comment names. The rendered
-// document's issuer and every endpoint URL come from that first request's Host,
-// and the response is then handed out with `Cache-Control: public, max-age=300`.
-// cmd/re0auth always sets an issuer (config.go rejects an empty one), so this is
-// not reachable in the shipped binary; the probe documents the trap for the
-// dynamic shape the wrapper supports and the test suite uses.
+// 【原为发现演示，现为回归守卫】This probe used to demonstrate the opposite: that
+// serveDiscovery cached by request path alone, so the FIRST caller's Host fixed
+// the advertised issuer — and every endpoint URL in the document, including
+// jwks_uri — for the life of the handler. S02-5 / P-03 fixed exactly that:
+// `discoveryDoc` now records the issuer it was rendered for and a cache hit is
+// served only when it matches the request's issuer
+// (internal/oidchttp/oidchttp.go:315-359). The probe is now the regression guard
+// for that check.
+//
+// What it pins, in order:
+//  1. the dynamic issuer still follows the Host header (the premise of the
+//     poisoning shape — without it this probe would be aimed at nothing);
+//  2. a second Host asking the same path is answered with ITS OWN document, not
+//     the first Host's cached one;
+//  3. the first Host's own fetch is likewise re-rendered, so neither Host can
+//     inherit the other's document;
+//  4. the RFC 8414 alias shares the OIDC document's cache entry (serveDiscovery
+//     renders the OIDC path for both) and is subject to the same issuer check,
+//     and the document is still publicly cacheable.
+//
+// Note the reachability caveat it always carried: cmd/re0auth always sets
+// Config.Issuer (config.go rejects an empty one), so the dynamic shape is the
+// development/test shape; the probe documents the property for the shape the
+// wrapper supports and the test suite uses.
 func TestProbeDiscoveryIsCachedFromTheFirstRequestsHost(t *testing.T) {
 	e := newEnv(t, envOptions{}) // dynamic issuer, like the package's own fixture
 
-	fetch := func(host string) map[string]any {
+	fetch := func(host string) (map[string]any, string) {
 		t.Helper()
 		req, err := http.NewRequest(http.MethodGet, e.server.URL+"/.well-known/openid-configuration", nil)
 		if err != nil {
@@ -257,28 +273,40 @@ func TestProbeDiscoveryIsCachedFromTheFirstRequestsHost(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return decodeJSON(t, bodyOf(t, resp))
+		return decodeJSON(t, bodyOf(t, resp)), resp.Header.Get("Cache-Control")
 	}
 
-	poisoned := fetch("attacker.example")
-	if got, _ := poisoned["issuer"].(string); !strings.Contains(got, "attacker.example") {
+	// 1. The Host still drives the issuer. This is the premise; if it ever stops
+	// holding, the probe must fail loudly rather than pass vacuously.
+	poisoned, _ := fetch("attacker.example")
+	poisonedIssuer, _ := poisoned["issuer"].(string)
+	if !strings.Contains(poisonedIssuer, "attacker.example") {
 		t.Fatalf("the dynamic issuer does not follow the Host header, so this probe is aimed at nothing: %v", poisoned["issuer"])
 	}
 	t.Logf("first fetch (Host: attacker.example) -> issuer=%v authorization_endpoint=%v jwks_uri=%v",
 		poisoned["issuer"], poisoned["authorization_endpoint"], poisoned["jwks_uri"])
 
-	honest := fetch("re0auth.example")
-	if got, _ := honest["issuer"].(string); got != poisoned["issuer"] {
-		t.Fatalf("discovery is not cached; the poisoning shape does not hold: %v vs %v", got, poisoned["issuer"])
+	// 2/3. S02-5: the cached entry is not served across issuers.
+	honest, honestCC := fetch("re0auth.example")
+	honestIssuer, _ := honest["issuer"].(string)
+	if strings.Contains(honestIssuer, "attacker.example") {
+		t.Errorf("a second Host was handed the first Host's cached document: issuer=%v jwks_uri=%v",
+			honest["issuer"], honest["jwks_uri"])
 	}
-	if got, _ := honest["jwks_uri"].(string); !strings.Contains(got, "attacker.example") {
-		t.Fatalf("the cached document is not the poisoned one: %v", got)
+	if !strings.Contains(honestIssuer, "re0auth.example") {
+		t.Errorf("the second Host's document does not name its own issuer: %v", honest["issuer"])
 	}
-	t.Logf("every later fetch is answered with the attacker's issuer, including jwks_uri=%v", honest["jwks_uri"])
+	t.Logf("second fetch (Host: re0auth.example) -> issuer=%v jwks_uri=%v cache-control=%q",
+		honest["issuer"], honest["jwks_uri"], honestCC)
 
-	// The RFC 8414 alias shares the OIDC document's cache entry — serveDiscovery
-	// with RFC8414Path renders (and looks up) the OIDC path — so ONE request with a
-	// spoofed Host poisons BOTH published documents.
+	again, _ := fetch("attacker.example")
+	if got, _ := again["issuer"].(string); got != poisonedIssuer {
+		t.Errorf("the first Host's document was not re-rendered for it either: %v vs %v", got, poisonedIssuer)
+	}
+
+	// 4. The RFC 8414 alias shares the OIDC document's cache entry AND its issuer
+	// check: a third Host must render its own document rather than borrow either
+	// cached one.
 	req, err := http.NewRequest(http.MethodGet, e.server.URL+"/.well-known/oauth-authorization-server", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -289,13 +317,13 @@ func TestProbeDiscoveryIsCachedFromTheFirstRequestsHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	alias := decodeJSON(t, bodyOf(t, resp))
-	if got, _ := alias["issuer"].(string); got != poisoned["issuer"] {
-		t.Fatalf("the alias rendered its own document instead of sharing the cache: %v vs %v",
-			got, poisoned["issuer"])
+	aliasIssuer, _ := alias["issuer"].(string)
+	if !strings.Contains(aliasIssuer, "second-attacker.example") {
+		t.Errorf("the alias borrowed another Host's document instead of rendering for its own: %v", alias["issuer"])
 	}
 	if cc := resp.Header.Get("Cache-Control"); !strings.Contains(cc, "max-age") {
 		t.Fatalf("discovery is no longer publicly cacheable: %q", cc)
 	}
-	t.Logf("the RFC 8414 alias serves the same poisoned document: issuer=%v cache-control=%q",
+	t.Logf("the RFC 8414 alias renders for its own Host: issuer=%v cache-control=%q",
 		alias["issuer"], resp.Header.Get("Cache-Control"))
 }

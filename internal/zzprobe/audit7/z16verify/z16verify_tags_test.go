@@ -175,7 +175,7 @@ func TestTaggedCorpusGuardParsesOnlyGoBuildNotTheLegacyTag(t *testing.T) {
 	code, out := run(t, tmp, nil, "go", "test", "-tags", "audit7", "-count=1", "-v",
 		"-run", "^TestEveryTaggedTestFileIsReachableFromCI$",
 		"./internal/zzprobe/audit7/z16guardtestquality/")
-	if !strings.Contains(out, "tracked test files are behind a tag no workflow sets") {
+	if !strings.Contains(out, "tracked test files are behind a constraint no workflow can satisfy") {
 		t.Fatalf("the guard did not run at all:\n%s", out)
 	}
 	if strings.Contains(out, "rev1_test.go") {
@@ -190,16 +190,22 @@ func TestTaggedCorpusGuardParsesOnlyGoBuildNotTheLegacyTag(t *testing.T) {
 }
 
 // TestLoadJobInspectionIfFixed keeps the one-line fix honest: the guard the Z16
-// report proposes (read the step's output) must be able to distinguish the live
+// report proposed (read the step's output) must be able to distinguish the live
 // run from the zero-measurement run. This is the same positive control as in the
 // other file, asserted here as a named guard so a later edit cannot silently
 // weaken it.
+//
+// 【原为发现演示，现为回归守卫】The fix landed (ci.yml:624-632), and this is now
+// the control that says the job's grep would actually fire: the marker is present
+// on the live run and absent on a `-run` that matches nothing. The live fixture
+// uses loadLiveSeconds/loadLiveWorkers so it clears TestLoadProfile's own floor
+// instead of tripping it (see that const's comment).
 func TestLoadJobInspectionIfFixed(t *testing.T) {
 	root := repoRoot(t)
-	code, out := run(t, root, []string{"RE0AUTH_LOAD_PROFILE=1", "RE0AUTH_LOAD_SECONDS=1", "RE0AUTH_LOAD_WORKERS=1"},
+	code, out := run(t, root, loadLiveEnv(),
 		"go", "test", "-count=1", "-v", "-run", "^TestLoadProfile$", "./internal/httpapi/")
 	if code != 0 || !strings.Contains(out, "capacity profile:") {
-		t.Fatalf("the proposed anti-vacuity marker is not produced by the live run:\n%s", out)
+		t.Fatalf("the anti-vacuity marker is not produced by the live run:\n%s", out)
 	}
 	code, out = run(t, root, nil, "go", "test", "-count=1", "-run", "^TestLoadProfileRenamedAway$", "./internal/httpapi/")
 	if code != 0 || strings.Contains(out, "capacity profile:") {

@@ -483,19 +483,35 @@ func newStack(t *testing.T) *stackEnv {
 	}
 	logger := audit.NewMemoryLogger()
 
-	// The login hook is the production shape (cmd/re0auth openOIDC): the
-	// handle is bound to the browser session, and the session's real
+	// The login hook is the production shape (cmd/re0auth openOIDC, S02-1/O-8b):
+	// the handle is bound to the browser session, the session's real
 	// authentication time is recorded on the pending request so the id_token's
-	// auth_time is the login, not the consent decision.
+	// auth_time is the login and not the consent decision — and a request that
+	// asked for a fresh authentication the session cannot prove is sent through
+	// the identity provider again instead of to the consent screen.
+	//
+	// The freshness branch is not optional garnish: a fixture that omitted it
+	// measured its own omission (the login hook never re-entered the login
+	// plane), which is exactly the false positive this probe set exists to avoid.
 	var store *memory.OIDCStore
 	login := func(ctx context.Context, id string) string {
 		manager.Bind(ctx, "authz", id)
+		consent := "/app/consent?id=" + url.QueryEscape(id)
 		if at, ok := manager.AuthenticatedAt(ctx); ok {
+			ar, err := store.AuthRequestByID(ctx, id)
+			if err != nil {
+				t.Logf("AuthRequestByID: %v", err)
+			} else if fresh, ok := ar.(interface {
+				FreshnessNeeded(at, now time.Time) bool
+			}); ok && fresh.FreshnessNeeded(at, time.Now()) {
+				// Same target cmd/re0auth's login hook builds.
+				return "/auth/reauth?return_to=" + url.QueryEscape(consent)
+			}
 			if err := store.SetAuthTime(ctx, id, at); err != nil {
 				t.Logf("SetAuthTime: %v", err)
 			}
 		}
-		return "/app/consent?id=" + url.QueryEscape(id)
+		return consent
 	}
 	storeOpts := memory.OIDCOptions{
 		Clients:  clients,
@@ -589,8 +605,25 @@ func (e *stackEnv) signIn(t *testing.T, c *http.Client) {
 }
 
 // authorize starts an authorization request from this browser and returns the
-// consent handle the redirect carried.
+// consent handle the redirect carried. It fails when the answer was not a
+// consent handle; use authorizeLocation to read the raw redirect (a
+// freshness-bound request is answered with /auth/reauth, not a handle).
 func (e *stackEnv) authorize(t *testing.T, c *http.Client, scope string, extra url.Values) string {
+	t.Helper()
+	loc := e.authorizeLocation(t, c, scope, extra)
+	handle := loc.Query().Get("id")
+	if handle == "" {
+		t.Fatalf("no consent handle in %q", loc)
+	}
+	return handle
+}
+
+// authorizeLocation starts an authorization request from this browser and
+// returns the raw Location the protocol plane answered with. It asserts nothing
+// about the shape of that Location beyond "a redirect", because the two legal
+// answers are the consent handle (`?id=…`) and the re-authentication entrance
+// (`/auth/reauth?return_to=…`, S02-1).
+func (e *stackEnv) authorizeLocation(t *testing.T, c *http.Client, scope string, extra url.Values) *url.URL {
 	t.Helper()
 	verifier := strings.Repeat("v", 64)
 	q := url.Values{
@@ -614,11 +647,8 @@ func (e *stackEnv) authorize(t *testing.T, c *http.Client, scope string, extra u
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle := loc.Query().Get("id")
-	if handle == "" {
-		t.Fatalf("no consent handle in %q", resp.Header.Get("Location"))
-	}
-	return handle
+	e.body(t, resp)
+	return loc
 }
 
 // consentView fetches the consent screen's data.
@@ -640,6 +670,37 @@ func (e *stackEnv) decide(t *testing.T, c *http.Client, handle, csrf string, bod
 	}
 	req, err := http.NewRequest(http.MethodPost,
 		e.server.URL+"/v1/authorization_requests/"+handle+"/decision", strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if json.Unmarshal(b, &out) != nil {
+		return resp, map[string]any{"_raw": string(b)}
+	}
+	return resp, out
+}
+
+// decideDevice posts a device decision, the exact call the device page's
+// approve button makes.
+func (e *stackEnv) decideDevice(t *testing.T, c *http.Client, csrf string, body map[string]any) (*http.Response, map[string]any) {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost,
+		e.server.URL+"/v1/device/decision", strings.NewReader(string(raw)))
 	if err != nil {
 		t.Fatal(err)
 	}

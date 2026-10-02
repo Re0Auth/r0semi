@@ -148,6 +148,16 @@ func (b *blockingFederation) AllSources() []federation.Source {
 // function so the concurrency is observable; the durable path is
 // `store.db.Ping` (cmd/re0auth/main.go:774), which acquires a pooled connection
 // per call, bounded only by internal/httpapi's 2s readinessTimeout.
+//
+// 【原为发现演示，现为回归守卫】The 0e6b701 readiness cache — completed by the
+// 22-1 / G-11 three-state fix — bounds the exempt work: at most one check runs at
+// a time and its verdict is reused for readinessTTL. The old measurement (32
+// concurrent calls inside the readiness probe, peak==32) is therefore no longer
+// reachable and was itself the red
+// (docs/audit-7/findings/22-audit5-red-reconciliation.md:63,219-221: "the red is
+// the probe counting concurrent checks, not the exemption being lost"). The guard
+// now pins the exemption the other way: every /readyz is admitted while the cap is
+// saturated, and the dependency is reached exactly once.
 func TestProbeReadyzBypassesTheLimiterAndTheInFlightCap(t *testing.T) {
 	get := func(handler http.Handler, path string) int {
 		rec := httptest.NewRecorder()
@@ -205,30 +215,44 @@ func TestProbeReadyzBypassesTheLimiterAndTheInFlightCap(t *testing.T) {
 	const n = 32
 	var wg sync.WaitGroup
 	codes := make([]int, n)
+	bodies := make([]string, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			codes[i] = get(handler, "/readyz")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			codes[i], bodies[i] = rec.Code, rec.Body.String()
 		}(i)
 	}
-	waitFor(t, func() bool { return ready.inside.Load() == int64(n) }, "not every /readyz reached the probe")
-	peak := ready.peak.Load()
+	// The exempt work is now bounded: one readiness check runs at a time and is
+	// reused for readinessTTL, so 32 concurrent probes make exactly ONE call into
+	// the dependency (health.go's readinessCache). Waiting for 32 concurrent calls
+	// was the pre-0e6b701 behavior and was this probe's red.
+	waitFor(t, func() bool { return ready.calls.Load() == 1 }, "the readiness check did not coalesce to one call")
 	close(ready.release)
 	wg.Wait()
 	close(blocking.release)
 	<-held
 
+	if calls := ready.calls.Load(); calls != 1 {
+		t.Errorf("%d concurrent /readyz made %d readiness checks, want exactly 1 (the check must coalesce)",
+			n, calls)
+	}
 	for i, code := range codes {
-		if code != http.StatusOK {
-			t.Fatalf("/readyz #%d = %d, want 200 (probes are exempt)", i, code)
+		if code == http.StatusOK {
+			continue // a verdict landed before this caller was answered
+		}
+		// A probe must never be shed by the in-flight cap; the only 503 it may get
+		// is the readiness cache's own cold-start "checking" (fail closed, never a
+		// 200 without a verdict).
+		if code != http.StatusServiceUnavailable || bodies[i] != "checking\n" {
+			t.Fatalf("/readyz #%d = %d %q, want 200 or the readiness 503 \"checking\" — a probe was "+
+				"refused by the in-flight cap", i, code, bodies[i])
 		}
 	}
-	if peak < n {
-		t.Fatalf("peak readiness concurrency = %d, want %d", peak, n)
-	}
 	t.Logf("%d concurrent /readyz calls were all admitted while max_in_flight=1 was saturated; "+
-		"peak concurrency inside the readiness check = %d", n, peak)
+		"the readiness check ran %d time(s)", n, ready.calls.Load())
 }
 
 // READY-2 probe: a readiness check that never returns holds its caller for

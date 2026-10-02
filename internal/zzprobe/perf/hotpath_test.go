@@ -219,9 +219,55 @@ func (d *gatedDoer) Do(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
+// collectParked waits until n requests have reached the gated upstream and are
+// parked holding their body. It fails instead of blocking forever when a request
+// was refused before the proxy ever called the upstream: the old bare
+// `<-gated.bodies` turned one missing fixture scope into a package-level 600s
+// timeout with no output at all (Z20-2's `<game>.raw.read` gate did exactly that).
+func collectParked(t *testing.T, gated *gatedDoer, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case b := <-gated.bodies:
+			select {
+			case <-b.reached:
+			case <-time.After(30 * time.Second):
+				t.Fatalf("request %d reached the upstream but never finished reading its body", i)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("only %d of %d requests reached the upstream; the handler is refusing or failing them "+
+				"before the proxy calls the gated Doer (check the token's scopes — since Z20-2 the raw path "+
+				"needs `<game>.raw.read`). Without this bound the probe blocks until the package-level timeout.",
+				i, n)
+		}
+	}
+}
+
 func newProbeEnvWithDoer(tb testing.TB, doer httpclient.Doer) *probeEnv {
 	tb.Helper()
 	return newProbeEnvWithBudget(tb, doer, 0)
+}
+
+// probeScopeRegistry is the shipped catalogue plus the game's explicit raw
+// passthrough scope.
+//
+// Since Z20-2 the raw passthrough is gated on `<game>.raw.read` and nothing else
+// (internal/httpapi/federation_routes.go:230-275), and the production composition
+// root registers one such descriptor per game with a raw_base
+// (cmd/re0auth/main.go rawScopeDescriptors). Without it the OP refuses the scope
+// at authorize time, every raw probe below reads a 403 scope gate instead of the
+// proxy, and the gated probes block forever waiting for an upstream body that is
+// never requested (the package then hangs until go test's timeout). The sibling
+// fixtures in internal/zzprobe/federationhttp and audit7/z09 do the same.
+func probeScopeRegistry(tb testing.TB) *oauth.Registry {
+	tb.Helper()
+	reg := oauth.DefaultRegistry()
+	if err := reg.Register(oauth.Descriptor{
+		Scope: oauth.Scope(oauth.RawScope(probeGame)), Title: "raw passthrough", Risk: oauth.RiskHigh,
+	}); err != nil {
+		tb.Fatal(err)
+	}
+	return reg
 }
 
 // newProbeEnvWithBudget is newProbeEnvWithDoer with the data plane's joint buffer
@@ -236,10 +282,11 @@ func newProbeEnvWithBudget(tb testing.TB, doer httpclient.Doer, maxBufferedBytes
 	ctx := context.Background()
 
 	metrics := observability.New()
+	scopes := probeScopeRegistry(tb)
 	clients := oauth.NewMemoryClientRegistry()
 	client, err := oauth.NewClient(probeClientID, "Probe", oauth.ClientConfidential, probeSecret,
 		[]string{probeRedirect},
-		[]oauth.Scope{oauth.ScopeAccountID, oauth.ScopePhigrosScore})
+		[]oauth.Scope{oauth.ScopeAccountID, oauth.ScopePhigrosScore, oauth.Scope(oauth.RawScope(probeGame))})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -253,7 +300,7 @@ func newProbeEnvWithBudget(tb testing.TB, doer httpclient.Doer, maxBufferedBytes
 	}
 	store, err := memory.NewOIDCStore(memory.OIDCOptions{
 		Clients:  clients,
-		Registry: oauth.DefaultRegistry(),
+		Registry: scopes,
 		Signer:   oidcstore.NewSigner("probe", key),
 		Login: func(_ context.Context, id string) string {
 			return "/login?authRequestID=" + url.QueryEscape(id)
@@ -269,7 +316,7 @@ func newProbeEnvWithBudget(tb testing.TB, doer httpclient.Doer, maxBufferedBytes
 		CryptoKeyID:   "probe",
 		AllowInsecure: false,
 		Clients:       clients,
-		Registry:      oauth.DefaultRegistry(),
+		Registry:      scopes,
 		Consent:       store,
 		Metrics:       metrics,
 	})
@@ -362,7 +409,10 @@ func probeCryptoKey() [32]byte {
 // scoped for the data plane.
 func probeCodeFlow(tb testing.TB, handler http.Handler, store *memory.OIDCStore) string {
 	tb.Helper()
-	scopes := []string{oauth.ScopeAccountID.String(), probeScope}
+	// The token carries the game's explicit raw scope as well as the resource
+	// scope, so the raw-path probes below reach the proxy rather than the Z20-2
+	// scope gate (see probeScopeRegistry).
+	scopes := []string{oauth.ScopeAccountID.String(), probeScope, oauth.RawScope(probeGame)}
 	q := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {probeClientID},
@@ -521,10 +571,7 @@ func TestProbeInFlightBytesPerDataPlaneRequest(t *testing.T) {
 
 	// Wait until every request has read its whole upstream body (so every one of
 	// them is holding its buffer), then read the live heap while they are parked.
-	for i := 0; i < inFlight; i++ {
-		b := <-gated.bodies
-		<-b.reached
-	}
+	collectParked(t, gated, inFlight)
 	runtime.GC()
 	var during runtime.MemStats
 	runtime.ReadMemStats(&during)

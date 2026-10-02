@@ -3,26 +3,86 @@
 // Zone-01 findings on the consent face: what an interactive authorization can
 // and cannot complete, and what prompt=none / prompt=login actually do to a
 // signed-in session.
+//
+// Every red probe in this file has been REPOSITIONED: the finding it demonstrated
+// was fixed, so the probe now guards the fixed behaviour under its original name
+// (a "regression guard", per the round-6 truthfulness rule). Where a fixture
+// rather than production caused the red, the fixture was brought back to the
+// production shape and the probe measures the real boundary.
 package z01protocolauth
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Re0Auth/r0semi/internal/oidcstore"
 )
 
-// 01-1 · A request whose scope set is entirely OIDC protocol scopes — the
-// default request of every standard relying party ("openid profile email") —
-// cannot be approved: the consent screen renders no scope at all, and the only
-// decision body that screen can build is refused by the server. The authorize
-// entrance accepts the request (StandardOIDCScope bypasses the catalogue
-// check), the pending request is allocated, and then the flow dead-ends.
+// scopeEntry returns the rendered scope object for a scope name.
+func scopeEntry(t *testing.T, scopes []any, name string) map[string]any {
+	t.Helper()
+	for _, raw := range scopes {
+		entry, ok := raw.(map[string]any)
+		if ok && entry["scope"] == name {
+			return entry
+		}
+	}
+	t.Fatalf("scope %q is not rendered; the display set must cover the grant set: %v", name, scopes)
+	return nil
+}
+
+// assertSystemRequired checks the A-FE-3 placeholder: a requested scope the
+// catalogue does not describe is shown as system-required (never dropped, never
+// offered as a user-selectable catalogue scope).
+func assertSystemRequired(t *testing.T, entry map[string]any) {
+	t.Helper()
+	if entry["title"] != "系统必需" {
+		t.Fatalf("catalogue-less scope %v rendered without the system-required placeholder: %v", entry["scope"], entry)
+	}
+	if entry["explicit_consent"] != false {
+		t.Fatalf("the system-required placeholder must not claim explicit_consent: %v", entry)
+	}
+	if d, _ := entry["description"].(string); d == "" {
+		t.Fatalf("the system-required placeholder carries no description: %v", entry)
+	}
+}
+
+// handleFromReauth pulls the consent handle out of the /auth/reauth redirect the
+// login boundary builds (`return_to=/app/consent?id=…`).
+func handleFromReauth(t *testing.T, loc *url.URL) string {
+	t.Helper()
+	returnTo := loc.Query().Get("return_to")
+	if returnTo == "" {
+		t.Fatalf("the re-authentication redirect carries no return_to: %s", loc)
+	}
+	consent, err := url.Parse(returnTo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := consent.Query().Get("id")
+	if id == "" {
+		t.Fatalf("return_to %q carries no consent handle", returnTo)
+	}
+	return id
+}
+
+// 01-1 · A-FE-3/A-FE-V1 (fixed — now a regression guard, name kept for the
+// coverage matrix). A request whose scope set is entirely OIDC protocol scopes —
+// the default request of every standard relying party ("openid profile email") —
+// used to dead-end: the consent screen rendered zero scopes (the catalogue did
+// not describe them) while the server still carried them through, so the only
+// decision body the screen could build was an empty scope array that the API
+// refused.
 //
-// What the attacker gets is nothing; what the deployment gets is an OP that
-// cannot serve the pure-OIDC relying parties that ADR-0001's positioning
-// ("对下游：标准 OIDC，一次接入拿到 id_token/userinfo") says it exists to serve.
+// The fix renders every granted scope: a scope with no descriptor gets the
+// explicit system-required placeholder, so the display set covers the grant set
+// (A-FE-3). The probe now asserts that placeholder AND that the standard request
+// completes end to end with an id_token.
 func TestProbeProtocolOnlyScopesCannotBeApproved(t *testing.T) {
 	e := newStack(t)
 	browser := newBrowser(t)
@@ -37,38 +97,45 @@ func TestProbeProtocolOnlyScopesCannotBeApproved(t *testing.T) {
 	if csrf == "" {
 		t.Fatalf("consent view without a csrf token: %v", view)
 	}
-	if len(scopes) != 0 {
-		t.Fatalf("expected the protocol-only request to render no catalogue scopes, got %v", scopes)
+	if len(scopes) != 3 {
+		t.Fatalf("the protocol-only request rendered %d scopes, want all three requested scopes "+
+			"(the display set must cover the grant set): %v", len(scopes), scopes)
+	}
+	for _, name := range []string{"openid", "profile", "email"} {
+		assertSystemRequired(t, scopeEntry(t, scopes, name))
 	}
 
-	// The consent page's own logic (web/src/routes/consent/+page.svelte) builds
-	// the approve body from exactly the scopes it rendered:
-	//
-	//	granted = request.scopes.filter(selected).map(s => s.scope)   // == []
-	//	scopes: decision === 'approve' ? granted : undefined           // []
-	//	canApprove = granted.length > 0 && ...                         // false
-	//
-	// so `{"decision":"approve","scopes":[]}` is the only shape the UI can
-	// send, and the button that would send it never enables. The server
-	// refuses that shape: the empty-approval refusal the round-5 suite pinned
-	// as correct (for a request that HAD catalogue scopes) also closes the only
-	// door a protocol-only request has.
+	// The consent page builds its approve body from exactly the scopes it
+	// rendered (granted.length > 0), so this is the shape the UI sends — and it
+	// must be accepted.
 	resp, body := e.decide(t, browser, handle, csrf, map[string]any{
 		"decision": "approve",
-		"scopes":   []string{},
+		"scopes":   []string{"openid", "profile", "email"},
 	})
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("an authorization whose requested scopes are all protocol scopes (openid profile email) "+
-			"is accepted by /oauth/authorize but can never be approved: the consent screen renders zero scopes, "+
-			"its approve button stays disabled (canApprove requires granted.length > 0), and the API refuses "+
-			"the empty scope array that is all the screen could echo back — status %d, body %v",
-			resp.StatusCode, body)
+		t.Fatalf("an authorization whose requested scopes are all protocol scopes (openid profile email) "+
+			"is accepted by /oauth/authorize but cannot be approved: the consent screen renders them as "+
+			"system-required and the decision is refused — status %d, body %v", resp.StatusCode, body)
+	}
+	redirect, _ := body["redirect_to"].(string)
+	if redirect == "" {
+		t.Fatalf("approval answered without a redirect_to: %v", body)
+	}
+	code := e.followCallback(t, browser, redirect)
+	if code == "" {
+		t.Fatal("the protocol-only flow produced no code")
+	}
+	// openid must survive the round trip: a standard relying party needs its
+	// id_token, which is what ADR-0001's positioning promises.
+	tokens := e.exchange(t, code)
+	if idToken, _ := tokens["id_token"].(string); idToken == "" {
+		t.Errorf("the protocol-only approval issued no id_token although openid was requested: %v", tokens)
 	}
 }
 
-// 01-1 control · The same request with one catalogue scope completes
-// normally, so the dead end above is about the scope set, not a broken
-// environment. This probe is expected to stay green.
+// 01-1 control · The same request with one catalogue scope completes normally
+// and now renders the catalogue scope ALONGSIDE the three protocol placeholders
+// (A-FE-3 made the display set cover the grant set in both cases).
 func TestProbeMixedScopesStillComplete(t *testing.T) {
 	e := newStack(t)
 	browser := newBrowser(t)
@@ -78,12 +145,19 @@ func TestProbeMixedScopesStillComplete(t *testing.T) {
 	view := e.consentView(t, browser, handle)
 	scopes, _ := view["scopes"].([]any)
 	csrf, _ := view["csrf_token"].(string)
-	if len(scopes) != 1 {
-		t.Fatalf("control consent view scopes = %v, want [account.id]", scopes)
+	if len(scopes) != 4 {
+		t.Fatalf("control consent view scopes = %v, want the three protocol scopes plus account.id", scopes)
+	}
+	for _, name := range []string{"openid", "profile", "email"} {
+		assertSystemRequired(t, scopeEntry(t, scopes, name))
+	}
+	account := scopeEntry(t, scopes, "account.id")
+	if account["title"] == "系统必需" || account["title"] == "" {
+		t.Fatalf("account.id was rendered without its catalogue descriptor: %v", account)
 	}
 	resp, body := e.decide(t, browser, handle, csrf, map[string]any{
 		"decision": "approve",
-		"scopes":   []string{"account.id"},
+		"scopes":   []string{"openid", "profile", "email", "account.id"},
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("control decision = %d %v", resp.StatusCode, body)
@@ -94,9 +168,11 @@ func TestProbeMixedScopesStillComplete(t *testing.T) {
 	}
 }
 
-// 01-1 (device half) · The device verification page has the same gate: a
-// device authorization whose scopes are all protocol scopes renders an empty
-// scope list, and its canApprove requires granted.length > 0.
+// 01-1 (device half) · A-FE-V1 (fixed — now a regression guard). The device
+// verification page had the same gate: a device authorization whose scopes are
+// all protocol scopes rendered an empty scope list, so its canApprove
+// (`granted.length > 0`) could never enable. The proto scope is now rendered as
+// system-required, and the device decision the page builds completes.
 func TestProbeProtocolOnlyDeviceFlowCannotBeApproved(t *testing.T) {
 	e := newStack(t)
 	browser := newBrowser(t)
@@ -110,44 +186,59 @@ func TestProbeProtocolOnlyDeviceFlowCannotBeApproved(t *testing.T) {
 	}
 	view := decodeJSON(t, e.body(t, resp))
 	scopes, _ := view["scopes"].([]any)
-	if len(scopes) != 0 {
-		t.Fatalf("expected the protocol-only device request to render no scopes, got %v", scopes)
+	if len(scopes) != 1 {
+		t.Fatalf("the protocol-only device request rendered %d scopes, want openid as system-required: %v", len(scopes), scopes)
 	}
-	// web/src/routes/device/+page.svelte: canApprove = granted.length > 0 && …
-	t.Errorf("a device authorization whose scopes are all protocol scopes shows an empty scope " +
-		"list and an approve button that can never enable — the standard OIDC device request " +
-		"(scope=openid) is accepted at /oauth/device_authorization but can never be approved")
+	assertSystemRequired(t, scopeEntry(t, scopes, "openid"))
+	csrf, _ := view["csrf_token"].(string)
+	if csrf == "" {
+		t.Fatalf("device verification view without a csrf token: %v", view)
+	}
+
+	// The device page's canApprove is `granted.length > 0` over the rendered
+	// (and by default selected) scopes, so this is the decision it can now send.
+	dresp, dbody := e.decideDevice(t, browser, csrf, map[string]any{
+		"user_code": userCode,
+		"decision":  "approve",
+		"scopes":    []string{"openid"},
+	})
+	if dresp.StatusCode != http.StatusOK {
+		t.Fatalf("a device authorization whose scopes are all protocol scopes (scope=openid) is accepted "+
+			"at /oauth/device_authorization but cannot be approved — status %d, body %v", dresp.StatusCode, dbody)
+	}
+	if dbody["state"] != "approved" {
+		t.Fatalf("device decision state = %v, want approved", dbody["state"])
+	}
 }
 
-// 01-3 · prompt=none with a live session renders the interactive consent page
-// instead of answering through the redirect. OIDC Core §3.1.2.1: a request with
-// prompt=none MUST NOT display any authentication or consent user interface
-// pages; when the OP needs consent it cannot obtain silently it MUST return
-// error=consent_required. Re0Auth has no pre-stored consent (every request
-// goes through the consent screen), so prompt=none with a session can never be
-// satisfied silently — and still it renders UI. O-8a implemented only the
-// no-session half (login_required); this is the other half of the same MUST.
+// 01-3 · S02-2 (fixed — now a regression guard, name kept). prompt=none with a
+// live session used to render the interactive consent page. OIDC Core §3.1.2.1:
+// a request with prompt=none MUST NOT display any authentication or consent user
+// interface pages; when the OP must obtain consent it cannot get silently it
+// MUST return error=consent_required. Re0Auth has no pre-stored consent, so a
+// silent request can NEVER be satisfied silently — the correct answer is always
+// consent_required through the redirect.
 func TestProbePromptNoneWithASessionRendersTheConsentUI(t *testing.T) {
 	e := newStack(t)
 	browser := newBrowser(t)
 	e.signIn(t, browser)
 
-	// prompt=none on a request this OP can only answer interactively (it has
-	// no stored consent to fall back on) must come back through the redirect
-	// with error=consent_required. Instead the browser is handed the consent
-	// page — inside a hidden iframe, a silent-auth RP now renders the OP's UI
-	// and never receives an error.
-	handle := e.authorize(t, browser, "openid account.id", url.Values{"prompt": {"none"}})
-	t.Logf("prompt=none with a live session went straight to the interactive consent plane (handle %q)", handle)
-	if handle != "" {
-		t.Errorf("prompt=none with a live session rendered the interactive consent UI (handle %q): "+
-			"OIDC Core §3.1.2.1 requires error=consent_required through the redirect_uri whenever the "+
-			"OP must not display UI — and this OP always needs consent, so it can never answer a "+
-			"silent request as satisfied", handle)
+	loc := e.authorizeLocation(t, browser, "openid account.id", url.Values{"prompt": {"none"}})
+	if loc.Host != "app.example" {
+		t.Fatalf("prompt=none with a live session redirected to %s, want the client's registered callback", loc)
+	}
+	if got := loc.Query().Get("error"); got != "consent_required" {
+		t.Errorf("prompt=none with a live session answered error=%q (%s), want consent_required: this OP "+
+			"has no pre-existing consent to reuse, so the silent request must fail closed through the "+
+			"redirect instead of rendering the interactive consent UI", got, loc)
+	}
+	if got := loc.Query().Get("iss"); got == "" {
+		t.Errorf("the consent_required redirect carries no iss (RFC 9207 §2): %s", loc)
 	}
 
-	// Control: without a session the same request is answered correctly (the
-	// O-8a half the fix did implement).
+	// Control: without a session the same request is answered with
+	// login_required (the O-8a half), so the answer above is about consent and
+	// not a blanket refusal.
 	anon := newBrowser(t)
 	q := url.Values{
 		"response_type":         {"code"},
@@ -163,20 +254,30 @@ func TestProbePromptNoneWithASessionRendersTheConsentUI(t *testing.T) {
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("anonymous prompt=none = %d: %s", resp.StatusCode, e.body(t, resp))
 	}
-	loc, _ := url.Parse(resp.Header.Get("Location"))
-	if loc.Host != "app.example" || loc.Query().Get("error") != "login_required" {
-		t.Fatalf("anonymous prompt=none redirected to %s", loc)
+	aloc, _ := url.Parse(resp.Header.Get("Location"))
+	if aloc.Host != "app.example" || aloc.Query().Get("error") != "login_required" {
+		t.Fatalf("anonymous prompt=none redirected to %s", aloc)
 	}
 }
 
-// 01-6 · prompt=login and max_age are accepted at the entrance and silently
-// dropped. OIDC Core §3.1.2.1: prompt=login — "the OP MUST prompt the
-// end-user for re-authentication"; max_age — "the OP MUST re-authenticate the
-// End-User" when the last auth is older. Neither the wrapper nor the storage
-// keeps MaxAge (oidcstore.AuthRequest has no field for it), and prompt=login
-// never re-enters the login plane: a signed-in browser completes the whole
-// authorization with the original session, and the id_token's auth_time is
-// the original sign-in.
+// 01-6 · S02-1/O-8b (fixed — now a regression guard, name kept). prompt=login
+// and max_age used to be accepted at the entrance and silently dropped: a
+// signed-in browser completed the whole authorization with the original session
+// and the id_token carried the original auth_time, so an RP asking for step-up
+// authentication silently got a token from a session that could be hours old.
+//
+// The fix has two halves, and this probe measures both:
+//   - the login boundary sends a freshness-bound request through the identity
+//     provider (/auth/reauth → /auth/{provider}/start?mode=login) instead of to
+//     the consent screen, and
+//   - the store refuses CompleteLogin on a recorded authentication that does not
+//     satisfy the bound (oidcstore.ErrReauthenticationRequired, never a
+//     fabricated auth_time); a real re-authentication completes it and the
+//     id_token carries that recorded time.
+//
+// The stack fixture's login hook was brought back to the production shape
+// (cmd/re0auth openOIDC) before this was measured: the red it used to produce was
+// the fixture omitting the freshness branch.
 func TestProbePromptLoginAndMaxAgeDoNotForceReauthentication(t *testing.T) {
 	e := newStack(t)
 	browser := newBrowser(t)
@@ -185,41 +286,59 @@ func TestProbePromptLoginAndMaxAgeDoNotForceReauthentication(t *testing.T) {
 	// Enough for the seconds-granularity auth_time to fall strictly behind the
 	// authorization request.
 	time.Sleep(1100 * time.Millisecond)
-	authorizeAt := time.Now()
 
-	handle := e.authorize(t, browser, "openid account.id",
-		url.Values{"prompt": {"login"}, "max_age": {"0"}})
+	for name, extra := range map[string]url.Values{
+		"prompt=login": {"prompt": {"login"}},
+		"max_age=0":    {"max_age": {"0"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			loc := e.authorizeLocation(t, browser, "openid account.id", extra)
+			if loc.Path != "/auth/reauth" {
+				t.Fatalf("%s reached %s instead of the re-authentication entrance: the login boundary "+
+					"must send a request whose freshness the session cannot prove through the identity "+
+					"provider (S02-1/O-8b), not to the consent screen", name, loc)
+			}
+			id := handleFromReauth(t, loc)
 
-	// The flow must have re-entered the login plane. It did not: the consent
-	// view answers 200 for the still-signed-in session — the request was
-	// ready for a decision without any authentication happening after
-	// prompt=login asked for one.
-	view := e.consentView(t, browser, handle)
-	csrf, _ := view["csrf_token"].(string)
-	resp, body := e.decide(t, browser, handle, csrf, map[string]any{
-		"decision": "approve",
-		"scopes":   []string{"account.id"},
-	})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("decision = %d %v", resp.StatusCode, body)
-	}
-	redirect, _ := body["redirect_to"].(string)
-	tokens := e.exchange(t, e.followCallback(t, browser, redirect))
+			// The store's half: the prior session's authentication cannot
+			// complete the request, and the refusal leaves it undecided.
+			stale := time.Now().Add(-2 * time.Hour)
+			if err := e.store.SetAuthTime(context.Background(), id, stale); err != nil {
+				t.Fatal(err)
+			}
+			err := e.store.CompleteLogin(context.Background(), id, "usr_z01", []string{"openid", "account.id"})
+			if !errors.Is(err, oidcstore.ErrReauthenticationRequired) {
+				t.Fatalf("%s: completing on a two-hour-old session = %v, want oidcstore.ErrReauthenticationRequired", name, err)
+			}
+			if ar, aerr := e.store.AuthRequestByID(context.Background(), id); aerr != nil || ar.Done() {
+				t.Fatalf("%s: the refused completion left the request decided: done=%v err=%v",
+					name, ar != nil && ar.Done(), aerr)
+			}
 
-	idToken, _ := tokens["id_token"].(string)
-	if idToken == "" {
-		t.Fatalf("no id_token: %v", tokens)
-	}
-	claims := idTokenClaims(t, idToken)
-	authTime, _ := claims["auth_time"].(float64)
-	t.Logf("prompt=login flow completed; id_token auth_time = %d, authorize at %d",
-		int64(authTime), authorizeAt.Unix())
-
-	if int64(authTime) < authorizeAt.Unix() {
-		t.Errorf("prompt=login + max_age=0 completed with the ORIGINAL session's auth_time "+
-			"(auth_time=%d < authorize=%d): no re-authentication was forced, and the id_token is the "+
-			"proof — an RP asking for step-up auth silently gets a token from a session that could be "+
-			"hours old", int64(authTime), authorizeAt.Unix())
+			// A real re-authentication satisfies it, and the id_token carries the
+			// recorded time rather than the consent-decision clock.
+			fresh := time.Now().Add(-2 * time.Second)
+			if err := e.store.SetAuthTime(context.Background(), id, fresh); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.store.CompleteLogin(context.Background(), id, "usr_z01",
+				withOfflineAccess([]string{"openid", "account.id"})); err != nil {
+				t.Fatalf("%s: completing after a fresh authentication: %v", name, err)
+			}
+			code := e.followCallback(t, browser, "/oauth/authorize/callback?id="+url.QueryEscape(id))
+			tokens := e.exchange(t, code)
+			raw, _ := tokens["id_token"].(string)
+			if raw == "" {
+				t.Fatalf("%s: no id_token: %v", name, tokens)
+			}
+			claims := idTokenClaims(t, raw)
+			at, _ := claims["auth_time"].(float64)
+			got := time.Unix(int64(at), 0).UTC()
+			if got.Sub(fresh) < -time.Minute || got.Sub(fresh) > time.Minute {
+				t.Errorf("%s: id_token auth_time = %s, want the recorded re-authentication %s — the "+
+					"id_token must never advertise a fresh authentication that never happened", name, got, fresh)
+			}
+		})
 	}
 
 	// Control: an anonymous browser is still gated — the same view answers
@@ -234,7 +353,7 @@ func TestProbePromptLoginAndMaxAgeDoNotForceReauthentication(t *testing.T) {
 		"code_challenge":        {pkceChallenge(strings.Repeat("v", 64))},
 		"code_challenge_method": {"S256"},
 	}
-	resp = e.get(t, anon, e.server.URL+"/oauth/authorize?"+q.Encode())
+	resp := e.get(t, anon, e.server.URL+"/oauth/authorize?"+q.Encode())
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("anonymous authorize = %d: %s", resp.StatusCode, e.body(t, resp))
 	}

@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Re0Auth/r0semi/internal/account"
 	"github.com/Re0Auth/r0semi/internal/admin"
@@ -130,6 +131,12 @@ func TestProbeInternalSurfaceRequestsAreNotLogged(t *testing.T) {
 // `/healthz` returning a cacheable 200 would let an intermediary hide a dead
 // instance; a body that names the build would hand an anonymous caller a version
 // to look up.
+//
+// 【原为发现演示，现为回归守卫】The old form asserted that a dependency failing
+// after a ready verdict produced an immediate 503. The 0e6b701 readiness cache
+// (readinessTTL) made that false — the documented, bounded cost — so the probe
+// now waits out the TTL and additionally pins the deterministic first-check
+// failure path. See docs/audit-7/findings/22-audit5-red-reconciliation.md:64,216.
 func TestProbeHealthEndpointsAreNoStoreAndLeakNothing(t *testing.T) {
 	ready := true
 	cfg := probeConfig(t)
@@ -181,14 +188,51 @@ func TestProbeHealthEndpointsAreNoStoreAndLeakNothing(t *testing.T) {
 		}
 	}
 
+	// The verdict is reused for readinessTTL (1s, internal/httpapi/health.go:18-34)
+	// — the documented price of the probe's exemption (docs/operations.md:171-183).
+	// Flipping the dependency and asserting a 503 on the very next request asserted
+	// the PRE-cache behavior, which is exactly why this probe stayed red
+	// (docs/audit-7/findings/22-audit5-red-reconciliation.md:214-218 recommends
+	// "sleep(TTL+ε) then assert 503").
+	//
+	// 【原为发现演示，现为回归守卫】The guard now checks the post-fix contract: a
+	// dependency that fails reaches /readyz no later than one TTL after the flip,
+	// and the failure leaks nothing when it does.
 	ready = false
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("/readyz with a failing dependency = %d, want 503", rec.Code)
+	var rec *httptest.ResponseRecorder
+	deadline := time.Now().Add(3 * time.Second) // > readinessTTL, with slack
+	for {
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if rec.Code == http.StatusServiceUnavailable {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/readyz still answered %d (%q) > 3s after the dependency failed: the failure is not "+
+				"reported within one readinessTTL", rec.Code, rec.Body.String())
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	if rec.Body.String() != "not ready\n" {
-		t.Errorf("the failing /readyz body = %q", rec.Body.String())
+		t.Errorf("the failing /readyz body = %q, want %q", rec.Body.String(), "not ready\n")
+	}
+
+	// Deterministic fail path, independent of any cached verdict: a server whose
+	// FIRST-ever check fails must answer 503 "not ready", not the cold-start
+	// fail-open the 22-1 / G-11 regression introduced
+	// (internal/httpapi/health.go:130-145 — "unknown" is answered "checking",
+	// never "ok").
+	coldCfg := probeConfig(t)
+	coldCfg.Ready = func(context.Context) error { return errProbeNotReady }
+	cold, err := httpapi.New(coldCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	cold.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != "not ready\n" {
+		t.Errorf("a first-ever failing readiness check = %d %q, want 503 %q",
+			rec.Code, rec.Body.String(), "not ready\n")
 	}
 }
 

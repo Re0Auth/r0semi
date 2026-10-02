@@ -191,12 +191,15 @@ func TestV07WrongSecretIsIndistinguishable(t *testing.T) {
 // 8 · percent-encoded client_id bypasses the introspection guard
 // ---------------------------------------------------------------------------
 
-// TestV08PercentEncodedClientIDBypassesTheIntrospectionGuard sends the SAME
-// public client id twice to /oauth/introspect, once literally and once with one
-// character percent-encoded. The library's ClientBasicAuth runs
-// url.QueryUnescape on the Basic username; the project's guard
-// (refuseIntrospectionByANonConfidentialClient) and its introspection filter
-// read the raw string.
+// TestV08PercentEncodedClientIDBypassesTheIntrospectionGuard was the
+// falsification attempt for claim 8. It is FALSIFIED — the guard now resolves
+// the Basic username the way the library does (url.QueryUnescape,
+// internal/oidchttp basicClientID), so the escaped spelling reaches the same
+// public client and is refused with 401 invalid_client. The test stands as the
+// regression guard, under its original name.
+//
+// The two spellings must answer the SAME way; a future change that reads the raw
+// header again would make the escaped one pass this guard.
 func TestV08PercentEncodedClientIDBypassesTheIntrospectionGuard(t *testing.T) {
 	clock := newVClock()
 	// The round-5 P0-6 shape: the public client is on the allowlist.
@@ -220,28 +223,23 @@ func TestV08PercentEncodedClientIDBypassesTheIntrospectionGuard(t *testing.T) {
 	t.Logf("literal id : %d %s", plainResp.StatusCode, strings.TrimSpace(string(plainRaw)))
 	t.Logf("escaped id : %d %s", escResp.StatusCode, strings.TrimSpace(string(escRaw)))
 
-	if escResp.StatusCode == http.StatusUnauthorized {
-		t.Logf("FALSIFIED: the escaped id was refused too (%d)", escResp.StatusCode)
-		return
-	}
 	if plainResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("control failed: the literal public id was not refused (%d)", plainResp.StatusCode)
 	}
-	if escResp.StatusCode != http.StatusOK {
-		t.Fatalf("the escaped id answered %d, which the mechanism does not predict", escResp.StatusCode)
+	if escResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("the percent-encoded public id was admitted (%d: %s): the guard read the raw header "+
+			"instead of the decoded username the library authenticates (claim 8 is back)", escResp.StatusCode, escRaw)
 	}
-	if active, _ := vJSON(t, escRaw)["active"].(bool); active {
-		t.Errorf("the escaped caller got active=true: %s", escRaw)
+	if got := vJSON(t, escRaw)["error"]; got != "invalid_client" {
+		t.Errorf("the escaped refusal error = %v, want invalid_client: %s", got, escRaw)
 	}
-	t.Errorf("CONFIRMED: Basic username %q (QueryUnescape -> %q) authenticates as the PUBLIC client "+
-		"while the project's non-confidential guard cannot resolve it, so the documented 401 "+
-		"invalid_client is bypassable by encoding one character of the id",
-		escaped, e.pubID)
 }
 
-// TestV08DataHalfStillFailsClosed is the control the original probe claims: even
-// with the guard bypassed, a real foreign token is not described, because the
-// introspection filter keys on the raw (escaped) id.
+// TestV08DataHalfStillFailsClosed is the control the original probe claimed: even
+// with the guard bypassed, a real foreign token was not described because the
+// introspection filter keyed on the raw (escaped) id. The guard bypass is now
+// closed — the escaped spelling is refused outright — so the data half holds
+// one step earlier, and this test pins that refusal plus the control.
 func TestV08DataHalfStillFailsClosed(t *testing.T) {
 	clock := newVClock()
 	e := newVEnv(t, clock, []string{"vfy-public"})
@@ -252,19 +250,26 @@ func TestV08DataHalfStillFailsClosed(t *testing.T) {
 
 	resp, raw := e.post(t, "/oauth/introspect",
 		map[string]string{"token": tokens.AccessToken}, escaped, "not-a-secret")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("the escaped caller was refused (%d): %s", resp.StatusCode, raw)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("the escaped caller was admitted on a real foreign token (%d): %s", resp.StatusCode, raw)
 	}
 	body := vJSON(t, raw)
-	if body["active"] == true {
-		t.Fatalf("the escaped public client read another client's token facts: %s", raw)
+	if body["error"] != "invalid_client" {
+		t.Errorf("the refusal error = %v, want invalid_client: %s", body["error"], raw)
 	}
-	if _, leaked := body["scope"]; leaked {
-		t.Errorf("the response leaked scope: %s", raw)
+	// A refusal must describe nothing: no liveness bit, no scope, no subject.
+	for _, field := range []string{"active", "scope", "sub"} {
+		if _, leaked := body[field]; leaked {
+			t.Errorf("the refusal body carries %q: %s", field, raw)
+		}
 	}
-	if _, leaked := body["sub"]; leaked {
-		t.Errorf("the response leaked sub: %s", raw)
+
+	// Control: the literal spelling is refused the same way, so the answer is
+	// the non-confidential guard and not an escape-specific accident.
+	plainResp, plainRaw := e.post(t, "/oauth/introspect",
+		map[string]string{"token": tokens.AccessToken}, e.pubID, "not-a-secret")
+	if plainResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("control: the literal public id answered %d: %s", plainResp.StatusCode, plainRaw)
 	}
-	t.Logf("data half holds: escaped caller on a real foreign token = 200 %s",
-		strings.TrimSpace(string(raw)))
+	t.Logf("both spellings refused: escaped=%d literal=%d", resp.StatusCode, plainResp.StatusCode)
 }

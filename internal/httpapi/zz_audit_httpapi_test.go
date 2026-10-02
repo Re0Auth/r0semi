@@ -12,6 +12,7 @@ package httpapi
 // package's own helpers or with another probe file.
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -437,28 +438,119 @@ func TestZZA6EncodedSpellingsWidenTheSurface(t *testing.T) {
 // header / request edges
 // ---------------------------------------------------------------------------
 
-// TestZZA6RequestIdIsReflectedVerbatim checks how far a caller-controlled
-// request id travels: into the response header, into the JSON error body and
-// into the log line. An unbounded or unescaped echo is a log/response
-// injection surface at worst and an amplification knob at best.
+// TestZZA6RequestIdIsReflectedVerbatim — 原为发现演示，现为 Z11-3 回归守卫。
+//
+// The round-6 demonstration asked how far a caller-controlled request id
+// travels: into the response header, into the JSON error body and into the log
+// line. The answer then was that an unbounded/unescaped value was adopted
+// verbatim, so one unauthenticated request could buy a 64 KiB response header
+// and a 64 KiB log line. Z11-3 fixed that: internal/httpapi/middleware.go:176-180
+// adopts the caller's X-Request-Id only when validRequestID accepts it
+// (<= maxRequestIDBytes = 128, opaque charset), and otherwise substitutes a
+// generated id.
+//
+// The guard:
+//   - a short opaque id is echoed unchanged (the positive control);
+//   - a valid-but-oversized or non-opaque value is replaced, never reflected;
+//   - CR / LF / NUL are never reflected either — but Go's client refuses to
+//     transmit those at all (net/http transport.go:600 validateHeaders), so the
+//     probe writes the request bytes itself, which is what an attacker controls.
 func TestZZA6RequestIdIsReflectedVerbatim(t *testing.T) {
 	h := za6New(t, nil)
 
-	big := strings.Repeat("A", 8<<10)
-	hostile := []string{
-		big,
-		"x\r\nInjected: 1",
-		"x\nInjected: 1",
-		"x\x00y",
-		"x<script>alert(1)</script>",
-		"trace-me",
+	// Positive control: an id inside the adopted shape must round-trip.
+	resp, _ := h.do(t, http.MethodGet, "/v1/nope", map[string]string{"X-Request-Id": "trace-me"}, "")
+	if got := resp.Header.Get("X-Request-Id"); got != "trace-me" {
+		t.Errorf("a valid request id was not echoed: sent %q got %q", "trace-me", got)
 	}
-	for _, id := range hostile {
+
+	// Values the Go client will transmit but the server must reject.
+	for _, id := range []string{
+		strings.Repeat("A", 8<<10),
+		strings.Repeat("A", 60<<10),
+		"x<script>alert(1)</script>",
+	} {
 		resp, _ := h.do(t, http.MethodGet, "/v1/nope", map[string]string{"X-Request-Id": id}, "")
 		got := resp.Header.Get("X-Request-Id")
 		t.Logf("sent len=%d %q -> echoed len=%d %q (status %d, injected=%v)",
 			len(id), za6Short(id), len(got), za6Short(got), resp.StatusCode, resp.Header.Get("Injected"))
+		za6AssertOpaqueReplacement(t, id, got)
 	}
+
+	// Values Go's client will not transmit: put them on the wire ourselves.
+	for _, id := range []string{"x\r\nInjected: 1", "x\nInjected: 1", "x\x00y", "x\ry"} {
+		resp, raw := za6RawHeaderRequest(t, h.base, "X-Request-Id: "+id)
+		if resp == nil {
+			t.Logf("sent %q -> the server answered no parseable response: %.120q", id, raw)
+			if strings.Contains(strings.ToLower(raw), "injected") {
+				t.Errorf("a raw request header was reflected back: %q", raw)
+			}
+			continue
+		}
+		got := resp.Header.Get("X-Request-Id")
+		t.Logf("sent %q -> status %d echoed len=%d %q injected=%q",
+			id, resp.StatusCode, len(got), za6Short(got), resp.Header.Get("Injected"))
+		if injected := resp.Header.Get("Injected"); injected != "" {
+			t.Errorf("a raw header split the request into an Injected response header: %q", injected)
+		}
+		if got != "" {
+			za6AssertOpaqueReplacement(t, id, got)
+		}
+	}
+}
+
+// za6AssertOpaqueReplacement pins Z11-3: whatever the caller sent, the echoed id
+// is never that value and is always a short opaque token.
+func za6AssertOpaqueReplacement(t *testing.T, sent, got string) {
+	t.Helper()
+	if got == "" {
+		t.Errorf("sent %q but no request id was echoed at all", sent)
+		return
+	}
+	if got == sent {
+		t.Errorf("the caller's request id was adopted verbatim: %q", got)
+	}
+	if len(got) > maxRequestIDBytes {
+		t.Errorf("echoed request id is %d bytes, want at most %d", len(got), maxRequestIDBytes)
+	}
+	for i := 0; i < len(got); i++ {
+		c := got[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		t.Errorf("echoed request id %q contains %q, which is not an opaque-token byte", got, string(c))
+		break
+	}
+}
+
+// za6RawHeaderRequest writes a request line and one raw header line on a TCP
+// connection, because Go's client refuses to transmit a value with CR/LF/NUL
+// (net/http transport.go:600). It returns the parsed response, or nil plus the
+// raw reply when the server answers something unparseable.
+func za6RawHeaderRequest(t *testing.T, base, rawHeaderLine string) (*http.Response, string) {
+	t.Helper()
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	req := "GET /v1/nope HTTP/1.1\r\nHost: " + u.Host + "\r\n" +
+		rawHeaderLine + "\r\nConnection: close\r\n\r\n"
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(conn)
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), nil)
+	if err != nil {
+		return nil, string(raw)
+	}
+	return resp, string(raw)
 }
 
 func za6Short(s string) string {
