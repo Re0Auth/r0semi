@@ -25,12 +25,21 @@ export function focusFirstControl(node: HTMLElement) {
 /**
  * Hand focus back to the control that opened the surface, once it has closed.
  *
- * Takes a selector rather than the element itself on purpose: closing the surface
- * re-creates the trigger, so a node captured when it was clicked is detached by
- * the time focus needs returning and `.focus()` on it does nothing. It also
- * awaits `tick()`, because the replacement does not exist until the DOM updates.
+ * Takes an attribute *name* and its value, never a finished selector: closing the
+ * surface re-creates the trigger, so a node captured when it was clicked is
+ * detached by the time focus needs returning and `.focus()` on it does nothing —
+ * but the id that has to be matched comes from the server or the deployment
+ * config, and splicing it into a selector makes a quote or a bracket in an id an
+ * invalid selector that `querySelector` throws on. Matching by attribute
+ * comparison keeps that data out of the selector grammar entirely.
+ *
+ * It also awaits `tick()`, because the replacement does not exist until the DOM
+ * updates.
  */
-export async function restoreFocus(selector: string) {
+export async function restoreFocus(attribute: string, value: string) {
 	await tick();
-	document.querySelector<HTMLElement>(selector)?.focus();
+	const target = Array.from(document.querySelectorAll<HTMLElement>(`[${attribute}]`)).find(
+		(element) => element.getAttribute(attribute) === value
+	);
+	target?.focus();
 }

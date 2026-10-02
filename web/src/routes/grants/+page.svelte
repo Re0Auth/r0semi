@@ -70,7 +70,7 @@
 	// confirmation re-creates it.
 	function cancelRevoke(clientId: string) {
 		confirming = null;
-		void restoreFocus(`[data-revoke="${clientId}"]`);
+		void restoreFocus('data-revoke', clientId);
 	}
 
 	function formatDate(iso: string): string {

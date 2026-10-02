@@ -33,6 +33,17 @@
 	let unlinking = $state<string | null>(null);
 	let linking = $state<string | null>(null);
 
+	// What the sign-in buttons come back to. The current query is kept so a pending
+	// task is not lost, minus `error`: carrying a stale failure through return_to
+	// made the next load read it again and report failure for a login that had just
+	// succeeded.
+	const returnTo = $derived.by(() => {
+		const params = new URLSearchParams(page.url.search);
+		params.delete('error');
+		const query = params.toString();
+		return `${page.url.pathname}${query ? `?${query}` : ''}`;
+	});
+
 	onMount(async () => {
 		// A failed login or link comes back as ?error=... on the return URL. Read it
 		// before probing the session: a denied *login* leaves the visitor anonymous,
@@ -79,7 +90,10 @@
 			case 'invalid_request':
 				return '登录没有完成，请重试。';
 			default:
-				return `登录没有完成（${code}）。`;
+				// A fixed sentence, never the code: the value comes from the query
+				// string, so echoing it put attacker-chosen text inside the branded
+				// failure alert.
+				return '登录没有完成，请重试。';
 		}
 	}
 
@@ -133,7 +147,7 @@
 	// selector because the confirmation re-creates it, so a cached node would be stale.
 	function cancelUnlink(id: string) {
 		confirmingUnlink = null;
-		void restoreFocus(`[data-unlink="${id}"]`);
+		void restoreFocus('data-unlink', id);
 	}
 
 	// Linking is the opposite of signing in: it adds an identity to the account
@@ -161,7 +175,11 @@
 			a.href = url;
 			a.download = `re0auth-account-${data.profile.user_id}.json`;
 			a.click();
-			URL.revokeObjectURL(url);
+			// Revoking in the same task as click() can cancel the download the click
+			// just started, because the browser has not read the blob URL yet. One
+			// task of slack lets that read begin; the URL is still released
+			// immediately afterwards instead of holding the export in memory.
+			setTimeout(() => URL.revokeObjectURL(url), 0);
 		} catch (err) {
 			if (err instanceof ApiError && err.needsSignIn) {
 				session = null;
@@ -238,7 +256,7 @@
 	{/if}
 	<p class="mt-4 text-sm text-ink-muted">用外部账号登录，首次登录即注册。</p>
 	<div class="mt-4">
-		<SignIn returnTo={`${page.url.pathname}${page.url.search}`} />
+		<SignIn returnTo={returnTo} />
 	</div>
 {:else if session}
 	{#if authError}

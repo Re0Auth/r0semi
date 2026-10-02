@@ -294,6 +294,24 @@ function looksLikeProblem(value: unknown): value is Problem {
 	);
 }
 
+/**
+ * A list endpoint answers with `{ data: [...] }`.
+ *
+ * The type parameter only asserts that shape; JSON is not typed, and a response
+ * whose `data` is missing (or is an object where the page iterates) throws inside
+ * a render, where the only handler left is SvelteKit's error boundary — which
+ * shows the JavaScript message instead of something a person can act on. Checking
+ * at the boundary turns the same response into an ApiError every caller already
+ * knows how to display.
+ */
+function requireDataList<T>(value: unknown, what: string): { data: T[] } {
+	const data = (value as { data?: unknown } | null | undefined)?.data;
+	if (!Array.isArray(data)) {
+		throw new ApiError(0, local('malformed_response', `${what} response is missing its data array`));
+	}
+	return value as { data: T[] };
+}
+
 interface CallOptions {
 	body?: unknown;
 	csrf?: string;
@@ -360,6 +378,11 @@ async function call<T>(
 		// "try again", never on a 4xx the client caused.
 		if (method === 'GET' && attempt < MAX_ATTEMPTS && [502, 503, 504].includes(res.status)) {
 			clearTimeout(timer);
+			// The attempt is abandoned, but its body is still an open stream. Left
+			// alone, the transport keeps the connection (and whatever it buffers)
+			// busy delivering bytes nobody will ever read. Cancelling is how the
+			// retry releases it instead of waiting for a response we no longer want.
+			await res.body?.cancel().catch(() => {});
 			const after = retryAfterSeconds(res) ?? 0;
 			await sleep(Math.min(after * 1000, 2000) + 100 * attempt);
 			continue;
@@ -403,7 +426,8 @@ async function call<T>(
 }
 
 export const api = {
-	listIDPProviders: () => call<{ data: IDPProvider[] }>('GET', '/v1/idp/providers'),
+	listIDPProviders: async () =>
+		requireDataList<IDPProvider>(await call('GET', '/v1/idp/providers'), 'identity providers'),
 
 	// The success shape is validated at the boundary, not merely asserted by the
 	// type parameter. TypeScript cannot check JSON, and a missing csrf_token here
@@ -450,11 +474,12 @@ export const api = {
 	decideDevice: (csrf: string, decision: DeviceDecision) =>
 		call<DeviceDecisionResult>('POST', '/v1/device/decision', { body: decision, csrf }),
 
-	listGrants: () => call<{ data: Grant[] }>('GET', '/v1/grants'),
+	listGrants: async () => requireDataList<Grant>(await call('GET', '/v1/grants'), 'grants'),
 
 	// Session-scoped, like grants: the ways an account can sign in are not a
 	// downstream client's business.
-	listIdentities: () => call<{ data: Identity[] }>('GET', '/v1/identities'),
+	listIdentities: async () =>
+		requireDataList<Identity>(await call('GET', '/v1/identities'), 'identities'),
 
 	// 204. Removing the last identity is refused by the server with
 	// 409 last_identity, so the UI can leave the last one's button off rather
@@ -468,14 +493,27 @@ export const api = {
 	revokeGrant: (clientId: string, csrf: string) =>
 		call<void>('DELETE', `/v1/grants/${encodeURIComponent(clientId)}`, { csrf }),
 
-	listAllSources: () => call<{ data: FederationSource[] }>('GET', '/v1/sources'),
+	listAllSources: async () =>
+		requireDataList<FederationSource>(await call('GET', '/v1/sources'), 'sources'),
 
-	listBindings: () => call<{ data: Binding[] }>('GET', '/v1/bindings'),
+	listBindings: async () => requireDataList<Binding>(await call('GET', '/v1/bindings'), 'bindings'),
 
 	// The account's own data, assembled by the server from the same view builders
 	// the list endpoints use. no-store, session-scoped, and no CSRF because it
 	// changes nothing.
-	exportAccount: () => call<AccountExport>('GET', '/v1/account/export'),
+	exportAccount: async () => {
+		const data = await call<AccountExport>('GET', '/v1/account/export');
+		// The filename of the download is built from profile.user_id, so an export
+		// that does not carry one must fail where the caller can catch it rather
+		// than as a TypeError deep inside the download.
+		if (typeof data?.profile?.user_id !== 'string' || data.profile.user_id === '') {
+			throw new ApiError(
+				0,
+				local('malformed_response', 'account export is missing profile.user_id')
+			);
+		}
+		return data;
+	},
 
 	// Erasure is idempotent server-side; the acknowledgement is required by the
 	// server so the act cannot happen without naming what it does.
@@ -487,8 +525,11 @@ export const api = {
 
 	// Operator plane. Every write here needs a fresh authentication; a
 	// `reauth_required` code means the operator must sign in again.
-	listAdminClients: () =>
-		call<{ data: AdminClient[]; csrf_token: string }>('GET', '/v1/admin/clients'),
+	listAdminClients: async () => {
+		const res = await call<{ data: AdminClient[]; csrf_token: string }>('GET', '/v1/admin/clients');
+		requireDataList<AdminClient>(res, 'admin clients');
+		return res;
+	},
 
 	registerAdminClient: (
 		csrf: string,

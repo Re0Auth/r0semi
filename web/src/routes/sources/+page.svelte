@@ -179,12 +179,12 @@
 	// found by selector because the confirmation re-creates that button.
 	function cancelDisconnect(id: string) {
 		confirming = null;
-		void restoreFocus(`[data-disconnect="${id}"]`);
+		void restoreFocus('data-disconnect', id);
 	}
 
 	function cancelCascade(id: string) {
 		cascadeConfirming = null;
-		void restoreFocus(`[data-cascade="${id}"]`);
+		void restoreFocus('data-cascade', id);
 	}
 
 	function formatDate(iso: string): string {

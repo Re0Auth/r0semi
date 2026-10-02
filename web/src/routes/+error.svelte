@@ -7,11 +7,17 @@
 	// is broken rather than like something went wrong.
 	const status = $derived(page.status);
 	const message = $derived(
-		page.error?.message && page.error.message !== 'Not Found'
-			? page.error.message
-			: status === 404
-				? '这个页面不存在。'
-				: '页面没有加载成功。'
+		// A 5xx here is an uncaught exception, and its message is a JavaScript one
+		// ("x is not iterable"): internal, and not something a person can act on.
+		// Whatever it says, the page shows its own sentence instead. A 4xx message
+		// is still worth showing, because it is addressed to the visitor.
+		status >= 500
+			? '页面没有加载成功。'
+			: page.error?.message && page.error.message !== 'Not Found'
+				? page.error.message
+				: status === 404
+					? '这个页面不存在。'
+					: '页面没有加载成功。'
 	);
 </script>
 
