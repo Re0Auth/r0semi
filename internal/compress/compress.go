@@ -158,8 +158,20 @@ func (c *Compressor) Handler(next http.Handler) http.Handler {
 		}
 
 		cw := &responseWriter{ResponseWriter: w, c: c, coding: coding, status: http.StatusOK}
+		// The encoder must go back to its pool however the handler leaves. finish()
+		// used to run only on the normal return path, so a panic past startCompress
+		// left the writer checked out for good: the pool never got it back and every
+		// such panic allocated a fresh encoder (S10-3). After a panic the response
+		// is not finished here — the recoverer outside this middleware owns it — so
+		// abandon() releases the encoder without writing a header or a buffered body.
+		defer func() {
+			if p := recover(); p != nil {
+				cw.abandon()
+				panic(p)
+			}
+			cw.finish()
+		}()
 		next.ServeHTTP(cw, r)
-		cw.finish()
 	})
 }
 
@@ -178,17 +190,17 @@ func negotiate(header string, serverPref []string) (string, bool) {
 	// with a `;` or a `*` takes the general path below, which is where the map and
 	// the q-value arithmetic belong.
 	if !strings.ContainsAny(header, ";*") {
-		offered := func(name string) bool {
-			for _, part := range strings.Split(header, ",") {
-				if strings.EqualFold(strings.TrimSpace(part), name) {
-					return true
-				}
-			}
-			return false
-		}
+		// Split the header once, not once per configured coding: re-splitting it
+		// inside the per-coding closure made the fast path's cost grow with the
+		// server's own configuration, which is the opposite of what a fast path is
+		// for (Z15-4). The slice is a handful of tokens and matching against it does
+		// not allocate.
+		listed := strings.Split(header, ",")
 		for _, name := range serverPref {
-			if offered(name) {
-				return name, true
+			for _, part := range listed {
+				if strings.EqualFold(strings.TrimSpace(part), name) {
+					return name, true
+				}
 			}
 		}
 		// No coding matched; the spec's default for identity is q=1, so it is
@@ -316,6 +328,17 @@ func (w *responseWriter) Header() http.Header { return w.ResponseWriter.Header()
 func (w *responseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *responseWriter) WriteHeader(status int) {
+	// An informational response is not the response: RFC 9110 lets a handler send a
+	// 1xx (100/102/103 Early Hints) and then the real status, and net/http forwards
+	// it without committing. Latching wroteHeader on the first call therefore
+	// swallowed the final status — w.status and the skip decision stayed on the 1xx,
+	// so a final 204 or 304 never reached the client (S13-6). 101 Switching
+	// Protocols is the exception: it ends the HTTP exchange, so it is handled below
+	// as the final status.
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
 	if w.wroteHeader {
 		return
 	}
@@ -430,6 +453,19 @@ func (w *responseWriter) finish() {
 		_, _ = w.ResponseWriter.Write(w.buf)
 		w.buf = nil
 	}
+}
+
+// abandon releases the encoder when the handler panicked. It writes nothing: the
+// response has not been finished, and the panic is on its way to the recoverer
+// outside this middleware, which owns the error response. A response whose
+// compression had already started keeps its committed header, and closing the
+// stream is the only way the pooled writer can be reused (S10-3).
+func (w *responseWriter) abandon() {
+	if w.enc != nil {
+		w.c.release(w.coding, w.enc)
+		w.enc = nil
+	}
+	w.buf = nil
 }
 
 // addVary adds a Vary token if it is not already present, case-insensitively and
