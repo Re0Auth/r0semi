@@ -759,11 +759,20 @@ func (t *boundedBodyTransport) RoundTrip(req *http.Request) (*http.Response, err
 // the whole outage. Past the ceiling the cache is refused and the error names the
 // age, which fails closed.
 func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
+	// The cache hit is answered under the lock, but the network round trip below
+	// is NOT: holding providerMu across discovery serialized every concurrent
+	// login on a slow or failing issuer, so one caller's 250ms wait became the
+	// next caller's too — a discovery timeout turned into an outage for logins
+	// that could have run in parallel. Two callers may now discover at once; the
+	// last successful write wins and a failure is still not cached.
 	c.providerMu.Lock()
-	defer c.providerMu.Unlock()
 	if c.discovered != nil && time.Since(c.discoveredAt) < c.providerTTL {
-		return c.discovered, nil
+		cached := c.discovered
+		c.providerMu.Unlock()
+		return cached, nil
 	}
+	c.providerMu.Unlock()
+
 	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, discoveryClient(c.http)), c.issuer)
 	if err != nil {
 		return c.retainOnDiscoveryFailure(fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err))
@@ -774,8 +783,10 @@ func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 		// downgrade a provider that was already pinned.
 		return c.retainOnDiscoveryFailure(err)
 	}
+	c.providerMu.Lock()
 	c.discovered = provider
 	c.discoveredAt = time.Now()
+	c.providerMu.Unlock()
 	return provider, nil
 }
 
@@ -790,13 +801,19 @@ func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 // never expires on its own — would otherwise keep verifying keys the issuer has
 // retired.
 func (c *Client) retainOnDiscoveryFailure(cause error) (*oidc.Provider, error) {
-	if c.discovered == nil {
+	// The discovery call no longer holds providerMu, so the cache fields are read
+	// under it: this decision is the one place that observes another caller's
+	// concurrent successful write.
+	c.providerMu.Lock()
+	discovered, discoveredAt := c.discovered, c.discoveredAt
+	c.providerMu.Unlock()
+	if discovered == nil {
 		return nil, cause
 	}
-	age := time.Since(c.discoveredAt)
+	age := time.Since(discoveredAt)
 	ceiling := providerStaleCeiling * c.providerTTL
 	if age < ceiling {
-		return c.discovered, nil
+		return discovered, nil
 	}
 	return nil, fmt.Errorf("idp: %s: discovery has been failing but the cached provider is %s old, "+
 		"past the %s ceiling (%d x the %s TTL); refusing the stale key set: %w",
