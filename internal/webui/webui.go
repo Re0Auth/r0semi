@@ -13,11 +13,14 @@
 package webui
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"io/fs"
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 )
 
 // BasePath is the URL prefix the app is mounted at.
@@ -43,6 +46,11 @@ const BasePath = "/app"
 // the one directive that must live here because browsers ignore frame-ancestors
 // in a <meta> tag.
 const shellCSP = "frame-ancestors 'none'"
+
+// shellName is the build's fallback document. It is the file a path that names
+// nothing is answered with, and the only document whose cache validator this
+// package can compute -- the digest its own bytes produce.
+const shellName = "index.html"
 
 //go:embed all:dist
 var embedded embed.FS
@@ -97,14 +105,30 @@ func Robots(fsys fs.FS) ([]byte, bool) {
 //     step. CI builds the real frontend and asserts the shell exists, so the
 //     placeholder cannot be the thing that gets tested.
 func Handler(fsys fs.FS) http.Handler {
+	// Whether there is a build at all is a property of the tree, not of the
+	// request: answering it once here is what keeps an asset request from
+	// re-statting the embedded filesystem for a fact that cannot change while the
+	// process runs (S12-11). The method gate stays inside, so an unbuilt binary
+	// still answers a write with 405 rather than 503.
+	if !Built(fsys) {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				w.Header().Set("Allow", "GET, HEAD")
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			writeNotBuilt(w)
+		})
+	}
+
+	// The shell's validator is computed once from the bytes that will be served:
+	// the embedded shell cannot change while the process runs (S12-8 / A-FE-1).
+	var shell shellValidator
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !Built(fsys) {
-			writeNotBuilt(w)
 			return
 		}
 
@@ -117,15 +141,43 @@ func Handler(fsys fs.FS) http.Handler {
 		// that a directory is not a file: there are no directory listings, and a
 		// path like /app/_app would otherwise enumerate the build.
 		if name == "" || name == "." || !isFile(fsys, name) {
-			name = "index.html"
+			name = shellName
 		}
 
-		if name == "index.html" {
+		if isHTMLDocument(name) {
 			// Set, not Add: this handler owns its own document's policy even when it is
 			// wrapped by the API's middleware, which sets the same single directive.
+			//
+			// The rule is the response's type, not the name index.html (A-FE-6): a
+			// build that ships a second document gets the same framing guard. What
+			// the header must NOT carry is anything the build's <meta> policy already
+			// states -- the two are enforced as an intersection.
 			w.Header().Set("Content-Security-Policy", shellCSP)
+			// A document is one representation, not a byte range (A-FE-2): cut into
+			// ranges it could arrive without the <meta> policy that governs the script
+			// inside it. The request is cloned so the caller's own does not change.
+			r = r.Clone(r.Context())
+			r.Header.Del("Range")
+			r.Header.Del("If-Range")
+			// Only the shell gets this validator: it is the digest of index.html, so
+			// pinning it to any other document would let a 304 stand in for bytes
+			// that changed.
+			if name == shellName {
+				if tag := shell.etag(fsys); tag != "" {
+					w.Header().Set("ETag", tag)
+				}
+			}
 		}
 		setCacheHeaders(w, name)
+		if strings.HasPrefix(name, "_app/immutable/") {
+			// The session middleware adds `Vary: Cookie` to every response on the
+			// tree before any handler runs, which keys a content-hashed,
+			// user-independent asset on the session cookie and cancels the immutable
+			// directive for any shared cache (Z08-5). The representation does not
+			// depend on the cookie, so the token is dropped here; the compression
+			// layer outside this handler adds `Accept-Encoding` back if it applies.
+			w.Header().Del("Vary")
+		}
 		// name was cleaned above and only reaches "index.html" or a file that
 		// fs.Stat confirmed inside fsys; the server is an fs.FS, not the host
 		// filesystem, so there is no path to escape to. G703 cannot see the
@@ -134,21 +186,68 @@ func Handler(fsys fs.FS) http.Handler {
 	})
 }
 
+// shellValidator holds the SPA shell's strong ETag, computed from the bytes that
+// will be served the first time a document is requested.
+//
+// `Cache-Control: no-cache` means "revalidate"; with no validator there is
+// nothing to revalidate against, so every navigation re-sent the whole document
+// (S12-8 / A-FE-1). The shell is embedded and therefore immutable for the life of
+// the process, so one read and one hash are enough, and the value only changes
+// when a new build is deployed.
+type shellValidator struct {
+	once sync.Once
+	tag  string
+}
+
+func (v *shellValidator) etag(fsys fs.FS) string {
+	v.once.Do(func() {
+		raw, err := fs.ReadFile(fsys, shellName)
+		if err != nil {
+			// No readable shell means nothing to validate; ServeFileFS will report
+			// the same condition as a 404 rather than a second failure here.
+			return
+		}
+		sum := sha256.Sum256(raw)
+		v.tag = `"` + hex.EncodeToString(sum[:16]) + `"`
+	})
+	return v.tag
+}
+
+// isHTMLDocument reports whether a served name is a document rather than an
+// asset, by extension. The served file's own type is what decides whether the
+// response gets a document policy.
+func isHTMLDocument(name string) bool {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".html", ".htm":
+		return true
+	default:
+		return false
+	}
+}
+
 func isFile(fsys fs.FS, name string) bool {
 	info, err := fs.Stat(fsys, name)
 	return err == nil && !info.IsDir()
 }
 
-// setCacheHeaders caches hashed assets forever and the shell not at all.
+// setCacheHeaders caches hashed assets forever and everything else not at all.
 //
-// Getting this backwards is a subtle and expensive bug: a cached shell would
-// keep pointing at asset filenames that no longer exist, so a deployment would
-// break for returning users until they hard-refreshed.
+// Getting the default backwards is a subtle and expensive bug: a cached shell
+// would keep pointing at asset filenames that no longer exist, so a deployment
+// would break for returning users until they hard-refreshed. Leaving a file
+// unclassified was the other half of that bug in the opposite direction
+// (Z08-3): it inherited no directive at all, so each browser chose a freshness
+// heuristic for the favicon, the app's robots.txt copy and the version document
+// the client polls. Only `_app/immutable/` is content-addressed and safe to pin
+// for a year; the version document exists to be re-read, so it is not stored; a
+// document must be revalidated (and now has an ETag to revalidate with).
 func setCacheHeaders(w http.ResponseWriter, name string) {
 	switch {
 	case strings.HasPrefix(name, "_app/immutable/"):
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	case name == "index.html":
+	case name == "_app/version.json":
+		w.Header().Set("Cache-Control", "no-store")
+	default:
 		w.Header().Set("Cache-Control", "no-cache")
 	}
 }
