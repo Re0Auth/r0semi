@@ -158,9 +158,13 @@ func TestSweepExpiredRemovesDatedRows(t *testing.T) {
 		{"oauth_refresh_tombstones", `INSERT INTO oauth_refresh_tombstones
 			(token_hash, family_id, client_id, subject, expires_at)
 			VALUES ($1, 'fam', 'cli', 'usr', $2)`},
+		// user_code doubles as the row key on BOTH device tables: the canonical
+		// user code carries a UNIQUE index (0008 on oidc_devices, 0033 on
+		// oauth_device_authorizations), so the live and dead rows must not collide
+		// on it.
 		{"oauth_device_authorizations", `INSERT INTO oauth_device_authorizations
 			(device_code_hash, user_code, client_id, scopes, status, expires_at)
-			VALUES ($1, 'ABCD', 'cli', '{}', 'pending', $2)`},
+			VALUES ($1, $1, 'cli', '{}', 'pending', $2)`},
 		{"federation_bind_flows", `INSERT INTO federation_bind_flows
 			(state, id, user_id, game, source, pkce_verifier, expires_at)
 			VALUES ($1, 'bnd', 'usr', 'phigros', 'tap', 'v', $2)`},
@@ -178,8 +182,8 @@ func TestSweepExpiredRemovesDatedRows(t *testing.T) {
 		{"oidc_refresh_token_tombstones", `INSERT INTO oidc_refresh_token_tombstones
 			(token_hash, family_id, id_hash, client_id, subject, expires_at)
 			VALUES ($1, 'fam', 'h', 'cli', 'usr', $2)`},
-		// user_code doubles as the row key: the canonical user code carries a
-		// UNIQUE index, so the live and dead rows must not collide on it.
+		// The other device table (oauth_device_authorizations above) carries the
+		// same UNIQUE canonical user-code index, so it uses $1 too.
 		{"oidc_devices", `INSERT INTO oidc_devices
 			(device_code_hash, user_code, client_id, scopes, expires_at)
 			VALUES ($1, $1, 'cli', '{}', $2)`},

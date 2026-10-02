@@ -69,24 +69,34 @@ func TestGooseDownCannotRerunTheSameSection(t *testing.T) {
 	}
 }
 
-// TestTheTwoUnguardedDownsAreStillThere keeps the true half of Z21-1 honest: the
-// files really do lack IF EXISTS, and the report's file:line citations are right.
+// TestTheTwoUnguardedDownsAreStillThere is the regression guard for Z21-1 after
+// the fix. The name is kept for the round-9 coverage matrix; the assertion now
+// pins the re-runnable shape rather than the old omission, so un-guarding any of
+// the three Downs makes it fail again.
 func TestTheTwoUnguardedDownsAreStillThere(t *testing.T) {
 	ten := migrationText(t, "0010_client_status.sql")
 	eleven := migrationText(t, "0011_session_subjects.sql")
+	twentySeven := migrationText(t, "0027_client_allow_missing_pkce.sql")
 
-	if !strings.Contains(ten, "ALTER TABLE oauth_clients DROP COLUMN status;") {
-		t.Fatalf("0010's Down changed; re-read Z21-1 before trusting it")
+	_, downTen := splitDirection(ten)
+	if !strings.Contains(strings.ToUpper(downTen), "DROP COLUMN IF EXISTS") {
+		t.Fatalf("0010's Down is not re-runnable: %q", downTen)
 	}
-	if !strings.Contains(eleven, "DROP TABLE session_subjects;") {
-		t.Fatalf("0011's Down changed; re-read Z21-1 before trusting it")
+	_, downEleven := splitDirection(eleven)
+	if !strings.Contains(strings.ToUpper(downEleven), "DROP TABLE IF EXISTS") {
+		t.Fatalf("0011's Down is not re-runnable: %q", downEleven)
 	}
-	// Positive control for the reader: the neighbouring migrations' Downs are
-	// guarded, so "no IF EXISTS" here is an omission and not the house style.
+	_, down27 := splitDirection(twentySeven)
+	if !strings.Contains(strings.ToUpper(down27), "DROP COLUMN IF EXISTS") {
+		t.Fatalf("0027's Down is not re-runnable: %q", down27)
+	}
+	// Positive control for the reader: 0009's Down is the house style these three
+	// now match, so the assertion is about this project's convention rather than
+	// a string that happens to be present.
 	nine := migrationText(t, "0009_oidc_token_issued_at.sql")
 	_, down := splitDirection(nine)
 	if !strings.Contains(strings.ToUpper(down), "DROP COLUMN IF EXISTS") {
 		t.Fatalf("control failed: 0009's Down is not the IF EXISTS shape, so the comparison is vacuous")
 	}
-	t.Log("0010:15 and 0011:24 really are the only two unguarded DROP statements")
+	t.Log("0010/0011/0027 Downs are re-runnable, matching 0009")
 }

@@ -21,4 +21,4 @@ CREATE TABLE session_subjects (
 CREATE INDEX session_subjects_subject_idx ON session_subjects (subject);
 
 -- +goose Down
-DROP TABLE session_subjects;
+DROP TABLE IF EXISTS session_subjects;

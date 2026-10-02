@@ -12,4 +12,4 @@ ALTER TABLE oauth_clients
     ADD COLUMN allow_missing_pkce boolean NOT NULL DEFAULT false;
 
 -- +goose Down
-ALTER TABLE oauth_clients DROP COLUMN allow_missing_pkce;
+ALTER TABLE oauth_clients DROP COLUMN IF EXISTS allow_missing_pkce;

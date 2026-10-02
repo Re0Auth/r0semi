@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -183,22 +184,41 @@ func TestPseudonymCacheTrimsRatherThanResets(t *testing.T) {
 // TestPseudonymCacheEntriesExpire: a TTL is what bounds how long a replica that
 // was NOT told about an erasure keeps resolving the erased subject. Without it the
 // stale key is permanent — a steady-state failure of erasure, not a window (Z10-1).
+//
+// The TTL is measured on the logger's injected clock (l.now), never on the wall
+// clock: nothing here sleeps or races real time. The clock value is read and
+// advanced under a mutex so the test stays correct (and race-clean) even if a
+// future caller lets the logger's clock be read from another goroutine.
 func TestPseudonymCacheEntriesExpire(t *testing.T) {
 	l := keyWith(0x5a)
-	current := time.Unix(1_700_000_000, 0)
-	l.now = func() time.Time { return current }
+	var (
+		mu      sync.Mutex
+		current = time.Unix(1_700_000_000, 0)
+	)
+	l.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return current
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		current = current.Add(d)
+		mu.Unlock()
+	}
 
 	l.remember("usr_a", bytes.Repeat([]byte{1}, 32))
 	if _, ok := l.cached("usr_a"); !ok {
 		t.Fatal("a fresh entry is not cached")
 	}
 
-	current = current.Add(pseudoCacheTTL - time.Second)
+	// Just inside the TTL: still warm.
+	advance(pseudoCacheTTL - time.Second)
 	if _, ok := l.cached("usr_a"); !ok {
 		t.Fatal("an entry inside its TTL is not cached")
 	}
 
-	current = current.Add(2 * time.Second)
+	// Past the TTL: dead, with no wall-clock time having passed.
+	advance(2 * time.Second)
 	if _, ok := l.cached("usr_a"); ok {
 		t.Fatal("a cache entry outlived its TTL: an erasure on another replica would never be observed")
 	}

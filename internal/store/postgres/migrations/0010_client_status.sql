@@ -12,4 +12,4 @@ ALTER TABLE oauth_clients
     ADD COLUMN status text NOT NULL DEFAULT 'active';
 
 -- +goose Down
-ALTER TABLE oauth_clients DROP COLUMN status;
+ALTER TABLE oauth_clients DROP COLUMN IF EXISTS status;
