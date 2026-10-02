@@ -42,7 +42,10 @@ jobs:
         # The audit-chain benchmarks skip without TEST_DATABASE_URL (their
         # fixture says so); the service is what makes them real numbers instead
         # of a skip line in the report.
-        image: postgres:16
+        # Digest-pinned like every other image in this repository (S15-2). The
+        # whole point of this workflow is comparing one week's numbers against the
+        # next, so the server behind them must not change under it.
+        image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres

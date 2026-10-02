@@ -8,9 +8,21 @@
 #      the environment variable that holds it (`*_env`). That keeps "where does
 #      this key come from" auditable, and means a committed config cannot leak a
 #      credential.
-#   2. EVERY FIELD HAS A DEFAULT. Write only what differs from it.
+#   2. EVERY FIELD IN THIS FILE HAS A DEFAULT — with one exception, `secret_env`
+#      in [client] and [[clients]], which names the required secret of a
+#      confidential client. Write only what differs from the default.
 #
 # Precedence is: environment > this file > built-in default.
+#
+# Two settings are ENVIRONMENT-ONLY, because they describe where the process runs
+# (a terminal, or a collector that wants JSON) rather than what it is. They have
+# no key in this file and no section below:
+#
+#   RE0AUTH_LOG_LEVEL   debug | info | warn | error   (default: info)
+#   RE0AUTH_LOG_FORMAT  text  | json                  (default: text)
+#
+# A value that is present but unrecognised refuses startup rather than falling
+# back silently, so a level that looks applied is applied.
 
 [server]
 # Public base URL. Must be absolute; it is the OAuth issuer and appears in every
@@ -20,6 +32,7 @@ issuer = "https://re0auth.example"
 addr   = "0.0.0.0:8080"
 # Set true whenever the issuer is https. Leave false only for local plain-HTTP
 # development.
+# Environment override: RE0AUTH_COOKIE_SECURE=true
 cookie_secure = true
 
 # A per-client-address limit, for load shedding rather than quota enforcement.
@@ -29,7 +42,9 @@ cookie_secure = true
 # address out of signing in. 0 disables the limiter, which is the right answer for a
 # deployment that already has one in front of it. rate_limit_burst is how many may
 # arrive at once.
+# Environment override: RE0AUTH_RATE_LIMIT="50"
 rate_limit       = 50
+# Environment override: RE0AUTH_RATE_LIMIT_BURST="100"
 rate_limit_burst = 100
 
 # Hard cap on requests served concurrently, separate from the rate limiter. 0
@@ -223,6 +238,7 @@ kek_env = "RE0AUTH_KEK"
 # changes.** It is how a record says which key wrapped it, and reusing the id with
 # new material leaves every existing credential unreadable — the server refuses to
 # start a rotation rather than let that pass quietly.
+# Environment override: RE0AUTH_KEK_ID="kek-1"
 kek_id = "kek-1"
 
 # Rotating the key, in four steps:
@@ -264,7 +280,9 @@ kek_id = "kek-1"
 # client, the process refuses to start and names every differing field. Revert
 # this section to the seeded values, or delete the registered client and restart
 # to re-seed it.
+# Environment override: RE0AUTH_CLIENT_ID="cli"
 id   = "cli"
+# Environment override: RE0AUTH_CLIENT_NAME="First-party client"
 name = "First-party client"
 # Omit secret_env for a public client (desktop, CLI, SPA); set it for a
 # confidential one.
@@ -348,13 +366,19 @@ reauth_window = "15m"
 # {tenantid} placeholder), so NewRegistry rejects `[idp.microsoft]` without one
 # rather than letting the login fail silently at the callback.
 
-[idp.github]
-client_id         = "Ov23li..."
-client_secret_env = "GITHUB_CLIENT_SECRET"
-
-[idp.google]
-client_id         = "1234.apps.googleusercontent.com"
-client_secret_env = "GOOGLE_CLIENT_SECRET"
+# Both are COMMENTED OUT on purpose. An active section with a `client_secret_env`
+# that is not set refuses startup (`idp.<name>.client_secret_env names "...",
+# which is not set`), so leaving them enabled would make `cp` + run — the
+# README's quickstart — fail before the listener binds. Uncomment one and export
+# the variable it names.
+#
+# [idp.github]
+# client_id         = "Ov23li..."
+# client_secret_env = "GITHUB_CLIENT_SECRET"
+#
+# [idp.google]
+# client_id         = "1234.apps.googleusercontent.com"
+# client_secret_env = "GOOGLE_CLIENT_SECRET"
 
 # A custom OpenID Provider — a self-hosted Keycloak, Authentik, or any OIDC
 # server, including one that signs people in with a Passkey. Only `issuer` is

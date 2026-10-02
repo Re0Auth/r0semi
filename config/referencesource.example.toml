@@ -3,7 +3,10 @@
 # Copy to config/referencesource.toml (gitignored) and edit.
 #
 # Same two rules as the server config: secrets are named (`*_env`), never
-# written, and every field has a default. Precedence is
+# written, and every field has a default — with one exception. `[client]
+# secret_env` below has no default: Re0Auth is a confidential client, so the
+# variable it names (REFERENCE_SOURCE_CLIENT_SECRET) must be exported or startup
+# refuses at stage=config. Precedence is
 # environment > this file > built-in default.
 
 [server]
@@ -19,7 +22,10 @@ re0auth_base_url = "http://127.0.0.1:8080"
 # The one downstream client this source trusts.
 id = "re0auth"
 # Re0Auth is a confidential client: it holds a secret, and the secret itself is
-# never written here.
+# never written here. Export the variable named below before starting, or the
+# process refuses with "client.secret_env names
+# \"REFERENCE_SOURCE_CLIENT_SECRET\", which is not set":
+#   export REFERENCE_SOURCE_CLIENT_SECRET=$(head -c 32 /dev/urandom | base64)
 secret_env = "REFERENCE_SOURCE_CLIENT_SECRET"
 
 [source]

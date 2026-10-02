@@ -2,3 +2,26 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: re0auth
+  # Pod Security Admission (S15-9). The hardened pod spec beside this file —
+  # runAsNonRoot, seccompProfile RuntimeDefault, allowPrivilegeEscalation: false,
+  # capabilities: drop ALL, readOnlyRootFilesystem — was a description of the
+  # manifests rather than a precondition of the namespace: a pod applied here with
+  # a weaker spec (a debug container, an `kubectl run --privileged`) was admitted
+  # silently. `enforce: restricted` makes the profile the admission decision, so a
+  # spec that drifts fails at apply time instead of being deployed.
+  #
+  # Both workloads that live here satisfy it: the Deployment and the backup
+  # CronJob (deploy/k8s/backup/cronjob.yaml) each carry runAsNonRoot with a
+  # numeric uid/gid, a RuntimeDefault seccomp profile, allowPrivilegeEscalation:
+  # false, capabilities: drop ALL and a read-only root filesystem.
+  #
+  # `enforce-version: latest` tracks the cluster's own API version. Pinning a
+  # version here (v1.34, say) would be refused by an older or newer API server,
+  # and the restricted profile's requirements only ever get stricter.
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

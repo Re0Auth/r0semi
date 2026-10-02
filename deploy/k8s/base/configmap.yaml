@@ -40,8 +40,26 @@ data:
     # buckets are correct. A proxy that forwards the caller's own header verbatim
     # would make the bucket key caller-chosen; declaring the header is this
     # deployment's assertion that its ingress does not.
+    #
+    # REPLACE the CIDR before deploying (S15-5). It must be the network the ingress
+    # controller's PODS come from, which is the cluster's pod CIDR (kubeadm's
+    # default is 10.244.0.0/16, EKS/GKE differ, and a "10.0.0.0/8" guess is right
+    # only by luck). It cannot be derived here: nothing in the repository knows
+    # your cluster's pod network, which is why this is a value to edit rather than
+    # a default. Ask the cluster: `kubectl get pods -n ingress-nginx -o
+    # jsonpath='{.items[0].status.podIP}'` and use that network.
+    #
+    # Getting it wrong is quiet, and this is the one setting whose failure is
+    # quiet: a peer outside trusted_proxies has its X-Forwarded-For ignored, so
+    # every client is attributed to the ingress pod's address and they all share
+    # ONE rate-limit bucket (rate_limit above, per plane) — which is both a
+    # trivial way to exhaust it and a per-client budget that is not per client.
+    #
+    # Both keys are needed: the process REFUSES to start when
+    # client_addr_header = "x-forwarded-for" has an empty trusted_proxies, so the
+    # header cannot simply be dropped to work around a wrong CIDR.
     client_addr_header = "x-forwarded-for"
-    trusted_proxies    = ["10.0.0.0/8"]
+    trusted_proxies    = ["10.0.0.0/8"] # REPLACE: your cluster's ingress pod network
 
     [storage]
     driver  = "postgres"

@@ -31,7 +31,12 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # Digest-pinned like every other image in this repository (S15-2): a
+        # floating `postgres:16` is a different server tomorrow, and these are the
+        # tests that assert behaviour against a real one — a server that moved
+        # under the suite is a red build nobody can explain. Same digest the
+        # backup CronJob's client uses (deploy/k8s/backup/cronjob.yaml).
+        image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -178,6 +183,63 @@ jobs:
             exit 1
           fi
 
+      # The total above cannot see the failure it names: "a package can rot to zero
+      # statements executed" (Z16-7). The suite is ~12,500 statements, so a package
+      # of a few hundred going to zero costs the total well under a point — it
+      # stays over the floor and the per-package table below is only printed. This
+      # is the missing gate: every package the profile reports is held to its own
+      # floor, from the same table `make cover` prints.
+      - name: per-package coverage floor
+        env:
+          # Deliberately below the lowest package that is covered at all. The
+          # lowest on the CI-equivalent run (in-memory stores, no Postgres tests)
+          # is internal/store/postgres at 12.0%, and it is higher in CI where the
+          # Postgres tests execute — 10 fires on rot, not on the normal ebb of a
+          # refactor. Raise it when the low end rises.
+          PACKAGE_COVERAGE_FLOOR: '10'
+          # Packages that execute none of their own statements today, named one by
+          # one rather than caught by a rule like "has no test files": a rule is
+          # exactly what would let a package WITH a test file slip to zero
+          # unnoticed, which is the case this gate exists for. cmd/referencesource
+          # has a test, but it only calls into internal/config — none of the
+          # package's own statements run. Shrink this list; do not grow it to make
+          # a red build green.
+          PACKAGE_COVERAGE_EXEMPT: |
+            github.com/Re0Auth/r0semi/cmd/referencesource
+            github.com/Re0Auth/r0semi/internal/testoidc
+        run: |
+          set -euo pipefail
+          go run ./cmd/covertable coverage.out > coverage-table.txt
+          printf '%s\n' "$PACKAGE_COVERAGE_EXEMPT" | tr -d '\r' |
+            grep -v '^[[:space:]]*$' | sort -u > exempt.txt
+          awk -v floor="$PACKAGE_COVERAGE_FLOOR" '
+            NR == FNR { if ($0 != "") exempt[$0] = 1; next }
+            $NF == "TOTAL" { next }
+            NF < 4 { next }
+            {
+              pkg = $NF
+              if (pkg in exempt) { printf "exempt from the floor: %s\n", pkg; next }
+              pct = $1
+              sub(/%$/, "", pct)
+              checked++
+              if (pct + 0 < floor + 0) {
+                printf "::error::%s is at %s, below the per-package floor of %s%%\n", pkg, $1, floor
+                bad = 1
+              }
+            }
+            END {
+              printf "checked %d packages against the %s%% floor\n", checked, floor
+              # Anti-vacuous: a table that stopped parsing passes every check above
+              # by finding nothing.
+              if (checked < 10) {
+                print "::error::too few packages were checked; the coverage table is not being read"
+                bad = 1
+              }
+              if (bad) exit 1
+            }
+          ' exempt.txt coverage-table.txt
+          echo "no package is below the per-package floor"
+
       # The floor is enforced above; this makes the number *readable*. Without a
       # service like Codecov, per-package coverage is invisible in a review, and a
       # package that barely clears the floor looks exactly like one at 90%. The
@@ -275,7 +337,12 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # Digest-pinned like every other image in this repository (S15-2): a
+        # floating `postgres:16` is a different server tomorrow, and these are the
+        # tests that assert behaviour against a real one — a server that moved
+        # under the suite is a red build nobody can explain. Same digest the
+        # backup CronJob's client uses (deploy/k8s/backup/cronjob.yaml).
+        image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -582,6 +649,25 @@ jobs:
     # first artifact built from parsers that were never fuzzed beyond their seeds.
     runs-on: ubuntu-latest
 
+    env:
+      # The list lives here, once. Running it proves each listed target fuzzes; it
+      # does not prove every target is listed, which is why the step below asks the
+      # toolchain instead of a reader (Z16-5). That check is what makes this list
+      # maintained rather than hand-maintained: a new Fuzz* function that is not
+      # added here fails the job, which is the failure that let eight targets sit
+      # outside the gate while it stayed green.
+      FUZZ_TARGETS: |
+        ./idp:FuzzStripJSONP
+        ./oauth:FuzzBuildRedirect
+        ./internal/federation:FuzzCleanRawPath
+        ./internal/federation:FuzzRejectEscapingPath
+        ./internal/federation:FuzzValidateRawBase
+        ./internal/oidchttp:FuzzTokenErrorCode
+        ./internal/oidchttp:FuzzIsOAuthErrorBody
+        ./internal/oidchttp:FuzzStripUnsupportedDiscoveryFields
+        ./internal/oidchttp:FuzzValidPKCEValue
+        ./internal/oidchttp:FuzzDuplicatedParam
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -590,29 +676,50 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Before the fuzzing, and from the toolchain rather than from a reading of
+      # the file: `go test -list '^Fuzz'` is the list of targets that exist. A new
+      # parser with a Fuzz* function is caught here; so is a rename, which
+      # otherwise leaves the list naming a target that no longer builds.
+      - name: the fuzz list covers every target
+        run: |
+          set -euo pipefail
+          module=$(go list -m)
+          # Every Fuzz* function the toolchain can see, written in the same
+          # `./pkg:Name` form the list above uses — `go list` reports import paths,
+          # so the module prefix is stripped to get there. `-list` compiles each
+          # package, so a target whose package does not build fails here instead of
+          # being skipped as unlisted.
+          : > found.txt
+          for full in $(go list ./...); do
+            rel="./${full#"$module"/}"
+            go test -list '^Fuzz' "$rel" |
+              sed -n "s|^\(Fuzz.*\)$|${rel}:\1|p" >> found.txt
+          done
+          sort -u -o found.txt found.txt
+          printf '%s\n' "$FUZZ_TARGETS" | tr -d '\r' |
+            grep -v '^[[:space:]]*$' | sort -u > declared.txt
+          echo "declared vs the toolchain:"
+          diff -u declared.txt found.txt || {
+            echo "::error::FUZZ_TARGETS and the toolchain disagree (Z16-5): either the" \
+                 "repository has a Fuzz* target the list omits, so the gate never" \
+                 "fuzzes it, or the list names a target that no longer exists. Fix" \
+                 "FUZZ_TARGETS in this job."
+            exit 1
+          }
+          echo "the fuzz list covers every target the toolchain sees ($(wc -l < found.txt))"
+
       # One `go test -fuzz` per target: the tool fuzzes exactly one at a time. The
-      # loop is `set -e`, so a target that was renamed or deleted fails the job
-      # instead of quietly dropping out of the gate — which is how the eight above
-      # came to be missing in the first place.
+      # loop is `set -e`, so a target that fails fails the job instead of quietly
+      # dropping out of the gate. The list is the one checked above.
       - name: fuzz every target
         run: |
           set -euo pipefail
           while IFS=: read -r pkg target; do
+            [ -n "${pkg}" ] || continue
             echo "::group::fuzz ${target} (${pkg})"
             go test -fuzz="${target}" -fuzztime=20s "${pkg}"
             echo "::endgroup::"
-          done <<'TARGETS'
-          ./idp:FuzzStripJSONP
-          ./oauth:FuzzBuildRedirect
-          ./internal/federation:FuzzCleanRawPath
-          ./internal/federation:FuzzRejectEscapingPath
-          ./internal/federation:FuzzValidateRawBase
-          ./internal/oidchttp:FuzzTokenErrorCode
-          ./internal/oidchttp:FuzzIsOAuthErrorBody
-          ./internal/oidchttp:FuzzStripUnsupportedDiscoveryFields
-          ./internal/oidchttp:FuzzValidPKCEValue
-          ./internal/oidchttp:FuzzDuplicatedParam
-          TARGETS
+          done <<< "$FUZZ_TARGETS"
 
   lint:
     # Static analysis as its own gate. It needs no Postgres, no Node and no

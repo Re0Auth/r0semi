@@ -49,15 +49,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The OCI reference is lowercase in its repository part, and this
+      # organization's name is not. Handing `ghcr.io/Re0Auth/r0semi@sha256:…`
+      # straight to Trivy fails with "could not parse reference" — the build and
+      # push tools normalize the name on the way out, this parser does not. That is
+      # what failed the first tag run, after the DB and the image had both been
+      # fetched successfully; the same string went to the steps below.
+      #
+      # One step computes the name; the build, the scan, the tag and the signature
+      # all read it, so they cannot drift apart. It runs before the build now,
+      # because the build pushes by digest under this name.
+      - name: image reference
+        id: image
+        run: echo "name=$(echo 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
-          # Only the version tag here. `latest` is NOT one of the tags this step
-          # produces: the image is pushed before the Trivy gate runs, so a build
-          # that fails the gate would already be the tag a redeploy picks up if
-          # `latest` were attached now. It is added below, and only after the scan
-          # passes (see "promote to latest").
+          # The version tag only. `latest` is NOT one of the tags this step
+          # produces: it is added below by "promote to latest", and only after the
+          # scan has passed. `steps.meta.outputs.version` — the tag value this
+          # computes — is what "tag the release" creates the release tag from,
+          # AFTER the gate rather than before it (S15-6/Z13-2).
           tags: |
             type=ref,event=tag
 
@@ -66,8 +80,14 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          # Pushed BY DIGEST, with no tag (S15-6/Z13-2). The release tag used to be
+          # attached right here, before the Trivy gate ran, so a build that failed
+          # the scan was already pullable as `ghcr.io/<repo>:<tag>` — the very name
+          # deploy/k8s/base/deployment.yaml pins, and indistinguishable from a
+          # scanned one. push-by-digest keeps the multi-platform manifest and its
+          # provenance/SBOM attestations while leaving nothing for a redeploy to
+          # resolve until "tag the release" creates it below, after the gate.
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           # The tag, so `re0auth -version` and the startup log answer "which build
           # is this" in the released image too — without it ARG VERSION falls back
@@ -79,48 +99,60 @@ jobs:
           provenance: true
           sbom: true
 
-      # An OCI reference is lowercase in its repository part, and this
-      # organization's name is not. Handing `ghcr.io/Re0Auth/r0semi@sha256:…`
-      # straight to Trivy fails with "could not parse reference" — the build and
-      # push tools normalize the name on the way out, this parser does not. That is
-      # what failed the first tag run, after the DB and the image had both been
-      # fetched successfully; the same string went to the two steps below.
-      #
-      # One step computes the name, the scan and the signature read it, so the
-      # three cannot drift apart.
-      - name: image reference
-        id: image
-        run: echo "name=$(echo 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
       # Trivy is pinned by digest too: a scanner that can change under its tag is
       # the same supply-chain problem the pinning below exists to avoid. The
       # runtime image is scratch, so there is no OS package surface — this scan
       # is about the Go binary's dependency graph and whatever the base stages
       # left behind.
+      #
+      # The host Docker socket is NOT mounted (S15-7). It was there so the scanner
+      # could read an image pushed into the runner's daemon; the image now lives in
+      # the registry and Trivy reads it over the registry API, so the only thing
+      # this job still hands the scanner is a read-only copy of its registry
+      # credential — not control of the daemon that sits in a job holding
+      # packages: write and id-token: write.
       - name: scan the image
         run: |
           docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.docker/config.json":/root/.docker/config.json:ro \
             aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
             image --exit-code 1 --severity HIGH,CRITICAL --no-progress \
             "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
 
-      # Only now, with the image scanned clean, does the floating `latest` point at
-      # it. imagetools promotes the manifest by digest, so the exact bytes that
-      # passed the gate are what the tag resolves to — no rebuild, and the cosign
-      # signature below covers the same digest. A pre-release tag keeps no `latest`
-      # at all (the whole point of the tag, and the reason this is conditional).
+      # The signature comes BEFORE any tag points at the image (Z13-2). cosign
+      # signs the digest, which needs no tag to exist, so a signing failure leaves
+      # neither the release tag nor the floating `latest` attached to an unsigned
+      # image — the old order signed after `latest` had already moved.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: sign the image digest
+        run: cosign sign --yes "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
+
+      # Only now — scanned and signed — is the release tag created (S15-6). It is
+      # the name deploy/k8s/base/deployment.yaml pins, and the whole point of the
+      # ordering is that it does not exist while the gate is still to run.
+      #
+      # The tag value travels through the environment rather than being
+      # interpolated into the script: git allows shell metacharacters in a ref name
+      # and this job holds packages: write. imagetools moves the manifest by
+      # digest, so the exact bytes that passed the gate are what the tag resolves
+      # to — no rebuild.
+      - name: tag the release
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.image.outputs.name }}:${RELEASE_TAG}" \
+            "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
+
+      # The floating `latest` points at the same digest, and only after the scan
+      # and the signature. A pre-release tag keeps no `latest` at all (the whole
+      # point of the tag, and the reason this is conditional).
       - name: promote to latest
         if: ${{ !contains(github.ref_name, '-') }}
         run: |
           docker buildx imagetools create \
             --tag "${{ steps.image.outputs.name }}:latest" \
             "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
-
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: sign the image digest
-        run: cosign sign --yes "${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"
 
   release:
     needs: [ci, image]
