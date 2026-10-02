@@ -284,15 +284,27 @@ func TestDeleteAccountIsAbsentWhenNotConfigured(t *testing.T) {
 	}
 }
 
-// failingDeleteStore is an scs.Store whose Delete fails. It is the only way the
-// post-erasure session-cookie cleanup can fail once the erasure itself has
-// succeeded, which is the branch the handler logs on.
+// failingDeleteStore is an scs.Store whose Delete fails once armed. It is the
+// only way the post-erasure session-cookie cleanup can fail once the erasure
+// itself has succeeded, which is the branch the handler logs on.
+//
+// It is armed AFTER login: scs.RenewToken deletes the pre-login token, and S03-2
+// made a failing session-store delete during sign-in fail closed, so an
+// always-failing store can no longer produce a session at all.
 type failingDeleteStore struct {
 	scs.Store
-	err error
+	err   error
+	armed bool
 }
 
-func (s failingDeleteStore) Delete(string) error { return s.err }
+func (s *failingDeleteStore) Delete(id string) error {
+	if !s.armed {
+		return s.Store.Delete(id)
+	}
+	return s.err
+}
+
+func (s *failingDeleteStore) arm() { s.armed = true }
 
 // TestDeleteAccountDoesNotLogTheRawSubjectWhenSessionCleanupFails is the guard
 // for k1. The erasure destroys the account's pseudonym key as its last step, so a
@@ -302,12 +314,14 @@ func (s failingDeleteStore) Delete(string) error { return s.err }
 // made to fail here; the test then asserts the warning fired (so the assertion is
 // not vacuous) and that the raw subject is absent from the captured log.
 func TestDeleteAccountDoesNotLogTheRawSubjectWhenSessionCleanupFails(t *testing.T) {
-	env := newDeleteEnvWithSessions(t, failingDeleteStore{
+	sessions := &failingDeleteStore{
 		Store: memstore.New(),
 		err:   errors.New("session store unreachable"),
-	})
+	}
+	env := newDeleteEnvWithSessions(t, sessions)
 	browser := newBrowser(t)
 	csrf := csrfFor(t, browser, env.base)
+	sessions.arm()
 
 	uid, err := env.accounts.FindByIdentity(context.Background(), idp.GitHub, "42")
 	if err != nil {
