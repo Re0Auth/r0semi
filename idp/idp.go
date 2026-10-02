@@ -35,6 +35,13 @@ type Provider string
 // key the upstream has retired can keep verifying.
 const defaultProviderCacheTTL = 15 * time.Minute
 
+// defaultDiscoveryTimeout is how long one discovery or key-set round trip may
+// take before it is abandoned. Discovery happens on the interactive login path,
+// and the key set cannot be stopped by cancelation at all (go-oidc runs it on a
+// context.WithoutCancel), so this ceiling is the only thing between a hung issuer
+// and a pinned login goroutine. It matches the default outbound client's timeout.
+const defaultDiscoveryTimeout = 10 * time.Second
+
 // providerStaleCeiling bounds how long the cached provider may keep serving after
 // a re-discovery FAILS, as a multiple of providerTTL.
 //
@@ -242,6 +249,13 @@ type RegistryConfig struct {
 	// HTTPClient is used for token and userinfo calls. Defaults to a client
 	// with a 10s timeout.
 	HTTPClient *http.Client
+	// DiscoveryTimeout bounds one discovery OR key-set round trip performed while
+	// resolving a provider's OIDC configuration. It caps the injected HTTPClient's
+	// own Timeout for that traffic, because go-oidc builds its key set on a
+	// context.WithoutCancel: cancelation cannot end a hung JWKS fetch, so only a
+	// client timeout can (S06-8). Token and userinfo calls are unaffected — they
+	// use HTTPClient exactly as given. At zero the default (10s) is used.
+	DiscoveryTimeout time.Duration
 	// ProviderCacheTTL bounds how long a custom OIDC provider's discovery result
 	// is reused. The provider owns the JWKS cache inside it, so this is also how
 	// long a key the upstream has retired can keep verifying: at zero the default
@@ -278,6 +292,9 @@ type Client struct {
 	// forbids: "OIDC 绝不自己写"). A failed re-discovery may keep the cached
 	// provider only up to providerStaleCeiling times this.
 	providerTTL time.Duration
+	// discoveryTimeout bounds one discovery or key-set round trip; see
+	// RegistryConfig.DiscoveryTimeout.
+	discoveryTimeout time.Duration
 }
 
 // NewRegistry builds a registry from configuration.
@@ -309,6 +326,10 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 	providerTTL := cfg.ProviderCacheTTL
 	if providerTTL <= 0 {
 		providerTTL = defaultProviderCacheTTL
+	}
+	discoveryTimeout := cfg.DiscoveryTimeout
+	if discoveryTimeout <= 0 {
+		discoveryTimeout = defaultDiscoveryTimeout
 	}
 
 	r := &Registry{clients: make(map[Provider]*Client, len(cfg.Credentials))}
@@ -394,6 +415,8 @@ func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 			http: hc,
 
 			providerTTL: providerTTL,
+
+			discoveryTimeout: discoveryTimeout,
 		}
 	}
 	return r, nil
@@ -496,6 +519,11 @@ func (c *Client) Exchange(ctx context.Context, code, verifier string) (*oauth2.T
 // built-in provider carries AuthURL/TokenURL statically; a custom OIDC provider
 // has them discovered from its issuer.
 //
+// An explicitly configured endpoint is never overwritten. A document fills only
+// the half the operator left empty, so setting auth_url alone keeps that endpoint
+// and gets token_endpoint from discovery rather than silently sending the login
+// to the document's own authorize URL (S06-7 / Z14-5).
+//
 // A discovered endpoint is pinned to the issuer's scheme and host. The document
 // is the thing an attacker controls in a mix-up or a hijacked-discovery scenario,
 // and the client secret is a long-lived credential that outlives their control of
@@ -505,21 +533,64 @@ func (c *Client) Exchange(ctx context.Context, code, verifier string) (*oauth2.T
 // (and, for its key set, jwks_uri) explicitly, which skips discovery entirely.
 func (c *Client) oauthConfig(ctx context.Context) (oauth2.Config, error) {
 	cfg := c.oauth
-	if cfg.Endpoint.AuthURL != "" && cfg.Endpoint.TokenURL != "" {
-		return cfg, nil
+	if cfg.Endpoint.AuthURL == "" || cfg.Endpoint.TokenURL == "" {
+		if c.issuer == "" {
+			// Nothing to discover from: an endpoint is missing and the provider has
+			// no issuer to supply it. Refuse rather than hand http.Redirect a
+			// relative or empty location.
+			return oauth2.Config{}, fmt.Errorf("idp: %s: auth_url and token_url must both be set: "+
+				"the provider carries no issuer to discover the missing endpoint from", c.provider)
+		}
+		provider, err := c.oidcProvider(ctx)
+		if err != nil {
+			return oauth2.Config{}, err
+		}
+		endpoint := provider.Endpoint()
+		// The key set is pinned in oidcProvider, where the document is read; here
+		// only the endpoints this call actually adopts are pinned, so an explicit
+		// auth_url on another origin is honoured instead of being checked against a
+		// document value that is then discarded.
+		if cfg.Endpoint.AuthURL == "" {
+			if err := c.pinToIssuer(endpoint.AuthURL, "", ""); err != nil {
+				return oauth2.Config{}, err
+			}
+			cfg.Endpoint.AuthURL = endpoint.AuthURL
+		}
+		if cfg.Endpoint.TokenURL == "" {
+			if err := c.pinToIssuer("", endpoint.TokenURL, ""); err != nil {
+				return oauth2.Config{}, err
+			}
+			cfg.Endpoint.TokenURL = endpoint.TokenURL
+		}
 	}
-	provider, err := c.oidcProvider(ctx)
-	if err != nil {
+	if err := c.validateEndpoints(cfg.Endpoint); err != nil {
 		return oauth2.Config{}, err
 	}
-	endpoint := provider.Endpoint()
-	// The key set is pinned in oidcProvider, where the document is read; here the
-	// only endpoints in hand are the OAuth ones.
-	if err := c.pinToIssuer(endpoint.AuthURL, endpoint.TokenURL, ""); err != nil {
-		return oauth2.Config{}, err
-	}
-	cfg.Endpoint = endpoint
 	return cfg, nil
+}
+
+// validateEndpoints refuses an endpoint that cannot be used the way this client
+// will use it. authorization_endpoint becomes the Location http.Redirect hands
+// the browser, so a document that omits it — or names a bare path — produced a
+// relative login URL and a browser that came straight back to this origin
+// (RP-5); token_endpoint receives the client secret, and an empty one turns the
+// exchange into a decode error instead of naming the misconfiguration.
+func (c *Client) validateEndpoints(endpoint oauth2.Endpoint) error {
+	for _, e := range []struct{ name, value string }{
+		{"auth_url (authorization_endpoint)", endpoint.AuthURL},
+		{"token_url (token_endpoint)", endpoint.TokenURL},
+	} {
+		u, err := url.Parse(e.value)
+		if err != nil {
+			return fmt.Errorf("idp: %s: %s %q is not a URL: %w", c.provider, e.name, e.value, err)
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("idp: %s: %s is missing or is not an absolute URL with a scheme and host (%q); "+
+				"fix the provider's discovery document or set the endpoint explicitly",
+				c.provider, e.name, e.value)
+		}
+	}
+	return nil
 }
 
 // pinToIssuer refuses a discovered endpoint that is not on the configured
@@ -714,7 +785,13 @@ const maxDiscoveryBytes = 1 << 20
 // provider built with it reuses the same client for JWKS, so discovery and the
 // key set share one bound. The clone keeps the caller's timeout and any wrapped
 // transport (pooling, bulkhead, SSRF guard); only the body is capped.
-func discoveryClient(hc *http.Client) *http.Client {
+//
+// A caller-supplied client may carry no Timeout at all, and go-oidc's key set
+// ignores cancelation, so an issuer that accepts the connection and then never
+// answers would pin the login goroutine for as long as the process lives. The
+// shorter of the client's own timeout and the configured ceiling therefore
+// applies to this traffic (S06-8).
+func discoveryClient(hc *http.Client, timeout time.Duration) *http.Client {
 	if hc == nil {
 		hc = http.DefaultClient
 	}
@@ -724,6 +801,9 @@ func discoveryClient(hc *http.Client) *http.Client {
 		base = http.DefaultTransport
 	}
 	clone.Transport = &boundedBodyTransport{next: base, limit: maxDiscoveryBytes}
+	if clone.Timeout <= 0 || clone.Timeout > timeout {
+		clone.Timeout = timeout
+	}
 	return &clone
 }
 
@@ -773,7 +853,7 @@ func (c *Client) oidcProvider(ctx context.Context) (*oidc.Provider, error) {
 	}
 	c.providerMu.Unlock()
 
-	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, discoveryClient(c.http)), c.issuer)
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, discoveryClient(c.http, c.discoveryTimeout)), c.issuer)
 	if err != nil {
 		return c.retainOnDiscoveryFailure(fmt.Errorf("idp: %s: discovery failed: %w", c.provider, err))
 	}
@@ -894,7 +974,7 @@ func getJSON(ctx context.Context, hc *http.Client, endpoint, accessToken string)
 func getText(ctx context.Context, hc *http.Client, endpoint, accessToken string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", fmt.Errorf("idp: build request: %w", err)
+		return "", fmt.Errorf("idp: build request: %w", redactURLError(err))
 	}
 	if accessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -903,7 +983,7 @@ func getText(ctx context.Context, hc *http.Client, endpoint, accessToken string)
 
 	resp, err := hc.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("idp: request: %w", err)
+		return "", fmt.Errorf("idp: request: %w", redactURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -914,6 +994,25 @@ func getText(ctx context.Context, hc *http.Client, endpoint, accessToken string)
 		return "", fmt.Errorf("idp: profile endpoint returned HTTP %d", resp.StatusCode)
 	}
 	return string(body), nil
+}
+
+// redactURLError strips the query string from the URL a transport error carries.
+//
+// QQ's profile API has no header form for its credential: the access token
+// travels in the query string, and net/http's *url.Error embeds the whole URL in
+// its message, so an error returned from here would hand the token to whoever
+// logs it (Z19-2). The endpoint's own query is not diagnostic; the scheme and
+// host are, and they are kept.
+func redactURLError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.URL != "" {
+		if u, perr := url.Parse(uerr.URL); perr == nil {
+			u.RawQuery = ""
+			u.Fragment = ""
+			uerr.URL = u.String()
+		}
+	}
+	return err
 }
 
 func field(raw map[string]any, key string) string {
