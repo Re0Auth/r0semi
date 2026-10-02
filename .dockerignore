@@ -36,11 +36,16 @@ backups
 *.dump
 *.env
 
-# The audit workspace and the other local state .gitignore excludes. The build
-# needs none of it, and scratchpad/ is where audits leave probes and generated
-# material — including key-shaped files — so it must not reach the build context
-# or the backend stage's `COPY . .` layer (Dockerfile:42).
+# The audit workspaces and the other local state .gitignore excludes. The build
+# needs none of it: scratchpad/ is where a running audit leaves probes and
+# generated material — including key-shaped files — and _audit/, AUDIT-ISSUES.md
+# and the audit reports are the round's raw record, which .gitleaks.toml exempts
+# precisely because it quotes token-shaped output. None of it may reach the build
+# context or the backend stage's `COPY . .` layer (Dockerfile:53).
 scratchpad
+_audit
+AUDIT-ISSUES.md
+docs/security-audit-*.md
 go.work
 go.work.sum
 *.local.toml
@@ -48,6 +53,23 @@ go.work.sum
 bench.txt
 load.txt
 report.md
+
+# Key, certificate and private-key shapes. The build reads no key from the
+# context — the CA bundle comes from the pinned base stage (Dockerfile:70) — so a
+# stray key anywhere in the tree must not be uploaded with the context and land in
+# an intermediate layer. A .dockerignore pattern without a slash is matched
+# against the path relative to the context root, so a bare `*.pem` covers the root
+# only; the `**/` twin is what covers the directories below it.
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.p12
+**/*.p12
+*.crt
+**/*.crt
+*.jks
+**/*.jks
 
 # Editor and VCS noise.
 .gitignore

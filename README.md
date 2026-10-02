@@ -21,11 +21,15 @@ export DATABASE_URL='postgres://user:pass@localhost:5432/re0auth?sslmode=disable
 export RE0AUTH_AUDIT_KEY=$(head -c 32 /dev/urandom | base64)
 export RE0AUTH_OIDC_TOKEN_KEY=$(head -c 32 /dev/urandom | base64)
 export RE0AUTH_OIDC_SIGNING_KEY=$(openssl genpkey -algorithm RSA \
-  -pkeyopt rsa_keygen_bits:2048 -outform DER 2>/dev/null | base64 -w0)
+  -pkeyopt rsa_keygen_bits:2048 2>/dev/null \
+  | openssl pkcs8 -topk8 -nocrypt -outform DER | base64 -w0)
 
 go build ./cmd/re0auth
 ./re0auth -config config/re0auth.toml
 ```
+
+`RE0AUTH_OIDC_SIGNING_KEY` 要的是 **PKCS#8 DER 的 base64**；`openssl genpkey -outform DER`
+给的是 PKCS#1 DER，所以上面经 `openssl pkcs8 -topk8 -nocrypt` 转一次（两种 OpenSSL 都成立）。
 
 不设 `DATABASE_URL` 也能跑：状态全部在内存，重启即丢；**但授权引擎仍然是 OpenID Provider**
 （ADR-0001 P4b），只是存储从 Postgres 换成内存。无论哪种模式，两把 OP 密钥都必填
@@ -35,9 +39,17 @@ go build ./cmd/re0auth
 
 ```sh
 RE0AUTH_ISSUER=https://re0auth.example \
+RE0AUTH_COOKIE_SECURE=true \
 RE0AUTH_KEK=$(head -c 32 /dev/urandom | base64) \
+RE0AUTH_OIDC_TOKEN_KEY=$(head -c 32 /dev/urandom | base64) \
+RE0AUTH_OIDC_SIGNING_KEY=$(openssl genpkey -algorithm RSA \
+  -pkeyopt rsa_keygen_bits:2048 2>/dev/null \
+  | openssl pkcs8 -topk8 -nocrypt -outform DER | base64 -w0) \
 ./re0auth
 ```
+
+issuer 是 `https://`，所以 `RE0AUTH_COOKIE_SECURE=true` 必填（会话 cookie 的 `Secure` 位）——
+文件里对应 `[server] cookie_secure`；两把 OP 密钥在片段里就生成，因为内存模式同样必填（见上一段）。
 
 完整键位、默认值与每段说明见 [`config/re0auth.example.toml`](config/re0auth.example.toml)；
 配置优先级为 **环境变量 > 文件 > 默认值**。
@@ -72,7 +84,12 @@ re0auth -rotate-keys -config config/re0auth.toml
 
 ```sh
 cp config/referencesource.example.toml config/referencesource.toml
-export TAPTAP_LEANCLOUD_APP_KEY=...   # 或 GOOGLE_CLIENT_SECRET=...
+# `[client] secret_env` has no default: export it or startup refuses.
+export REFERENCE_SOURCE_CLIENT_SECRET=$(head -c 32 /dev/urandom | base64)
+# `[taptap]` is active in the sample, so its key is required too. The
+# `[social.*]` sections are commented out, so GOOGLE_CLIENT_SECRET is not an
+# alternative unless one is uncommented.
+export TAPTAP_LEANCLOUD_APP_KEY=...
 
 go build ./cmd/referencesource
 ./referencesource -config config/referencesource.toml
@@ -126,9 +143,13 @@ govulncheck ./...
 ## 发布产物
 
 打 `v*` tag 时 CI 会构建并发布预编译二进制（`linux` / `darwin` / `windows` × `amd64` / `arm64`），
-每个平台一个归档，内含可执行文件、`config/re0auth.example.toml`、`LICENSE`、`NOTICE`，以及
+每个平台一个归档，内含可执行文件、`re0auth.example.toml`（仓库里的 `config/re0auth.example.toml`
+按 basename 放进归档根）、`LICENSE`、`NOTICE`、`re0auth_<version>_npm-attribution.json`，以及
 `README.md` 与 `SECURITY.md`——**「未达生产可用」那条警告要跟着产物走**，而不是留在仓库里。
-另有 `SHA256SUMS`、一份 CycloneDX **SBOM**（`re0auth_<version>_sbom.cdx.json`，列出链接进二进制的全部模块），
+另有 `SHA256SUMS`、一份 CycloneDX **SBOM**（`re0auth_<version>_sbom.cdx.json`，列出链接进二进制的全部模块）、
+那份同名的 npm 归属清单（`re0auth_<version>_npm-attribution.json`，`pnpm licenses list --json` 的产物：
+Svelte/SvelteKit/Tailwind 与其余 npm 代码随 SPA 编进每个二进制，MIT/ISC 要求版权与许可声明随副本走，
+所以每个归档都带它，镜像也 `COPY` 同一份），
 以及 `SHA256SUMS` 的 **cosign keyless 签名**（`SHA256SUMS.sig` + `SHA256SUMS.pem`）。最后一步是 `gh release create`。
 
 **验证签名。** keyless 意味着签名身份就是发布这个 tag 的 workflow，由 GitHub 的 OIDC 签发、并记录在透明日志里——
@@ -144,7 +165,7 @@ cosign verify-blob \
 sha256sum -c SHA256SUMS    # macOS: shasum -a 256 -c SHA256SUMS
 ```
 
-签名覆盖 `SHA256SUMS`，而 `SHA256SUMS` 覆盖每个归档**与** SBOM——一次验证锁住全部产物。
+签名覆盖 `SHA256SUMS`，而 `SHA256SUMS` 覆盖每个归档、SBOM 与 npm 归属清单——一次验证锁住全部产物。
 
 产物**不是开箱即用**：三把密钥与 issuer 必填（`RE0AUTH_KEK`、`RE0AUTH_OIDC_TOKEN_KEY`、
 `RE0AUTH_OIDC_SIGNING_KEY`），缺一即拒绝启动；**持久化部署还多一把 `RE0AUTH_AUDIT_KEY`**。
@@ -157,7 +178,8 @@ sha256sum -c SHA256SUMS    # macOS: shasum -a 256 -c SHA256SUMS
 ## 容器镜像
 
 `make docker` 用仓库根的多阶段 `Dockerfile` 构建镜像：前端（`pnpm` 构建，锁文件固定版本）→ 静态 Go
-二进制（前端 `go:embed` 进同一个文件）→ `scratch` 非 root 运行时（只带二进制与 CA 证书）。基础镜像按
+二进制（前端 `go:embed` 进同一个文件）→ `scratch` 非 root 运行时（只带二进制、`LICENSE`、`NOTICE`、
+npm 归属清单与 CA 证书）。基础镜像按
 digest 固定，`internal/archtest` 会检查这一点。CI 每次改动都会构建一次；**tag 发布会把
 `linux/amd64` 与 `linux/arm64` 镜像推到 GHCR**，附带 SBOM 与 provenance 证明、Trivy 扫描（HIGH/CRITICAL
 失败即阻断）与 cosign 签名。

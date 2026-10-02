@@ -15,9 +15,14 @@ useDefault = true
 # Those tokens came from a throwaway local run and were never valid anywhere, but
 # the default generic-api-key rule reads their entropy as a secret. Only the audit
 # reports are exempt; every other path stays under the full ruleset.
+#
+# `paths` entries are regexes matched anywhere in the path, so the pattern is
+# anchored to the exact report names: an unanchored `docs/security-audit-\d+\.md`
+# would also exempt `docs/security-audit-7.md.bak`, a backup of that file, or
+# anything nested under a directory of that name.
 [[allowlists]]
 description = "Proof-of-concept output quoted in the adversarial audit reports"
-paths = ['''docs/security-audit-\d+\.md''']
+paths = ['''^docs/security-audit-[0-9]+\.md$''']
 
 # The same exemption, for the fifth-round audit's artifacts that quote failing-test
 # output and carry fixture strings: three findings reports and one probe script.

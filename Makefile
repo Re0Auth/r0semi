@@ -129,7 +129,8 @@ play:
 	cd web && pnpm run dev
 
 # Release artifacts: one archive per platform, each carrying the example config,
-# the licence and the pre-release warning.
+# the licence, the pre-release warning and the npm licence listing for the SPA the
+# binary embeds.
 #
 # `release` depends on `web` for the reason the header gives, and asserts the
 # result: the Go binaries embed internal/webui/dist, so packaging before the
@@ -141,7 +142,19 @@ play:
 # output directory, so an SBOM produced before it would be deleted, and a release
 # assembled by hand in the wrong order is exactly the kind of mistake an ordering
 # someone has to remember invites. `release` is the whole thing: archives, the
-# SBOM, and checksums that cover both.
+# SBOM, the npm licence listing, and checksums that cover all of it.
+#
+# The npm listing is generated inside `dist` itself — after the wipe and before
+# the first archive is sealed — because every archive carries it: the SPA is
+# embedded in the binary, so an archive has the same MIT/ISC notice obligation the
+# image does. It cannot be a separate target that runs after `dist` (the archives
+# would already be closed) and it must not run before it (the wipe would delete
+# it); the `npm-attribution` target below names the same artifact for the release
+# chain and refuses one that is missing or empty.
+#
+# The example config is put into the archive by basename, so it is
+# `re0auth.example.toml` at the archive root — the name the per-file assertion
+# below checks. (README's release section says the same thing.)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 # Exported so the recipes read it as a shell variable ($${VERSION}) instead of
 # letting make interpolate $(VERSION) into the script text. This is a git ref
@@ -160,6 +173,12 @@ SBOM ?= cyclonedx-gomod
 dist: web
 	@test -f internal/webui/dist/index.html || { echo "refusing to package: the embedded frontend is the placeholder"; exit 1; }
 	rm -rf dist && mkdir -p dist
+	@# Generated here, not by a later target: the archives below carry it.
+	@command -v node >/dev/null 2>&1 || { \
+		echo "node is required to list the npm licences; run this where the frontend can be installed"; \
+		exit 1; }
+	cd web && pnpm licenses list --json > "../dist/re0auth_$${VERSION}_npm-attribution.json"
+	@test -s "dist/re0auth_$${VERSION}_npm-attribution.json" || { echo "refusing to ship an empty npm licence list"; exit 1; }
 	@for platform in $(RELEASE_PLATFORMS); do \
 		os=$${platform%/*}; arch=$${platform#*/}; \
 		name="re0auth_$${VERSION}_$${os}_$${arch}"; \
@@ -169,8 +188,9 @@ dist: web
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath \
 			-ldflags "-s -w -X main.version=$${VERSION}" \
 			-o "dist/$$name/re0auth$$ext" ./cmd/re0auth || exit 1; \
-		cp config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md "dist/$$name/" || exit 1; \
-		for f in re0auth$$ext config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md; do \
+		cp config/re0auth.example.toml LICENSE NOTICE README.md SECURITY.md "dist/re0auth_$${VERSION}_npm-attribution.json" "dist/$$name/" || exit 1; \
+		for f in re0auth$$ext re0auth.example.toml LICENSE NOTICE README.md SECURITY.md \
+			"re0auth_$${VERSION}_npm-attribution.json"; do \
 			test -s "dist/$$name/$$f" || { echo "refusing to package: $$f is missing from $$name"; exit 1; }; \
 		done; \
 		if [ "$$os" = windows ]; then \
@@ -206,17 +226,17 @@ sbom: dist
 #
 # NOTICE covers the Go modules. The SPA is third-party code too (Svelte, SvelteKit,
 # Tailwind), and it ships inside every binary, archive and image, so it needs the
-# same attribution. This lists every npm package in the tree and its license, as
-# JSON, into dist/ — one file for all platforms, so it is generated here rather
-# than inside the archive loop, and the checksum glob below covers it.
+# same attribution. It lists every npm package in the tree and its license, as
+# JSON, into dist/ — one file for all platforms.
 #
-# It reads the INSTALLED tree, so it needs the frontend dependencies; `dist` (and
-# therefore `web`) has already run by the time this does.
+# `dist` generates it, because the archives that target builds carry it: the SPA
+# is embedded in each binary, so the listing has to be present after `dist` wipes
+# the output directory and before the first archive is sealed. This target is the
+# release chain's name for that artifact, and it re-asserts that the file the
+# archives carry is present and non-empty, so a release cannot proceed without it.
+# The listing reads the INSTALLED tree, which `dist` (and therefore `web`) has
+# already produced by the time this runs.
 npm-attribution: dist
-	@command -v node >/dev/null 2>&1 || { \
-		echo "node is required to list the npm licences; run this where the frontend can be installed"; \
-		exit 1; }
-	cd web && pnpm licenses list --json > "../dist/re0auth_$${VERSION}_npm-attribution.json"
 	@test -s "dist/re0auth_$${VERSION}_npm-attribution.json" || { echo "refusing to ship an empty npm licence list"; exit 1; }
 	@echo "npm licences: dist/re0auth_$${VERSION}_npm-attribution.json"
 

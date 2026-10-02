@@ -118,8 +118,8 @@ report: the invariants are the product.
 ## Our own audits
 
 We run an adversarial pass against our own invariants rather than waiting for
-someone else to. Four rounds have been run. Two of them were written up as
-documents, and those are the ones on disk:
+someone else to. Nine rounds have been run, and five of them have a standalone
+write-up on disk:
 
 - [`docs/security-audit-2.md`](docs/security-audit-2.md) — the invariant sweep:
   token issuance, account isolation, revocation, credential containment,
@@ -128,12 +128,28 @@ documents, and those are the ones on disk:
   the seam with the third-party OpenID Provider library, the audit-log read
   surface, and the device flow's concurrency and binding. Same rule: a finding is
   not a finding until a test can fail on it.
+- [`docs/security-audit-5.md`](docs/security-audit-5.md) — the pre-launch round:
+  it widened the sweep to performance, the deployment and release artifacts, the
+  frontend and the dependency supply chain, and handed every area report to a
+  second agent whose brief was to falsify it.
+- [`docs/security-audit-7.md`](docs/security-audit-7.md) — the pre-launch
+  regression round: it re-ran every red probe the sixth round left, then reported
+  where the same classes of defect had moved instead of assuming they were fixed.
+- [`docs/security-audit-9.md`](docs/security-audit-9.md) — the independent
+  pre-launch round: fifteen area audits and fifteen separate adversarial
+  verifiers, deliberately reading none of the earlier findings, with severity
+  weighted by whether the path is reachable in the production binary.
 
-Rounds 1 and 4 have **no document of their own**. They are referenced by the two
-above (round 4's dispositions carry the commit that landed them), and the guards
-those rounds added are in the suite like every other fix — but there is nothing
-to open, so treat the references as pointers to commits and tests, not to a
-report.
+The other rounds are not unrecorded, they just have no standalone write-up: where
+a round left its working material, it is archived next to the report it backs —
+round 6's brief, area findings and consolidated report under
+[`docs/audit-6/`](docs/audit-6/), round 7's under [`docs/audit-7/`](docs/audit-7/),
+and round 9's raw findings, adversarial verification and coverage matrix under
+`_audit/round9/`. Rounds 1 and 4 have **no document of their own** anywhere: they
+are referenced by the write-ups above (round 4's dispositions carry the commit
+that landed them), and the guards those rounds added are in the suite like every
+other fix — but there is nothing to open, so treat the references as pointers to
+commits and tests, not to a report.
 
 Each finding's reproducer is now part of the ordinary suite: it failed before the
 fix and passes after, so it guards the fix the way any other test guards its
