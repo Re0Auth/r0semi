@@ -810,16 +810,38 @@ func loadConfig(path string) (settings, error) {
 
 	// Vault: the KEK is required, and its length is checked here so a bad key
 	// fails before anything else is wired.
-	kekValue := os.Getenv("RE0AUTH_KEK")
-	if kekValue == "" {
-		if f.Vault.KEKEnv == "" {
+	//
+	// The file's `kek_env` NAMES the variable holding the key, and
+	// docs/operations.md tells operators they may rename it and must not assume it
+	// is called RE0AUTH_KEK. Reading the hardcoded name first made the rename a
+	// silent no-op: the process came up on whatever RE0AUTH_KEK still held, logged
+	// nothing, and every unwrap after the first write failed with "authentication
+	// failed" — with the old key still in the environment, that is discovered only
+	// when records stop being readable (S08-1). RE0AUTH_KEK is the default NAME,
+	// used when the file names no other.
+	kekName := strings.TrimSpace(f.Vault.KEKEnv)
+	if kekName == "" {
+		kekName = "RE0AUTH_KEK"
+	}
+	// The accident this refuses: the file was renamed, the orchestrator still
+	// injects the old variable. Two different keys under two names is not a
+	// preference to resolve quietly — the one that is read decides whether every
+	// existing record stays readable.
+	if kekName != "RE0AUTH_KEK" {
+		if stale := os.Getenv("RE0AUTH_KEK"); stale != "" && stale != os.Getenv(kekName) {
+			return settings{}, fmt.Errorf(
+				"vault.kek_env names %q, but RE0AUTH_KEK is also set and holds a different key; "+
+					"remove the stale variable, or point both at the same key, before starting", kekName)
+		}
+	}
+	kekValue, err := config.Secret(kekName, "vault.kek_env")
+	if err != nil {
+		if kekName == "RE0AUTH_KEK" {
+			// Name both spellings: an operator with neither set needs the file key
+			// and the variable, not the position alone.
 			return settings{}, errors.New("the vault KEK is required: set RE0AUTH_KEK or vault.kek_env")
 		}
-		resolved, err := config.Secret(f.Vault.KEKEnv, "vault.kek_env")
-		if err != nil {
-			return settings{}, err
-		}
-		kekValue = resolved
+		return settings{}, err
 	}
 	cfg.KEK, err = decodeKEK32(kekValue)
 	if err != nil {
