@@ -68,8 +68,15 @@ type OIDCStore struct {
 	refreshTombstones map[string]refreshTombstone
 	// maxTombstones bounds refreshTombstones. See OIDCOptions.
 	maxTombstones int
-	devices       map[string]deviceRecord // by TokenHash(device code)
-	userCodes     map[string]string       // normalized user code -> TokenHash(device code)
+	// maxPendingAuthRequests and maxPendingDeviceAuthorizations bound the two maps
+	// an unauthenticated caller can make the store hold: pending consent handles
+	// and pending device authorizations. Without a bound the resident population is
+	// arrival_rate x TTL, which per-address rate limiting does not cap (R10-107).
+	// See OIDCOptions.
+	maxPendingAuthRequests         int
+	maxPendingDeviceAuthorizations int
+	devices                        map[string]deviceRecord // by TokenHash(device code)
+	userCodes                      map[string]string       // normalized user code -> TokenHash(device code)
 
 	// Subject indexes. The token maps are keyed by token hash, so every lookup by
 	// subject — and every revocation by subject, which is what a Kill Switch sweep
@@ -84,6 +91,13 @@ type OIDCStore struct {
 	accessBySubject  subjectIndex
 	refreshBySubject subjectIndex
 	requestBySubject subjectIndex
+	// refreshByIDHash maps a refresh row's paired access-token hash to the refresh
+	// row's own key. RevokeToken resolves "the refresh half of this access token"
+	// by that hash; without the index the only way to answer is to walk every live
+	// refresh row under the store's single mutex (R10-106/R10-145). It reuses the
+	// subjectIndex shape because the two are the same map-of-sets pattern, but its
+	// first key is an id hash, never a subject.
+	refreshByIDHash subjectIndex
 
 	accessTTL  time.Duration
 	refreshTTL time.Duration
@@ -148,6 +162,7 @@ func (s *OIDCStore) deleteAccessLocked(key string) bool {
 func (s *OIDCStore) putRefreshLocked(key string, t refreshToken) {
 	s.refreshTokens[key] = t
 	s.refreshBySubject.add(t.subject, key)
+	s.refreshByIDHash.add(t.idHash, key)
 }
 
 func (s *OIDCStore) deleteRefreshLocked(key string) bool {
@@ -157,6 +172,7 @@ func (s *OIDCStore) deleteRefreshLocked(key string) bool {
 	}
 	delete(s.refreshTokens, key)
 	s.refreshBySubject.remove(t.subject, key)
+	s.refreshByIDHash.remove(t.idHash, key)
 	return true
 }
 
@@ -276,6 +292,20 @@ func (s *OIDCStore) requestKeysLocked(subject string) []string {
 	return out
 }
 
+// refreshKeysByIDHashLocked returns the refresh rows whose paired access token
+// has this id hash. It is the index that makes RevokeToken's "refresh half of
+// this access token" lookup O(1) instead of a walk over the whole table under
+// the store's single mutex (R10-106/R10-145). The caller holds the lock and must
+// not delete while ranging the result, which is why this copies.
+func (s *OIDCStore) refreshKeysByIDHashLocked(idHash string) []string {
+	indexed := s.refreshByIDHash.keys(idHash)
+	out := make([]string, 0, len(indexed))
+	for k := range indexed {
+		out = append(out, k)
+	}
+	return out
+}
+
 // ErrRefreshTokenSpent reports a refresh token presented after it had already
 // been rotated. It is a refusal, not a lookup miss: the caller asked to spend a
 // token this store has already consumed, which is what a replayed (or stolen)
@@ -286,6 +316,17 @@ func (s *OIDCStore) requestKeysLocked(subject string) []string {
 // endpoint maps a typed protocol error to 400, while an untyped one becomes a
 // 500 server_error and hides the refusal from the client.
 var ErrRefreshTokenSpent = oidc.ErrInvalidGrant().WithDescription("refresh token was already rotated")
+
+// ErrPendingAuthRequestsFull is returned by CreateAuthRequest when the resident
+// pending population is already at its bound. It fails closed: nothing is
+// stored. The bound exists because the pending set is written before any
+// credential is checked, so without it an anonymous caller sets the store's
+// memory floor (R10-107).
+var ErrPendingAuthRequestsFull = errors.New("memory: pending authorization request limit reached")
+
+// ErrPendingDeviceAuthorizationsFull is the device-grant counterpart of
+// ErrPendingAuthRequestsFull.
+var ErrPendingDeviceAuthorizationsFull = errors.New("memory: pending device authorization limit reached")
 
 type codeRecord struct {
 	requestID string
@@ -366,6 +407,15 @@ type OIDCOptions struct {
 	// MaxRefreshTombstones bounds the replay-detection residues the store keeps.
 	// Defaults to defaultMaxRefreshTombstones. See the field's own comment.
 	MaxRefreshTombstones int
+	// MaxPendingAuthRequests bounds the resident pending consent handles.
+	// Defaults to defaultMaxPendingAuthRequests. Past the bound CreateAuthRequest
+	// fails closed with ErrPendingAuthRequestsFull.
+	MaxPendingAuthRequests int
+	// MaxPendingDeviceAuthorizations bounds the resident pending device
+	// authorizations. Defaults to defaultMaxPendingDeviceAuthorizations. Past the
+	// bound StoreDeviceAuthorization fails closed with
+	// ErrPendingDeviceAuthorizationsFull.
+	MaxPendingDeviceAuthorizations int
 }
 
 // defaultMaxRefreshTombstones is the resident tombstone bound: 65536 entries is a
@@ -373,6 +423,19 @@ type OIDCOptions struct {
 // 30-day refresh TTL; past it the oldest residues are dropped rather than the
 // process growing without limit.
 const defaultMaxRefreshTombstones = 1 << 16
+
+// defaultMaxPendingAuthRequests bounds the pending consent handles. 131072
+// entries is a few tens of megabytes at the measured ~418 bytes each, sits above
+// every population the repository's own growth probes build (100k, 50k), and
+// leaves the deployment's memory budget to the token maps, which grow with real
+// traffic rather than with an anonymous flood. It bounds memory, which is the
+// attacked property; the 5-minute janitor bounds how long a stale entry hangs on.
+const defaultMaxPendingAuthRequests = 1 << 17
+
+// defaultMaxPendingDeviceAuthorizations bounds the pending device grants. A
+// device record is smaller than an auth request, so 32768 covers the largest
+// population the repository's probes build (20 400) with room to spare.
+const defaultMaxPendingDeviceAuthorizations = 1 << 15
 
 // NewOIDCStore builds an empty in-memory store.
 func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
@@ -396,29 +459,40 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 	if maxTombstones <= 0 {
 		maxTombstones = defaultMaxRefreshTombstones
 	}
+	maxPendingAuthRequests := opts.MaxPendingAuthRequests
+	if maxPendingAuthRequests <= 0 {
+		maxPendingAuthRequests = defaultMaxPendingAuthRequests
+	}
+	maxPendingDeviceAuthorizations := opts.MaxPendingDeviceAuthorizations
+	if maxPendingDeviceAuthorizations <= 0 {
+		maxPendingDeviceAuthorizations = defaultMaxPendingDeviceAuthorizations
+	}
 	s := &OIDCStore{
-		clients:           opts.Clients,
-		registry:          opts.Registry,
-		login:             opts.Login,
-		signer:            opts.Signer,
-		audit:             opts.Audit,
-		authRequests:      make(map[string]*oidcstore.AuthRequest),
-		authRequestExpiry: make(map[string]time.Time),
-		codes:             make(map[string]codeRecord),
-		codeByRequest:     make(map[string]map[string]struct{}),
-		accessTokens:      make(map[string]accessToken),
-		refreshTokens:     make(map[string]refreshToken),
-		refreshTombstones: make(map[string]refreshTombstone),
-		devices:           make(map[string]deviceRecord),
-		userCodes:         make(map[string]string),
-		accessBySubject:   newSubjectIndex(),
-		refreshBySubject:  newSubjectIndex(),
-		requestBySubject:  newSubjectIndex(),
-		accessTTL:         time.Hour,
-		refreshTTL:        30 * 24 * time.Hour,
-		requestTTL:        ttl,
-		now:               now,
-		maxTombstones:     maxTombstones,
+		clients:                        opts.Clients,
+		registry:                       opts.Registry,
+		login:                          opts.Login,
+		signer:                         opts.Signer,
+		audit:                          opts.Audit,
+		authRequests:                   make(map[string]*oidcstore.AuthRequest),
+		authRequestExpiry:              make(map[string]time.Time),
+		codes:                          make(map[string]codeRecord),
+		codeByRequest:                  make(map[string]map[string]struct{}),
+		accessTokens:                   make(map[string]accessToken),
+		refreshTokens:                  make(map[string]refreshToken),
+		refreshTombstones:              make(map[string]refreshTombstone),
+		devices:                        make(map[string]deviceRecord),
+		userCodes:                      make(map[string]string),
+		accessBySubject:                newSubjectIndex(),
+		refreshBySubject:               newSubjectIndex(),
+		requestBySubject:               newSubjectIndex(),
+		refreshByIDHash:                newSubjectIndex(),
+		accessTTL:                      time.Hour,
+		refreshTTL:                     30 * 24 * time.Hour,
+		requestTTL:                     ttl,
+		now:                            now,
+		maxTombstones:                  maxTombstones,
+		maxPendingAuthRequests:         maxPendingAuthRequests,
+		maxPendingDeviceAuthorizations: maxPendingDeviceAuthorizations,
 	}
 	// This store mints the tokens the client registry's clients hold, so it is
 	// the one that can revoke them when the operator plane deletes a client
@@ -502,6 +576,13 @@ func (s *OIDCStore) CreateAuthRequest(_ context.Context, req *oidc.AuthRequest, 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Admission control before the insert, under the same lock, so the bound is
+	// exact rather than check-then-act (R10-107). It fails closed: refuse, store
+	// nothing. The pending set is written before any credential is checked, so
+	// without this an anonymous caller's arrival rate is the population.
+	if len(s.authRequests) >= s.maxPendingAuthRequests {
+		return nil, ErrPendingAuthRequestsFull
+	}
 	a := &oidcstore.AuthRequest{
 		ID: id, ClientID: req.ClientID, RedirectURI: req.RedirectURI,
 		ResponseType: req.ResponseType, ResponseMode: req.ResponseMode,
@@ -913,16 +994,11 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 		}
 		s.deleteAccessLocked(h)
 		// RFC 7009 §2.1: revoking a token should revoke the whole grant. The
-		// refresh token minted alongside this access token shares its id hash.
-		//
-		// This one lookup is by id hash rather than by subject, so it is a scan —
-		// and it is left as one deliberately. A revocation is an operator or user
-		// action, not a hot path, and a fourth index would have to be maintained on
-		// every refresh rotation for it.
-		for k, rt := range s.refreshTokens {
-			if rt.idHash == h {
-				s.deleteRefreshLocked(k)
-			}
+		// refresh token minted alongside this access token shares its id hash, and
+		// refreshByIDHash resolves that half by index rather than by walking every
+		// live refresh row under the store's single mutex (R10-106/R10-145).
+		for _, k := range s.refreshKeysByIDHashLocked(h) {
+			s.deleteRefreshLocked(k)
 		}
 		for k, ts := range s.refreshTombstones {
 			if ts.idHash == h {
@@ -937,17 +1013,23 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	// token expires after an hour, the refresh token after thirty days, and the
 	// sweep removes each on its own. Without this lookup the presented access token
 	// matches nothing, the call answers RFC 7009's "unknown token is success", and
-	// the refresh token — the half that mints replacements — stays live.
-	for k, rt := range s.refreshTokens {
-		if rt.idHash != h {
-			continue
+	// the refresh token — the half that mints replacements — stays live. The id
+	// hash index is what makes the lookup O(1) rather than a walk over the whole
+	// table under the store's single mutex (R10-106/R10-145).
+	keys := s.refreshKeysByIDHashLocked(h)
+	if len(keys) > 0 {
+		// Ownership first, as before: a foreign live row answers the uniform
+		// RFC 7009 success and deletes nothing (G-8). The set normally holds one
+		// key, because a grant mints one refresh row per access id.
+		for _, k := range keys {
+			if t, ok := s.refreshTokens[k]; ok && t.clientID != clientID {
+				s.mu.Unlock()
+				return nil
+			}
 		}
-		if rt.clientID != clientID {
-			// RFC 7009 §2.1 / G-8: the uniform success, deleting nothing.
-			s.mu.Unlock()
-			return nil
+		for _, k := range keys {
+			s.deleteRefreshLocked(k)
 		}
-		s.deleteRefreshLocked(k)
 		s.deleteAccessLocked(h)
 		for tk, ts := range s.refreshTombstones {
 			if ts.idHash == h {
@@ -1214,6 +1296,12 @@ func (s *OIDCStore) StoreDeviceAuthorization(_ context.Context, clientID, device
 		delete(s.userCodes, key)
 	}
 	h := oauth.TokenHash(deviceCode)
+	// Admission control before the insert, under the same lock (R10-107). A
+	// re-used device code overwrites a record rather than adding one, so only a
+	// new key can grow the population and only a new key is refused.
+	if _, exists := s.devices[h]; !exists && len(s.devices) >= s.maxPendingDeviceAuthorizations {
+		return ErrPendingDeviceAuthorizationsFull
+	}
 	s.devices[h] = deviceRecord{
 		deviceCodeHash: h, userCode: userCode, clientID: clientID,
 		scopes: append([]string(nil), scopes...), expiresAt: expires,
