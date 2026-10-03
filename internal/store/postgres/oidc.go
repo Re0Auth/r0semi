@@ -1655,20 +1655,36 @@ func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int,
 func revokePendingAuthorizations(ctx context.Context, db querier, f oauth.TokenFilter) (int, error) {
 	removed := 0
 	clause, args := revokePredicate(f)
-	tag, err := db.Exec(ctx, `
-		DELETE FROM oidc_codes
-		 WHERE request_id IN (
-		       SELECT id FROM oidc_auth_requests`+clause+`)`, args...)
-	if err != nil {
-		return removed, err
-	}
-	removed += int(tag.RowsAffected())
+	queryArgs := make([]any, 0, len(args)+1)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, revokeBatchSize)
 
-	tag, err = db.Exec(ctx, `DELETE FROM oidc_auth_requests`+clause, args...)
+	// Both statements are bounded (R10-121): the whole-table case used to be one
+	// unbounded DELETE whose statement_timeout would roll the entire revocation
+	// back. The literals keep the tables named for the schema guards; the LIMIT is
+	// the bound.
+	codes := fmt.Sprintf(`
+		DELETE FROM oidc_codes
+		 WHERE ctid IN (
+		       SELECT c.ctid FROM oidc_codes c
+		        WHERE c.request_id IN (
+		              SELECT id FROM oidc_auth_requests%s)
+		        LIMIT $%d)`, clause, len(args)+1)
+	n, err := execBatched(ctx, db, codes, queryArgs)
+	removed += n
 	if err != nil {
 		return removed, err
 	}
-	removed += int(tag.RowsAffected())
+
+	requests := fmt.Sprintf(`
+		DELETE FROM oidc_auth_requests
+		 WHERE ctid IN (SELECT ctid FROM oidc_auth_requests%s LIMIT $%d)`,
+		clause, len(args)+1)
+	n, err = execBatched(ctx, db, requests, queryArgs)
+	removed += n
+	if err != nil {
+		return removed, err
+	}
 	return removed, nil
 }
 

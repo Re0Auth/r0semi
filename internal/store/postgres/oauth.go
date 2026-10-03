@@ -494,7 +494,7 @@ func (s *Tokens) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int, er
 	}
 	clause, args := revokePredicate(f)
 	for _, table := range []string{"oauth_codes", "oauth_refresh_tombstones"} {
-		if _, err := tx.Exec(ctx, `DELETE FROM `+table+clause, args...); err != nil {
+		if _, err := deleteMatchingBatched(ctx, tx, table, clause, args); err != nil {
 			return 0, err
 		}
 	}
@@ -550,6 +550,47 @@ func (s *Tokens) PurgeLegacySubject(ctx context.Context, subject string) (int, e
 	return total, nil
 }
 
+// revokeBatchSize bounds one statement of one bulk revocation. It matches the
+// session sweep's bound: a single statement can never outlive the pool's
+// per-statement statement_timeout, so a large table is worked off in batches
+// instead of being cancelled and rolling the whole revocation back (R10-121).
+const revokeBatchSize = 1000
+
+// deleteMatchingBatched removes every row matching clause, one bounded statement
+// at a time, on the caller's handle.
+//
+// It carries the same predicate and the same transaction as the unbounded DELETE
+// it replaces — only the LIMIT changes what one statement can do — so the summed
+// count and the all-or-nothing semantics are unchanged. The ctid subquery is the
+// bounded form used by the dated sweep and the session sweep.
+func deleteMatchingBatched(ctx context.Context, db querier, table, clause string, args []any) (int, error) {
+	stmt := fmt.Sprintf(
+		`DELETE FROM %s WHERE ctid IN (SELECT ctid FROM %s%s LIMIT $%d)`,
+		table, table, clause, len(args)+1)
+	queryArgs := make([]any, 0, len(args)+1)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, revokeBatchSize)
+	return execBatched(ctx, db, stmt, queryArgs)
+}
+
+// execBatched runs one already-bounded statement repeatedly until a batch removes
+// fewer rows than the bound, and returns the total. The statement must carry its
+// own LIMIT $n, whose value is the last entry of queryArgs.
+func execBatched(ctx context.Context, db querier, stmt string, queryArgs []any) (int, error) {
+	total := 0
+	for {
+		tag, err := db.Exec(ctx, stmt, queryArgs...)
+		if err != nil {
+			return total, err
+		}
+		n := int(tag.RowsAffected())
+		total += n
+		if n < revokeBatchSize {
+			return total, nil
+		}
+	}
+}
+
 // revokeMatching deletes rows selected by the filter from two token tables and
 // returns the total. Empty filter fields match everything, so the same statement
 // serves "all", "this client" and "this subject".
@@ -559,17 +600,21 @@ func (s *Tokens) PurgeLegacySubject(ctx context.Context, subject string) (int, e
 // half of itself and reported a count is not something a retry can distinguish
 // from success.
 //
-// Table names are compile-time constants, never request input, so concatenating
-// one into the statement does not put anything user-controlled into the SQL.
+// Each table is deleted in bounded batches (R10-121): the empty-filter case is a
+// whole-table DELETE, and one unbounded statement on a grown table would be
+// cancelled by the pool's statement_timeout and roll the entire revocation back.
+//
+// Table names are compile-time constants, never request input, so Sprintf-ing one
+// into the statement does not put anything user-controlled into the SQL.
 func revokeMatching(ctx context.Context, db querier, tables []string, f oauth.TokenFilter) (int, error) {
 	clause, args := revokePredicate(f)
 	total := 0
 	for _, table := range tables {
-		tag, err := db.Exec(ctx, `DELETE FROM `+table+clause, args...)
+		n, err := deleteMatchingBatched(ctx, db, table, clause, args)
+		total += n
 		if err != nil {
 			return total, err
 		}
-		total += int(tag.RowsAffected())
 	}
 	return total, nil
 }
