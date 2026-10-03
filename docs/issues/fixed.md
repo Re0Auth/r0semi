@@ -3,6 +3,24 @@
 > **这里不是待办。** 保留它只为了回答"这条当初为什么存在、后来被哪个 commit 收掉"。
 > 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-03）。
 
+### 第 13 轮
+
+- S13-11 — FIXED（43e5d9a）
+- S15-10 — FIXED（43e5d9a）
+- S15-8 — FIXED（43e5d9a）
+- NF-Z07-1 — FIXED（43e5d9a）
+- Z08V-1 — FIXED（43e5d9a）
+- Z08V-2 — FIXED（43e5d9a）
+- VZ16-1 — FIXED（43e5d9a）
+- VZ16-2 — FIXED（43e5d9a）
+- Z17-6 — FIXED（43e5d9a）
+- Z18v-3 — FIXED（43e5d9a）
+- Z18v-4 — FIXED（43e5d9a）
+- Z20V-3 — FIXED（43e5d9a）
+- A-FE-4 — FIXED（43e5d9a）
+- A-FE-8 — FIXED（43e5d9a）
+- A-FE-10 — FIXED（43e5d9a）
+
 ### 第 12 轮
 
 - A-FE-11 — FIXED（工作区清理，未跟踪的 %SC% 空目录已删除）
