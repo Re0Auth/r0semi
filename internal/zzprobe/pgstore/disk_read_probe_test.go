@@ -99,8 +99,8 @@ func TestMigrationsDirectoryResolves(t *testing.T) {
 	}
 
 	names := migrationFiles(t)
-	if len(names) != 34 {
-		t.Errorf("found %d migration files, want 34; update the probes if a migration was added or removed "+
+	if len(names) != 35 {
+		t.Errorf("found %d migration files, want 35; update the probes if a migration was added or removed "+
 			"(names: %v)", len(names), names)
 	}
 	// The schema's own anchor: the first and last migration must be readable and

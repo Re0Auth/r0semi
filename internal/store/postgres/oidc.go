@@ -354,6 +354,13 @@ func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.Auth
 		}
 		return nil, fmt.Errorf("postgres: auth request: %w", err)
 	}
+	// Capture the revocation generation before the transaction commits (R10-59).
+	// The code and the auth request are already consumed by the deletes above, so
+	// a Kill Switch after this point has no source row to find; the mint compares
+	// against this value.
+	if err := captureRevocationEpochs(ctx, tx, row.ClientID, row.Subject); err != nil {
+		return nil, fmt.Errorf("postgres: capture revocation epochs: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -517,6 +524,14 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 		return "", "", time.Time{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// R10-59: read the revocation generations under FOR SHARE before the claim.
+	// The share lock makes a concurrent revocation's UPDATE wait for this
+	// transaction, so a revocation that got here first is seen and refused, and
+	// one that arrives after the mint commits sees and deletes the new rows.
+	if err := checkRevocationEpochs(ctx, tx, oidcstore.ClientIDOf(request), request.GetSubject()); err != nil {
+		return "", "", time.Time{}, err
+	}
 
 	// familyID names the chain the new refresh token belongs to. A first issuance
 	// mints one; a rotation inherits the spent row's, which is what makes the set
@@ -734,6 +749,12 @@ func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string
 		Audience: row.Audience,
 		AuthTime: row.AuthTime,
 		Nonce:    row.Nonce,
+	}
+	// Capture the revocation generation while the live row is still the one the
+	// mint will consume (R10-59). The mint's own DELETE happens after this read,
+	// and a revocation in between must not be lost.
+	if err := captureRevocationEpochs(ctx, s.pool, row.ClientID, row.Subject); err != nil {
+		return nil, fmt.Errorf("postgres: capture revocation epochs: %w", err)
 	}
 	return &r, nil
 }
@@ -1171,7 +1192,12 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 	// the DELETE matched an expired row and handed the library a Done state,
 	// which the library consumes BEFORE it checks Expires
 	// (zitadel/oidc pkg/op/device.go CheckDeviceAuthorizationState).
-	rows, err := s.pool.Query(ctx, `
+	consumeTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: consume device authorization: %w", err)
+	}
+	defer func() { _ = consumeTx.Rollback(ctx) }()
+	rows, err := consumeTx.Query(ctx, `
 		DELETE FROM oidc_devices
 		 WHERE device_code_hash = $1 AND client_id = $2 AND done = true AND denied = false
 		   AND expires_at > $3
@@ -1182,11 +1208,21 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, de
 	}
 	row, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[deviceStateRow])
 	if err == nil {
+		// Capture the revocation generation before the consume commits (R10-59):
+		// the approved record is gone from here, so a later Kill Switch has nothing
+		// left to delete, and the mint's re-check is what catches it.
+		if cerr := captureRevocationEpochs(ctx, consumeTx, row.ClientID, row.Subject); cerr != nil {
+			return nil, fmt.Errorf("postgres: capture revocation epochs: %w", cerr)
+		}
+		if cerr := consumeTx.Commit(ctx); cerr != nil {
+			return nil, fmt.Errorf("postgres: consume device authorization: %w", cerr)
+		}
 		return row.state(), nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("postgres: consume device authorization: %w", err)
 	}
+	_ = consumeTx.Rollback(ctx)
 
 	// RFC 8628 §3.5: a client polling faster than the advertised interval is told
 	// to slow down. The library maps context.DeadlineExceeded to that error.
@@ -1555,6 +1591,12 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Bump before deleting (R10-59): a mint already between its claim and its
+	// writes has no row here for the deletes to find, so the generation is what
+	// lets it notice the revocation and roll its pair back.
+	if err := bumpRevocationEpochs(ctx, tx, clientID, subject); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM oidc_access_tokens WHERE subject = $1 AND client_id = $2`, subject, clientID); err != nil {
 		return err
 	}
@@ -1617,6 +1659,13 @@ func (s *OIDCStore) RevokeTokens(ctx context.Context, f oauth.TokenFilter) (int,
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Bump the revoked scope before any delete (R10-59). An empty filter is the
+	// Kill Switch's "everything", so it moves the global generation every mint
+	// compares.
+	if err := bumpRevocationEpochs(ctx, tx, f.ClientID, f.Subject); err != nil {
+		return 0, err
+	}
 
 	total, err := revokeMatching(ctx, tx, []string{"oidc_access_tokens", "oidc_refresh_tokens"}, f)
 	if err != nil {

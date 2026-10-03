@@ -697,6 +697,12 @@ func (h *Handler) serveOAuth(w http.ResponseWriter, r *http.Request) {
 	// pooled writer for the life of the process. The writer never escapes this
 	// handler, so returning it is always correct once we hold it.
 	defer releaseBufferedWriter(bw)
+	// R10-59: carry the revocation generation from the credential-resolution step
+	// to the mint. Resolution consumes the source row (a code, a device record, a
+	// rotated refresh value); a Kill Switch that commits between that consume and
+	// the mint has nothing left to delete, so the mint compares against what the
+	// resolve step observed and refuses a pair minted across a revocation.
+	r = r.WithContext(oidcstore.WithRevocationEpochs(r.Context()))
 	h.provider.ServeHTTP(bw, r)
 	body := bw.body.Bytes()
 

@@ -75,8 +75,13 @@ type OIDCStore struct {
 	// See OIDCOptions.
 	maxPendingAuthRequests         int
 	maxPendingDeviceAuthorizations int
-	devices                        map[string]deviceRecord // by TokenHash(device code)
-	userCodes                      map[string]string       // normalized user code -> TokenHash(device code)
+	// revocationEpochs are the per-scope revocation generations (R10-59). A
+	// revocation bumps the scope it names before it deletes; a mint re-checks the
+	// generation it captured at resolve time and fails closed if it moved. The map
+	// is small (one entry per revoked client or subject) and guarded by s.mu.
+	revocationEpochs map[string]int64
+	devices          map[string]deviceRecord // by TokenHash(device code)
+	userCodes        map[string]string       // normalized user code -> TokenHash(device code)
 
 	// Subject indexes. The token maps are keyed by token hash, so every lookup by
 	// subject — and every revocation by subject, which is what a Kill Switch sweep
@@ -306,6 +311,35 @@ func (s *OIDCStore) refreshKeysByIDHashLocked(idHash string) []string {
 	return out
 }
 
+// revocationEpochsLocked returns the (global, client, subject) generations for a
+// grant. The caller holds the lock.
+func (s *OIDCStore) revocationEpochsLocked(clientID, subject string) (global, client, sub int64) {
+	global = s.revocationEpochs["*"]
+	if clientID != "" {
+		client = s.revocationEpochs["c:"+clientID]
+	}
+	if subject != "" {
+		sub = s.revocationEpochs["s:"+subject]
+	}
+	return global, client, sub
+}
+
+// bumpRevocationEpochsLocked advances the generation of the scope a revocation
+// names, BEFORE its deletes (R10-59). A revocation with no filter bumps the
+// global generation, which every mint compares. The caller holds the lock.
+func (s *OIDCStore) bumpRevocationEpochsLocked(clientID, subject string) {
+	if clientID == "" && subject == "" {
+		s.revocationEpochs["*"]++
+		return
+	}
+	if clientID != "" {
+		s.revocationEpochs["c:"+clientID]++
+	}
+	if subject != "" {
+		s.revocationEpochs["s:"+subject]++
+	}
+}
+
 // ErrRefreshTokenSpent reports a refresh token presented after it had already
 // been rotated. It is a refusal, not a lookup miss: the caller asked to spend a
 // token this store has already consumed, which is what a replayed (or stolen)
@@ -316,6 +350,12 @@ func (s *OIDCStore) refreshKeysByIDHashLocked(idHash string) []string {
 // endpoint maps a typed protocol error to 400, while an untyped one becomes a
 // 500 server_error and hides the refusal from the client.
 var ErrRefreshTokenSpent = oidc.ErrInvalidGrant().WithDescription("refresh token was already rotated")
+
+// ErrGrantRevokedInFlight is returned by CreateAccessAndRefreshTokens when the
+// grant's revocation generation moved between the resolve step and the mint
+// (R10-59). It is a typed invalid_grant, so the token endpoint answers 400 and
+// the client re-runs the grant instead of seeing a 500.
+var ErrGrantRevokedInFlight = oidc.ErrInvalidGrant().WithDescription("the grant was revoked while this request was in flight")
 
 // ErrPendingAuthRequestsFull is returned by CreateAuthRequest when the resident
 // pending population is already at its bound. It fails closed: nothing is
@@ -493,6 +533,7 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		maxTombstones:                  maxTombstones,
 		maxPendingAuthRequests:         maxPendingAuthRequests,
 		maxPendingDeviceAuthorizations: maxPendingDeviceAuthorizations,
+		revocationEpochs:               make(map[string]int64),
 	}
 	// This store mints the tokens the client registry's clients hold, so it is
 	// the one that can revoke them when the operator plane deletes a client
@@ -640,7 +681,7 @@ func (s *OIDCStore) AuthRequestByID(_ context.Context, id string) (op.AuthReques
 // concurrent exchanges both succeeded. Treating the lookup itself as the claim is
 // what makes the code single-use under concurrency; a failed exchange burns the
 // code, which is the fail-closed direction.
-func (s *OIDCStore) AuthRequestByCode(_ context.Context, code string) (op.AuthRequest, error) {
+func (s *OIDCStore) AuthRequestByCode(ctx context.Context, code string) (op.AuthRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := oauth.TokenHash(code)
@@ -652,6 +693,11 @@ func (s *OIDCStore) AuthRequestByCode(_ context.Context, code string) (op.AuthRe
 	if !ok {
 		return nil, errors.New("memory: auth request not found")
 	}
+	// Capture the revocation generation before the code and request are consumed
+	// (R10-59): the mint runs after this call, and a revocation committed in
+	// between has no source row left to delete.
+	global, client, subject := s.revocationEpochsLocked(a.ClientID, a.Subject)
+	oidcstore.CaptureRevocationEpochs(ctx, global, client, subject)
 	s.deleteCodeLocked(key)
 	s.deleteRequestLocked(c.requestID)
 	return cloneAuthRequest(a), nil
@@ -868,6 +914,15 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 		}
 		familyID = id
 	}
+	// R10-59: the resolve step captured the revocation generation. If a revocation
+	// landed since — including one that consumed the source row before this mint
+	// ran, leaving the deletes nothing to find — refuse and write nothing. The
+	// store's mutex makes this check atomic with RevokeTokens, so a revocation
+	// cannot slip between the check and the writes below.
+	if g, c, sub := s.revocationEpochsLocked(access.clientID, access.subject); !oidcstore.RevocationUnchanged(ctx, g, c, sub) {
+		s.mu.Unlock()
+		return "", "", time.Time{}, ErrGrantRevokedInFlight
+	}
 	refresh.familyID = familyID
 	s.putAccessLocked(oauth.TokenHash(accessID), access)
 	s.putRefreshLocked(oauth.TokenHash(value), refresh)
@@ -884,7 +939,7 @@ func (s *OIDCStore) CreateAccessAndRefreshTokens(ctx context.Context, request op
 // token that was already rotated — the theft signal RFC 9700 §4.14.2 keys on — so
 // the whole family is revoked before the refusal is returned. The library maps
 // the error to invalid_grant, so the client still sees a 400.
-func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) (op.RefreshTokenRequest, error) {
+func (s *OIDCStore) TokenRequestByRefreshToken(ctx context.Context, value string) (op.RefreshTokenRequest, error) {
 	spent := oauth.TokenHash(value)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -898,6 +953,11 @@ func (s *OIDCStore) TokenRequestByRefreshToken(_ context.Context, value string) 
 		// Postgres backend returns, so a boundary can classify both alike (N-02).
 		return nil, oauth.ErrTokenNotFound
 	}
+	// Capture the revocation generation while the row is still readable (R10-59).
+	// This is a non-destructive read; the mint's own DELETE of the row happens
+	// later, and a revocation in between must not be lost.
+	global, client, subject := s.revocationEpochsLocked(r.clientID, r.subject)
+	oidcstore.CaptureRevocationEpochs(ctx, global, client, subject)
 	// Copy every slice and the *time.Time: Scopes was already copied, but AMR,
 	// Audience and AuthTime aliased the stored record, so a caller's write reached
 	// the store and kept applying on every later refresh (verified finding).
@@ -1311,7 +1371,7 @@ func (s *OIDCStore) StoreDeviceAuthorization(_ context.Context, clientID, device
 }
 
 // GetDeviceAuthorizatonState implements op.Storage.
-func (s *OIDCStore) GetDeviceAuthorizatonState(_ context.Context, clientID, deviceCode string) (*op.DeviceAuthorizationState, error) {
+func (s *OIDCStore) GetDeviceAuthorizatonState(ctx context.Context, clientID, deviceCode string) (*op.DeviceAuthorizationState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := oauth.TokenHash(deviceCode)
@@ -1336,6 +1396,10 @@ func (s *OIDCStore) GetDeviceAuthorizatonState(_ context.Context, clientID, devi
 		// kept minting fresh access/refresh pairs for the rest of its TTL, and a
 		// revocation performed in between was undone by the next poll. A denied or
 		// still-pending record is left in place for the library to answer.
+		// Capture the revocation generation before the approved record is consumed
+		// (R10-59).
+		global, client, subject := s.revocationEpochsLocked(d.clientID, d.subject)
+		oidcstore.CaptureRevocationEpochs(ctx, global, client, subject)
 		delete(s.devices, h)
 		delete(s.userCodes, normalizeUserCode(d.userCode))
 		// RFC 8628 §3.5: expires_in bounds the device_code as well as the
@@ -1709,6 +1773,10 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 		return errors.New("memory: subject and client id are required")
 	}
 	s.mu.Lock()
+	// Bump before deleting (R10-59): a mint already between its claim and its
+	// writes has no row here for the deletes below to find, so the generation is
+	// what lets the mint notice the revocation and roll its pair back.
+	s.bumpRevocationEpochsLocked(clientID, subject)
 	for key := range s.accessBySubject.keys(subject) {
 		if t, ok := s.accessTokens[key]; ok && t.clientID == clientID {
 			s.deleteAccessLocked(key)
@@ -1768,6 +1836,10 @@ func (s *OIDCStore) RevokeGrant(ctx context.Context, subject, clientID string) e
 func (s *OIDCStore) RevokeTokens(_ context.Context, f oauth.TokenFilter) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Bump the revoked scope before any delete (R10-59). An empty filter is the
+	// Kill Switch's "everything", so it moves the global generation every mint
+	// compares.
+	s.bumpRevocationEpochsLocked(f.ClientID, f.Subject)
 	removed := 0
 	// A revocation filtered by subject only has to look at that subject's records;
 	// the unfiltered one is the Kill Switch's "everything", and it must look at all

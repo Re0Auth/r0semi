@@ -47,6 +47,11 @@ var credentialColumnAllowed = map[string]string{
 	// audit history resolvable, which is why deleting it IS the erasure; it is not a
 	// credential for anything and grants no access.
 	"audit_subject_keys.key": "per-subject audit pseudonym key; deleting it is the erasure",
+
+	// The revocation epoch's scope name (migration 0036): "*", "client:<id>" or
+	// "subject:<id>". It names which grants a counter covers; it is not a secret
+	// and grants no access (R10-59).
+	"oidc_revocation_epochs.scope_key": "names the revoked scope, not a credential",
 }
 
 // TestNoColumnCanHoldACredential enumerates EVERY column in every table and refuses
