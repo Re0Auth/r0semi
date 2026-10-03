@@ -52,9 +52,18 @@ func sessionTokenHash(token string) string { return oauth.TokenHash(token) }
 func (s *Sessions) Delete(token string) error { return s.DeleteCtx(context.Background(), token) }
 
 // DeleteCtx implements scs.CtxStore. Deleting an absent session is not an error.
+//
+// A delete marks the row rather than removing it (R10-96). scs commits a session
+// after the handler returns, so a request that loaded this session before the
+// delete would otherwise re-create it with an unconditional upsert. The marker is
+// the conflict target that makes CommitCtx's upsert lose; the payload is blanked
+// because the session is over. The row itself, with its deadline, is removed by
+// the sweep.
 func (s *Sessions) DeleteCtx(ctx context.Context, token string) error {
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM sessions WHERE token_hash = $1`, sessionTokenHash(token))
+	_, err := s.pool.Exec(ctx, `
+		UPDATE sessions SET invalidated_at = $2, data = '\x'::bytea
+		 WHERE token_hash = $1 AND invalidated_at IS NULL`,
+		sessionTokenHash(token), s.now())
 	return err
 }
 
@@ -80,7 +89,7 @@ func (s *Sessions) FindCtx(ctx context.Context, token string) ([]byte, bool, err
 		expiry time.Time
 	)
 	err := s.pool.QueryRow(ctx,
-		`SELECT data, expiry FROM sessions WHERE token_hash = $1`, sessionTokenHash(token)).
+		`SELECT data, expiry FROM sessions WHERE token_hash = $1 AND invalidated_at IS NULL`, sessionTokenHash(token)).
 		Scan(&data, &expiry)
 	if noRows(err) {
 		return nil, false, nil
@@ -89,7 +98,11 @@ func (s *Sessions) FindCtx(ctx context.Context, token string) ([]byte, bool, err
 		return nil, false, err
 	}
 	if !s.now().Before(expiry) {
-		_ = s.DeleteCtx(ctx, token)
+		// Housekeeping, not invalidation: a lapsed row is removed outright, like
+		// the sweep does. It is not a marker, and leaving it would keep a dead row
+		// for the account's whole lifetime.
+		_, _ = s.pool.Exec(ctx, `DELETE FROM sessions WHERE token_hash = $1 AND expiry <= $2`,
+			sessionTokenHash(token), s.now())
 		return nil, false, nil
 	}
 	return data, true, nil
@@ -124,7 +137,8 @@ func (s *Sessions) CommitCtx(ctx context.Context, token string, data []byte, exp
 		VALUES ($1, $2, $3)
 		ON CONFLICT (token_hash) DO UPDATE SET
 			data   = EXCLUDED.data,
-			expiry = EXCLUDED.expiry`,
+			expiry = EXCLUDED.expiry
+		WHERE sessions.invalidated_at IS NULL`,
 		sessionTokenHash(token), data, expiry)
 	return err
 }
@@ -220,14 +234,47 @@ func deleteTableBatched(ctx context.Context, tx pgx.Tx, table string) (int64, er
 	}
 }
 
-// RevokeAllSessions deletes every session, signing everyone out. It is the session
-// half of the Kill Switch. Returns how many sessions were removed.
+// invalidateTableBatched marks every live row of one table as deleted, one
+// bounded statement at a time, on the caller's transaction. It is
+// deleteTableBatched's tombstone-preserving sibling: the Kill Switch must make
+// sessions unreachable without removing the conflict target that an in-flight
+// scs commit would otherwise re-create (R10-96).
 //
-// Both deletes run in one transaction and in bounded batches: the session row and
-// its subject index row are two halves of one revocable session, and a partial
-// application that reported a count is not a state a retry can distinguish from
-// success. The count is zero when any statement fails, because the rollback
-// leaves nothing removed (S03-10, S09-8).
+// The table name is a compile-time constant at both call sites, never request
+// input, and the deadline that retires the markers is the row's existing expiry,
+// which the sweep already removes.
+func invalidateTableBatched(ctx context.Context, tx pgx.Tx, table string, now time.Time) (int64, error) {
+	var marked int64
+	for {
+		// Same Sprintf-with-compile-time-constant shape as the dated sweep: the
+		// table name is never request input.
+		tag, err := tx.Exec(ctx, fmt.Sprintf(`
+			UPDATE %s SET invalidated_at = $1, data = '\x'::bytea
+			 WHERE invalidated_at IS NULL
+			   AND ctid IN (SELECT ctid FROM %s WHERE invalidated_at IS NULL LIMIT $2)`,
+			table, table),
+			now, sessionSweepBatchSize)
+		if err != nil {
+			return marked, err
+		}
+		n := tag.RowsAffected()
+		marked += n
+		if n < sessionSweepBatchSize {
+			return marked, nil
+		}
+	}
+}
+
+// RevokeAllSessions invalidates every session, signing everyone out. It is the
+// session half of the Kill Switch. Returns how many sessions were invalidated.
+//
+// The session rows are marked rather than deleted (R10-96): an in-flight request
+// that loaded a session before this call commits after it, and an unconditional
+// upsert would re-create the row. Both statements run in one transaction and in
+// bounded batches: the session row and its subject index row are two halves of one
+// revocable session, and a partial application that reported a count is not a
+// state a retry can distinguish from success. The count is zero when any statement
+// fails, because the rollback leaves nothing removed (S03-10, S09-8).
 func (s *Sessions) RevokeAllSessions(ctx context.Context) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -235,7 +282,7 @@ func (s *Sessions) RevokeAllSessions(ctx context.Context) (int64, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	removed, err := deleteTableBatched(ctx, tx, "sessions")
+	removed, err := invalidateTableBatched(ctx, tx, "sessions", s.now())
 	if err != nil {
 		return 0, err
 	}
@@ -248,11 +295,17 @@ func (s *Sessions) RevokeAllSessions(ctx context.Context) (int64, error) {
 	return removed, nil
 }
 
-// RevokeSubjectSessions deletes every session belonging to one account. It needs
-// the subject index: a session cookie carries no subject, and the store cannot
-// read the account out of an encoded payload.
+// RevokeSubjectSessions invalidates every session belonging to one account. It
+// needs the subject index: a session cookie carries no subject, and the store
+// cannot read the account out of an encoded payload.
 //
-// The two deletes share one transaction for the same reason RevokeAllSessions'
+// The session rows are marked, not deleted (R10-96): a request that loaded one of
+// them before this call commits after it, and an unconditional upsert would both
+// re-create the row and leave it absent from the index this method just cleared —
+// a revived session no later per-subject sweep could reach. The index rows are
+// still deleted: they are the mapping, not the session.
+//
+// Both statements share one transaction for the same reason RevokeAllSessions'
 // do: an index row left behind after its session was removed is an orphan the
 // sweep has to age out, and a session removed without its index row is one the
 // next Kill Switch cannot reach (S09-8).
@@ -267,8 +320,10 @@ func (s *Sessions) RevokeSubjectSessions(ctx context.Context, subject string) (i
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag, err := tx.Exec(ctx, `
-		DELETE FROM sessions
-		 WHERE token_hash IN (SELECT token_hash FROM session_subjects WHERE subject = $1)`, subject)
+		UPDATE sessions SET invalidated_at = $2, data = '\x'::bytea
+		 WHERE invalidated_at IS NULL
+		   AND token_hash IN (SELECT token_hash FROM session_subjects WHERE subject = $1)`,
+		subject, s.now())
 	if err != nil {
 		return 0, err
 	}

@@ -81,11 +81,6 @@ type Manager struct {
 // NewManager builds a session manager with secure cookie defaults.
 func NewManager(opts Options) *Manager {
 	sm := scs.New()
-	if opts.Store != nil {
-		sm.Store = opts.Store
-	} else {
-		sm.Store = memstore.New()
-	}
 	if opts.Lifetime > 0 {
 		sm.Lifetime = opts.Lifetime
 	} else {
@@ -95,6 +90,16 @@ func NewManager(opts Options) *Manager {
 		sm.IdleTimeout = opts.IdleTimeout
 	} else {
 		sm.IdleTimeout = 2 * time.Hour
+	}
+	if opts.Store != nil {
+		sm.Store = opts.Store
+	} else {
+		// The in-process fallback has no column to mark an invalidation with, so
+		// its authority comes from a wrapper that refuses a commit for a token it
+		// was asked to delete (R10-96). The durable store's Kill Switch calls its
+		// revoke methods directly, never through scs, so it must not be wrapped
+		// here — only its own invalidated_at marker can cover that path.
+		sm.Store = newTombstoningStore(memstore.New(), sm.Lifetime)
 	}
 
 	name := opts.CookieName

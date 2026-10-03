@@ -431,6 +431,7 @@ jobs:
             ./internal/zzprobe/perf \
             ./internal/zzprobe/protocol \
             ./internal/zzprobe/pubaddr \
+            ./internal/zzprobe/sessionrevive \
             ./internal/zzprobe/verifycm \
             ./internal/zzprobe/verifycrypto \
             ./internal/zzprobe/verifydependencies \
