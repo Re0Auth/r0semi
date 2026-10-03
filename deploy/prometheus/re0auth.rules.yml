@@ -2,9 +2,16 @@
 #
 # Load this file into any Prometheus-compatible rule evaluator, pointed at a
 # scrape of the internal listener's /metrics (server.internal_addr, default
-# :9090). The expressions name only re0auth_* series and carry no job/instance
-# selector, so they do not bind to one scrape convention — a deployment's own
-# labels are applied where the rule is loaded.
+# :9090). Every expression names only re0auth_* series and carries no job/instance
+# selector, so the service's own series do not bind to one scrape convention — a
+# deployment's own labels are applied where the rule is loaded. The three generic
+# runtime rules at the end of the `re0auth` group are the deliberate exception:
+# they read `go_goroutines`, `process_resident_memory_bytes` and `process_open_fds`
+# / `process_max_fds`, which every Go process and every process-exporter target
+# exports, so each carries an explicit `{job=~"re0auth.*"}` selector (S15-8).
+# A deployment must name the re0auth scrape job so it matches that pattern;
+# otherwise the selector matches the wrong process and fires under a Re0Auth
+# alert name.
 #
 # Each rule serves a SLI defined in docs/slo.md, and each points at a per-alert
 # runbook in docs/runbooks.md (not at the design doc). The thresholds are starting
@@ -305,7 +312,11 @@ groups:
         # A non-request runtime signal: the go_* collector is exported for exactly
         # this, and nothing else consumes it. The threshold must be tuned to the
         # deployment's concurrency; it is a leak detector, not a load alarm.
-        expr: go_goroutines > 5000
+        #
+        # `go_goroutines` is generic — every Go process scraped by the same
+        # Prometheus exports it — so the selector is not optional (S15-8): without
+        # it any other Go target's goroutine count fires this Re0Auth alert.
+        expr: go_goroutines{job=~"re0auth.*"} > 5000
         for: 30m
         labels:
           severity: warning
@@ -319,8 +330,10 @@ groups:
       - alert: Re0AuthMemoryHigh
         # Threshold should match the deployment's memory limit (k8s default limit
         # is 512Mi); it is 400MiB here to warn before an OOMKill. A non-request
-        # signal, hence no re0auth_ series.
-        expr: process_resident_memory_bytes > 400e6
+        # signal, hence no re0auth_ series — and `process_resident_memory_bytes` is
+        # generic, so the job selector is what keeps this off unrelated targets
+        # (S15-8).
+        expr: process_resident_memory_bytes{job=~"re0auth.*"} > 400e6
         for: 15m
         labels:
           severity: warning
@@ -334,8 +347,11 @@ groups:
 
       - alert: Re0AuthFileDescriptorsHigh
         # Saturation of a resource the service cannot grow on its own. Most fds are
-        # sockets: upstream, database and HTTP connections.
-        expr: process_open_fds / process_max_fds > 0.8
+        # sockets: upstream, database and HTTP connections. Both sides of the ratio
+        # are generic process metrics, so both carry the job selector (S15-8);
+        # vector matching would otherwise pair Re0Auth's numerator with any other
+        # target's denominator.
+        expr: process_open_fds{job=~"re0auth.*"} / process_max_fds{job=~"re0auth.*"} > 0.8
         for: 15m
         labels:
           severity: warning

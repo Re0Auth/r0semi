@@ -120,6 +120,13 @@ type zOptions struct {
 	// ExtraPublicIDs registers additional public clients, so a probe can put two
 	// clients in the same deployment.
 	ExtraPublicIDs []string
+	// SecondSource, when set, registers another source of the same game that also
+	// serves a resource. The normalized authorization gate requires the scope of
+	// EVERY candidate source (httpapi/federation_routes.go:105-122), and with the
+	// single configured source that rule is indistinguishable from "the first
+	// source's scope" — the shape the Z20-2 finding was about. A second candidate
+	// with its own scope is what makes the "every" observable.
+	SecondSource *federation.Source
 }
 
 // zCriticalScope is a catalogue scope the shipped descriptor set does not have.
@@ -128,6 +135,20 @@ type zOptions struct {
 // (oauth/scope.go:126-131, oauth/scope_test.go:31), which is exactly why
 // `_audit/protocol.md` P-02 could not be probed.
 const zCriticalScope = oauth.Scope("phigros.secret.read")
+
+// zSecondScoreScope is the scope a SECOND source of `phigros` declares for the
+// `scores` resource. The shipped catalogue has no such scope; a probe that needs
+// two candidate sources registers it.
+const zSecondScoreScope = oauth.Scope("phigros.score2.read")
+
+// secondSources turns the optional second source into the variadic tail of the
+// registry construction.
+func secondSources(opts zOptions) []federation.Source {
+	if opts.SecondSource == nil {
+		return nil
+	}
+	return []federation.Source{*opts.SecondSource}
+}
 
 // zRegistryWithCritical is the default catalogue plus one ExplicitConsent
 // descriptor.
@@ -183,7 +204,7 @@ func newZEnv(t *testing.T, opts zOptions) *zEnv {
 		// addresses the very URL the normalized route addresses.
 		rawBase = upstream.URL
 	}
-	reg, err := federation.NewRegistry(federation.Source{
+	reg, err := federation.NewRegistry(append([]federation.Source{{
 		Game: zGame, Name: zSource, DisplayName: "Fake",
 		Issuer: upstream.URL, RawBase: rawBase,
 		ClientID: "cid", ClientSecret: "sec", TokenClass: "revocable",
@@ -191,7 +212,7 @@ func newZEnv(t *testing.T, opts zOptions) *zEnv {
 			{Name: "profile", Schema: "re0auth.phigros.profile/1", Scope: "phigros.profile.read"},
 			{Name: "scores", Schema: "re0auth.phigros.scores/1", Scope: "phigros.score.read"},
 		},
-	})
+	}}, secondSources(opts)...)...)
 	if err != nil {
 		t.Fatalf("federation.NewRegistry: %v", err)
 	}

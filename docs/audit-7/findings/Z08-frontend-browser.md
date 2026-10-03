@@ -130,8 +130,8 @@
 - **状态**：CONFIRMED
 - **影响**：这几个响应没有声明新鲜度，缓存只能按各浏览器自己的启发式规则猜（Chrome 与 Safari 的策略不同），
   行为不可预测；`_app/version.json` 尤其敏感：SvelteKit 的部署探测就读它，**一个被中间缓存留住的旧 version.json 会让客户端永远发现不了新部署**
-  （注：本机构建里客户端没有轮询它——grep 构建产物无 `version.json` 引用——所以今天只有潜在风险，一旦将来打开轮询就立刻成立）。
-- **探针**：`frontend_handler_test.go::TestZ08NonShellStaticFilesDeclareACachePolicy`（红）
+  （更正，第七轮复核 Z08V-2：构建产物 `_app/immutable/chunks/*.js` 确实带 `fetch(.../_app/version.json)` 与版本比对逻辑，客户端在轮询它；原「本机构建产物无 `version.json` 引用、只是潜在风险」的判断是错的，风险在审计当时即已成立。该条现已落地：`setCacheHeaders`（`webui.go`）对 `_app/version.json` 写 `no-store`）。
+- **探针**：`frontend_handler_test.go::TestZ08NonShellStaticFilesDeclareACachePolicy`（修复前红，现已转绿）
 - **修法建议**：在 `setCacheHeaders` 里把默认值写成「除 `_app/immutable/` 外一律 `no-cache`」（`favicon.svg` 可给 `max-age=3600`，
   `_app/version.json` 必须 `no-store`），把「有缓存指令」变成规则而不是两个特例。
 - **是否与既有编号相关**：无。（第五轮 `A5-4`/一轮的 `no-store` 覆盖讲的是 `/v1` 平面，不是 `/app` 静态面。）

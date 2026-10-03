@@ -217,6 +217,36 @@ func TestComparePairsByNameAndFlagsRenames(t *testing.T) {
 	}
 }
 
+// TestCompareRefusesAZeroMedianInsteadOfFabricatingADelta: the parser accepts
+// `ns/op=0` and an empty sample set reports 0, so a ratio is ±Inf and the geomean
+// becomes NaN for every other benchmark. Such a pair must be reported as not
+// comparable, and the healthy pairs must keep their real geomean.
+func TestCompareRefusesAZeroMedianInsteadOfFabricatingADelta(t *testing.T) {
+	current := []*bench{
+		mkBench("pkg/a", "ZeroBaseline", []float64{100}),
+		mkBench("pkg/a", "ZeroCurrent", []float64{0}),
+		mkBench("pkg/a", "Healthy", []float64{110}),
+	}
+	baseline := []*bench{
+		mkBench("pkg/a", "ZeroBaseline", []float64{0}),
+		mkBench("pkg/a", "ZeroCurrent", []float64{100}),
+		mkBench("pkg/a", "Healthy", []float64{100}),
+	}
+	c := compare(current, baseline, 15)
+	if c.shared != 1 {
+		t.Fatalf("shared = %d, want 1 (only the healthy pair is comparable)", c.shared)
+	}
+	if len(c.zeroBaseline) != 2 {
+		t.Fatalf("zeroBaseline = %v, want the two unusable pairs", c.zeroBaseline)
+	}
+	if math.IsNaN(c.geomeanDelta) || math.IsInf(c.geomeanDelta, 0) {
+		t.Fatalf("geomean = %v: a zero median poisoned it", c.geomeanDelta)
+	}
+	if want := 10.0; math.Abs(c.geomeanDelta-want) > 1e-9 {
+		t.Fatalf("geomean = %v, want %v", c.geomeanDelta, want)
+	}
+}
+
 func TestRenderIncludesWhatTheReaderCameFor(t *testing.T) {
 	benches := []*bench{
 		mkBench("github.com/Re0Auth/r0semi/internal/httpapi", "BusinessPlaneBearerMe", []float64{19727}),

@@ -1488,8 +1488,13 @@ paths:
           in: query
           required: false
           description: |
-            `pagination.next_cursor` from the previous page. Opaque; the server
-            rejects anything it did not issue.
+            `pagination.next_cursor` from the previous page. It is **not** a signed
+            or opaque cursor: it is the decimal `id` of the last entry of that page,
+            and the response then holds entries with a smaller `id`. The server
+            accepts any base-10 integer `>= 1` — a value it did not issue is fine as
+            long as it parses — and rejects only a value that is not base-10 or is
+            `< 1`, with `400 invalid_request`. It is reproducible from the entry ids
+            in the response, not a token the server minted.
           schema: { type: string }
       responses:
         '200':
@@ -2036,8 +2041,10 @@ components:
             next_cursor:
               type: string
               description: |
-                Pass as `cursor` to fetch the next page. Absent on the last page,
-                which is how a caller knows to stop.
+                Pass as `cursor` to fetch the next page. It is the decimal `id` of
+                the last entry in this page — not an opaque or signed token — so a
+                caller may equivalently resume from any entry's `id`. Absent on the
+                last page, which is how a caller knows to stop.
 
     AuditEntry:
       type: object

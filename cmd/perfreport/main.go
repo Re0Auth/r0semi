@@ -330,6 +330,15 @@ type comparison struct {
 	improvements []string
 	newNames     []string
 	missingNames []string
+	// zeroBaseline holds benchmarks whose current or baseline median is zero or
+	// non-finite. The benchmark parser accepts `ns/op=0`, and an empty sample set
+	// reports 0, so a ratio is not computable for these and is never fabricated.
+	zeroBaseline []string
+}
+
+// isUsableMedian reports whether a median can be the denominator of a delta.
+func isUsableMedian(m float64) bool {
+	return m > 0 && !math.IsNaN(m) && !math.IsInf(m, 0)
 }
 
 // compare pairs every current benchmark with its baseline counterpart. A name
@@ -352,7 +361,14 @@ func compare(current, baseline []*bench, thresholdPct float64) comparison {
 			c.newNames = append(c.newNames, label(cur))
 			continue
 		}
-		delta := (cur.median() - base.median()) / base.median() * 100
+		curMed, baseMed := cur.median(), base.median()
+		if !isUsableMedian(curMed) || !isUsableMedian(baseMed) {
+			// Dividing by a zero/non-finite median yields ±Inf or NaN, which
+			// would poison logSum and the geomean for every other benchmark.
+			c.zeroBaseline = append(c.zeroBaseline, label(cur))
+			continue
+		}
+		delta := (curMed - baseMed) / baseMed * 100
 		c.shared++
 		c.deltas[cur.key()] = delta
 		logSum += math.Log1p(delta / 100)
@@ -498,6 +514,7 @@ func render(env benchEnv, benches []*bench, load *loadProfile, comp *comparison,
 		writeList("Beyond the noise threshold, faster", comp.improvements)
 		writeList("New since the baseline (no comparison)", comp.newNames)
 		writeList("In the baseline but absent now", comp.missingNames)
+		writeList("Zero or non-finite median (no ratio possible)", comp.zeroBaseline)
 	}
 
 	fmt.Fprintln(&sb, "## Reading notes")

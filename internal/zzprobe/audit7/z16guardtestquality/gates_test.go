@@ -4,9 +4,11 @@ package z16guardtestquality
 
 import (
 	"errors"
+	"fmt"
 	"go/build/constraint"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -299,6 +301,14 @@ func newExprSet(tags ...string) map[string]bool {
 // one-liner: this repository's own probe files carry a staticcheck diagnostic that
 // the CI lint step does not report (`golangci-lint run ./...` is clean) and that
 // `golangci-lint run --build-tags audit7 ./...` does report.
+//
+// The probe has two halves and neither alone is enough. The first is a census:
+// every tracked test file is read, its constraint parsed (both the `//go:build` and
+// the legacy `// +build` spelling, Z16V-2), and it is a finding when no CI tag set
+// satisfies it. The second is the compile step: the files the census calls
+// reachable are actually compiled with `go vet` under that tag set (Z16-1), so a
+// file that is reachable on paper but no longer builds is a finding too. A text
+// scan by itself is the shape of a fake guard; the toolchain is what closes it.
 func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 	root := repoRoot(t)
 
@@ -360,19 +370,12 @@ func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
-		for _, line := range strings.Split(string(raw), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "//go:build") {
-				expr, err := constraint.Parse(strings.TrimSpace(line))
-				if err != nil {
-					t.Fatalf("parse build constraint of %s (%q): %v", name, strings.TrimSpace(line), err)
-				}
-				constrained = append(constrained, taggedFile{name: name, expr: expr})
-				break
-			}
-			trimmed := strings.TrimSpace(line)
-			if trimmed != "" && !strings.HasPrefix(trimmed, "//") {
-				break
-			}
+		expr, tagged, err := buildConstraintOf(raw)
+		if err != nil {
+			t.Fatalf("parse build constraint of %s: %v", name, err)
+		}
+		if tagged {
+			constrained = append(constrained, taggedFile{name: name, expr: expr})
 		}
 	}
 	if total < 200 {
@@ -410,7 +413,7 @@ func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 		if reachableBy(f.expr, tagSets) {
 			continue
 		}
-		label := f.name + " (//go:build " + f.expr.String() + ")"
+		label := f.name + " (build constraint " + f.expr.String() + ")"
 		if reachableBy(f.expr, documentedSets) {
 			documented = append(documented, label)
 			continue
@@ -424,19 +427,230 @@ func TestEveryTaggedTestFileIsReachableFromCI(t *testing.T) {
 	for _, d := range documented {
 		t.Logf("  documented as not-a-gate: %s — %s", d, intentionalTag["gzhttpspike"])
 	}
+
+	// ---------------------------------------------------------------- real compile
+	//
+	// Everything above is a text scan, and a text scan is exactly the shape of a
+	// fake guard: it can say a file is reachable while the file no longer builds.
+	// So the reachable files are COMPILED, by the toolchain's own build-constraint
+	// engine rather than by this probe's parse: for each constrained file, the
+	// first CI tag set that satisfies its expression is the set the file's package
+	// is vetted under (`go vet` compiles test files; `go build` does not).
+	//
+	// The work is grouped by tag set and deduplicated by directory, so a probe
+	// with N tagged files in one package costs one package compilation, not N. The
+	// common case is a single group — the repo-wide
+	// `-tags audit5,audit6,audit7,conformance,audit,protocolaudit` set satisfies
+	// almost every positive constraint — plus a small second group for the few
+	// files a negation excludes from that set.
+	compileDirs := map[string]map[string]bool{}
+	compileFiles := make([]string, 0, len(constrained))
+	for _, f := range constrained {
+		set, ok := firstSatisfying(f.expr, tagSets)
+		if !ok {
+			// Unreachable from CI: the reachability half above reports it. There
+			// is no CI tag set to compile it under.
+			continue
+		}
+		key := strings.Join(sortedKeys(set), ",")
+		if compileDirs[key] == nil {
+			compileDirs[key] = map[string]bool{}
+		}
+		compileDirs[key]["./"+path.Dir(f.name)] = true
+		compileFiles = append(compileFiles, f.name)
+	}
+	if len(compileFiles) == 0 && len(documented) == 0 {
+		// Non-vacuous: if no reachable file was selected for compilation and
+		// nothing was recorded as deliberately manual, the census itself is empty
+		// and a green compile step would prove nothing.
+		t.Fatal("the compile step selected no file and no file is documented as deliberately manual: " +
+			"the reachability census is broken, so a green result here would be vacuous")
+	}
+	var compileKeys []string
+	for key := range compileDirs {
+		compileKeys = append(compileKeys, key)
+	}
+	sort.Strings(compileKeys)
+	for _, key := range compileKeys {
+		dirs := make([]string, 0, len(compileDirs[key]))
+		for d := range compileDirs[key] {
+			dirs = append(dirs, d)
+		}
+		sort.Strings(dirs)
+		var tags []string
+		if key != "" {
+			tags = strings.Split(key, ",")
+		}
+		t.Logf("compiling %d package(s) under -tags=%q (%d tagged files in this group)",
+			len(dirs), key, countTaggedInDirs(compileFiles, dirs))
+		if err := vetTagSet(t, root, tags, dirs); err != nil {
+			t.Errorf("COMPILE FAILURE: a tracked test file behind a build constraint CI sets does not "+
+				"compile under that set. `go build`, `go test ./...` and golangci-lint all skip it, so "+
+				"without this step a probe that stopped compiling would be discovered by nobody. %v", err)
+		}
+	}
+
 	if len(orphaned) > 0 {
 		t.Errorf("STILL-OPEN (CI configuration — this probe cannot fix itself): %d tracked test files are "+
 			"behind a build constraint no workflow can satisfy. They are not run by `go test ./...` and not "+
 			"even compiled by `go build`, `go vet` or golangci-lint, so a probe that stops compiling or grows "+
 			"a lint error fails nothing.\n%s\n"+
-			"Fix (Lead, in .github/workflows/ci.yml:400): the repo-wide vet step already compiles every "+
-			"tag-gated file — `go vet -tags audit5,audit6,audit7,conformance ./...` — except this pair. Add "+
-			"`protocolaudit` (and `audit`, for the legacy spelling) to that -tags list, or add a "+
-			"`go vet -tags protocolaudit ./...` step. Nothing else is needed: the pair is `audit || protocolaudit`, "+
-			"and every `audit || audit6` file is already compiled by the audit6 tag. This probe stays red until "+
-			"that CI change lands.",
+			"Fix (Lead, in .github/workflows/ci.yml): add the missing tag to the repo-wide vet step's -tags "+
+			"list (or add a `go vet -tags <missing> ./...` step), so the file is compiled by CI. This probe "+
+			"stays red until that CI change lands.",
 			len(orphaned), strings.Join(orphaned, "\n"))
 	}
+}
+
+// buildConstraintOf returns the build constraint a Go source file's header
+// declares, and whether it declares one.
+//
+// Both spellings are read. The first version of this walk matched only the
+// `//go:build` prefix, so a file carrying the legacy `// +build` form was
+// indistinguishable from an untagged file: it was never added to the census, so
+// it was never checked for reachability and never compiled by this probe — the
+// exact blind spot the probe exists to remove. `go/build/constraint.Parse` already
+// understands both syntaxes; the bug was in the walk, not the parser.
+//
+// When both forms are present `//go:build` is authoritative (it is what the
+// toolchain uses), and multiple legacy lines are ANDed, which is what the
+// go/build rule for `// +build` says. The scan stops at the first non-comment,
+// non-blank line — the package clause.
+func buildConstraintOf(raw []byte) (constraint.Expr, bool, error) {
+	var goBuild constraint.Expr
+	var legacy []constraint.Expr
+	finish := func() (constraint.Expr, bool, error) {
+		if goBuild != nil {
+			return goBuild, true, nil
+		}
+		if len(legacy) == 0 {
+			return nil, false, nil
+		}
+		expr := legacy[0]
+		for _, next := range legacy[1:] {
+			expr = &constraint.AndExpr{X: expr, Y: next}
+		}
+		return expr, true, nil
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "//go:build"):
+			expr, err := constraint.Parse(trimmed)
+			if err != nil {
+				return nil, false, fmt.Errorf("%q: %w", trimmed, err)
+			}
+			if goBuild == nil {
+				goBuild = expr
+			}
+		case strings.HasPrefix(trimmed, "// +build"):
+			expr, err := constraint.Parse(trimmed)
+			if err != nil {
+				return nil, false, fmt.Errorf("%q: %w", trimmed, err)
+			}
+			legacy = append(legacy, expr)
+		case trimmed == "" || strings.HasPrefix(trimmed, "//"):
+			// A comment or a blank line: the header continues.
+		default:
+			// The package clause ends the build-constraint header.
+			return finish()
+		}
+	}
+	return finish()
+}
+
+// TestZ16BuildConstraintParserReadsBothSpellings is the anti-vacuity control for
+// buildConstraintOf.
+//
+// The repository currently carries no `// +build`-only file, so the walk alone
+// cannot prove that the legacy spelling is read at all: reverting the parser to
+// its old `//go:build`-only shape would leave the main probe green. This table
+// makes the difference observable — every legacy case below fails the moment the
+// `// +build` branch is removed.
+func TestZ16BuildConstraintParserReadsBothSpellings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+		want string // the constraint's String(), or "" for "no constraint"
+	}{
+		{"go:build only", "//go:build audit7\n\npackage p\n", "audit7"},
+		{"legacy +build only", "// +build audit7\n\npackage p\n", "audit7"},
+		{"legacy conjunction", "// +build linux,amd64\n\npackage p\n", "linux && amd64"},
+		{"legacy disjunction", "// +build linux darwin\n\npackage p\n", "linux || darwin"},
+		{"legacy lines are ANDed", "// +build audit7\n// +build !conformance\n\npackage p\n", "audit7 && !conformance"},
+		{"go:build wins over +build", "//go:build audit7\n// +build audit5\n\npackage p\n", "audit7"},
+		{"after a licence comment", "// Copyright 2024\n//\n//go:build audit7\n\npackage p\n", "audit7"},
+		{"no constraint", "package p\n", ""},
+		{"comment that merely mentions a constraint", "// the constraint is //go:build audit7\n\npackage p\n", ""},
+	} {
+		expr, ok, err := buildConstraintOf([]byte(tc.src))
+		if err != nil {
+			t.Errorf("%s: buildConstraintOf: %v", tc.name, err)
+			continue
+		}
+		if tc.want == "" {
+			if ok {
+				t.Errorf("%s: parsed constraint %q, want none", tc.name, expr.String())
+			}
+			continue
+		}
+		if !ok {
+			t.Errorf("%s: buildConstraintOf found no constraint, want %q — a file behind `// +build` is "+
+				"invisible to a walk that only looks for `//go:build`, which is how such a file escapes the "+
+				"reachability census and this probe's compile step (Z16V-2)", tc.name, tc.want)
+			continue
+		}
+		if got := expr.String(); got != tc.want {
+			t.Errorf("%s: constraint = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// firstSatisfying returns the first tag set whose assignment satisfies expr, and
+// false when none does (the file is unreachable from CI).
+func firstSatisfying(expr constraint.Expr, sets []map[string]bool) (map[string]bool, bool) {
+	for _, set := range sets {
+		if satisfiable(expr, set) {
+			return set, true
+		}
+	}
+	return nil, false
+}
+
+// countTaggedInDirs counts the compileFiles (slash-separated, repo-relative) that
+// live in one of dirs ("./x/y"), for the per-group log line.
+func countTaggedInDirs(files, dirs []string) int {
+	in := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		in[strings.TrimPrefix(d, "./")] = true
+	}
+	n := 0
+	for _, f := range files {
+		if in[path.Dir(f)] {
+			n++
+		}
+	}
+	return n
+}
+
+// vetTagSet compiles the packages in dirs under tags and returns the toolchain's
+// output on failure. `go vet` is the cheapest command that compiles a package's
+// test files as well as its non-test files; `go build` ignores `_test.go`
+// entirely, which is the hole this step closes.
+func vetTagSet(t *testing.T, root string, tags, dirs []string) error {
+	t.Helper()
+	args := []string{"vet"}
+	if len(tags) > 0 {
+		args = append(args, "-tags="+strings.Join(tags, ","))
+	}
+	args = append(args, dirs...)
+	cmd := exec.Command("go", args...)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("go vet -tags=%s: %v\n%s", strings.Join(tags, ","), err, firstLines(string(out), 20))
 }
 
 func sortedKeys(m map[string]bool) []string {

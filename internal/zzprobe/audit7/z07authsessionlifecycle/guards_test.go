@@ -225,6 +225,34 @@ func TestZ07BindHandleIsOwnedByTheAccountThatStartedIt(t *testing.T) {
 	} else {
 		t.Logf("account B is refused A's bind handle with 400, as designed")
 	}
+
+	// Control: B's 400 must be attributable to the OWNERSHIP check, not to a dead
+	// handle. Account A signs back in (same browser) and re-consumes the very same
+	// state. A's callback must pass the ownership check — so it is NOT a 400 — and
+	// then fail after it, in the upstream token exchange: the fake source's token
+	// endpoint answers 404, which handleBindCallback renders as a 303 carrying
+	// error=bind_failed. If A were also 400, then B's 400 would have been produced
+	// by the handle being unbound, consumed or lost across B's sign-in, and this
+	// probe would prove nothing about account ownership.
+	env.setIdentity("bind-a")
+	b.signIn(probeProvider)
+	resp = b.get("/auth/upstream/phigros/fake/callback?state=" + url.QueryEscape(state) + "&code=c")
+	body := bodyOf(t, resp)
+	if resp.StatusCode == http.StatusBadRequest {
+		t.Fatalf("account A was refused its OWN bind handle with 400 (%s): the handle is dead for everyone, "+
+			"so account B's 400 above does not distinguish the ownership check from a consumed or unbound "+
+			"state", body)
+	}
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("account A's own callback = %d (%s), want 303 (the fake source cannot exchange the code, so "+
+			"the flow fails AFTER the ownership check)", resp.StatusCode, body)
+	}
+	if loc := resp.Header.Get("Location"); !strings.Contains(loc, "bind_failed") {
+		t.Errorf("account A's own callback redirected to %q, want a redirect carrying error=bind_failed", loc)
+	} else {
+		t.Logf("account A passes the ownership check for its own handle and fails later at the upstream "+
+			"exchange: 303 %s", loc)
+	}
 }
 
 // TestZ07ExportIsPersonalAndUncacheable: the export is a GET, so a cross-site

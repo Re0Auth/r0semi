@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/Re0Auth/r0semi/internal/federation"
 	"github.com/Re0Auth/r0semi/oauth"
 )
 
@@ -116,38 +117,135 @@ func TestZ20RawPassthroughIsBoundToTheSourceThatIsNamed(t *testing.T) {
 		t.Errorf("an unknown source reached the upstream: %v", e.upstream.calls())
 	}
 
-	// A path that climbs out of the raw base is refused before any call.
+	// A path that climbs out of the raw base is refused, with the explicit 400 the
+	// data plane's ErrRawPathEscapes maps to, and before any upstream call. The old
+	// assertion (`status == 200 && calls > 0`) was single-sided: a 500, a 502 or a
+	// hang passed it, so "the escape was refused" was never actually pinned.
+	beforeEscape := len(e.upstream.calls())
 	status, _, body = e.zGet("/v1/games/"+zGame+"/sources/"+zSource+"/raw/..%2f..%2fetc", raw)
 	t.Logf("raw escaping path -> %d %s", status, body)
-	if status == http.StatusOK && len(e.upstream.calls()) > 0 {
-		t.Errorf("an escaping raw path reached the upstream: %v", e.upstream.calls())
+	if status != http.StatusBadRequest {
+		t.Errorf("an escaping raw path answered %d, want 400 (federation.ErrRawPathEscapes): %s\n"+
+			"upstream calls: %v", status, body, e.upstream.calls())
+	}
+	if len(e.upstream.calls()) != beforeEscape {
+		t.Errorf("an escaping raw path reached the upstream (want zero new calls): %v", e.upstream.calls())
 	}
 }
 
 // TestZ20NormalizedGateRequiresTheScopeOfEveryCandidateSource is a guard: two
-// sources that can both serve the resource each declare a scope, and the gate
-// demands both (httpapi/federation_routes.go:105-122), so a token holding one
-// source's scope cannot be served by the other.
+// sources can both serve `scores`, each declaring its OWN scope, and the
+// normalized gate demands both (httpapi/federation_routes.go:105-122). A token
+// holding one source's scope cannot be served by the other — the exact mix-up the
+// old "first source that declares the resource, in config order" rule made.
+//
+// With a single configured source this property cannot be tested at all: "the
+// scope of every candidate" and "the scope of the only source" are the same
+// statement, so the guard would pass even if the gate had reverted to reading a
+// single source. The second source, with its own scope, is what makes it
+// falsifiable.
 func TestZ20NormalizedGateRequiresTheScopeOfEveryCandidateSource(t *testing.T) {
-	e := newZEnv(t, zOptions{})
-	// The single configured source declares `phigros.score.read` for `scores`;
-	// a token without it must be refused, and the upstream must not be touched.
-	profileOnly := e.mintToken(zSubject, "phigros.profile.read")
+	// The second candidate serves the same resource under a different scope. It is
+	// deliberately unbound for this user: the gate must refuse before any fetch, so
+	// a refusal cannot be confused with "not bound", and the positive control below
+	// is served by the first (bound) source, which candidates() tries first.
+	second := federation.Source{
+		Game: zGame, Name: "fake2", DisplayName: "Fake 2",
+		Issuer: "https://fake2.example", ClientID: "cid", ClientSecret: "sec",
+		TokenClass: "revocable",
+		Resources: []federation.Resource{{
+			Name: "scores", Schema: "re0auth.phigros.scores.alt/1", Scope: zSecondScoreScope.String(),
+		}},
+	}
+	registry := zRegistryWithRaw(t)
+	if err := registry.Register(oauth.Descriptor{
+		Scope: zSecondScoreScope, Title: "读取 Phigros 成绩（第二数据源）", Risk: oauth.RiskMedium,
+	}); err != nil {
+		t.Fatalf("register %s: %v", zSecondScoreScope, err)
+	}
+	e := newZEnv(t, zOptions{
+		Registry:     registry,
+		ClientScopes: []oauth.Scope{oauth.ScopeAccountID, oauth.ScopePhigrosProfile, oauth.ScopePhigrosScore, oauth.Scope(oauth.RawScope(zGame)), zSecondScoreScope},
+		SecondSource: &second,
+	})
+
+	// Control 0: the deployment really has two candidates for `scores`, so the two
+	// refusals below are about the "every" rule rather than about a missing source.
+	status, _, body := e.zGet("/v1/games/"+zGame+"/sources", "")
+	t.Logf("game sources -> %d %s", status, body)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"fake2"`)) || !bytes.Contains(body, []byte(`"fake"`)) {
+		t.Fatalf("control: the deployment does not list both candidate sources: %d %s", status, body)
+	}
+
+	// Source 1's scope alone is refused, and the refusal names source 2's scope —
+	// the requirement the old first-match rule never produced.
+	firstOnly := e.mintToken(zSubject, oauth.ScopePhigrosScore.String())
 	before := len(e.upstream.calls())
-	status, _, body := e.zGet("/v1/games/"+zGame+"/scores", profileOnly)
-	t.Logf("normalized scores with a profile-only token -> %d %s", status, body)
+	status, _, body = e.zGet("/v1/games/"+zGame+"/scores", firstOnly)
+	t.Logf("normalized scores with source 1's scope only -> %d %s", status, body)
 	if status != http.StatusForbidden {
-		t.Errorf("the normalized gate answered %d, want 403", status)
+		t.Errorf("a token holding source 1's scope but not source 2's was served (%d): %s", status, body)
 	}
 	if len(e.upstream.calls()) != before {
 		t.Errorf("the upstream was reached for a refused read: %v", e.upstream.calls())
 	}
-	// And the source's OTHER resource is refused too, so the gate is not simply
-	// open for this source.
-	scoreOnly := e.mintToken(zSubject, "phigros.score.read")
-	status, _, body = e.zGet("/v1/games/"+zGame+"/profile", scoreOnly)
-	t.Logf("normalized profile with a score-only token -> %d %s", status, body)
+	if !bytes.Contains(body, []byte(zSecondScoreScope.String())) {
+		t.Errorf("the refusal does not name the second source's required scope %s: %s", zSecondScoreScope, body)
+	}
+
+	// Source 2's scope alone is refused too, and the refusal names source 1's scope.
+	secondOnly := e.mintToken(zSubject, zSecondScoreScope.String())
+	before = len(e.upstream.calls())
+	status, _, body = e.zGet("/v1/games/"+zGame+"/scores", secondOnly)
+	t.Logf("normalized scores with source 2's scope only -> %d %s", status, body)
 	if status != http.StatusForbidden {
-		t.Errorf("the normalized gate answered %d for the resource it was not granted, want 403", status)
+		t.Errorf("a token holding source 2's scope but not source 1's was served (%d): %s", status, body)
+	}
+	if len(e.upstream.calls()) != before {
+		t.Errorf("the upstream was reached for a refused read: %v", e.upstream.calls())
+	}
+	if !bytes.Contains(body, []byte(oauth.ScopePhigrosScore.String())) {
+		t.Errorf("the refusal does not name the first source's required scope %s: %s", oauth.ScopePhigrosScore, body)
+	}
+
+	// Positive control: both scopes together open the gate and the read is served
+	// by the bound source. Without this, the two refusals above could be explained
+	// by the route being closed for every token.
+	both := e.mintToken(zSubject, oauth.ScopePhigrosScore.String(), zSecondScoreScope.String())
+	status, hdr, body := e.zGet("/v1/games/"+zGame+"/scores", both)
+	t.Logf("normalized scores with both scopes -> %d %s", status, body)
+	if status != http.StatusOK || !bytes.Contains(body, []byte("Z20-SCORES")) {
+		t.Fatalf("control: holding every candidate source's scope was still not served (%d %s)", status, body)
+	}
+	if got := hdr.Get("Re0Auth-Source"); got != zSource {
+		t.Fatalf("control: the read was served by %q, want the bound source %q", got, zSource)
+	}
+	if !e.upstream.hit("/resources/scores") {
+		t.Fatalf("control: the upstream never saw /resources/scores; calls=%v", e.upstream.calls())
+	}
+
+	// And a token with neither resource scope is still refused, so the gate is not
+	// simply open once two sources exist.
+	profileOnly := e.mintToken(zSubject, "phigros.profile.read")
+	before = len(e.upstream.calls())
+	status, _, body = e.zGet("/v1/games/"+zGame+"/scores", profileOnly)
+	t.Logf("normalized scores with a profile-only token -> %d %s", status, body)
+	if status != http.StatusForbidden {
+		t.Errorf("the normalized gate answered %d for a profile-only token, want 403", status)
+	}
+	if len(e.upstream.calls()) != before {
+		t.Errorf("the upstream was reached for a refused read: %v", e.upstream.calls())
+	}
+
+	// The other resource is refused with the resource scopes but no profile scope,
+	// so the gate is not simply open once two sources exist.
+	before = len(e.upstream.calls())
+	status, _, body = e.zGet("/v1/games/"+zGame+"/profile", both)
+	t.Logf("normalized profile with the score scopes -> %d %s", status, body)
+	if status != http.StatusForbidden {
+		t.Errorf("the normalized gate answered %d for the resource the token was not granted, want 403", status)
+	}
+	if len(e.upstream.calls()) != before {
+		t.Errorf("the upstream was reached for a refused read: %v", e.upstream.calls())
 	}
 }

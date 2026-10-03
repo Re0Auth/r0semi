@@ -289,33 +289,17 @@ func TestZ08RealProcessStaticSurfaceSurvey(t *testing.T) {
 	}
 }
 
-// TestZ08RealProcessOpenRedirectSurface drives the browser plane's redirect entry
-// points with hostile return_to values. None of the flows is configured in
-// memory mode, so the assertion is about what the *router* does with the
-// parameter, and the anti-vacuous control is that a benign value is handled the
-// same way (never a redirect to another origin).
-func TestZ08RealProcessOpenRedirectSurface(t *testing.T) {
-	seen := 0
-	for _, target := range []string{
-		"/auth/z08idp/start?return_to=//evil.example",
-		"/auth/z08idp/start?return_to=https://evil.example/x",
-		"/auth/z08idp/start?return_to=/\\evil.example",
-		"/auth/z08idp/start?return_to=/%09/evil.example",
-		"/bind?game=g&source=s&return_to=//evil.example",
-		"/bind?game=g&source=s&return_to=javascript:alert(1)",
-	} {
-		resp, body := z08ProcGet(t, http.MethodGet, target, nil)
-		seen++
-		loc := resp.Header.Get("Location")
-		if strings.Contains(loc, "evil.example") || strings.HasPrefix(loc, "javascript:") {
-			t.Errorf("%s -> %d Location=%q: the value reached a redirect", target, resp.StatusCode, loc)
-		}
-		t.Logf("%-52s -> %d loc=%q body=%q", target, resp.StatusCode, loc, firstLine(body))
-	}
-	if seen < 6 {
-		t.Fatalf("only %d redirect cases ran", seen)
-	}
-}
+// NOTE(Z08V-1): the open-redirect surface probe that used to live here// (TestZ08RealProcessOpenRedirectSurface) was deleted rather than kept.
+//
+// It drove the memory-mode binary's /auth/z08idp/start with hostile return_to
+// values, but that binary has no identity provider configured, so every one of
+// those requests was answered 404 and the flow never reached the redirect sink
+// the test claimed to check. Its assertion (`Location` must not name
+// evil.example) was therefore green no matter what the sink did — a fake guard.
+// The real check needs a fixture with a configured provider so start→callback can
+// complete; it lives in openredirect_test.go
+// (TestZ08OpenRedirectSurfaceOnTheAuthFlow), which also carries a benign
+// return_to as positive control proving the sink is actually reached.
 
 // TestZ08RealProcessSessionViewIsUncacheableAndCarriesNoCORS records the
 // business-plane bootstrap's cache and CORS posture from outside the process.

@@ -11,6 +11,8 @@
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:bundle": "node scripts/check-bundle-size.mjs",
+		"check:kit-config": "node scripts/check-kit-config.mjs",
+		"check:dist-warnings": "node scripts/check-dist-warnings.mjs",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test:e2e": "playwright test --grep-invert @visual",
 		"test:visual": "playwright test --grep @visual",

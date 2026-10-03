@@ -15,9 +15,9 @@ import (
 
 // This file is a meta-guard: it reads the repository's own tests and reports the
 // ones that assert nothing about the thing they are named after. A test that
-// computes a verdict and only prints it — the shape round 5 shipped in
+// computes a verdict and only prints it —the shape round 5 shipped in
 // internal/zzprobe/federation/raw_test.go and round 6 shipped in
-// internal/zzprobe/pubaddr/addr_test.go — is worse than no test: it is cited as
+// internal/zzprobe/pubaddr/addr_test.go —is worse than no test: it is cited as
 // evidence in an audit document while a green run says nothing at all.
 //
 // "Asserts nothing" is decided syntactically, on purpose: the question is whether
@@ -147,7 +147,7 @@ func scanFuncs(fset *token.FileSet, file string, f *ast.File, defaultRun bool) [
 // isFixture reports whether a helper that fails on a testing handle is shaped like
 // a fixture constructor rather than an assertion: it returns a value (so its
 // t.Fatal is "the fixture could not be built"), or it is named like one. An
-// assertion helper takes t and returns nothing — and a helper named assert*/check*/
+// assertion helper takes t and returns nothing —and a helper named assert*/check*/
 // verify* is an assertion whatever it returns, so the name wins.
 func isFixture(fi funcInfo) bool {
 	if isAssertionName(fi.name) {
@@ -448,7 +448,7 @@ func citedTestNames(t *testing.T, root string) map[string]bool {
 
 // hasNonDefaultTag reports whether the file's //go:build constraint mentions any
 // tag at all. The default `go test ./...` sets none, so any constraint excludes
-// the file from the ordinary gate — which is what the tag census in
+// the file from the ordinary gate —which is what the tag census in
 // TestEveryTaggedTestFileIsReachableFromCI is about.
 func hasNonDefaultTag(src string) bool {
 	for _, line := range strings.Split(src, "\n") {

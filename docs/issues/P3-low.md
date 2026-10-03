@@ -1,7 +1,7 @@
 # P3 · 低 / 提示（LOW）
 
 > 加固、纵深防御、文档与实现不一致、可维护性。**这一类最大，也最容易被永久搁置。**
-> **条目数：226** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-02，HEAD `f7286d7`）。
+> **条目数：226** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-03，HEAD `6126072`）。
 > 严重度取**对抗性复核后的裁定**；同一机制多编号者已合并，别名写在 ID 列。
 
 > 三个反复出现的形态，建议成批处理而不是逐条修：
@@ -12,6 +12,11 @@
 
 | ID | 严重度 | 问题 | 位置 | 状态 | 修法要点 |
 |---|---|---|---|---|---|
+| S10-5 | P3 · 信息 | [info] Limiter.Check heap-allocates a *rate.Reservation on every request | internal/ratelimit/ratelimit.go:289; internal/ratelimit/ratelimit.go:295 | NOT-A-DEFECT（BenchmarkCheckExistingKey = 0 B/op, 0 allocs/op；ReserveN 被内联，go1.27.1 上不可复现） | 见 `docs/security-audit-9.md` §4（类别：performance） |
+| S12-12 | P3 · 信息 | [info] SignIn appends return_to after a URL fragment, unlike the equivalent link() path | web/src/lib/components/SignIn.svelte:50; web/src/lib/components/SignIn.svelte:52 | NOT-A-DEFECT（start_url 无 fragment，前提不可达；round9 _audit/round9/verify/S12.json:82-86 rejected） | 见 `docs/security-audit-9.md` §4（类别：correctness） |
+| S12-2 | P3 · 信息 | [info] Dev root redirect does not match a request that carries a query string | web/vite.config.ts:27; web/vite.config.ts:28 | NOT-A-DEFECT（Vite base 中间件去 query 后 302 并保留 query；round9 S12.json:12-16 实跑 302→308→200） | 见 `docs/security-audit-9.md` §4（类别：correctness） |
+| S15-12 | P3 · 信息 | [info] Backup CronJob writes plaintext database dumps; no age encryption path is wired, unlike scripts/backup.sh | deploy/k8s/backup/cronjob.yaml:59-70; docs/operations.md:125-126 | DECIDED-NONGOAL（docs/issues/not-doing.md:124 备份转储不加密—文档化取舍） | 见 `docs/security-audit-9.md` §4（类别：security） |
+| A-FE-11 | P3 | 仓库根有一个名为 `%SC%` 的空目录（未被展开的 Windows 变量） | `%SC%/`（仓库根，空目录，未被 git 跟踪） | FIXED（工作区清理：仓库根 %SC% 空目录已不存在；该目录未被跟踪，无提交记录） | 直接删掉；真实风险是同类笔误落在有内容的路径上 — 来源：`docs/audit-5/findings/frontend.md:224（第 5 轮）` |
 | S01-10 | P3 | Client secrets are stored as an unsalted SHA-256 digest, so a weak config-file secret is off-line crackable if the store leaks | oauth/client.go:99-105; oauth/client.go:107-114; cmd/re0auth/main.go:1634-1643 | FIXED（fddbde4） | 见 `docs/security-audit-9.md` §3（类别：security） |
 | S01-11 | P3 | MemoryStore serialises all token operations on one Mutex and scans every record under the lock, so account-page reads and sweeps block token introspection | oauth/tokens.go:263-273; oauth/tokens.go:298-328; oauth/grants.go:157-221 | FIXED（c17ce23） | 见 `docs/security-audit-9.md` §3（类别：performance） |
 | S01-12 | P3 | Store reads return struct copies whose Scopes slices alias the stored backing array, so a caller mutating a returned record corrupts stored authorization state | oauth/tokens.go:373-382; oauth/tokens.go:341-349; oauth/tokens.go:421-429; oauth/as.go:370-376 | FIXED（c17ce23） | 见 `docs/security-audit-9.md` §3（类别：correctness） |
@@ -219,11 +224,7 @@
 | S15-10 | P3 | scripts/backup-keys.sh is committed mode 100644 while the documented invocation runs it directly | scripts/backup-keys.sh:1; docs/operations.md:90-92 | OPEN | 见 `docs/security-audit-9.md` §3（类别：correctness） |
 | S15-8 | P3 | Three alert rules keyed on generic go_*/process_* metrics carry no job selector and can fire on unrelated targets | deploy/prometheus/re0auth.rules.yml:304-348; deploy/prometheus/re0auth.rules.yml:4-7 | OPEN | 见 `docs/security-audit-9.md` §3（类别：reliability） |
 | S02-11 | P3 · 信息 | [info] DenyAuthorization uses the static issuer only, so a dynamic-issuer deployment emits a denial without the RFC 9207 iss parameter | internal/oidchttp/oidchttp.go:1794; internal/oidchttp/oidchttp.go:1444 | OPEN | 见 `docs/security-audit-9.md` §4（类别：correctness） |
-| S10-5 | P3 · 信息 | [info] Limiter.Check heap-allocates a *rate.Reservation on every request | internal/ratelimit/ratelimit.go:289; internal/ratelimit/ratelimit.go:295 | OPEN | 见 `docs/security-audit-9.md` §4（类别：performance） |
-| S12-12 | P3 · 信息 | [info] SignIn appends return_to after a URL fragment, unlike the equivalent link() path | web/src/lib/components/SignIn.svelte:50; web/src/lib/components/SignIn.svelte:52 | OPEN | 见 `docs/security-audit-9.md` §4（类别：correctness） |
-| S12-2 | P3 · 信息 | [info] Dev root redirect does not match a request that carries a query string | web/vite.config.ts:27; web/vite.config.ts:28 | OPEN | 见 `docs/security-audit-9.md` §4（类别：correctness） |
 | S12-7 | P3 · 信息 | [info] Sources page re-runs O(available x bindings) scans on every reactive invalidation | web/src/routes/sources/+page.svelte:82; web/src/routes/sources/+page.svelte:89; web/src/routes/sources/+page.svelte:288 | OPEN | 见 `docs/security-audit-9.md` §4（类别：performance） |
-| S15-12 | P3 · 信息 | [info] Backup CronJob writes plaintext database dumps; no age encryption path is wired, unlike scripts/backup.sh | deploy/k8s/backup/cronjob.yaml:59-70; docs/operations.md:125-126 | OPEN | 见 `docs/security-audit-9.md` §4（类别：security） |
 | NF-Z07-1 | P3 | `/bind` 归属守卫是单侧的：探针只证明「B 被拒」，无法区分「B 被拒」与「所有人被拒」（守卫空洞，非产品漏洞） | `internal/zzprobe/audit7/z07authsessionlifecycle/handle_binding_test.go` | OPEN | 在该探针补一步「A 自己用同一 state 打 callback」的对照，断言其不是 400（夹具下应为 303 `bind_failed`）；依据 `Z07-VERIFIED.md:165-186` |
 | Z08V-1 | P3 | 「开放重定向面」的绿是假守卫：内存模式无 IdP，`/auth/{p}/start` 回 404、`/bind` 匿名回 401，探针永远到不了任何重定向 sink（产品无洞，是报告守卫无效） | `internal/zzprobe/audit7/z08frontendbrowser/realproc_test.go` | OPEN | 删掉该条「探过没破」，或用已配 provider 的全接线夹具走完 start→callback 再断言 `Location`；依据 `Z08-VERIFIED.md:25`、`Z08-VERIFIED.md:114-128` |
 | Z08V-2 | P3 | Z08-3 的「构建产物无 `version.json` 引用」是错的：产物 `chunks/DqohD3-m.js` 确实带 `fetch(.../_app/version.json)` 与版本比对逻辑（方向是低估风险） | `docs/audit-7/findings/Z08-frontend-browser.md:133` | OPEN | 更正该事实，并据此给 `_app/version.json` 明确缓存指令；依据 `Z08-VERIFIED.md:26`、`Z08-VERIFIED.md:130-136` |
@@ -237,4 +238,3 @@
 | A-FE-4 | P3 | `web/svelte.config.js` 不存在——kit 配置只活在 `vite.config.ts` 里 | `web/vite.config.ts:46-110`（`web/svelte.config.*` 不存在） | OPEN | 在 `web/README.md` 写明「刻意不用 `svelte.config.js`」，或把配置搬回标准位置并让 `webui_test.go` 改读它；加一条「两份 kit 配置即失败」的守卫 — 来源：`docs/audit-5/findings/frontend.md:109（第 5 轮）` |
 | A-FE-8 | P3 | 未使用的 `web/src/lib/assets/favicon.svg` 仍是 Svelte 官方 logo | `web/src/lib/assets/favicon.svg:1` | OPEN | 删掉该文件或换成真正的品牌标记 — 来源：`docs/audit-5/findings/frontend.md:160（第 5 轮）` |
 | A-FE-10 | P3 | 发布产物里有 6 处 `console.warn`，带 `svelte.dev/e/…` 文档链接 | `internal/webui/dist/_app/immutable/chunks/`（构建产物；具体分块名随构建变化） | OPEN | 在 `web/scripts/` 加一条产物 grep 守卫（与 `check-bundle-size.mjs` 同风格）；确认不可达则在守卫里显式豁免并写理由 — 来源：`docs/audit-5/findings/frontend.md:200（第 5 轮）` |
-| A-FE-11 | P3 | 仓库根有一个名为 `%SC%` 的空目录（未被展开的 Windows 变量） | `%SC%/`（仓库根，空目录，未被 git 跟踪） | OPEN | 直接删掉；真实风险是同类笔误落在有内容的路径上 — 来源：`docs/audit-5/findings/frontend.md:224（第 5 轮）` |

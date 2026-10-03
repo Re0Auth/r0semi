@@ -112,6 +112,15 @@ jobs:
         working-directory: web
         run: pnpm run check
 
+      # There is deliberately no web/svelte.config.js: the SvelteKit config is
+      # inline in vite.config.ts. A second config would be read by SvelteKit in
+      # place of that inline block — the adapter and paths would silently come
+      # from the file, the base path or the CSP could change, and the build would
+      # still succeed. This fails on its existence. See web/README.md.
+      - name: frontend check (single kit config)
+        working-directory: web
+        run: pnpm run check:kit-config
+
       # The SPA is embedded in every binary and image, so its weight is paid by
       # every deployment, and nothing else in the build notices when it grows.
       # It runs here, right after the build, because the script refuses to measure
@@ -120,6 +129,15 @@ jobs:
       - name: bundle budget
         working-directory: web
         run: pnpm run check:bundle
+
+      # The bundle budget measures how big the output is; nothing looked at what
+      # is in it. This fails on console.log/debugger/sourceMappingURL/localhost
+      # and on any console.warn or svelte.dev/e link that is not an explicitly
+      # allowlisted Svelte client-runtime diagnostic (A-FE-10). It runs here,
+      # right after the build, because it scans the real chunks.
+      - name: dist hygiene
+        working-directory: web
+        run: pnpm run check:dist-warnings
 
       - name: cache playwright browsers
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -13,6 +13,28 @@ Two facts shape everything here:
   In production that is the same origin, so no CORS and no proxy; in development
   Vite proxies those paths to the Go binary.
 
+## There is deliberately no `svelte.config.js`
+
+The SvelteKit config does **not** live in a `svelte.config.js` — there is no such
+file in this repository, on purpose, and adding one is a CI failure
+(`pnpm run check:kit-config`). It is inline in `vite.config.ts`, inside the
+`sveltekit({...})` call (`vite.config.ts:46-110`): the `adapter-static` output into
+`../internal/webui/dist`, `paths.base = '/app'`, the runes compiler option and the
+CSP.
+
+Keeping it there is the point. `paths.base` must equal `internal/webui.BasePath`,
+and the CSP has to agree with the header Go sends (`internal/webui`); the adapter,
+the base path, the proxy and the CSP are one build posture, so they are readable in
+one file rather than split across two.
+
+A `svelte.config.*` beside it is not a harmless duplicate: when one exists,
+SvelteKit reads it for the adapter and paths and ignores the inline `sveltekit({...})`
+options, so the two silently diverge — the build still succeeds and the base path or
+the CSP has quietly changed. That is what the gate is for. If the config is ever
+moved to the standard location, move it deliberately: delete the inline block, add
+the file, update this section, and remove `scripts/check-kit-config.mjs` from the
+check and from CI in the same commit.
+
 ## Run it, embedded (what ships)
 
 ```sh
@@ -60,9 +82,11 @@ returns to `return_to=/` lands on the app rather than a 404.
 ## Checks and tests
 
 ```sh
-pnpm run check        # svelte-check (types)
+pnpm run check             # svelte-check (types)
+pnpm run check:kit-config  # no second SvelteKit config (see above)
 pnpm run build && pnpm run check:bundle   # the SPA's weight budget (see below)
-pnpm run test:e2e     # Playwright; builds and starts its own re0auth + fake IdP
+pnpm run build && pnpm run check:dist-warnings   # shipped output hygiene (see below)
+pnpm run test:e2e          # Playwright; builds and starts its own re0auth + fake IdP
 ```
 
 `check:bundle` measures what actually ships — the SPA is embedded in every binary
@@ -71,6 +95,15 @@ and image, so its weight is paid by every deployment. The budget lives in
 why) rather than nudged to make a red build green. It refuses to measure the embed
 placeholder: a budget that passes on an empty directory is worse than no budget, so
 run it after a build.
+
+`check:dist-warnings` reads the same built chunks and fails on `console.log`,
+`console.debug`, `debugger`, `sourceMappingURL` or `localhost` in the shipped JS,
+and on any `console.warn` or `svelte.dev/e/…` link that is not one of the Svelte
+client-runtime diagnostics explicitly allowlisted in
+`scripts/check-dist-warnings.mjs` (the vendor chunk carries Svelte 5's own warning
+helpers; the allowlist pins the exact set so a new warning from our code or a
+dependency change fails). Like the budget, it refuses the placeholder. Review its
+allowlist on every Svelte upgrade.
 
 The e2e suite (`web/e2e/`) is where the login, consent, device and binding flows
 are covered end to end, through the real shipping code, with a fake IdP at the
