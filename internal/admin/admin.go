@@ -278,7 +278,8 @@ func (s *service) Register(ctx context.Context, actor string, req RegisterReques
 			return Registration{}, err
 		}
 	}
-	client, err := oauth.NewClient(id, req.Name, req.Type, secret, req.RedirectURIs, req.AllowedScopes)
+	client, err := oauth.NewClientWithVerifier(id, req.Name, req.Type, secret, req.RedirectURIs, req.AllowedScopes,
+		oauth.VerifierGenerated)
 	if err != nil {
 		return Registration{}, fmt.Errorf("%w: %w", ErrInvalidRegistration, err)
 	}
@@ -303,7 +304,7 @@ func (s *service) RotateClientSecret(ctx context.Context, actor, clientID string
 	if err != nil {
 		return "", err
 	}
-	err = s.clients.RotateSecret(ctx, clientID, oauth.NewSecretHash(secret))
+	err = s.clients.RotateSecret(ctx, clientID, oauth.NewGeneratedSecretHash(secret))
 	s.record(ctx, actor, "admin.client.rotate_secret", clientID, outcome(err), map[string]string{
 		"client_id": clientID,
 	})

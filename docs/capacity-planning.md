@@ -54,6 +54,14 @@ capacity profile: 8 workers, 10s, 237824 requests, 23782.4 req/s
   goroutines 3 -> 9, heap 6.0 MiB, clock 1.013ms, GOMAXPROCS 20
 ```
 
+> **这张表的 `POST /oauth/introspect` 已经过时（R10-138 / R10-141）。** 它记录的是
+> PBKDF2 慢哈希还没有覆盖机密客户端校验时的数字；`S01-10` 引入 PBKDF2-HMAC-SHA256 ×
+> 210,000 之后，每次机密客户端认证约 23 ms，实测画像降到 551–653 req/s、p50≈24 ms。
+> R10-138 的修复把**形状可证为 CSPRNG 生成**的密钥（64 位小写 hex、或 ≥32 随机字节的
+> base64，见 `oauth.LooksGeneratedSecret`）改走加盐 HMAC-SHA256 快验证器；人类可选或
+> 未声明形状的密钥仍走 PBKDF2（S01-10 的强度不变）。因此表里的 introspect 数字只对
+> 「弱/未声明形状密钥」的夹具成立，重新测量是 R10-141 的收口项。
+
 读法有三条，缺一条都会把数字读错：
 
 1. **仍然是内存存储的上界**，理由与 §1 相同：真实 Postgres 部署每次请求多几次往返，把它当"天花板在哪"。

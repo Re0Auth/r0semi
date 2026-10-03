@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
@@ -82,7 +83,29 @@ func (c Client) WithAllowMissingPKCE(allow bool) Client {
 
 // NewClient validates and constructs a client. A confidential client must have
 // a secret; a public client must not.
+//
+// It writes the slow PBKDF2 verifier (S01-10) for every secret, which is the
+// right default for a secret this process did not generate. Callers that know a
+// secret came from a CSPRNG use NewClientWithVerifier with VerifierGenerated.
 func NewClient(id, name string, typ ClientType, secret string, redirects []string, allowed []Scope) (Client, error) {
+	return newClient(id, name, typ, secret, redirects, allowed, NewSecretHash)
+}
+
+// NewClientWithVerifier is NewClient with an explicit verifier policy. Use
+// VerifierGenerated only for a high-entropy generated secret (R10-138): it costs
+// microseconds to verify instead of ~23 ms, and the slow KDF buys nothing against
+// an offline guess at 256 random bits.
+func NewClientWithVerifier(id, name string, typ ClientType, secret string, redirects []string, allowed []Scope, policy VerifierPolicy) (Client, error) {
+	hash := NewSecretHash
+	if policy == VerifierGenerated {
+		hash = NewGeneratedSecretHash
+	}
+	return newClient(id, name, typ, secret, redirects, allowed, hash)
+}
+
+// newClient is the shared constructor; hash is the verifier writer the chosen
+// policy selected.
+func newClient(id, name string, typ ClientType, secret string, redirects []string, allowed []Scope, hash func(string) []byte) (Client, error) {
 	if id == "" {
 		return Client{}, errors.New("oauth: client id is required")
 	}
@@ -114,7 +137,7 @@ func NewClient(id, name string, typ ClientType, secret string, redirects []strin
 		AllowedScopes: append([]Scope(nil), allowed...),
 	}
 	if secret != "" {
-		c.secretHash = NewSecretHash(secret)
+		c.secretHash = hash(secret)
 	}
 	return c, nil
 }
@@ -149,6 +172,34 @@ const (
 	secretHashSaltBytes = 16
 	// secretHashKeyBytes is the derived verifier length.
 	secretHashKeyBytes = 32
+
+	// secretHashFastAlgorithm is the scheme for a server-generated,
+	// high-entropy secret (R10-138): a salted HMAC-SHA256 verifier. A 256-bit
+	// random secret needs no slow KDF to resist an offline guess, while the
+	// PBKDF2 work factor made every confidential-client authentication cost ~23 ms
+	// of CPU — the token and introspection endpoints' dominant cost, and an
+	// anonymous CPU amplifier (a public client id plus any secret reaches it).
+	// Human-chosen or operator-supplied secrets keep the PBKDF2 verifier; the
+	// scheme is stored per row, so both verify through Authenticate.
+	secretHashFastAlgorithm = "hmac-sha256"
+	// secretHashFastVersion is the fast scheme's own version field, so the shape
+	// can change later without ambiguity.
+	secretHashFastVersion = "v=1"
+	// secretHashFastDomain separates this HMAC from every other use of the salt.
+	secretHashFastDomain = "r0semi:client-secret:v2\x00"
+)
+
+// VerifierPolicy selects which verifier NewClientWithVerifier writes for a new
+// client secret.
+type VerifierPolicy int
+
+const (
+	// VerifierPBKDF2 is the slow, salted KDF (S01-10). It is the zero value and
+	// what NewClient uses, so nothing changes unless a caller asks.
+	VerifierPBKDF2 VerifierPolicy = iota
+	// VerifierGenerated is the fast salted-HMAC verifier, for a secret this
+	// process generated (or one an operator declared high-entropy).
+	VerifierGenerated
 )
 
 // NewSecretHash returns the stored digest of a client secret. Registration and
@@ -189,6 +240,75 @@ func hashSecret(secret string) ([]byte, error) {
 		base64.RawStdEncoding.EncodeToString(dk)), nil
 }
 
+// NewGeneratedSecretHash returns the fast verifier for a secret this process
+// generated. It panics only when the system CSPRNG fails, like NewSecretHash.
+func NewGeneratedSecretHash(secret string) []byte {
+	encoded, err := hashGeneratedSecret(secret)
+	if err != nil {
+		panic("oauth: NewGeneratedSecretHash: " + err.Error())
+	}
+	return encoded
+}
+
+// hashGeneratedSecret is NewGeneratedSecretHash with the entropy failure
+// returned rather than panicked.
+func hashGeneratedSecret(secret string) ([]byte, error) {
+	salt := make([]byte, secretHashSaltBytes)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, fmt.Errorf("client secret salt: %w", err)
+	}
+	mac := hmac.New(sha256.New, salt)
+	mac.Write([]byte(secretHashFastDomain))
+	mac.Write([]byte(secret))
+	dk := mac.Sum(nil)
+	return []byte("$" + secretHashFastAlgorithm + "$" + secretHashFastVersion + "$" +
+		base64.RawStdEncoding.EncodeToString(salt) + "$" +
+		base64.RawStdEncoding.EncodeToString(dk)), nil
+}
+
+// LooksGeneratedSecret reports whether secret has the shape of a CSPRNG output
+// rather than a human-chosen password. It accepts the recipes this repository
+// documents — 64 lowercase hex (`openssl rand -hex 32`) and base64/base64url of
+// at least 32 random bytes — and nothing else. A caller uses it to choose
+// VerifierGenerated; a false negative only costs the slow KDF, so the shape is
+// deliberately strict.
+func LooksGeneratedSecret(secret string) bool {
+	if len(secret) == 64 {
+		lowerHex := true
+		for i := 0; i < len(secret); i++ {
+			c := secret[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				lowerHex = false
+				break
+			}
+		}
+		if lowerHex {
+			return true
+		}
+	}
+	if len(secret) < 43 {
+		// Base64 of 32 random bytes is 44 chars with padding, 43 raw. Anything
+		// shorter than the recipe cannot be a CSPRNG output of the documented size.
+		return false
+	}
+	distinct := make(map[byte]struct{}, 16)
+	hasLetter, hasDigit := false, false
+	for i := 0; i < len(secret); i++ {
+		c := secret[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+			hasLetter = true
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c == '+' || c == '/' || c == '-' || c == '_' || c == '=':
+		default:
+			return false
+		}
+		distinct[c] = struct{}{}
+	}
+	return hasLetter && hasDigit && len(distinct) >= 16
+}
+
 // splitSecretHash parses a stored verifier, returning its salt, derived key and
 // work factor. It is the only reader of the encoding, so RestoreClient's
 // admission and Authenticate's verification cannot disagree about what a
@@ -218,11 +338,31 @@ func splitSecretHash(encoded []byte) (salt, dk []byte, iterations int, ok bool) 
 	return salt, dk, iterations, true
 }
 
+// splitFastSecretHash parses a fast (generated-secret) verifier.
+func splitFastSecretHash(encoded []byte) (salt, dk []byte, ok bool) {
+	parts := strings.Split(string(encoded), "$")
+	if len(parts) != 5 || parts[0] != "" || parts[1] != secretHashFastAlgorithm || parts[2] != secretHashFastVersion {
+		return nil, nil, false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[3])
+	if err != nil || len(salt) < 8 {
+		return nil, nil, false
+	}
+	dk, err = base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil || len(dk) != secretHashKeyBytes {
+		return nil, nil, false
+	}
+	return salt, dk, true
+}
+
 // validSecretHash reports whether encoded is a verifier this package produced, so
 // a registry cannot persist a digest that no later process can authenticate
 // against.
 func validSecretHash(encoded []byte) bool {
-	_, _, _, ok := splitSecretHash(encoded)
+	if _, _, _, ok := splitSecretHash(encoded); ok {
+		return true
+	}
+	_, _, ok := splitFastSecretHash(encoded)
 	return ok
 }
 
@@ -239,9 +379,16 @@ func ValidSecretHash(encoded []byte) bool {
 }
 
 // verifySecretHash recomputes the verifier for secret and compares it in constant
-// time. The iterations come from the stored encoding, so an older verifier keeps
-// working after the current work factor is raised.
+// time. The scheme is carried in the stored encoding, so a PBKDF2 row keeps the
+// slow path (and its own work factor) while a generated-secret row takes the fast
+// one.
 func verifySecretHash(encoded []byte, secret string) bool {
+	if salt, want, ok := splitFastSecretHash(encoded); ok {
+		mac := hmac.New(sha256.New, salt)
+		mac.Write([]byte(secretHashFastDomain))
+		mac.Write([]byte(secret))
+		return subtle.ConstantTimeCompare(want, mac.Sum(nil)) == 1
+	}
 	salt, want, iterations, ok := splitSecretHash(encoded)
 	if !ok {
 		return false

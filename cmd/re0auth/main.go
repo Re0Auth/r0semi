@@ -1917,7 +1917,16 @@ func buildClient(id, name, secret string, redirects, scopes []string, allowMissi
 	for _, s := range scopes {
 		allowed = append(allowed, oauth.Scope(s))
 	}
-	client, err := oauth.NewClient(id, name, typ, secret, redirects, allowed)
+	// R10-138: a configured secret that has the shape of a CSPRNG output (the
+	// documented `openssl rand -hex 32` / base64 recipe) gets the fast salted-HMAC
+	// verifier; the PBKDF2 work factor buys nothing against 256 random bits and
+	// costs ~23 ms on every confidential-client authentication. A human-chosen or
+	// otherwise unshaped secret keeps PBKDF2 (S01-10).
+	policy := oauth.VerifierPBKDF2
+	if secret != "" && oauth.LooksGeneratedSecret(secret) {
+		policy = oauth.VerifierGenerated
+	}
+	client, err := oauth.NewClientWithVerifier(id, name, typ, secret, redirects, allowed, policy)
 	if err != nil {
 		return oauth.Client{}, err
 	}
