@@ -14,6 +14,10 @@ addr   = "127.0.0.1:8081"
 # Public base URL of *this source*. It becomes the OAuth issuer Re0Auth reads
 # from /.well-known/re0auth-upstream, so it must be reachable by Re0Auth.
 issuer = "http://127.0.0.1:8081"
+# Secure flag for the session and social-login bind cookies. Must be true when
+# issuer is https: startup refuses an https issuer with this false, because the
+# bind cookie is what ties a social callback to the browser that started it.
+cookie_secure = false
 # Where Re0Auth lives. The registered redirect URI is derived from it:
 #   {re0auth_base_url}/auth/upstream/{game}/{source}/callback
 re0auth_base_url = "http://127.0.0.1:8080"

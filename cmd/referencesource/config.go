@@ -32,6 +32,10 @@ type serverSection struct {
 	// Issuer is this source's public base URL: it becomes the OAuth issuer in
 	// the discovery document Re0Auth reads.
 	Issuer string `toml:"issuer"`
+	// CookieSecure sets the Secure flag on the session and social-bind cookies.
+	// It must be true when Issuer is https; the R10-08 fix relies on the bind
+	// cookie travelling protected in a non-loopback deployment.
+	CookieSecure bool `toml:"cookie_secure"`
 	// Re0AuthBaseURL is where this source expects Re0Auth to live; the client
 	// redirect URI is derived from it.
 	Re0AuthBaseURL string `toml:"re0auth_base_url"`
@@ -84,6 +88,7 @@ type socialSection struct {
 type settings struct {
 	Addr           string
 	Issuer         string
+	CookieSecure   bool
 	Re0AuthBaseURL string
 	ClientID       string
 	ClientSecret   string
@@ -129,6 +134,20 @@ func loadConfig(path string) (settings, error) {
 	}
 	if cfg.Issuer == "" {
 		cfg.Issuer = "http://" + cfg.Addr
+	}
+	cookieSecure, err := config.Bool("REFERENCE_SOURCE_COOKIE_SECURE", f.Server.CookieSecure)
+	if err != nil {
+		return settings{}, err
+	}
+	cfg.CookieSecure = cookieSecure
+	// The cookie Secure flag has to agree with the issuer's scheme, the same
+	// rule the Re0Auth server enforces (R10-08 / KIT-R10-08). The https-without-
+	// Secure direction is the production-shaped mistake: the session and the
+	// social bind cookie would travel unprotected.
+	if strings.HasPrefix(cfg.Issuer, "https://") && !cfg.CookieSecure {
+		return settings{}, errors.New(
+			"server.cookie_secure must be true when server.issuer is https; " +
+				"the session and bind cookies would be sent without the Secure attribute")
 	}
 	if f.Client.SecretEnv != "" {
 		value, err := config.Secret(f.Client.SecretEnv, "client.secret_env")

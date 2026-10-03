@@ -443,6 +443,7 @@ jobs:
             ./cmd/re0auth \
             ./internal/ratelimit \
             ./oauth \
+            ./referencesource \
             ./vault
 
       - name: go test -tags audit6

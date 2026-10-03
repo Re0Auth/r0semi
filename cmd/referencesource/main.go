@@ -119,6 +119,7 @@ func main() {
 	src, err := referencesource.New(referencesource.Config{
 		Discovery: cfg.Discovery,
 		Provider:  cfg.Provider,
+		Session:   referencesource.SessionConfig{Secure: cfg.CookieSecure},
 		Downstream: referencesource.Client{
 			ID:     cfg.ClientID,
 			Secret: cfg.ClientSecret,
@@ -197,7 +198,10 @@ func newSocialLogin(cfg settings) (*referencesource.SocialLogin, error) {
 	if err != nil {
 		return nil, err
 	}
-	return referencesource.NewSocialLogin(referencesource.SocialConfig{}, referencesource.SocialDeps{Registry: registry})
+	return referencesource.NewSocialLogin(
+		referencesource.SocialConfig{Secure: cfg.CookieSecure},
+		referencesource.SocialDeps{Registry: registry},
+	)
 }
 
 func newVault() (vault.Service, error) {
