@@ -129,6 +129,10 @@ func (s *service) RevokeGrant(ctx context.Context, subject, clientID string) err
 	if subject == "" || clientID == "" {
 		return errors.New("oauth: subject and client id are required")
 	}
+	// Bump before deleting (R10-19). An issuance that is between its destructive
+	// claim and its mint has nothing left for this delete to remove; without the
+	// generation it would report success and then write a live pair behind it.
+	s.bumpGrantEpoch(subject, clientID)
 	if err := s.tokens.DeleteBySubjectClient(ctx, subject, clientID); err != nil {
 		return err
 	}

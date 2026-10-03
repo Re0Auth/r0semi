@@ -40,6 +40,15 @@ type service struct {
 	// held only for the step. See lockRefreshFamily.
 	refreshLocksMu sync.Mutex
 	refreshLocks   map[string]*refreshFamilyLock
+
+	// grantEpochs is the per-(subject, client) revocation generation (R10-19).
+	// RevokeGrant bumps it before it deletes; each issuing entry point captures it
+	// before its destructive claim and re-checks it after the pair is written, so a
+	// revocation that landed while this request was between its claim and its mint
+	// is never lost. grantEpochsMu is a leaf lock: it is held only for map
+	// operations, never across a store call and never nested inside a family lock.
+	grantEpochsMu sync.Mutex
+	grantEpochs   map[string]uint64
 }
 
 func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg Config) (Service, error) {
@@ -112,6 +121,7 @@ func NewService(clients ClientRegistry, tokens Store, logger audit.Logger, cfg C
 		verifyPath:   cfg.VerificationPath,
 		now:          cfg.Now,
 		refreshLocks: make(map[string]*refreshFamilyLock),
+		grantEpochs:  make(map[string]uint64),
 	}, nil
 }
 
@@ -232,6 +242,12 @@ func (s *service) Exchange(ctx context.Context, req CodeExchangeRequest) (TokenR
 		return TokenResponse{}, err
 	}
 
+	// Capture the revocation generation before the code is spent. A RevokeGrant
+	// that lands while this exchange is between its claim and its mint has nothing
+	// left to delete (the code is already gone), so the post-issue re-check in
+	// issueGuarded is the only thing that can catch it (R10-19).
+	epoch := s.grantEpoch(code.Subject, client.ID)
+
 	// The atomic gate. ConsumeCode's DELETE is what decides single use: a
 	// concurrent second request with the same valid code loses this race and is
 	// refused below, so exactly one exchange can mint.
@@ -252,7 +268,7 @@ func (s *service) Exchange(ctx context.Context, req CodeExchangeRequest) (TokenR
 		s.record(ctx, "oauth.exchange_failed", claimed.Subject, client.ID, audit.OutcomeDenied)
 		return TokenResponse{}, err
 	}
-	return s.issue(ctx, client.ID, claimed.Subject, claimed.Scopes, "")
+	return s.issueGuarded(ctx, client.ID, claimed.Subject, claimed.Scopes, "", epoch)
 }
 
 // checkCodeBinding judges an authorization code record against the request about
@@ -304,6 +320,15 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 		return TokenResponse{}, protocolError("invalid_grant", "refresh token was issued to another client")
 	case err != nil && !errors.Is(err, ErrTokenNotFound):
 		return TokenResponse{}, err
+	}
+
+	// Capture the revocation generation before the destructive claim (R10-19).
+	// GetRefresh is the non-destructive read peer of ConsumeRefresh; a spent or
+	// unknown value reports ErrTokenNotFound, and the claim below then mints
+	// nothing, so there is no live pair for the guard to protect.
+	var epoch uint64
+	if held, getErr := s.tokens.GetRefresh(ctx, req.RefreshToken); getErr == nil {
+		epoch = s.grantEpoch(held.Subject, client.ID)
 	}
 
 	// S14-5: the claim and the step that follows it are one act per family. The
@@ -372,7 +397,7 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (TokenRespons
 		}
 		scopes = req.Scopes
 	}
-	return s.issue(ctx, client.ID, rt.Subject, scopes, rt.FamilyID)
+	return s.issueGuarded(ctx, client.ID, rt.Subject, scopes, rt.FamilyID, epoch)
 }
 
 func (s *service) Revoke(ctx context.Context, req RevokeRequest) error {
@@ -467,6 +492,52 @@ func (s *service) Introspect(ctx context.Context, accessToken string) (TokenInfo
 		Scopes:    at.Scopes,
 		ExpiresAt: at.ExpiresAt,
 	}, nil
+}
+
+// grantEpochKey names one (subject, client) revocation generation. NUL cannot
+// occur in either component, so the two cannot be confused for one another.
+func grantEpochKey(subject, clientID string) string { return subject + "\x00" + clientID }
+
+// grantEpoch reads the current revocation generation for a grant.
+func (s *service) grantEpoch(subject, clientID string) uint64 {
+	s.grantEpochsMu.Lock()
+	defer s.grantEpochsMu.Unlock()
+	return s.grantEpochs[grantEpochKey(subject, clientID)]
+}
+
+// bumpGrantEpoch advances the generation. RevokeGrant calls it BEFORE its delete,
+// which is the ordering that makes the post-issue re-check complete: a revocation
+// whose delete could have preceded the pair is guaranteed to have bumped before
+// the issuance captured its epoch, and one that bumps after the capture is caught
+// by the re-check.
+func (s *service) bumpGrantEpoch(subject, clientID string) {
+	s.grantEpochsMu.Lock()
+	defer s.grantEpochsMu.Unlock()
+	s.grantEpochs[grantEpochKey(subject, clientID)]++
+}
+
+// issueGuarded mints a pair and then re-checks the grant's revocation generation.
+// A bump between the capture (before the destructive claim) and this point means
+// a RevokeGrant reported success while this request was in flight; the freshly
+// written pair is rolled back and the caller is refused (R10-19).
+func (s *service) issueGuarded(ctx context.Context, clientID, subject string, scopes []Scope, familyID string, epoch uint64) (TokenResponse, error) {
+	resp, err := s.issue(ctx, clientID, subject, scopes, familyID)
+	if err != nil {
+		return resp, err
+	}
+	if s.grantEpoch(subject, clientID) == epoch {
+		return resp, nil
+	}
+	accessErr := s.tokens.DeleteAccess(ctx, resp.AccessToken)
+	refreshErr := s.tokens.DeleteRefresh(ctx, resp.RefreshToken)
+	if accessErr != nil || refreshErr != nil {
+		return TokenResponse{}, fmt.Errorf(
+			"oauth: grant revoked during issuance; rolling the pair back failed: access=%v refresh=%v",
+			accessErr, refreshErr)
+	}
+	s.record(ctx, "oauth.issue_revoked", subject, clientID, audit.OutcomeDenied)
+	return TokenResponse{}, protocolError("invalid_grant",
+		"the grant was revoked while this request was in flight")
 }
 
 // issue mints an access and refresh pair. familyID names the rotation family the

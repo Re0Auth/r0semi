@@ -423,6 +423,12 @@ func (s *service) PollDeviceAuthorization(ctx context.Context, req DeviceCodeExc
 	// The read above saw an approval; only the consume may act on it. Issuing on
 	// the strength of the read alone would mint a fresh token pair on every poll,
 	// and would also silently revive an approval the user revoked in between.
+	//
+	// The revocation generation is captured before the consume (R10-19): a
+	// RevokeGrant landing while this poll is between its consume and its mint has
+	// no approved record left to delete, so the post-issue re-check is what stops
+	// it from being lost.
+	epoch := s.grantEpoch(rec.Subject, client.ID)
 	consumed, ok, err := s.devices.ConsumeDevice(ctx, rec.DeviceCodeHash)
 	if err != nil {
 		return TokenResponse{}, err
@@ -430,7 +436,7 @@ func (s *service) PollDeviceAuthorization(ctx context.Context, req DeviceCodeExc
 	if !ok {
 		return TokenResponse{}, protocolError("invalid_grant", "device code has already been redeemed")
 	}
-	return s.issue(ctx, client.ID, consumed.Subject, consumed.Scopes, "")
+	return s.issueGuarded(ctx, client.ID, consumed.Subject, consumed.Scopes, "", epoch)
 }
 
 // DescribeDeviceAuthorization returns what the verification page must render.
