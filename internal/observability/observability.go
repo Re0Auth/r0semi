@@ -82,6 +82,7 @@ type Metrics struct {
 	vaultLatency          *prometheus.HistogramVec
 	sweepRemoved          *prometheus.CounterVec
 	sweepFailed           *prometheus.CounterVec
+	sweepSaturated        prometheus.Counter
 }
 
 // New builds the instrumentation on its own registry. A private registry rather
@@ -146,6 +147,13 @@ func New() *Metrics {
 			"Expired rows a background sweep cycle removed, by store.", "store"),
 		sweepFailed: counter("sweep_failed_total",
 			"Background sweep cycles that returned an error, by store.", "store"),
+		sweepSaturated: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "sweep_saturated_total",
+			Help: "Expiry-sweep ticks that hit their drain budget with rows still removable. " +
+				"A rate above zero means expiry arrives faster than the configured sweep capacity, " +
+				"so the tables grow even though every cycle is deleting rows.",
+		}),
 	}
 	reg.MustRegister(m.requests, m.duration, m.inFlight)
 	reg.MustRegister(
@@ -154,7 +162,7 @@ func New() *Metrics {
 		m.upstreamFetch, m.upstreamFetchDuration, m.upstreamRefresh, m.circuitTransitions,
 		m.storeUnavailable,
 		m.vaultOps, m.vaultLatency,
-		m.sweepRemoved, m.sweepFailed,
+		m.sweepRemoved, m.sweepFailed, m.sweepSaturated,
 	)
 	// The runtime and process collectors are what make /metrics useful during an
 	// incident that is not a request: a goroutine leak, a GC cliff, an open
@@ -441,6 +449,20 @@ func (m *Metrics) ObserveSweepFailed(store string) {
 		return
 	}
 	m.sweepFailed.WithLabelValues(store).Inc()
+}
+
+// ObserveSweepSaturated records one sweep tick that spent its whole drain budget
+// with rows still removable.
+//
+// It is the saturation half of the sweep signal: a sweep whose per-tick capacity
+// is below the expiry arrival rate keeps deleting rows (so sweep_removed_total
+// looks healthy) and still loses ground (R10-139/R10-131, AUDIT-ROUND10.md). The
+// alert is a non-zero rate on re0auth_sweep_saturated_total.
+func (m *Metrics) ObserveSweepSaturated() {
+	if m == nil {
+		return
+	}
+	m.sweepSaturated.Inc()
 }
 
 // ObserveRevocation records one revocation operation. kind is one of the

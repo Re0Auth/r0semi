@@ -80,6 +80,20 @@ const (
 	// close to the size the live records justify.
 	opJanitorInterval = 5 * time.Minute
 
+	// sweepDrainBudget bounds how long one Postgres expiry-sweep tick keeps
+	// running its bounded cycle. The cycle itself is unchanged — one transaction,
+	// at most sweepBatchSize rows per table — but it is repeated until it reports
+	// nothing left, because one cycle per 15 minutes is only 1.11 rows/second per
+	// table while a single anonymous address may write 50 pending rows/second
+	// (R10-139/R10-131, AUDIT-ROUND10.md). The budget is well under the interval,
+	// so a saturated tick does not stack with the next one, and it leaves the pool
+	// to the data plane.
+	sweepDrainBudget = 2 * time.Minute
+
+	// sweepDrainPause is the gap between two cycles inside a drain. It keeps a
+	// saturated store from being hit back-to-back for the whole budget.
+	sweepDrainPause = 50 * time.Millisecond
+
 	// auditAnchorInterval is how often the durable audit chain's head hash is
 	// written to the log.
 	//
@@ -1019,20 +1033,27 @@ func openStorage(ctx context.Context, cfg settings, metrics *observability.Metri
 			// Each reports its own removals and failures, so a store that stops
 			// making progress is visible as a metric and not only as a Warn line
 			// (Z15-1 / Z15V-1, docs/issues/P2-medium.md). The methods are nil-safe.
-			expired, err := db.SweepExpired(ctx)
-			if err != nil {
-				metrics.ObserveSweepFailed(observability.SweepDated)
-			}
-			metrics.ObserveSweepRemoved(observability.SweepDated, expired)
-			if err != nil {
-				return expired, err
-			}
-			sessionRows, err := sessions.SweepExpired(ctx)
-			if err != nil {
-				metrics.ObserveSweepFailed(observability.SweepSessions)
-			}
-			metrics.ObserveSweepRemoved(observability.SweepSessions, sessionRows)
-			return expired + sessionRows, err
+			//
+			// drainSweep repeats this bounded cycle until nothing is left or the
+			// tick's budget is spent. One cycle per 15-minute tick is 1.11 rows/
+			// second/table, which a single anonymous address outruns ~45x
+			// (R10-139/R10-131, AUDIT-ROUND10.md); the cycle itself is unchanged.
+			return drainSweep(ctx, sweepDrainBudget, metrics, func(ctx context.Context) (int64, error) {
+				expired, err := db.SweepExpired(ctx)
+				if err != nil {
+					metrics.ObserveSweepFailed(observability.SweepDated)
+				}
+				metrics.ObserveSweepRemoved(observability.SweepDated, expired)
+				if err != nil {
+					return expired, err
+				}
+				sessionRows, err := sessions.SweepExpired(ctx)
+				if err != nil {
+					metrics.ObserveSweepFailed(observability.SweepSessions)
+				}
+				metrics.ObserveSweepRemoved(observability.SweepSessions, sessionRows)
+				return expired + sessionRows, err
+			})
 		},
 		durable: true,
 		close:   db.Close,
@@ -1225,6 +1246,42 @@ func verifyOnce(ctx context.Context, v chainVerifier, metrics *observability.Met
 		slog.Info("audit chain verified",
 			"chained", verification.Chained,
 			"legacy", verification.Legacy)
+	}
+}
+
+// drainSweep runs cycle repeatedly until it reports nothing left or budget is
+// spent, returning the total number of rows removed.
+//
+// One cycle is bounded by construction — at most sweepBatchSize rows per table,
+// in one transaction — so draining is only a matter of repeating it: no single
+// statement can outlive the pool's statement_timeout and no partially applied
+// sweep is possible. The budget is what keeps a store that can never catch up
+// from holding the tick open; when it is spent the caller learns that through
+// re0auth_sweep_saturated_total rather than from a silent, healthy-looking
+// removal count (R10-139/R10-131, AUDIT-ROUND10.md).
+func drainSweep(ctx context.Context, budget time.Duration, metrics *observability.Metrics, cycle func(context.Context) (int64, error)) (int64, error) {
+	deadline := time.Now().Add(budget)
+	var total int64
+	for {
+		removed, err := cycle(ctx)
+		total += removed
+		if err != nil {
+			return total, err
+		}
+		if removed == 0 {
+			return total, nil
+		}
+		if !time.Now().Before(deadline) {
+			metrics.ObserveSweepSaturated()
+			slog.Warn("expiry sweep did not drain within its budget",
+				"removed", total, "budget", budget)
+			return total, nil
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(sweepDrainPause):
+		}
 	}
 }
 
