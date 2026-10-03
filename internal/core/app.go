@@ -95,6 +95,10 @@ func (a *App) Remove(f *Fiber) error {
 		return fmt.Errorf("core: fiber %q is not registered", f.comp.Name)
 	}
 	a.fibers = append(a.fibers[:idx], a.fibers[idx+1:]...)
+	// Mark the fiber permanently removed. A load may already be in flight;
+	// step re-checks this under the same lock after Apply returns and must not
+	// resurrect the fiber to ACTIVE.
+	f.removed = true
 	// Stop providing immediately so dependents recompute as unsatisfied.
 	if f.state == StateActive {
 		f.state = StateUnloading
@@ -293,6 +297,13 @@ func (a *App) pass() bool {
 func (a *App) step(f *Fiber) bool {
 	a.mu.Lock()
 
+	// A fiber retired by Remove never transitions again. This also covers a
+	// pass whose fiber snapshot was taken just before the removal.
+	if f.removed {
+		a.mu.Unlock()
+		return false
+	}
+
 	target, satisfied := a.resolveTargetLocked(f)
 
 	// A fiber loads when it is inactive, or when its resolved providers have
@@ -332,6 +343,21 @@ func (a *App) step(f *Fiber) bool {
 		}
 
 		a.mu.Lock()
+		if f.removed {
+			// The fiber was removed while Apply was in flight. forceUnload has
+			// already disposed its scope (scope.add runs the inverse
+			// immediately once disposed), so this dispose is a defensive,
+			// idempotent backstop. Drop the activation without writing ACTIVE
+			// or FAILED.
+			a.mu.Unlock()
+			ctx.scope.dispose()
+			a.mu.Lock()
+			f.ctx = nil
+			f.target = nil
+			f.state = StateInactive
+			a.mu.Unlock()
+			return true
+		}
 		if err != nil {
 			f.state = StateFailed
 			f.err = err

@@ -95,6 +95,9 @@ Z16-3 降级（它加强而非削弱该结论），但它是一处需要更正�
   再跑被复核者的守卫：它**照常把该文件列进清单**（"…tracked test files are behind a tag no workflow
   sets"，文件按名出现），全程只读文本。探针：
   `z16verify::TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile`（绿）。
+  **后续（已修复）**：编译步已在 `gates_test.go` 的 "real compile" 段落地；该证伪探针据此改名并翻转为
+  回归对照 `z16verify::TestTaggedCorpusGuardCompilesWhatItAccepts`（同一株植入现在让守卫以
+  `COMPILE FAILURE` 变红，孤儿形态仍被点名）。
 - 影响：任何人为了消掉 Z16-3/N-04 的红，把 `-tags audit5,audit6,audit7` 加进一个 job，这条守卫
   会变成永久绿，而被 tag 排除的文件里的类型/未定义错误（VZ16-1 的实测面）仍然一个都看不见 ——
   "别靠标签藏起来"这条规则需要一个编译步骤，现在只有一次 grep。
@@ -105,6 +108,9 @@ Z16-3 降级（它加强而非削弱该结论），但它是一处需要更正�
   `go vet -tags audit6 …` exit 1（**工具链仍认它是受约束文件**），而守卫的报告里
   `rev1_test.go` 从不出现。探针：
   `z16verify::TestTaggedCorpusGuardParsesOnlyGoBuildNotTheLegacyTag`（绿）。
+  **后续（已修复）**：`buildConstraintOf` 已同时解析 `//go:build` 与 `// +build`；该证伪探针据此改名并翻转为
+  回归对照 `z16verify::TestTaggedCorpusGuardReadsTheLegacyBuildTag`（workflow 命中该旧式标签时编译步失败，
+  旧式孤儿标签被点名为 orphan）。
 - 影响：一条 `// +build` 形式的探针既是"默认套件看不见的"又是"守卫认为在默认套件里"的，
   它和它引用的修复都不会被任何一侧兜住。修法：`go list -f '{{.TestGoFiles}}'`（真工具链）取代
   文本扫描，或同时解析 `// +build`。

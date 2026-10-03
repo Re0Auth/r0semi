@@ -72,6 +72,11 @@ type Fiber struct {
 	state  State
 	err    error
 	target map[KeyRef]*Fiber // provider identity per declared key
+
+	// removed is set exactly once by App.Remove, under a.mu, and never
+	// cleared. A removed fiber is no longer registered and may never become
+	// ACTIVE again, even if a load was already in flight when it was removed.
+	removed bool
 }
 
 // Name returns the component name.

@@ -136,6 +136,12 @@ type Result struct {
 	// for the same reason: without it, "the account's audit history is unlinkable"
 	// and "the step that delivers that promise was skipped" are indistinguishable
 	// in a result that otherwise reports success.
+	//
+	// It is set only on the successful path, AFTER Destroy has run. The audit
+	// record does NOT carry a true: it is written before Destroy (the ordering the
+	// destroy depends on), so it reports pseudonym=pending / pseudonym_destroyed=
+	// false, and success is read from the absence of a later error record for the
+	// subject. This field is the returned result's truth, not the record's.
 	PseudonymDestroyed bool
 }
 
@@ -266,18 +272,28 @@ func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.User
 		return d.fail(ctx, actor, subject, "account", err, res)
 	}
 
-	// Whether the unlinkability step is configured has to be known before the
-	// record is written (below), because the record comes first and cannot be
-	// rewritten. A wired destroyer that then fails turns the whole call into an
-	// error — no success is returned — so on every path that returns nil this
-	// flag is the truth; on the failure path it is reset to false.
-	res.PseudonymDestroyed = d.cfg.Pseudonyms != nil
+	// The unlinkability step is the one thing the record below cannot state as
+	// fact, because it has not run yet: the record comes first (see the ordering
+	// note under Destroy, below). So the Result does not claim the destroy here —
+	// it is set only once Destroy has actually succeeded — and the record carries
+	// the three-state "pseudonym" field (pending / not_configured / failed)
+	// alongside pseudonym_destroyed=false.
+	res.PseudonymDestroyed = false
 
 	// The record is written after every store is clear, so it can state the result
-	// rather than a promise. A failure to write it fails the erasure: the account
-	// row is already gone, and DeleteUser is idempotent, so a repeat of the whole
-	// call would produce the record — though see the caveat on DeleteAccount about
-	// the session the erasure revokes, which is what the endpoint's caller loses.
+	// rather than a promise for those stores. A failure to write it fails the
+	// erasure: the account row is already gone, and DeleteUser is idempotent, so a
+	// repeat of the whole call would produce the record — though see the caveat on
+	// DeleteAccount about the session the erasure revokes, which is what the
+	// endpoint's caller loses.
+	//
+	// How to read this record for the pseudonym step: it is the ONLY account.delete
+	// record on a successful run, and it says "pending" (when a destroyer is wired)
+	// or "not_configured" — never "destroyed", because the key is still there when
+	// the line is written. A run whose Destroy succeeded is therefore the run whose
+	// record says pending and has NO later error record naming this subject. A
+	// failed Destroy appends exactly that later record via fail
+	// (outcome=error, failed_at=pseudonym, pseudonym=failed).
 	if err := d.record(ctx, actor, subject, audit.OutcomeOK, res, ""); err != nil {
 		return res, err
 	}
@@ -297,20 +313,48 @@ func (d *Deleter) DeleteAccount(ctx context.Context, actor, subject account.User
 			// itself an audit event about this account, so writing it after the key is
 			// gone would make the sink mint a fresh key, re-creating the very link the
 			// destroy exists to remove (see TestDeleteAccountDestroysThePseudonymKeyLast).
+			// The failure record is the last word on the run; fail joins it if it
+			// cannot even be written.
 			res.PseudonymDestroyed = false
 			return d.fail(ctx, actor, subject, "pseudonym", fmt.Errorf(
 				"lifecycle: the account was erased but its audit history is still linkable: %w", err), res)
 		}
+		// The key is gone, so only now does the returned result say so. No record is
+		// written: the sink would have to mint a fresh subject key to write one.
+		res.PseudonymDestroyed = true
 	}
 	return res, nil
 }
 
-// fail records the failed attempt and returns the error. The audit write is
-// best-effort here: the caller already has an error to act on, and losing it to
-// a second failure would help nobody.
+// fail records the failed attempt and returns the error.
+//
+// The caller already has an error to act on, so the cause it passed in is always
+// returned. The record write, though, is not allowed to vanish: if it fails, that
+// second error is joined into the returned one. errors.Is still reaches the
+// original cause, and a caller that wants to know the trail could not be corrected
+// reaches the record failure the same way. This matters most for the pseudonym
+// step, where the failure record is the only thing that can contradict the
+// outcome=ok record written before Destroy; discarding this error would leave a
+// false success as the subject's last word with nothing naming the loss.
 func (d *Deleter) fail(ctx context.Context, actor, subject account.UserID, step string, cause error, res Result) (Result, error) {
-	_ = d.record(ctx, actor, subject, audit.OutcomeError, res, step)
+	if rerr := d.record(ctx, actor, subject, audit.OutcomeError, res, step); rerr != nil {
+		return res, errors.Join(cause, fmt.Errorf("lifecycle: could not record the failure: %w", rerr))
+	}
 	return res, cause
+}
+
+// pseudonymState is the three-state label a record carries for the unlinkability
+// step; see the "pseudonym" detail comment in record for what each value means and
+// why "destroyed" is not one of them.
+func (d *Deleter) pseudonymState(failedAt string) string {
+	switch {
+	case d.cfg.Pseudonyms == nil:
+		return "not_configured"
+	case failedAt == "pseudonym":
+		return "failed"
+	default:
+		return "pending"
+	}
 }
 
 func (d *Deleter) record(ctx context.Context, actor, subject account.UserID, outcome string, res Result, failedAt string) error {
@@ -333,7 +377,21 @@ func (d *Deleter) record(ctx context.Context, actor, subject account.UserID, out
 		"legacy_removed":      strconv.Itoa(res.Legacy),
 		"session_scoped":      strconv.FormatBool(res.SessionScoped),
 		"pseudonym_destroyed": strconv.FormatBool(res.PseudonymDestroyed),
-		"self":                strconv.FormatBool(actor == subject),
+		// pseudonym is the three-state view of the unlinkability step. It exists
+		// because pseudonym_destroyed alone cannot tell "no destroyer is wired"
+		// from "a destroyer is wired and has not run yet": both are false. It is
+		// one of
+		//   "not_configured" — no PseudonymDestroyer is wired;
+		//   "pending"        — one is wired and the key still exists at record time;
+		//   "failed"         — the destroy ran and failed (the fail record, step
+		//                      "pseudonym", also carries failed_at=pseudonym).
+		// There is deliberately no "destroyed": the record is written before
+		// Destroy runs and none is written after (writing one would make the sink
+		// mint a fresh subject key, re-creating the link the destroy removes). A
+		// successful run is the one whose record says "pending" and which has no
+		// later error record for this subject.
+		"pseudonym": d.pseudonymState(failedAt),
+		"self":      strconv.FormatBool(actor == subject),
 	}
 	if failedAt != "" {
 		detail["failed_at"] = failedAt

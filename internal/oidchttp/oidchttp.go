@@ -154,9 +154,24 @@ type Handler struct {
 	registry *oauth.Registry
 	consent  ConsentStore
 	// issuer is the static authorization-server identifier, when one was
-	// configured. It is what RFC 9207 `iss` carries on paths that have no request
-	// to derive it from (DenyAuthorization). A dynamic-issuer deployment is a
-	// development shape; it derives `iss` per request on the HTTP paths.
+	// configured. It is what RFC 9207 `iss` carries on the one response path with
+	// no request to derive it from: DenyAuthorization is handed an interaction id,
+	// not an *http.Request, so it can only read this field. The HTTP paths use
+	// issuerFor, which prefers this field and falls back to the request Host.
+	//
+	// The empty case (the dynamic shape issuerFor falls back to) is not reachable
+	// in a shipped deployment. Both composition roots require the value:
+	// cmd/re0auth/config.go rejects an empty server.issuer / RE0AUTH_ISSUER, and
+	// internal/httpapi.New rejects an empty Config.Issuer; cmd/re0auth then copies
+	// the validated value into oidchttp.Config.Issuer. Only tests and development
+	// construct Handler directly with cfg.Issuer == "".
+	//
+	// If a composition root is ever relaxed to admit an empty issuer, this denial
+	// path starts emitting an authorization response with no `iss`. The fix then is
+	// to thread the request (or the issuer derived from it) through the
+	// DenyAuthorization interface, not to default a value here.
+	// internal/archtest.TestS02_11CompositionRootsRequireAStaticIssuer keeps the
+	// "not reachable when shipped" claim above from rotting.
 	issuer string
 	// introspectionClients is the allowlist of client ids that may see tokens
 	// issued to other clients.

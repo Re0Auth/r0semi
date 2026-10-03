@@ -81,28 +81,16 @@ func gitQuiet(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile runs the repository's own
-// "a tagged test file must be reachable from CI" guard against a tree whose
-// tracked, tagged test file cannot compile, holding the broken body fixed and
-// moving only its build comment. Reachability is asserted over file names and
-// build comments and never over the toolchain, so the guard is blind to whether
-// a file it accepts actually compiles.
+// TestTaggedCorpusGuardCompilesWhatItAccepts is the regression control for Z16-1.
 //
-// N-04 landed: ci.yml:400 now vets with `-tags audit5,audit6,audit7,conformance,
-// audit,protocolaudit`, so the guard's orphan list is empty and every
-// workflow-satisfiable constraint is compiled by that one step. The guard itself
-// still compiles nothing, and the two runs below separate the two facts:
-//
-//   - tagged `audit6` — a tag the workflows set, hence "reachable" — the guard is
-//     silent: it reports the corpus, accepts the file's constraint as reachable
-//     and never names it, while the tagged toolchain rejects it (control above).
-//   - tagged `z16orphanprobe` — a tag no workflow sets — the guard names the very
-//     same file. Corpus membership is therefore proved by run 2, and the only
-//     difference between the runs is satisfiability, not the compile error.
-//
-// Compilation of these files is covered exclusively by the CI vet step's -tags
-// list, so a file whose tag is absent from it can still decay in silence.
-func TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile(t *testing.T) {
+// The guard used to accept a tracked, tagged test file without ever compiling it,
+// so a probe that stopped building stayed green: reachability was decided over file
+// names and build comments, and the toolchain was never asked. The compile step
+// landed (gates_test.go, "real compile"), so the same plant now makes the guard
+// fail with COMPILE FAILURE. The orphan run still proves the planted file is in the
+// corpus the guard enumerates, so the failure is caused by the body, not by the
+// fixture being skipped.
+func TestTaggedCorpusGuardCompilesWhatItAccepts(t *testing.T) {
 	// The broken body, used verbatim in the isolated control and in the fixture
 	// the guard reads. Only the build comment changes between the two guard runs.
 	const body = "package z05memstore\n\nimport \"testing\"\n\n" +
@@ -155,59 +143,46 @@ func TestTaggedCorpusGuardIsBlindToWhetherItsFilesCompile(t *testing.T) {
 	gitQuiet(t, tmp, "add", "-A")
 	gitQuiet(t, tmp, "commit", "--quiet", "-m", "verify fixture")
 
-	// Corroboration in the copied tree: the fixture's own package must not vet
-	// clean under its tag. Whether the compiler names our callee is only logged —
-	// a copy taken while another process writes the repository can carry a torn
-	// unrelated file, and the package is then skipped as a broken dependency. The
-	// isolated control above is the normative proof of the fixture's breakage.
-	code, out = run(t, tmp, nil, "go", "vet", "-tags", "audit6", "./internal/zzprobe/audit6/z05memstore/...")
-	if code == 0 {
-		t.Fatalf("the fixture's own package vets clean under -tags audit6, so the fixture is not the " +
-			"broken sample this probe needs")
-	}
-	t.Logf("copied tree: `go vet -tags audit6 ./internal/zzprobe/audit6/z05memstore/...` exits %d (%s)",
-		code, strings.TrimSpace(firstLine(out)))
-
-	guardRun := func() string {
+	guardRun := func() (int, string) {
 		t.Helper()
-		_, out := run(t, tmp, nil, "go", "test", "-tags", "audit7", "-count=1", "-v",
+		c, o := run(t, tmp, nil, "go", "test", "-tags", "audit7", "-count=1", "-v",
 			"-run", "^TestEveryTaggedTestFileIsReachableFromCI$",
 			"./internal/zzprobe/audit7/z16guardtestquality/")
-		if !strings.Contains(out, "tracked test files are behind a constraint no workflow can satisfy") {
-			t.Fatalf("the guard did not report a corpus at all, so it is not reading the tree:\n%s", out)
+		if !strings.Contains(o, "tracked test files are behind a constraint no workflow can satisfy") {
+			t.Fatalf("the guard did not report a corpus at all, so it is not reading the tree:\n%s", o)
 		}
-		return out
+		return c, o
 	}
 
-	// Run 1 (reachable form): the fixture's tag is in ci.yml:400's list, and the
-	// guard says nothing about the file. It is accepted as reachable without ever
-	// being compiled — even though the isolated control shows it cannot compile.
-	out = guardRun()
-	if !strings.Contains(out, "audit6") {
-		t.Fatalf("the guard no longer reports the fixture's tag among the workflow tags, so the "+
-			"reachability half of this probe is void:\n%s", out)
+	// Run 1 (workflow-satisfiable tag): the planted file cannot compile, so the
+	// guard's compile step must fail and name the planted defect. Before the
+	// compile step landed this run was silent, which was the finding.
+	code, out = guardRun()
+	if code == 0 {
+		t.Fatalf("the guard passed with a tracked, tagged file that does not compile, so the compile "+
+			"step is not running:\n%s", out)
 	}
-	if strings.Contains(out, "alias_residual_test.go") {
-		t.Fatalf("the guard named a file whose tag the workflows set; that is a different guard "+
-			"than the one under test:\n%s", out)
+	if !strings.Contains(out, "COMPILE FAILURE") || !strings.Contains(out, "alias_residual_test.go") {
+		t.Fatalf("the guard failed without naming the compile failure of the planted file:\n%s", out)
+	}
+	if !strings.Contains(out, "noSuchFunctionAnywhere") {
+		t.Fatalf("the guard's failure is not the planted undefined callee, so the fixture did not reach "+
+			"the compiler:\n%s", out)
 	}
 
 	// Run 2 (orphan form): same tracked file, same broken body, a tag no workflow
-	// sets. The guard must now name it — proving the file IS in the corpus it
-	// enumerates, so run 1's silence was a satisfiability verdict and not a skip.
+	// sets. The guard must still name it in the orphan list — corpus membership is
+	// unchanged, only satisfiability differs.
 	writeFixture("z16orphanprobe")
-	out = guardRun()
-	const label = "alias_residual_test.go (//go:build z16orphanprobe)"
+	_, out = guardRun()
+	const label = "alias_residual_test.go (build constraint z16orphanprobe)"
 	if !strings.Contains(out, label) {
 		t.Fatalf("the guard did not name the same broken file under an unsatisfiable tag, so the "+
-			"file is not in the corpus it reads and run 1 proved nothing:\n%s", out)
+			"file is not in the corpus run 1 read:\n%s", out)
 	}
-	// The guard named it without compiling it. The isolated control already proved
-	// the same body cannot compile in either tag form, and the guard's report
-	// contains no compilation step for anything it lists.
-	t.Logf("the guard: names the fixture when its constraint is orphaned (run 2), accepts the same " +
-		"broken file silently when ci.yml:400's tags satisfy it (run 1); the report itself compiles " +
-		"nothing it lists")
+	t.Logf("the guard: refuses to pass when a workflow-satisfiable tagged file does not compile " +
+		"(run 1, COMPILE FAILURE naming the planted file), and reports the same file as orphaned under " +
+		"an unsatisfiable tag (run 2)")
 }
 
 func firstLine(s string) string {
@@ -217,21 +192,28 @@ func firstLine(s string) string {
 	return s
 }
 
-// TestTaggedCorpusGuardParsesOnlyGoBuildNotTheLegacyTag is the second half: the
-// guard's tag extraction looks for `//go:build` alone, so the older
-// `// +build` form — which Go still honours as a build constraint — is invisible
-// to it. A file whose constraint is only the legacy comment is therefore counted
-// as a default-suite test and never reported as orphaned.
-func TestTaggedCorpusGuardParsesOnlyGoBuildNotTheLegacyTag(t *testing.T) {
+// TestTaggedCorpusGuardReadsTheLegacyBuildTag is the regression control for Z16V-2.
+//
+// The guard's walk once looked for `//go:build` alone, so the older `// +build`
+// form — which Go still honours — was invisible: a legacy-tagged file was counted
+// as a default-suite test, never checked for reachability and never compiled. The
+// walk now parses both spellings (gates_test.go::buildConstraintOf), so the same
+// legacy fixtures are corroborated here: a legacy tag the workflows set makes the
+// guard's compile step fail, and a legacy-only orphan tag is named in the census.
+func TestTaggedCorpusGuardReadsTheLegacyBuildTag(t *testing.T) {
 	src := repoRoot(t)
 	tmp := t.TempDir()
 	copyRepo(t, src, tmp)
 
 	legacy := filepath.Join(tmp, "internal", "zzprobe", "audit6", "z05memstore", "rev1_test.go")
-	if err := os.WriteFile(legacy, []byte("// +build audit6\n\npackage z05memstore\n\nimport \"testing\"\n\n"+
-		"func TestZ16VerifyLegacyTagged(t *testing.T) { _ = noSuchFunctionAnywhere() }\n"), 0o644); err != nil {
-		t.Fatal(err)
+	writeLegacy := func(tag string) {
+		t.Helper()
+		if err := os.WriteFile(legacy, []byte("// +build "+tag+"\n\npackage z05memstore\n\nimport \"testing\"\n\n"+
+			"func TestZ16VerifyLegacyTagged(t *testing.T) { _ = noSuchFunctionAnywhere() }\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
+	writeLegacy("audit6")
 	gitQuiet(t, tmp, "init", "--quiet")
 	gitQuiet(t, tmp, "add", "-A")
 	gitQuiet(t, tmp, "commit", "--quiet", "-m", "verify fixture")
@@ -245,21 +227,38 @@ func TestTaggedCorpusGuardParsesOnlyGoBuildNotTheLegacyTag(t *testing.T) {
 		t.Fatalf("control: with the tag set the file must be compiled (and fail)")
 	}
 
-	code, out := run(t, tmp, nil, "go", "test", "-tags", "audit7", "-count=1", "-v",
-		"-run", "^TestEveryTaggedTestFileIsReachableFromCI$",
-		"./internal/zzprobe/audit7/z16guardtestquality/")
-	if !strings.Contains(out, "tracked test files are behind a constraint no workflow can satisfy") {
-		t.Fatalf("the guard did not run at all:\n%s", out)
+	guardRun := func() (int, string) {
+		t.Helper()
+		c, o := run(t, tmp, nil, "go", "test", "-tags", "audit7", "-count=1", "-v",
+			"-run", "^TestEveryTaggedTestFileIsReachableFromCI$",
+			"./internal/zzprobe/audit7/z16guardtestquality/")
+		if !strings.Contains(o, "tracked test files are behind a constraint no workflow can satisfy") {
+			t.Fatalf("the guard did not run at all:\n%s", o)
+		}
+		return c, o
 	}
-	if strings.Contains(out, "rev1_test.go") {
-		t.Fatalf("the guard named the legacy-tagged file, so it does understand the legacy form:\n%s", out)
+
+	// (a) A legacy tag the workflows set: the file is in the census now, so the
+	// compile step runs it and fails on the planted body.
+	code, out := guardRun()
+	if code == 0 {
+		t.Fatalf("the guard passed with a broken legacy-tagged file, so the legacy form is still "+
+			"invisible to the census:\n%s", out)
 	}
-	t.Logf("legacy-tagged fixture: excluded from the default build by the toolchain (control above), "+
-		"compiled under -tags audit6 (control above), and never named by the guard's report (exit %d)", code)
-	// And the guard's own scanner sees the file as untagged, which is why it is
-	// absent from the orphan list: `-tags audit6` runs it, `go test ./...` does
-	// not, and the guard's two halves disagree about what "tagged" means.
-	t.Log("legacy-tagged fixture: accounted as untagged by the guard, excluded from the default build by the toolchain")
+	if !strings.Contains(out, "COMPILE FAILURE") || !strings.Contains(out, "noSuchFunctionAnywhere") {
+		t.Fatalf("the guard failed without compiling the legacy-tagged fixture:\n%s", out)
+	}
+
+	// (b) A legacy-only orphan tag: the guard must now name it in the orphan list,
+	// which the old `//go:build`-only walk could never do.
+	writeLegacy("z16orphanprobe")
+	_, out = guardRun()
+	if !strings.Contains(out, "rev1_test.go (build constraint z16orphanprobe)") {
+		t.Fatalf("a legacy-only orphan tag is still invisible to the guard's census:\n%s", out)
+	}
+	t.Logf("legacy-tagged fixture: excluded from the default build by the toolchain (control above), " +
+		"compiled-and-failed by the guard when a workflow sets the tag (run a), named as orphaned when no " +
+		"workflow does (run b)")
 }
 
 // TestLoadJobInspectionIfFixed keeps the one-line fix honest: the guard the Z16

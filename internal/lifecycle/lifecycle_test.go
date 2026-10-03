@@ -368,6 +368,68 @@ func (failingLogger) Record(context.Context, audit.Event) error {
 	return errors.New("audit sink unavailable")
 }
 
+// flakyLogger writes records until failAt, then fails every subsequent one. It
+// stands in for a sink that is healthy while the pre-Destroy record is written and
+// down by the time fail() tries to append the corrective one — the only window in
+// which the second write's error used to be discarded (audit round 9, S08-3).
+type flakyLogger struct {
+	logged  *audit.MemoryLogger
+	failErr error
+	failAt  int
+	calls   int
+}
+
+func (l *flakyLogger) Record(ctx context.Context, e audit.Event) error {
+	l.calls++
+	if l.calls >= l.failAt {
+		return l.failErr
+	}
+	return l.logged.Record(ctx, e)
+}
+
+// TestDeleteAccountSurfacesARecordFailureOnTheFailurePath: fail()'s record is the
+// only thing that can contradict the outcome=ok record written before Destroy, so
+// losing THAT write must not be silent. The caller already has the destroy failure
+// to act on; when the corrective record also fails, both must be visible, and the
+// original cause must stay reachable through errors.Is.
+func TestDeleteAccountSurfacesARecordFailureOnTheFailurePath(t *testing.T) {
+	var calls []string
+	r := func() recorder { return recorder{calls: &calls} }
+	destroyErr := errors.New("pseudonym store unavailable")
+	recordErr := errors.New("audit sink unavailable")
+	logged := audit.NewMemoryLogger()
+	logger := &flakyLogger{logged: logged, failErr: recordErr, failAt: 2}
+	d, err := New(Config{
+		Accounts:   fakeAccounts{recorder: r()},
+		Tokens:     fakeTokens{recorder: r()},
+		Vault:      fakeVault{recorder: r()},
+		Pseudonyms: &fakePseudonyms{err: destroyErr},
+		Audit:      logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = d.DeleteAccount(context.Background(), "usr_actor", "usr_target")
+	if err == nil {
+		t.Fatal("a failed destroy must fail the erasure")
+	}
+	if !errors.Is(err, destroyErr) {
+		t.Errorf("err = %v, want the destroy failure still reachable", err)
+	}
+	if !errors.Is(err, recordErr) {
+		t.Errorf("err = %v, want the failure to record the failure surfaced too", err)
+	}
+	if !strings.Contains(err.Error(), "could not record the failure") {
+		t.Errorf("the record failure is not named: %v", err)
+	}
+	// The pre-Destroy record was written; the corrective write is the one that
+	// failed. That is the state the caller must be able to see.
+	if got := len(logged.Events()); got != 1 {
+		t.Errorf("durable records = %d, want the pre-Destroy one only", got)
+	}
+}
+
 // fakePseudonyms records that it was asked to destroy a key, and — importantly —
 // what had been written to the audit log by then.
 type fakePseudonyms struct {
@@ -451,6 +513,27 @@ func TestDeleteAccountReportsAFailedPseudonymDestroy(t *testing.T) {
 	if !strings.Contains(err.Error(), "still linkable") {
 		t.Errorf("the error does not say what is wrong: %v", err)
 	}
+
+	// The failure must also be readable in the log: the pre-Destroy record stays
+	// (it cannot be rewritten), and a second, truthful error record names the step
+	// that stopped the run.
+	events := logger.Events()
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want the pre-Destroy record plus the failure record", events)
+	}
+	last := events[len(events)-1]
+	if last.Outcome != audit.OutcomeError {
+		t.Errorf("last record outcome = %q, want %q", last.Outcome, audit.OutcomeError)
+	}
+	if got := last.Detail["failed_at"]; got != "pseudonym" {
+		t.Errorf("failed_at = %q, want pseudonym", got)
+	}
+	if got := last.Detail["pseudonym"]; got != "failed" {
+		t.Errorf("detail[pseudonym] = %q, want \"failed\"", got)
+	}
+	if got := last.Detail["pseudonym_destroyed"]; got != "false" {
+		t.Errorf("detail[pseudonym_destroyed] = %q, want \"false\"", got)
+	}
 }
 
 // TestDeleteAccountWithoutPseudonymsStillWorks: a deployment whose audit log does
@@ -502,10 +585,19 @@ func TestDeleteAccountWithoutPseudonymsIsNotReportedAsDestroyed(t *testing.T) {
 	if got := events[0].Detail["pseudonym_destroyed"]; got != "false" {
 		t.Fatalf("detail[pseudonym_destroyed] = %q, want \"false\"", got)
 	}
+	// "false" alone cannot tell a skipped step from one that has not run yet, so
+	// the record carries which it is.
+	if got := events[0].Detail["pseudonym"]; got != "not_configured" {
+		t.Fatalf("detail[pseudonym] = %q, want \"not_configured\"", got)
+	}
 }
 
 // TestDeleteAccountWithPseudonymsReportsDestroyed: with the port wired and the
-// destruction succeeding, the flag is true in both the result and the record.
+// destruction succeeding, the RETURNED RESULT says destroyed — but the record
+// cannot, because it is written before Destroy runs (the ordering Destroy itself
+// depends on; writing a record afterwards would make the sink mint a fresh subject
+// key). So the single record says pseudonym=pending and pseudonym_destroyed=false,
+// and success is read as "pending with no later error record for this subject".
 func TestDeleteAccountWithPseudonymsReportsDestroyed(t *testing.T) {
 	var calls []string
 	r := func() recorder { return recorder{calls: &calls} }
@@ -529,9 +621,14 @@ func TestDeleteAccountWithPseudonymsReportsDestroyed(t *testing.T) {
 	}
 	events := logger.Events()
 	if len(events) != 1 {
-		t.Fatalf("events = %+v", events)
+		t.Fatalf("events = %+v, want the pre-Destroy record only (no post-Destroy record, "+
+			"because writing one would re-mint the subject key)", events)
 	}
-	if got := events[0].Detail["pseudonym_destroyed"]; got != "true" {
-		t.Fatalf("detail[pseudonym_destroyed] = %q, want \"true\"", got)
+	if got := events[0].Detail["pseudonym_destroyed"]; got != "false" {
+		t.Fatalf("detail[pseudonym_destroyed] = %q: the record is written before Destroy and "+
+			"must not claim it already happened", got)
+	}
+	if got := events[0].Detail["pseudonym"]; got != "pending" {
+		t.Fatalf("detail[pseudonym] = %q, want \"pending\"", got)
 	}
 }

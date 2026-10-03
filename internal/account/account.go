@@ -107,11 +107,17 @@ type identityKey struct {
 
 // MemoryStore is a non-durable Store for development and tests. It is safe for
 // concurrent use.
+//
+// byUser indexes identity ids per user so that per-user reads and deletes never
+// scan the whole identities table. It is maintained under mu at every mutation
+// point and must mirror identities exactly: an id appears under the user that
+// owns it, at most once, and the key is absent when the user has no identities.
 type MemoryStore struct {
 	mu         sync.RWMutex
 	users      map[UserID]User
 	identities map[IdentityID]Identity
 	byKey      map[identityKey]IdentityID
+	byUser     map[UserID][]IdentityID
 }
 
 // NewMemoryStore returns an empty store.
@@ -120,7 +126,31 @@ func NewMemoryStore() *MemoryStore {
 		users:      make(map[UserID]User),
 		identities: make(map[IdentityID]Identity),
 		byKey:      make(map[identityKey]IdentityID),
+		byUser:     make(map[UserID][]IdentityID),
 	}
+}
+
+// indexIdentityLocked records id under its owner. Callers hold the write lock
+// and must have already checked that the identity is new.
+func (s *MemoryStore) indexIdentityLocked(user UserID, id IdentityID) {
+	s.byUser[user] = append(s.byUser[user], id)
+}
+
+// unindexIdentityLocked drops id from its owner's slice, removing the key
+// entirely once the user has no identities left.
+func (s *MemoryStore) unindexIdentityLocked(user UserID, id IdentityID) {
+	ids := s.byUser[user]
+	for i, got := range ids {
+		if got == id {
+			ids = append(ids[:i], ids[i+1:]...)
+			break
+		}
+	}
+	if len(ids) == 0 {
+		delete(s.byUser, user)
+		return
+	}
+	s.byUser[user] = ids
 }
 
 // FindByIdentity implements Store.
@@ -160,6 +190,7 @@ func (s *MemoryStore) CreateWithIdentity(_ context.Context, in idp.Identity) (Us
 	s.users[user.ID] = user
 	s.identities[ident.ID] = ident
 	s.byKey[key] = ident.ID
+	s.indexIdentityLocked(user.ID, ident.ID)
 	return user, ident, nil
 }
 
@@ -192,6 +223,7 @@ func (s *MemoryStore) LinkIdentity(_ context.Context, user UserID, in idp.Identi
 	}
 	s.identities[ident.ID] = ident
 	s.byKey[key] = ident.ID
+	s.indexIdentityLocked(user, ident.ID)
 	return ident, nil
 }
 
@@ -212,6 +244,7 @@ func (s *MemoryStore) UnlinkIdentity(_ context.Context, user UserID, identity Id
 
 	delete(s.identities, identity)
 	delete(s.byKey, identityKey{ident.Provider, ident.Subject})
+	s.unindexIdentityLocked(user, identity)
 
 	if u := s.users[user]; u.PrimaryIdentity == identity {
 		// Reassign to the earliest remaining identity. Any surviving identity
@@ -269,19 +302,25 @@ func (s *MemoryStore) DeleteUser(_ context.Context, user UserID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.users, user)
-	for id, ident := range s.identities {
-		if ident.User == user {
-			delete(s.identities, id)
-			delete(s.byKey, identityKey{ident.Provider, ident.Subject})
+	for _, id := range s.byUser[user] {
+		ident, ok := s.identities[id]
+		if !ok {
+			continue
 		}
+		delete(s.identities, id)
+		delete(s.byKey, identityKey{ident.Provider, ident.Subject})
 	}
+	delete(s.byUser, user)
 	return nil
 }
 
+// identitiesOfLocked returns the user's identities oldest first. It reads only
+// the user index, never the whole identities table.
 func (s *MemoryStore) identitiesOfLocked(user UserID) []Identity {
-	out := make([]Identity, 0, 4)
-	for _, ident := range s.identities {
-		if ident.User == user {
+	indexed := s.byUser[user]
+	out := make([]Identity, 0, len(indexed))
+	for _, id := range indexed {
+		if ident, ok := s.identities[id]; ok {
 			out = append(out, ident)
 		}
 	}

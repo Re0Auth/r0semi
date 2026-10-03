@@ -107,9 +107,11 @@ func TestProbeErasureAuditRecordClaimsSuccessWhileTheHistoryStaysLinkable(t *tes
 	}
 }
 
-// TestProbeErasureWithAWorkingDestroyRecordsSuccess is the control: the same
-// fields are present and true when the last step works, so the probe above is
-// not satisfied by a log that records nothing.
+// TestProbeErasureWithAWorkingDestroyRecordsSuccess is the control: the destroy
+// really ran and left exactly one `outcome=ok` record marked `pseudonym=pending`,
+// so the probe above is not satisfied by a log that records nothing. S08-3 changed
+// the field semantics: the pre-destroy record cannot claim `destroyed=true` (it is
+// written while the key still exists), so success is "pending and no error record".
 func TestProbeErasureWithAWorkingDestroyRecordsSuccess(t *testing.T) {
 	pseudo := &okPseudonyms{}
 	env := newProbeEnv(t, probeOptions{Pseudonyms: pseudo})
@@ -130,7 +132,12 @@ func TestProbeErasureWithAWorkingDestroyRecordsSuccess(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("account.delete records = %+v, want one", events)
 	}
-	if events[0].Outcome != audit.OutcomeOK || events[0].Detail["pseudonym_destroyed"] != "true" {
+	if events[0].Outcome != audit.OutcomeOK ||
+		events[0].Detail["pseudonym"] != "pending" ||
+		events[0].Detail["pseudonym_destroyed"] != "false" {
 		t.Fatalf("a successful erasure is not reported as one: %+v", events[0])
+	}
+	if events[0].Detail["failed_at"] != "" {
+		t.Fatalf("a successful erasure carries failed_at: %+v", events[0])
 	}
 }

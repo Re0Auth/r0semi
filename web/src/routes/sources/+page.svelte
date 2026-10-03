@@ -75,19 +75,25 @@
 
 	const key = (s: { game: string; source: string }) => `${s.game}/${s.source}`;
 
+	// Indexed once per catalogue change instead of scanned per card. The connected
+	// cards ask for resources twice each, so a linear find per call is O(bindings ×
+	// sources) for a lookup that is by definition keyed.
+	const byKey = $derived(new Map(available.map((s) => [key(s), s])));
+
+	// The same index, from the other side: which sources the account already has.
+	const bindingKeys = $derived(new Set(bindings.map((b) => key(b))));
+
 	// What a source exposes, looked up from the catalogue. Both cards show it, so
 	// the decision to connect (and the reminder of what was connected) is about
 	// data, not just a provider name.
 	function resourcesFor(sourceKey: string): string[] {
-		return available.find((s) => key(s) === sourceKey)?.resources.map((r) => r.name) ?? [];
+		return byKey.get(sourceKey)?.resources.map((r) => r.name) ?? [];
 	}
 
 	// What is not connected yet. A retired source is left out: offering a button
 	// that the server will refuse is worse than not offering it.
 	const connectable = $derived(
-		available.filter(
-			(src) => src.status !== 'retired' && !bindings.some((b) => key(b) === key(src))
-		)
+		available.filter((src) => src.status !== 'retired' && !bindingKeys.has(key(src)))
 	);
 
 	function connect(src: FederationSource) {
