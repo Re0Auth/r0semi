@@ -3,6 +3,13 @@
 > **这里不是待办。** 保留它只为了回答"这条当初为什么存在、后来被哪个 commit 收掉"。
 > 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-03）。
 
+### 第 14 轮
+
+- S03-11 — FIXED（94bbd4b）
+- S03-7 — FIXED（94bbd4b）
+- S08-3 — FIXED（94bbd4b）
+- S12-7 — FIXED（94bbd4b）
+
 ### 第 13 轮
 
 - S13-11 — FIXED（43e5d9a）

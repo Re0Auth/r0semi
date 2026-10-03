@@ -1,7 +1,7 @@
 # P3 · 低 / 提示（LOW）
 
 > 加固、纵深防御、文档与实现不一致、可维护性。**这一类最大，也最容易被永久搁置。**
-> **条目数：226** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-03，HEAD `43e5d9a`）。
+> **条目数：226** ｜ 由 `_fragments/_merge.mjs` 从各轮抽取结果生成（2026-10-03，HEAD `94bbd4b`）。
 > 严重度取**对抗性复核后的裁定**；同一机制多编号者已合并，别名写在 ID 列。
 
 > 三个反复出现的形态，建议成批处理而不是逐条修：
@@ -12,6 +12,11 @@
 
 | ID | 严重度 | 问题 | 位置 | 状态 | 修法要点 |
 |---|---|---|---|---|---|
+| S03-11 | P3 | core.App.Remove races with an in-flight load, allowing a removed fiber to be marked active without its scope | internal/core/app.go:99; internal/core/app.go:105; internal/core/app.go:334 | FIXED（94bbd4b） | 见 `docs/security-audit-9.md` §3（类别：correctness） |
+| S03-7 | P3 | MemoryStore.Identities scans every identity in the process and holds the lock for the whole scan | internal/account/account.go:231; internal/account/account.go:281; internal/account/account.go:283 | FIXED（94bbd4b） | 见 `docs/security-audit-9.md` §3（类别：performance） |
+| S08-3 | P3 | DeleteAccount writes an outcome=ok record claiming the pseudonym key was destroyed before Destroy runs, and the correcting record is best-effort | internal/lifecycle/lifecycle.go:262-271; internal/lifecycle/lifecycle.go:277-291; internal/lifecycle/lifecycle.go:299-302 | FIXED（94bbd4b） | 见 `docs/security-audit-9.md` §3（类别：correctness） |
+| S02-11 | P3 · 信息 | [info] DenyAuthorization uses the static issuer only, so a dynamic-issuer deployment emits a denial without the RFC 9207 iss parameter | internal/oidchttp/oidchttp.go:1794; internal/oidchttp/oidchttp.go:1444 | NOT-A-DEFECT（生产两个组合根 cmd/re0auth 与 httpapi.New 都拒绝空 issuer，动态 issuer 形态在 shipped 部署不可达；守卫 internal/archtest/issuer_test.go::TestS02_11CompositionRootsRequireAStaticIssuer 会在有人放开任一组合根时变红） | 见 `docs/security-audit-9.md` §4（类别：correctness） |
+| S12-7 | P3 · 信息 | [info] Sources page re-runs O(available x bindings) scans on every reactive invalidation | web/src/routes/sources/+page.svelte:82; web/src/routes/sources/+page.svelte:89; web/src/routes/sources/+page.svelte:288 | FIXED（94bbd4b） | 见 `docs/security-audit-9.md` §4（类别：performance） |
 | S13-11 | P3 | perfreport divides by the baseline median without a zero check, producing NaN/Inf deltas and a NaN geomean | cmd/perfreport/main.go:355; cmd/perfreport/main.go:373 | FIXED（43e5d9a） | 见 `docs/security-audit-9.md` §3（类别：correctness） |
 | S15-10 | P3 | scripts/backup-keys.sh is committed mode 100644 while the documented invocation runs it directly | scripts/backup-keys.sh:1; docs/operations.md:90-92 | FIXED（43e5d9a） | 见 `docs/security-audit-9.md` §3（类别：correctness） |
 | S15-8 | P3 | Three alert rules keyed on generic go_*/process_* metrics carry no job selector and can fire on unrelated targets | deploy/prometheus/re0auth.rules.yml:304-348; deploy/prometheus/re0auth.rules.yml:4-7 | FIXED（43e5d9a） | 见 `docs/security-audit-9.md` §3（类别：reliability） |
@@ -232,9 +237,4 @@
 | A-FE-V1 | P3 | 「显示少于授予」有第二/第三份独立实现（设备流）⇒ 只改一处覆盖不到 | `internal/store/memory/oidc.go:1250,1283-1288`、`internal/store/postgres/oidc.go:1060,1094-1102` | FIXED（fddbde4） | 与 A-FE-3 共用同一判据；修 A-FE-3 时必须一并覆盖设备流两后端 — 来源：`docs/audit-5/findings/frontend-VERIFIED.md:297（第 5 轮）` |
 | A-FE-6 | P3 | `internal/webui` 只对 shell 设文档策略，非 HTML 资源不带 CSP | `internal/webui/webui.go:123-127` | FIXED（93009b0） | 把 `shellCSP` 扩成「任何 `text/html` 响应」，并断言 shell 上存在 `frame-ancestors`（真实组合根已由 `withSecurityHeaders` 兜住，属纵深防御） — 来源：`docs/audit-5/findings/frontend.md:140（第 5 轮）` |
 | S11-1 | P3 | Admin audit detail stores the raw operator account id in `Detail["actor"]`, defeating pseudonym-key destruction | `internal/admin/admin.go:485`、`internal/admin/admin.go:490`；`audit/audit.go:73`、`audit/audit.go:84` | DECIDED-NONGOAL | 按 `not-doing.md` 已有裁定（第 7 轮生成区）：「`admin.*` 的 `detail["actor"]` 记操作员原始 `usr_` — **已裁定（企业审计合规）**」。本轮确认，不作为缺陷开工。已知残余边界：该操作员日后抹除自己的账号不会解除这些行的关联（第 2 轮已记录）。 |
-| S03-11 | P3 | core.App.Remove races with an in-flight load, allowing a removed fiber to be marked active without its scope | internal/core/app.go:99; internal/core/app.go:105; internal/core/app.go:334 | OPEN | 见 `docs/security-audit-9.md` §3（类别：correctness） |
-| S03-7 | P3 | MemoryStore.Identities scans every identity in the process and holds the lock for the whole scan | internal/account/account.go:231; internal/account/account.go:281; internal/account/account.go:283 | OPEN | 见 `docs/security-audit-9.md` §3（类别：performance） |
-| S08-3 | P3 | DeleteAccount writes an outcome=ok record claiming the pseudonym key was destroyed before Destroy runs, and the correcting record is best-effort | internal/lifecycle/lifecycle.go:262-271; internal/lifecycle/lifecycle.go:277-291; internal/lifecycle/lifecycle.go:299-302 | OPEN | 见 `docs/security-audit-9.md` §3（类别：correctness） |
-| S02-11 | P3 · 信息 | [info] DenyAuthorization uses the static issuer only, so a dynamic-issuer deployment emits a denial without the RFC 9207 iss parameter | internal/oidchttp/oidchttp.go:1794; internal/oidchttp/oidchttp.go:1444 | OPEN | 见 `docs/security-audit-9.md` §4（类别：correctness） |
-| S12-7 | P3 · 信息 | [info] Sources page re-runs O(available x bindings) scans on every reactive invalidation | web/src/routes/sources/+page.svelte:82; web/src/routes/sources/+page.svelte:89; web/src/routes/sources/+page.svelte:288 | OPEN | 见 `docs/security-audit-9.md` §4（类别：performance） |
 | Z21V-1 | P3 | `0014` 的 Down 丢弃全部每账号假名密钥（`audit_subject_keys` 是唯一副本）；回退后再 Up 时 `subjectKey` 重铸随机 key，同一账号的审计史被静默劈成两个假名，`?subject=` 此后只回一半，且无错误无标记、`Verify` 全绿 | `internal/store/postgres/migrations/0014_audit_pseudonyms.sql:41-42` | FIXED（17914d4） | 与 Z21-2 同批：0014 Down 改 no-op + 注释；`MigrateDown` 加 `SELECT 1 FROM audit_subject_keys LIMIT 1` 前置拒退。（来源：`Z21-VERIFIED.md:92`） |

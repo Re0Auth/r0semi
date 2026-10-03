@@ -26,6 +26,7 @@ try {
 // already-ruled items (S11-1, FO-02) into the register as DECIDED-NONGOAL, so it
 // outranks everything (prio -3) and its S11-1 row replaces round9's OPEN one.
 const FRAGMENTS = [
+  { file: 'round14.md',    round: 14, prio: -7 },
   { file: 'round13.md',    round: 13, prio: -6 },
   { file: 'round12.md',    round: 12, prio: -5 },
   { file: 'round11.md',    round: 11, prio: -4 },
