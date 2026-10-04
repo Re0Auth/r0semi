@@ -79,7 +79,9 @@ type OIDCStore struct {
 	// revocation bumps the scope it names before it deletes; a mint re-checks the
 	// generation it captured at resolve time and fails closed if it moved. The map
 	// is small (one entry per revoked client or subject) and guarded by s.mu.
-	revocationEpochs map[string]int64
+	// revocationScope is a struct key so a lookup costs no string concatenation on
+	// the mint path.
+	revocationEpochs map[revocationScope]int64
 	devices          map[string]deviceRecord // by TokenHash(device code)
 	userCodes        map[string]string       // normalized user code -> TokenHash(device code)
 
@@ -99,10 +101,13 @@ type OIDCStore struct {
 	// refreshByIDHash maps a refresh row's paired access-token hash to the refresh
 	// row's own key. RevokeToken resolves "the refresh half of this access token"
 	// by that hash; without the index the only way to answer is to walk every live
-	// refresh row under the store's single mutex (R10-106/R10-145). It reuses the
-	// subjectIndex shape because the two are the same map-of-sets pattern, but its
-	// first key is an id hash, never a subject.
-	refreshByIDHash subjectIndex
+	// refresh row under the store's single mutex (R10-106/R10-145).
+	//
+	// It is a flat map, not the map-of-sets the subject indexes use: an id hash is
+	// TokenHash(accessID) for a freshly drawn access id, so a live refresh row's
+	// id hash identifies exactly one row. A nested set would allocate an inner map
+	// per row on the rotation path; this costs one map entry.
+	refreshByIDHash map[string]string
 
 	accessTTL  time.Duration
 	refreshTTL time.Duration
@@ -167,7 +172,7 @@ func (s *OIDCStore) deleteAccessLocked(key string) bool {
 func (s *OIDCStore) putRefreshLocked(key string, t refreshToken) {
 	s.refreshTokens[key] = t
 	s.refreshBySubject.add(t.subject, key)
-	s.refreshByIDHash.add(t.idHash, key)
+	s.refreshByIDHash[t.idHash] = key
 }
 
 func (s *OIDCStore) deleteRefreshLocked(key string) bool {
@@ -177,7 +182,12 @@ func (s *OIDCStore) deleteRefreshLocked(key string) bool {
 	}
 	delete(s.refreshTokens, key)
 	s.refreshBySubject.remove(t.subject, key)
-	s.refreshByIDHash.remove(t.idHash, key)
+	// Only remove the id-hash entry if it still names this row: the invariant is
+	// one live row per id hash, but a stale entry must never be dropped for a
+	// different row that happens to share it.
+	if indexed, ok := s.refreshByIDHash[t.idHash]; ok && indexed == key {
+		delete(s.refreshByIDHash, t.idHash)
+	}
 	return true
 }
 
@@ -297,29 +307,35 @@ func (s *OIDCStore) requestKeysLocked(subject string) []string {
 	return out
 }
 
-// refreshKeysByIDHashLocked returns the refresh rows whose paired access token
-// has this id hash. It is the index that makes RevokeToken's "refresh half of
-// this access token" lookup O(1) instead of a walk over the whole table under
-// the store's single mutex (R10-106/R10-145). The caller holds the lock and must
-// not delete while ranging the result, which is why this copies.
-func (s *OIDCStore) refreshKeysByIDHashLocked(idHash string) []string {
-	indexed := s.refreshByIDHash.keys(idHash)
-	out := make([]string, 0, len(indexed))
-	for k := range indexed {
-		out = append(out, k)
-	}
-	return out
+// refreshKeyByIDHashLocked returns the refresh row whose paired access token has
+// this id hash. It is the index that makes RevokeToken's "refresh half of this
+// access token" lookup O(1) instead of a walk over the whole table under the
+// store's single mutex (R10-106/R10-145). The caller holds the lock.
+func (s *OIDCStore) refreshKeyByIDHashLocked(idHash string) (string, bool) {
+	key, ok := s.refreshByIDHash[idHash]
+	return key, ok
 }
+
+// revocationScope names one revocation-generation counter. kind is 0 for the
+// global scope, 1 for a client and 2 for a subject; a struct key avoids a string
+// concatenation on every mint and revocation (R10-59's counters are read on the
+// token path).
+type revocationScope struct {
+	kind uint8
+	id   string
+}
+
+var revocationGlobalScope = revocationScope{}
 
 // revocationEpochsLocked returns the (global, client, subject) generations for a
 // grant. The caller holds the lock.
 func (s *OIDCStore) revocationEpochsLocked(clientID, subject string) (global, client, sub int64) {
-	global = s.revocationEpochs["*"]
+	global = s.revocationEpochs[revocationGlobalScope]
 	if clientID != "" {
-		client = s.revocationEpochs["c:"+clientID]
+		client = s.revocationEpochs[revocationScope{kind: 1, id: clientID}]
 	}
 	if subject != "" {
-		sub = s.revocationEpochs["s:"+subject]
+		sub = s.revocationEpochs[revocationScope{kind: 2, id: subject}]
 	}
 	return global, client, sub
 }
@@ -329,14 +345,16 @@ func (s *OIDCStore) revocationEpochsLocked(clientID, subject string) (global, cl
 // global generation, which every mint compares. The caller holds the lock.
 func (s *OIDCStore) bumpRevocationEpochsLocked(clientID, subject string) {
 	if clientID == "" && subject == "" {
-		s.revocationEpochs["*"]++
+		s.revocationEpochs[revocationGlobalScope]++
 		return
 	}
 	if clientID != "" {
-		s.revocationEpochs["c:"+clientID]++
+		key := revocationScope{kind: 1, id: clientID}
+		s.revocationEpochs[key] = s.revocationEpochs[key] + 1
 	}
 	if subject != "" {
-		s.revocationEpochs["s:"+subject]++
+		key := revocationScope{kind: 2, id: subject}
+		s.revocationEpochs[key] = s.revocationEpochs[key] + 1
 	}
 }
 
@@ -525,7 +543,7 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		accessBySubject:                newSubjectIndex(),
 		refreshBySubject:               newSubjectIndex(),
 		requestBySubject:               newSubjectIndex(),
-		refreshByIDHash:                newSubjectIndex(),
+		refreshByIDHash:                make(map[string]string),
 		accessTTL:                      time.Hour,
 		refreshTTL:                     30 * 24 * time.Hour,
 		requestTTL:                     ttl,
@@ -533,7 +551,7 @@ func NewOIDCStore(opts OIDCOptions) (*OIDCStore, error) {
 		maxTombstones:                  maxTombstones,
 		maxPendingAuthRequests:         maxPendingAuthRequests,
 		maxPendingDeviceAuthorizations: maxPendingDeviceAuthorizations,
-		revocationEpochs:               make(map[string]int64),
+		revocationEpochs:               make(map[revocationScope]int64),
 	}
 	// This store mints the tokens the client registry's clients hold, so it is
 	// the one that can revoke them when the operator plane deletes a client
@@ -1057,7 +1075,7 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 		// refresh token minted alongside this access token shares its id hash, and
 		// refreshByIDHash resolves that half by index rather than by walking every
 		// live refresh row under the store's single mutex (R10-106/R10-145).
-		for _, k := range s.refreshKeysByIDHashLocked(h) {
+		if k, ok := s.refreshKeyByIDHashLocked(h); ok {
 			s.deleteRefreshLocked(k)
 		}
 		for k, ts := range s.refreshTombstones {
@@ -1076,20 +1094,15 @@ func (s *OIDCStore) RevokeToken(ctx context.Context, tokenOrTokenID, userID, cli
 	// the refresh token — the half that mints replacements — stays live. The id
 	// hash index is what makes the lookup O(1) rather than a walk over the whole
 	// table under the store's single mutex (R10-106/R10-145).
-	keys := s.refreshKeysByIDHashLocked(h)
-	if len(keys) > 0 {
+	key, indexed := s.refreshKeyByIDHashLocked(h)
+	if indexed {
 		// Ownership first, as before: a foreign live row answers the uniform
-		// RFC 7009 success and deletes nothing (G-8). The set normally holds one
-		// key, because a grant mints one refresh row per access id.
-		for _, k := range keys {
-			if t, ok := s.refreshTokens[k]; ok && t.clientID != clientID {
-				s.mu.Unlock()
-				return nil
-			}
+		// RFC 7009 success and deletes nothing (G-8).
+		if t, present := s.refreshTokens[key]; present && t.clientID != clientID {
+			s.mu.Unlock()
+			return nil
 		}
-		for _, k := range keys {
-			s.deleteRefreshLocked(k)
-		}
+		s.deleteRefreshLocked(key)
 		s.deleteAccessLocked(h)
 		for tk, ts := range s.refreshTombstones {
 			if ts.idHash == h {

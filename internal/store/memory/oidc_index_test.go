@@ -81,29 +81,32 @@ func checkIndexes(t *testing.T, store *OIDCStore) {
 
 	// The refresh id-hash index (R10-106/R10-145) agrees with refreshTokens in
 	// both directions: it is what keeps RevokeToken from walking the whole table,
-	// and a stale entry would either waste a lookup or strand a refresh half.
+	// and a stale entry would either waste a lookup or strand a refresh half. The
+	// map is flat (one live row per id hash), so the invariant is one entry per
+	// live refresh token, both ways.
 	seen = make(map[string]bool)
-	for idHash, keys := range store.refreshByIDHash {
+	for idHash, key := range store.refreshByIDHash {
 		if idHash == "" {
 			t.Fatal("a refresh token was indexed under an empty id hash")
 		}
-		for k := range keys {
-			if seen[k] {
-				t.Fatalf("refresh token %q is indexed twice by id hash", k)
-			}
-			seen[k] = true
-			tok, ok := store.refreshTokens[k]
-			if !ok {
-				t.Fatalf("the refresh id-hash index points at a missing record %q", k)
-			}
-			if tok.idHash != idHash {
-				t.Fatalf("refresh token %q is indexed under id hash %q but has %q", k, idHash, tok.idHash)
-			}
+		if seen[key] {
+			t.Fatalf("refresh token %q is indexed twice by id hash", key)
+		}
+		seen[key] = true
+		tok, ok := store.refreshTokens[key]
+		if !ok {
+			t.Fatalf("the refresh id-hash index points at a missing record %q", key)
+		}
+		if tok.idHash != idHash {
+			t.Fatalf("refresh token %q is indexed under id hash %q but has %q", key, idHash, tok.idHash)
 		}
 	}
 	for k, tok := range store.refreshTokens {
 		if !seen[k] {
 			t.Fatalf("refresh token %q (id hash %q) is not indexed by id hash", k, tok.idHash)
+		}
+		if got, ok := store.refreshByIDHash[tok.idHash]; !ok || got != k {
+			t.Fatalf("refresh token %q's id hash %q maps to %q (ok=%v)", k, tok.idHash, got, ok)
 		}
 	}
 

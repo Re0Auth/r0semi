@@ -59,8 +59,10 @@ capacity profile: 8 workers, 10s, 237824 requests, 23782.4 req/s
 > 210,000 之后，每次机密客户端认证约 23 ms，实测画像降到 551–653 req/s、p50≈24 ms。
 > R10-138 的修复把**形状可证为 CSPRNG 生成**的密钥（64 位小写 hex、或 ≥32 随机字节的
 > base64，见 `oauth.LooksGeneratedSecret`）改走加盐 HMAC-SHA256 快验证器；人类可选或
-> 未声明形状的密钥仍走 PBKDF2（S01-10 的强度不变）。因此表里的 introspect 数字只对
-> 「弱/未声明形状密钥」的夹具成立，重新测量是 R10-141 的收口项。
+> 未声明形状的密钥仍走 PBKDF2（S01-10 的强度不变）。`BenchmarkProtocolIntrospect` 的
+> 夹具现在用的是生成 secret（快路径，本机约 36 µs/op），慢路径保留为
+> `BenchmarkProtocolIntrospectPBKDF2` 对照（约 23 ms/op）；表里的 introspect 数字仍待用
+> 生成密钥夹具重跑刷新，这是 R10-141 的收口项。
 
 读法有三条，缺一条都会把数字读错：
 

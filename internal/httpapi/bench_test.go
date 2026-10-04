@@ -42,7 +42,19 @@ type benchEnv struct {
 	basic   string
 }
 
+// benchGeneratedSecret is the shape `openssl rand -hex 32` produces, which
+// oauth.LooksGeneratedSecret recognises. R10-138/R10-141: the headline
+// benchmarks model the recommended deployment (a generated secret with the fast
+// salted-HMAC verifier); BenchmarkProtocolIntrospectPBKDF2 keeps the slow path
+// measured as an explicit control.
+const benchGeneratedSecret = "9f2c1d4b6a8e0f3c5d7b9a1e2f4c6d8a0b1c3e5f7a9b0c2d4e6f8a1b3c5d7e9f"
+
 func newBenchEnv(b *testing.B) benchEnv {
+	b.Helper()
+	return newBenchEnvSecret(b, benchGeneratedSecret, oauth.VerifierGenerated)
+}
+
+func newBenchEnvSecret(b *testing.B, secret string, policy oauth.VerifierPolicy) benchEnv {
 	b.Helper()
 	// The access log writes one line per request, including the setup requests
 	// below, and its output interleaves with the benchmark result lines. Discard
@@ -66,10 +78,9 @@ func newBenchEnv(b *testing.B) benchEnv {
 	}
 
 	const clientID = "app"
-	const secret = "s3cret"
 	scopes := []oauth.Scope{oauth.ScopeAccountID}
-	client, err := oauth.NewClient(clientID, "App", oauth.ClientConfidential, secret,
-		[]string{"https://app.example/cb"}, scopes)
+	client, err := oauth.NewClientWithVerifier(clientID, "App", oauth.ClientConfidential, secret,
+		[]string{"https://app.example/cb"}, scopes, policy)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -189,7 +200,19 @@ func BenchmarkBusinessPlaneBearerMe(b *testing.B) {
 // reusing a parsed request would skip that parse. It stands in for the HTTP
 // layer's own request handling, which is not otherwise in the number.
 func BenchmarkProtocolIntrospect(b *testing.B) {
-	env := newBenchEnv(b)
+	benchIntrospect(b, newBenchEnv(b))
+}
+
+// BenchmarkProtocolIntrospectPBKDF2 is the R10-138 control: the same call for a
+// deployment whose secret is not a recognised generated shape, so it keeps the
+// slow PBKDF2 verifier (S01-10). The gap between this and the headline benchmark
+// is the capacity difference between a weak secret and a generated one.
+func BenchmarkProtocolIntrospectPBKDF2(b *testing.B) {
+	benchIntrospect(b, newBenchEnvSecret(b, "s3cret", oauth.VerifierPBKDF2))
+}
+
+func benchIntrospect(b *testing.B, env benchEnv) {
+	b.Helper()
 	form := url.Values{"token": {env.token}}.Encode()
 	b.ReportAllocs()
 	b.ResetTimer()
